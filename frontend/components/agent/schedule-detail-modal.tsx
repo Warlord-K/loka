@@ -33,6 +33,7 @@ export function ScheduleDetailModal({
   const [activeTab, setActiveTab] = useState<Tab>('runs');
   const [selectedRun, setSelectedRun] = useState<ScheduledRun | null>(null);
   const [loading, setLoading] = useState(false);
+  const [triggering, setTriggering] = useState(false);
   const logsEndRef = useRef<HTMLDivElement>(null);
 
   const prevScheduleId = useRef<string | null>(null);
@@ -70,14 +71,11 @@ export function ScheduleDetailModal({
   };
 
   const handleTrigger = async () => {
-    setLoading(true);
+    setTriggering(true);
     try {
       await onTrigger(schedule.id);
-      toast.success('Schedule triggered');
-    } catch {
-      toast.error('Failed to trigger');
     } finally {
-      setLoading(false);
+      setTriggering(false);
     }
   };
 
@@ -116,10 +114,15 @@ export function ScheduleDetailModal({
           <div className="flex items-center gap-1 sm:gap-1.5 flex-shrink-0">
             <button
               onClick={handleTrigger}
-              disabled={loading || !schedule.enabled}
+              disabled={triggering || loading}
               className="h-8 px-2 sm:px-3 text-[13px] text-gray-9 hover:text-sun-9 hover:bg-gray-3 rounded-lg transition-colors flex items-center gap-1.5 disabled:opacity-40"
             >
-              <Lightning size={14} weight="fill" /> <span className="hidden sm:inline">Run Now</span>
+              {triggering ? (
+                <div className="w-3.5 h-3.5 border-2 border-gray-7 border-t-sun-9 rounded-full animate-spin" />
+              ) : (
+                <Lightning size={14} weight="fill" />
+              )}
+              <span className="hidden sm:inline">{triggering ? 'Triggering...' : 'Run Now'}</span>
             </button>
             <button onClick={handleDelete} className="h-8 w-8 flex items-center justify-center text-gray-8 hover:text-red-400 hover:bg-gray-3 rounded-lg transition-colors">
               <Trash size={16} weight="bold" />

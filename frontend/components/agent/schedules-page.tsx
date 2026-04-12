@@ -112,6 +112,7 @@ export function SchedulesPage({ repos, backends, skills, mcpServers }: Schedules
                 onClick={() => setSelectedSchedule(schedule)}
                 onToggle={(enabled) => handleToggle(schedule, enabled)}
                 onTrigger={() => handleTrigger(schedule.id)}
+                isTriggering={triggerMutation.isPending && triggerMutation.variables === schedule.id}
               />
             ))}
           </div>
