@@ -1,38 +1,51 @@
-use axum::{extract::Request, http::StatusCode, middleware::Next, response::Response};
+use std::net::SocketAddr;
+
+use axum::{
+    extract::{ConnectInfo, Request},
+    http::{Method, StatusCode},
+    middleware::Next,
+    response::Response,
+};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use uuid::Uuid;
 
-/// Key in request extensions — set by auth middleware.
 #[derive(Clone, Debug)]
 pub struct UserId(pub Uuid);
 
-/// Default user ID when AUTH_DISABLED=true (matches frontend DEFAULT_USER_ID).
 const DEFAULT_USER_ID: &str = "00000000-0000-0000-0000-000000000000";
 
-/// Cookie names NextAuth uses (HTTPS vs HTTP).
 const SECURE_COOKIE: &str = "__Secure-authjs.session-token";
 const INSECURE_COOKIE: &str = "authjs.session-token";
 
-/// Axum middleware that extracts the user ID from a NextAuth v5 JWE token.
-///
-/// NextAuth v5 with JWT strategy produces a JWE (dir + A256CBC-HS512).
-/// The encryption key is derived via HKDF-SHA256 where the **salt** is the
-/// cookie name and the **info** includes the salt:
-///   `Auth.js Generated Encryption Key (<cookie_name>)`
 pub async fn auth_middleware(mut req: Request, next: Next) -> Result<Response, StatusCode> {
     let auth_disabled = std::env::var("AUTH_DISABLED").unwrap_or_default() == "true";
 
     if auth_disabled {
-        let uid = Uuid::parse_str(DEFAULT_USER_ID).unwrap();
+        if req.headers().contains_key("cf-connecting-ip") {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        if !local_caller(&req) {
+            tracing::warn!(
+                host = ?req.headers().get("host"),
+                origin = ?req.headers().get("origin"),
+                "AUTH_DISABLED=true refused a request that did not come from a local page; list extra hosts in AUTH_DISABLED_HOSTS if this was you"
+            );
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        let uid = disabled_auth_user(&req);
         req.extensions_mut().insert(UserId(uid));
         return Ok(next.run(req).await);
     }
 
-    // Extract token + the cookie name (needed as HKDF salt)
     let (token, salt) = extract_token(&req).ok_or(StatusCode::UNAUTHORIZED)?;
+    if salt_is_cookie(&req) && cross_site_write(&req) {
+        return Err(StatusCode::FORBIDDEN);
+    }
 
-    let auth_secret =
-        std::env::var("AUTH_SECRET").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let auth_secret = session_secret().ok_or_else(|| {
+        tracing::error!("AUTH_SECRET is missing or shorter than 16 characters, so no session can be trusted; set it to the same value the website uses");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let payload = decrypt_jwe(&token, &auth_secret, &salt).map_err(|e| {
         tracing::warn!("JWT decrypt failed: {e}");
@@ -49,22 +62,117 @@ pub async fn auth_middleware(mut req: Request, next: Next) -> Result<Response, S
 
     let uid = Uuid::parse_str(user_id_str).map_err(|_| StatusCode::UNAUTHORIZED)?;
 
-    // Check expiration
-    if let Some(exp) = claims.get("exp").and_then(|v| v.as_i64()) {
-        let now = chrono::Utc::now().timestamp();
-        if now > exp {
-            return Err(StatusCode::UNAUTHORIZED);
-        }
+    let expires = claims.get("exp").and_then(|v| v.as_i64()).ok_or(StatusCode::UNAUTHORIZED)?;
+    if chrono::Utc::now().timestamp() > expires {
+        return Err(StatusCode::UNAUTHORIZED);
     }
 
     req.extensions_mut().insert(UserId(uid));
     Ok(next.run(req).await)
 }
 
-/// Extract the JWE token and cookie name from the request.
-/// NextAuth may chunk large tokens across multiple cookies (.0, .1, etc).
+pub fn session_secret() -> Option<String> {
+    std::env::var("AUTH_SECRET").ok().filter(|secret| secret.trim().len() >= 16)
+}
+
+pub fn default_bind_host() -> &'static str {
+    let auth_disabled = std::env::var("AUTH_DISABLED").unwrap_or_default() == "true";
+    let contained = std::path::Path::new("/.dockerenv").exists() || std::env::var_os("KUBERNETES_SERVICE_HOST").is_some();
+    if auth_disabled && !contained {
+        "127.0.0.1"
+    } else {
+        "0.0.0.0"
+    }
+}
+
+fn bare_host(raw: &str) -> &str {
+    let raw = raw.trim();
+    if let Some(rest) = raw.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    match raw.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) && !host.contains(':') => host,
+        _ => raw,
+    }
+}
+
+fn url_host(raw: &str) -> Option<&str> {
+    let rest = raw.trim().split_once("://")?.1;
+    Some(bare_host(rest.split(['/', '?', '#']).next().unwrap_or(rest)))
+}
+
+fn local_host(raw: &str, extra: &[String]) -> bool {
+    let host = bare_host(raw).trim_end_matches('.').to_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    !host.contains('.')
+        || [".localhost", ".local", ".internal", ".lan", ".home.arpa", ".svc", ".cluster.local"].iter().any(|suffix| host.ends_with(suffix))
+        || extra.contains(&host)
+}
+
+fn allowed_hosts() -> Vec<String> {
+    let mut hosts: Vec<String> = std::env::var("AUTH_DISABLED_HOSTS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|h| bare_host(h).to_lowercase())
+        .filter(|h| !h.is_empty())
+        .collect();
+    for name in ["WORLD_APP_URL", "WORLD_PUBLIC_API_URL", "AUTH_URL", "NEXTAUTH_URL"] {
+        if let Some(host) = std::env::var(name).ok().as_deref().and_then(url_host) {
+            hosts.push(host.to_lowercase());
+        }
+    }
+    hosts
+}
+
+fn local_caller(req: &Request) -> bool {
+    came_from_a_local_page(req, &allowed_hosts())
+}
+
+fn came_from_a_local_page(req: &Request, extra: &[String]) -> bool {
+    let header = |name: &str| req.headers().get(name).and_then(|v| v.to_str().ok());
+    if header("host").is_some_and(|host| !local_host(host, extra)) {
+        return false;
+    }
+    match header("origin") {
+        Some(origin) => url_host(origin).is_some_and(|host| local_host(host, extra)),
+        None => header("sec-fetch-site") != Some("cross-site"),
+    }
+}
+
+fn disabled_auth_user(req: &Request) -> Uuid {
+    let local = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .is_some_and(|ConnectInfo(peer)| peer.ip().is_loopback())
+        && !["cf-connecting-ip", "x-forwarded-for", "x-real-ip"].iter().any(|name| req.headers().contains_key(*name));
+    req.headers()
+        .get("x-world-user")
+        .filter(|_| local)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| Uuid::parse_str(v).ok())
+        .unwrap_or_else(|| Uuid::parse_str(DEFAULT_USER_ID).unwrap())
+}
+
+fn salt_is_cookie(req: &Request) -> bool {
+    req.headers().get("authorization").is_none()
+}
+
+fn cross_site_write(req: &Request) -> bool {
+    if matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
+        return false;
+    }
+    req.headers()
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|site| !matches!(site, "same-origin" | "none"))
+}
+
 fn extract_token(req: &Request) -> Option<(String, String)> {
-    // Try Authorization header first (salt defaults to secure cookie name)
     if let Some(bearer) = req
         .headers()
         .get("authorization")
@@ -75,7 +183,6 @@ fn extract_token(req: &Request) -> Option<(String, String)> {
         return Some((decoded.into_owned(), SECURE_COOKIE.to_string()));
     }
 
-    // Parse cookies
     let cookie_header = req.headers().get("cookie")?.to_str().ok()?;
     let cookies: Vec<(&str, &str)> = cookie_header
         .split(';')
@@ -86,15 +193,12 @@ fn extract_token(req: &Request) -> Option<(String, String)> {
         })
         .collect();
 
-    // Try exact cookie names first, then check for chunked cookies (.0, .1, ...)
     for base_name in &[SECURE_COOKIE, INSECURE_COOKIE] {
-        // Direct match
         if let Some((_, val)) = cookies.iter().find(|(name, _)| *name == *base_name) {
             let decoded = urlencoding::decode(val).unwrap_or_else(|_| (*val).into());
             return Some((decoded.into_owned(), base_name.to_string()));
         }
 
-        // Chunked: __Secure-authjs.session-token.0, .1, .2, ...
         let mut chunks: Vec<(usize, &str)> = Vec::new();
         for (name, val) in &cookies {
             if let Some(suffix) = name.strip_prefix(base_name) {
@@ -118,15 +222,6 @@ fn extract_token(req: &Request) -> Option<(String, String)> {
     None
 }
 
-/// Decrypt a NextAuth v5 JWE token (compact serialization).
-///
-/// Algorithm: dir + A256CBC-HS512 (RFC 7518 §5.2.5)
-/// Key derivation: HKDF-SHA256(
-///   ikm  = AUTH_SECRET,
-///   salt = cookie_name,                                    // e.g. "__Secure-authjs.session-token"
-///   info = "Auth.js Generated Encryption Key (<cookie_name>)",
-///   len  = 64 bytes
-/// )
 fn decrypt_jwe(token: &str, secret: &str, salt: &str) -> anyhow::Result<Vec<u8>> {
     use aes::Aes256;
     use cbc::cipher::{BlockDecryptMut, KeyIvInit};
@@ -139,7 +234,6 @@ fn decrypt_jwe(token: &str, secret: &str, salt: &str) -> anyhow::Result<Vec<u8>>
     }
 
     let header_b64 = parts[0];
-    // parts[1] = encrypted key (empty for "dir" algorithm)
     let iv_b64 = parts[2];
     let ciphertext_b64 = parts[3];
     let tag_b64 = parts[4];
@@ -148,20 +242,15 @@ fn decrypt_jwe(token: &str, secret: &str, salt: &str) -> anyhow::Result<Vec<u8>>
     let ciphertext = URL_SAFE_NO_PAD.decode(ciphertext_b64)?;
     let tag = URL_SAFE_NO_PAD.decode(tag_b64)?;
 
-    // Derive 64-byte key via HKDF-SHA256
-    // salt = cookie name, info = "Auth.js Generated Encryption Key (<salt>)"
     let info = format!("Auth.js Generated Encryption Key ({salt})");
     let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(salt.as_bytes()), secret.as_bytes());
     let mut key = [0u8; 64];
     hk.expand(info.as_bytes(), &mut key)
         .map_err(|_| anyhow::anyhow!("HKDF expand failed"))?;
 
-    // A256CBC-HS512: first 32 bytes = HMAC key, last 32 bytes = AES key
     let mac_key = &key[..32];
     let enc_key = &key[32..];
 
-    // Verify HMAC-SHA-512 tag (RFC 7518 §5.2.2.1)
-    // Input: AAD || IV || ciphertext || AL (AAD bit length as 64-bit BE)
     let aad = header_b64.as_bytes();
     let al = (aad.len() as u64 * 8).to_be_bytes();
 
@@ -173,13 +262,11 @@ fn decrypt_jwe(token: &str, secret: &str, salt: &str) -> anyhow::Result<Vec<u8>>
     hmac.update(&al);
     let mac_result = hmac.finalize().into_bytes();
 
-    // Tag = first 32 bytes (T_LEN = 256 bits for HS512)
     let computed_tag = &mac_result[..32];
     if !constant_time_eq(computed_tag, &tag) {
         anyhow::bail!("JWE tag verification failed");
     }
 
-    // Decrypt AES-256-CBC
     type Aes256CbcDec = cbc::Decryptor<Aes256>;
     let decryptor = Aes256CbcDec::new_from_slices(enc_key, &iv)
         .map_err(|_| anyhow::anyhow!("AES init failed"))?;
@@ -200,4 +287,74 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         .zip(b.iter())
         .fold(0u8, |acc, (x, y)| acc | (x ^ y))
         == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+
+    fn from_page(host: Option<&str>, origin: Option<&str>, site: Option<&str>) -> bool {
+        let mut builder = axum::http::Request::builder().method(Method::POST).uri("/api/world/tokens");
+        for (name, value) in [("host", host), ("origin", origin), ("sec-fetch-site", site)] {
+            if let Some(value) = value {
+                builder = builder.header(name, value);
+            }
+        }
+        came_from_a_local_page(&builder.body(Body::empty()).unwrap(), &["loka.example.dev".to_string()])
+    }
+
+    #[test]
+    fn auth_disabled_only_answers_local_pages() {
+        assert!(from_page(Some("localhost:8081"), None, None), "curl and same-origin reads");
+        assert!(from_page(Some("127.0.0.1:8081"), Some("http://localhost:3000"), Some("same-site")));
+        assert!(from_page(Some("api:8081"), Some("http://192.168.1.20:3000"), None), "the compose frontend and a LAN browser");
+        assert!(from_page(Some("[::1]:8081"), Some("http://[::1]:3000"), None));
+        assert!(from_page(Some("loka.example.dev"), Some("https://loka.example.dev"), None), "hosts named in the environment");
+        assert!(!from_page(Some("127.0.0.1:8081"), Some("https://evil.example"), Some("cross-site")), "another website calling the local API");
+        assert!(!from_page(Some("127.0.0.1:8081"), Some("null"), None));
+        assert!(!from_page(Some("127.0.0.1:8081"), None, Some("cross-site")), "a cross-site read without an origin");
+        assert!(!from_page(Some("evil.example:8081"), None, None), "a rebound DNS name pointing at this machine");
+        assert!(!from_page(Some("localhost.evil.example"), Some("http://localhost.evil.example"), None));
+        assert_eq!(bare_host("[2001:db8::1]:443"), "2001:db8::1");
+        assert_eq!(url_host("https://Loka.example.dev:8443/path"), Some("Loka.example.dev"));
+    }
+
+    fn request(method: Method, site: Option<&str>, bearer: bool) -> Request {
+        let mut builder = axum::http::Request::builder().method(method).uri("/api/world/runs/x/stop");
+        if let Some(site) = site {
+            builder = builder.header("sec-fetch-site", site);
+        }
+        if bearer {
+            builder = builder.header("authorization", "Bearer t");
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    #[test]
+    fn cookie_writes_from_other_sites_are_refused() {
+        assert!(cross_site_write(&request(Method::POST, Some("cross-site"), false)));
+        assert!(cross_site_write(&request(Method::DELETE, Some("same-site"), false)));
+        assert!(!cross_site_write(&request(Method::POST, Some("same-origin"), false)));
+        assert!(!cross_site_write(&request(Method::POST, None, false)));
+        assert!(!cross_site_write(&request(Method::GET, Some("cross-site"), false)));
+        assert!(salt_is_cookie(&request(Method::POST, None, false)));
+        assert!(!salt_is_cookie(&request(Method::POST, None, true)));
+    }
+
+    #[test]
+    fn impersonation_header_needs_a_loopback_peer() {
+        let wanted = "11111111-1111-1111-1111-111111111111";
+        let from = |peer: Option<&str>| {
+            let mut req = axum::http::Request::builder().uri("/").header("x-world-user", wanted).body(Body::empty()).unwrap();
+            if let Some(peer) = peer {
+                req.extensions_mut().insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+            }
+            disabled_auth_user(&req).to_string()
+        };
+        assert_eq!(from(Some("127.0.0.1:5000")), wanted);
+        assert_eq!(from(Some("[::1]:5000")), wanted);
+        assert_eq!(from(Some("10.0.0.7:5000")), DEFAULT_USER_ID);
+        assert_eq!(from(None), DEFAULT_USER_ID);
+    }
 }
