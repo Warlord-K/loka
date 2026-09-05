@@ -1,172 +1,135 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
-mod agent;
+mod acp;
 mod api;
+mod apps;
+mod browser;
+mod screen;
 mod claude;
 mod cli;
 mod codex;
 mod config;
 mod cursor;
 mod db;
-mod external;
 mod git;
 mod grok;
-mod memory;
-mod models;
-mod notifications;
-mod onboarding;
+mod cmd_hub;
+mod key_proxy;
+mod mcp_hub;
+mod model_catalog;
+mod omp;
 mod opencode;
-mod policies;
 mod preflight;
-mod profiles;
-mod queue;
-mod reviewer;
-mod scheduler;
-mod slack;
-mod updater;
+mod remote_runner;
+mod resources;
+mod sandbox_wrap;
+mod tools_check;
+mod setup_scan;
+mod shell;
+mod terminal;
+mod world;
+#[cfg(test)]
+mod bench_live;
+#[cfg(test)]
+mod parity_live;
 
-/// Exit code indicating the agent needs a rebuild (code changes detected).
-pub const EXIT_CODE_UPDATE: i32 = 42;
+fn main() -> anyhow::Result<()> {
+    if cmd_hub::is_shell_invocation() {
+        cmd_hub::run_shell();
+    }
+    loka_shared::limits::hide_process_memory();
+    cli::capture_host_secrets();
+    match std::env::args().nth(1).as_deref() {
+        Some("browser") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            std::process::exit(browser::gate(&args));
+        }
+        Some("apps") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            std::process::exit(apps::gate(&args));
+        }
+        Some("screen") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            std::process::exit(screen::gate(&args));
+        }
+        Some("mcp-shim") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            mcp_hub::shim::run(&args)
+        }
+        Some("mcp-launch") => {
+            let spec = std::env::args().nth(2).ok_or_else(|| anyhow::anyhow!("missing MCP launch specification"))?;
+            codex::launch_mcp(&spec)
+        }
+        Some("mcp") => tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
+            if std::env::args().nth(2).as_deref() == Some("runner") {
+                return remote_runner::serve_mcp().await;
+            }
+            dotenvy::dotenv().ok();
+            loka_shared::environment::initialize();
+            world::mcp::serve().await
+        }),
+        _ => tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(serve()),
+    }
+}
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("karna_agent=info".parse()?),
-        )
-        .json()
-        .init();
+async fn serve() -> anyhow::Result<()> {
+    let service = if std::env::args().nth(1).as_deref() == Some("runner") { "runner" } else { "world" };
+    {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::from_default_env().add_directive("loka_agent=info".parse()?))
+            .with(tracing_subscriber::fmt::layer().json())
+            .with(loka_shared::telemetry::log_shipper(service))
+            .init();
+    }
+    loka_shared::telemetry::start(service);
+    loka_shared::limits::raise_open_files();
+
+    if service == "runner" {
+        return remote_runner::run().await;
+    }
 
     dotenvy::dotenv().ok();
+    loka_shared::environment::initialize();
 
-    let mut config = config::Config::from_env()?;
+    let config = config::Config::from_env()?;
     let backend_names: Vec<&str> = config.backends.keys().map(|s| s.as_str()).collect();
-    info!(
-        repos = config.repos.len(),
-        backends = ?backend_names,
-        poll_interval = config.poll_interval_secs,
-        "Karna Agent starting",
-    );
+    info!(repos = config.repos.len(), backends = ?backend_names, "Loka world worker starting");
 
-    // Graceful shutdown — flag + notify for instant wake from sleep
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
-    // Watch channel to signal the API server to stop accepting connections
     let (api_shutdown_tx, api_shutdown_rx) = tokio::sync::watch::channel(());
 
-    // Ensure directories exist
     tokio::fs::create_dir_all(&config.repos_dir).await?;
     tokio::fs::create_dir_all(&config.workspaces_dir).await?;
 
-    // Configure git credential store for HTTPS auth
+    if config.github_token.is_empty() {
+        warn!("GITHUB_TOKEN is not set, GitHub features are disabled");
+    }
     git::workspace::configure_git_auth(&config.github_token).await?;
-
-    // Configure SSH commit signing (auto-detected from ./signing/ mount or explicit config)
     git::workspace::configure_git_signing(config.signing.as_ref()).await?;
 
-    // Write the opencode MCP config (~/.config/opencode/opencode.json) so the
-    // `opencode` backend picks up Karna's MCP servers. No-op when opencode
-    // isn't in `agent.backends` or no MCP servers are configured.
     if let Err(e) = config.write_opencode_global_config() {
         warn!(error = %e, "Failed to write opencode MCP config");
     }
 
-    // Preflight: warn early if a configured backend CLI is missing or not
-    // logged in. Subscription backends (claude/cursor/grok/codex) authenticate
-    // via the host's login, inherited when the agent runs locally.
     preflight::check_backends(&config).await;
 
-    // Connect to Redis (first, so we can attach it to Database)
-    let redis = redis::Client::open(config.redis_url.as_str())?;
-    let mut conn = redis.get_multiplexed_async_connection().await?;
-    redis::cmd("PING").query_async::<String>(&mut conn).await?;
-    info!("Connected to Redis");
-
-    // Connect to Postgres with cache invalidation wired up.
-    // Shared workspace mode lets the agent treat all human-owned tasks as part
-    // of one pool — but the agent's `next_actionable_task()` already only
-    // looks at `assignee_user_id IS NULL` rows, so this is purely cosmetic for
-    // queries that use user-scoped filters. Keep it consistent with the API.
-    let shared_workspace = std::env::var("KARNA_SHARED_WORKSPACE")
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false);
-    let db = db::Database::connect(&config.database_url)
-        .await?
-        .with_redis(redis.clone())
-        .with_shared_workspace(shared_workspace);
+    let db = db::Database::connect(&config.database_url).await?;
     info!("Connected to Postgres");
 
-    // Seed agent profiles from config backends (one per cli × model pair).
-    // Idempotent — existing rows by slug are left alone, including user renames.
-    match profiles::seed_from_config(&config, &db).await {
-        Ok(()) => {}
-        Err(e) => warn!(error = %e, "Failed to seed agent profiles"),
-    }
-
-    // Sync config-defined schedules to database
-    match scheduler::sync_config_schedules(&config, &db).await {
-        Ok(()) => {}
-        Err(e) => warn!(error = %e, "Failed to sync config schedules"),
-    }
-
-    // Clone repos on startup
     for repo in &config.repos {
         info!(repo = %repo.repo, "Ensuring repo is cloned");
-        match git::workspace::ensure_cloned(&config.repos_dir, &repo.repo, &config.github_token)
-            .await
-        {
+        match git::workspace::ensure_cloned(&config.repos_dir, &repo.repo, &config.github_token).await {
             Ok(_) => info!(repo = %repo.repo, "Repo ready"),
             Err(e) => error!(repo = %repo.repo, error = %e, "Failed to clone repo"),
         }
     }
 
-    // Sync repo profiles — onboard any repos that don't have profiles yet
-    match onboarding::sync_repo_profiles(&config, &db).await {
-        Ok(()) => {}
-        Err(e) => warn!(error = %e, "Failed to sync repo profiles"),
-    }
+    let api_handle = tokio::spawn(api::serve(api_shutdown_rx));
 
-    let is_production = std::env::var("ENVIRONMENT")
-        .unwrap_or_default()
-        .eq_ignore_ascii_case("production");
-
-    // Spawn the Axum API server (health checks, webhooks)
-    let api_config = config.clone();
-    let api_db = db.clone();
-    let api_handle = tokio::spawn(api::serve(api_config, api_db, api_shutdown_rx));
-
-    // Optional Slack Socket Mode control plane (inbound commands + steering).
-    slack::spawn_socket_mode(config.clone(), db.clone());
-
-    // In production on Render free tier, self-ping to prevent spin-down.
-    // Render sets RENDER_EXTERNAL_URL automatically on web services.
-    if let Ok(external_url) = std::env::var("RENDER_EXTERNAL_URL") {
-        let url = format!("{external_url}/health");
-        tokio::spawn(async move {
-            let client = reqwest::Client::new();
-            loop {
-                tokio::time::sleep(Duration::from_secs(240)).await; // 4 minutes
-                match client.get(&url).send().await {
-                    Ok(_) => debug!("Keep-alive ping sent"),
-                    Err(e) => warn!(error = %e, "Keep-alive ping failed"),
-                }
-            }
-        });
-        info!("Keep-alive pinger started (4min interval → {external_url}/health)");
-    }
-
-    // Signal handler — runs in background, sets shutdown flag on SIGTERM/SIGINT.
-    // The poll loop checks the flag each iteration and drains gracefully.
     let sig_shutdown = shutdown.clone();
     let sig_notify = shutdown_notify.clone();
     tokio::spawn(async move {
@@ -187,137 +150,12 @@ async fn main() -> anyhow::Result<()> {
             info!("Received SIGINT");
         }
         sig_shutdown.store(true, Ordering::SeqCst);
-        sig_notify.notify_waiters(); // Wake poll loop immediately if sleeping
-        let _ = api_shutdown_tx.send(()); // Stop API server
+        sig_notify.notify_waiters();
+        let _ = api_shutdown_tx.send(());
         info!("Shutdown signal received, draining current task...");
     });
 
-    // Track config file mtime for hot-reload
-    let config_path =
-        std::env::var("CONFIG_PATH").unwrap_or_else(|_| "/etc/karna/config.yaml".to_string());
-    let mut last_config_mtime: Option<SystemTime> = std::fs::metadata(&config_path)
-        .ok()
-        .and_then(|m| m.modified().ok());
-
-    // Main poll loop with graceful shutdown + config hot-reload
-    let poll_interval = Duration::from_secs(config.poll_interval_secs);
-    let poll_shutdown = shutdown.clone();
-    let poll_notify = shutdown_notify.clone();
-    let mut needs_rebuild = false;
-
-    let poll_handle = tokio::spawn(async move {
-        info!("Poller started (interval: {}s)", config.poll_interval_secs);
-
-        loop {
-            // Check shutdown flag before claiming new work
-            if poll_shutdown.load(Ordering::SeqCst) {
-                info!("Shutdown flag set, exiting poll loop");
-                break;
-            }
-
-            // Hot-reload config if file changed
-            if let Some(current_mtime) = std::fs::metadata(&config_path)
-                .ok()
-                .and_then(|m| m.modified().ok())
-            {
-                if last_config_mtime.is_none_or(|last| current_mtime > last) {
-                    match config::Config::from_env() {
-                        Ok(new_config) => {
-                            info!("Config reloaded (file changed on disk)");
-                            config = new_config;
-                            last_config_mtime = Some(current_mtime);
-                            if let Err(e) = config.write_opencode_global_config() {
-                                warn!(error = %e, "Failed to refresh opencode MCP config");
-                            }
-                        }
-                        Err(e) => warn!(error = %e, "Config reload failed, keeping previous"),
-                    }
-                }
-            }
-
-            // Poll for tasks
-            match agent::poll_once(&config, &db, &redis).await {
-                Ok(()) => {}
-                Err(e) => error!("Poll error: {e:#}"),
-            }
-
-            // Onboard any repos added via UI (pending or stale profiles)
-            match onboarding::check_pending_onboards(&config, &db).await {
-                Ok(()) => {}
-                Err(e) => error!("Onboarding error: {e:#}"),
-            }
-
-            // Reconcile GitHub webhooks for ready repos whose webhook is missing
-            // or pointed at a different URL than what's currently configured.
-            match onboarding::reconcile_webhooks(&config, &db).await {
-                Ok(()) => {}
-                Err(e) => error!("Webhook reconcile error: {e:#}"),
-            }
-
-            // Drain pending PR reviews (enqueued by either webhook server)
-            match reviewer::run_pending_reviews(&config, &db).await {
-                Ok(()) => {}
-                Err(e) => error!("PR review drain error: {e:#}"),
-            }
-
-            // Check and run due schedules
-            match scheduler::check_schedules(&config, &db, &redis).await {
-                Ok(()) => {}
-                Err(e) => error!("Schedule error: {e:#}"),
-            }
-
-            // Check for self-repo updates (after task work is done)
-            // Disabled in production — Render/cloud platforms handle deploys.
-            if !is_production {
-                if let Some(self_repo) = config.self_repo() {
-                    let repo_path = config.repos_dir.join(self_repo.name());
-                    match updater::check_self_repo(&repo_path, &self_repo.branch).await {
-                        Ok(Some(change)) => {
-                            info!(change_type = ?change, "Self-repo update detected");
-                            if change.needs_rebuild() {
-                                info!("Code changes detected — initiating graceful shutdown for rebuild");
-                                if let Err(e) =
-                                    updater::pull_self_repo(&repo_path, &self_repo.branch).await
-                                {
-                                    warn!(error = %e, "Failed to pull self-repo (restart loop may occur)");
-                                }
-                                needs_rebuild = true;
-                                poll_shutdown.store(true, Ordering::SeqCst);
-                            } else {
-                                info!("Config-only changes — will be picked up via hot-reload");
-                            }
-                        }
-                        Ok(None) => {} // No changes
-                        Err(e) => warn!(error = %e, "Self-repo update check failed"),
-                    }
-                }
-            }
-
-            // Sleep between polls — but wake instantly on shutdown signal
-            tokio::select! {
-                _ = tokio::time::sleep(poll_interval) => {}
-                _ = poll_notify.notified() => {}
-            }
-        }
-
-        needs_rebuild
-    });
-
-    // Wait for poll loop or API server to exit.
-    tokio::select! {
-        r = api_handle => error!("API server exited unexpectedly: {r:?}"),
-        r = poll_handle => {
-            match r {
-                Ok(true) => {
-                    info!("Exiting with code {EXIT_CODE_UPDATE} for rebuild");
-                    std::process::exit(EXIT_CODE_UPDATE);
-                }
-                Ok(false) => info!("Poller exited cleanly"),
-                Err(e) => error!("Poller exited: {e:?}"),
-            }
-        }
-    }
-
-    info!("Agent shutdown complete");
+    world::run(config, db, shutdown, shutdown_notify).await?;
+    let _ = api_handle.await;
     Ok(())
 }

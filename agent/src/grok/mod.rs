@@ -3,16 +3,10 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
-use crate::cli::{CliOptions, CliResult, StreamEvent};
+use crate::cli::{collect_stderr, configure_child_environment, CliOptions, CliResult, StreamEvent};
 
-/// Default system prompt prepended to every Grok invocation.
-///
-/// Grok's `--system-prompt-override` *replaces* the built-in coding system
-/// prompt, which would drop its default tool-use behavior. Instead the agent
-/// identity and git rules are folded into the prompt content, matching the
-/// codex/opencode backends.
 const AGENT_PREAMBLE: &str = "\
-You are Karna, an autonomous coding agent. You work independently without \
+You are Loka, an autonomous coding agent. You work independently without \
 human interaction during execution. If you are uncertain, make the best judgment \
 call and document your reasoning in a code comment or commit message.\n\n\
 Follow existing code patterns and conventions in each repository. \
@@ -23,23 +17,12 @@ Git commit rules:\n\
 - NEVER add Co-Authored-By trailers to commits\n\
 - NEVER add Signed-off-by trailers to commits";
 
-/// Flush buffered assistant text as a stream event once this many unsent
-/// characters accumulate. Grok streams word-level `text` deltas, so emitting
-/// each one individually would flood `agent_logs`.
 const TEXT_FLUSH_CHARS: usize = 200;
 
-/// Run the Grok CLI (`grok`) in headless single-turn mode with streaming JSON.
-///
-/// Grok's `streaming-json` output emits `{"type":"thought"|"text","data":...}`
-/// deltas followed by `{"type":"end","sessionId":...,"stopReason":...}`. Tool
-/// calls are executed internally and not surfaced as discrete stream events, so
-/// no `ToolUse` events are produced for this backend (best-effort mapping).
-///
-/// The prompt is written to a temp file and passed via `--prompt-file` to avoid
-/// the Linux 128KB per-arg limit. Auth is a subscription login (`grok login`).
 pub async fn run(opts: CliOptions<'_>) -> Result<CliResult> {
-    // Build the prompt. When resuming, only send the new turn (prior context
-    // lives in the resumed session).
+    if opts.mcp_has_secrets {
+        anyhow::bail!("grok does not support MCP servers with environment secret references");
+    }
     let full_prompt = if opts.session_id.is_some() && opts.resume {
         opts.prompt.to_string()
     } else {
@@ -51,9 +34,7 @@ pub async fn run(opts: CliOptions<'_>) -> Result<CliResult> {
         parts.join("\n\n")
     };
 
-    // Write the prompt to a temp file so large prompts (skills + diffs) don't
-    // hit the per-arg size limit. Cleaned up before returning.
-    let prompt_path = std::env::temp_dir().join(format!("karna-grok-{}.txt", uuid::Uuid::new_v4()));
+    let prompt_path = std::env::temp_dir().join(format!("loka-grok-{}.txt", uuid::Uuid::new_v4()));
     tokio::fs::write(&prompt_path, full_prompt.as_bytes())
         .await
         .with_context(|| {
@@ -65,7 +46,6 @@ pub async fn run(opts: CliOptions<'_>) -> Result<CliResult> {
 
     let result = run_inner(&opts, &prompt_path).await;
 
-    // Best-effort cleanup of the temp prompt file.
     let _ = tokio::fs::remove_file(&prompt_path).await;
 
     result
@@ -73,20 +53,18 @@ pub async fn run(opts: CliOptions<'_>) -> Result<CliResult> {
 
 async fn run_inner(opts: &CliOptions<'_>, prompt_path: &std::path::Path) -> Result<CliResult> {
     let mut cmd = Command::new("grok");
+    configure_child_environment(&mut cmd, &opts.child_environment())?;
 
-    // Run inline (no TUI alt-screen) in headless single-turn mode.
     cmd.arg("--no-alt-screen");
     cmd.arg("--cwd").arg(opts.working_dir);
     cmd.arg("--prompt-file").arg(prompt_path);
     cmd.arg("--output-format").arg("streaming-json");
 
-    // The Docker container is the sandbox — bypass per-tool approvals.
     cmd.arg("--permission-mode").arg("bypassPermissions");
 
     cmd.arg("-m").arg(opts.model);
     cmd.arg("--max-turns").arg(opts.max_turns.to_string());
 
-    // Session continuation.
     if let Some(sid) = opts.session_id {
         if opts.resume {
             cmd.arg("--resume").arg(sid);
@@ -100,7 +78,6 @@ async fn run_inner(opts: &CliOptions<'_>, prompt_path: &std::path::Path) -> Resu
         );
     }
 
-    // MCP servers are read from grok's machine-level config, not per-task.
     if opts.mcp_config_json.is_some() {
         debug!("grok backend reads MCP servers from machine config, not per-task mcp_config_json");
     }
@@ -147,7 +124,6 @@ async fn run_inner(opts: &CliOptions<'_>, prompt_path: &std::path::Path) -> Resu
         };
 
         match json.get("type").and_then(|v| v.as_str()).unwrap_or("") {
-            // Assistant text deltas — accumulate and flush in chunks.
             "text" => {
                 if let Some(data) = json.get("data").and_then(|v| v.as_str()) {
                     output.push_str(data);
@@ -162,7 +138,6 @@ async fn run_inner(opts: &CliOptions<'_>, prompt_path: &std::path::Path) -> Resu
                     }
                 }
             }
-            // Reasoning deltas — tracked but not streamed to logs (too noisy).
             "thought" => {}
             "end" => {
                 if let Some(sid) = json.get("sessionId").and_then(|v| v.as_str()) {
@@ -185,7 +160,6 @@ async fn run_inner(opts: &CliOptions<'_>, prompt_path: &std::path::Path) -> Resu
         }
     }
 
-    // Flush any trailing assistant text.
     if !unflushed.is_empty() {
         if let Some(tx) = &opts.event_tx {
             let _ = tx.send(StreamEvent::AssistantText(std::mem::take(&mut unflushed)));
@@ -194,10 +168,14 @@ async fn run_inner(opts: &CliOptions<'_>, prompt_path: &std::path::Path) -> Resu
 
     let status = child.wait().await?;
     let exit_code = status.code().unwrap_or(-1);
-    let stderr = stderr_handle.await.unwrap_or_default();
+    let stderr = collect_stderr(stderr_handle).await;
 
     debug!(exit_code, stderr_len = stderr.len(), "Grok CLI finished");
-    if !stderr.is_empty() {
+    if !stderr.is_empty()
+        && (opts.environment.is_empty() && opts.provider_keys.is_empty())
+        && !opts.mcp_has_secrets
+        && !opts.sensitive
+    {
         debug!(stderr = %stderr, "Grok stderr");
     }
 
@@ -224,5 +202,7 @@ async fn run_inner(opts: &CliOptions<'_>, prompt_path: &std::path::Path) -> Resu
         session_id,
         cost_usd: 0.0,
         exit_code,
+        usage: Default::default(),
+        checkpoint: None,
     })
 }

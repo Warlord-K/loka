@@ -1,16 +1,3 @@
-//! Startup preflight for the CLI backends declared in `agent.backends`.
-//!
-//! Karna shells out to local agent CLIs that authenticate via the host's
-//! subscription login (`~/.cursor`, `~/.grok`, `~/.claude`, `~/.codex`, ...).
-//! When the agent runs locally these are inherited from the user's shell — no
-//! API keys in `.env` for the subscription backends. This check surfaces a
-//! missing binary or a stale login at startup with an actionable hint, instead
-//! of failing opaquely halfway through a task.
-//!
-//! Everything here is best-effort and never fatal: a failed probe only logs a
-//! warning. If you containerize Karna later, mount the relevant login dirs
-//! (e.g. `~/.cursor`, `~/.grok`) into the agent container so these CLIs stay
-//! authenticated.
 
 use std::time::Duration;
 
@@ -19,16 +6,10 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 
-/// How a single backend authenticates / is verified at startup.
 struct BackendCheck {
-    /// Executable name on PATH.
     bin: &'static str,
-    /// Args for a fast probe.
     args: &'static [&'static str],
-    /// When true, a zero exit code means "authenticated"; when false it only
-    /// means "installed".
     is_login_probe: bool,
-    /// Actionable hint shown when the probe fails.
     hint: &'static str,
 }
 
@@ -38,7 +19,7 @@ fn check_for(cli: &str) -> Option<BackendCheck> {
             bin: "claude",
             args: &["--version"],
             is_login_probe: false,
-            hint: "install @anthropic-ai/claude-code and run `claude login` (or set CLAUDE_CODE_OAUTH_TOKEN)",
+            hint: "install Claude Code (curl -fsSL https://claude.ai/install.sh | bash) and sign in with `claude` (or set CLAUDE_CODE_OAUTH_TOKEN)",
         },
         "codex" => BackendCheck {
             bin: "codex",
@@ -50,13 +31,19 @@ fn check_for(cli: &str) -> Option<BackendCheck> {
             bin: "opencode",
             args: &["--version"],
             is_login_probe: false,
-            hint: "install opencode and set OPENROUTER_API_KEY",
+            hint: "install opencode, set OPENROUTER_API_KEY and WORLD_ENABLE_OPENCODE=1",
         },
         "cursor" => BackendCheck {
             bin: "cursor-agent",
             args: &["status"],
             is_login_probe: true,
             hint: "run `cursor-agent login` on the agent host",
+        },
+        "omp" => BackendCheck {
+            bin: "omp",
+            args: &["--version"],
+            is_login_probe: false,
+            hint: "install @oh-my-pi/pi-coding-agent with bun, put models.yml in ~/.omp/agent (or OMP_CONFIG_DIR) and set FAL_KEY",
         },
         "grok" => BackendCheck {
             bin: "grok",
@@ -75,9 +62,12 @@ enum ProbeResult {
     Timeout,
 }
 
-/// Probe every configured backend and log readiness. Never fails.
 pub async fn check_backends(config: &Config) {
     for cli in config.backends.keys() {
+        if !loka_shared::backends::enabled_here(cli) {
+            warn!(backend = %cli, "OpenCode is configured but disabled; set WORLD_ENABLE_OPENCODE=1 to use it");
+            continue;
+        }
         let Some(check) = check_for(cli) else {
             info!(backend = %cli, "No preflight check for backend — skipping");
             continue;
@@ -123,7 +113,15 @@ pub async fn check_backends(config: &Config) {
 }
 
 async fn probe(check: &BackendCheck) -> ProbeResult {
-    let mut cmd = Command::new(check.bin);
+    let located = (check.bin == "claude").then(crate::claude::detect::locate).flatten();
+    let mut cmd = match &located {
+        Some((program, _)) => Command::new(program),
+        None => Command::new(check.bin),
+    };
+    if let Some(path) = located.and_then(|(_, path)| path) {
+        cmd.env("PATH", path);
+    }
+    cmd.env_remove("WORLD_SECRETS_KEY");
     cmd.args(check.args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
