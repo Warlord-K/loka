@@ -1,16 +1,31 @@
 [package]
-name = "karna-shared"
+name = "loka-shared"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 
 [dependencies]
+urlencoding = "2"
 anyhow = "1"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 cron = "0.15"
-redis = { version = "0.27", features = ["tokio-comp"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 slug = "0.1"
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json"] }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
+ring = "0.17"
+crypto_box = { version = "0.9", features = ["seal", "std"] }
+libc = "0.2"
+feed-rs = "3.0.0"
+tokio = { version = "1", features = ["net", "rt", "sync", "time"] }
+futures-util = "0.3.34"
+url = "2.5.8"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

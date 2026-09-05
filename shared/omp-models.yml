@@ -1,0 +1,40 @@
+providers:
+  fal:
+    baseUrl: https://fal.run/fal-ai
+    auth: none
+    api: openai-completions
+    headers:
+      Authorization: '!test -n "$FAL_KEY" && printf "Key %s" "$FAL_KEY"'
+    models:
+      - id: kimi-k3
+        name: fal Kimi-K3
+        cost:
+          input: 0
+          output: 0
+          cacheRead: 0
+          cacheWrite: 0
+        baseUrl: https://fal.run/fal-ai/kimi-k3-b300/openai/v1
+        reasoning: true
+        input: [text, image]
+        contextWindow: 1048576
+        maxTokens: 131072
+        compat:
+          supportsReasoningEffort: true
+          supportsStore: false
+          supportsDeveloperRole: false
+          reasoningContentField: reasoning_content
+          requiresReasoningContentForToolCalls: true
+      - id: glm-5.3
+        baseUrl: https://fal.run/fal-ai/glm-5-3/v1
+        name: fal GLM-5.3
+        reasoning: true
+        input: [text]
+        contextWindow: 1048576
+        cost:
+          input: 0
+          output: 0
+          cacheRead: 0
+          cacheWrite: 0
+        maxTokens: 65536
+        compat:
+          supportsReasoningEffort: true
