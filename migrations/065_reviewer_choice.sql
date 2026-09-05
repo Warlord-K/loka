@@ -1,0 +1,2 @@
+ALTER TABLE agent_profiles ADD COLUMN IF NOT EXISTS reviewer JSONB;
+ALTER TABLE agent_sessions ADD COLUMN IF NOT EXISTS reviewer JSONB;

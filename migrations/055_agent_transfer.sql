@@ -1,0 +1,1 @@
+ALTER TABLE agent_profiles ADD COLUMN IF NOT EXISTS wanted_keys TEXT[] NOT NULL DEFAULT '{}';

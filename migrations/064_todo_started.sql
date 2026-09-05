@@ -1,0 +1,1 @@
+ALTER TABLE world_todos ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;

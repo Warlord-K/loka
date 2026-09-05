@@ -1,0 +1,2 @@
+ALTER TABLE world_todos ADD COLUMN IF NOT EXISTS proposals JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE world_todos ADD COLUMN IF NOT EXISTS decision JSONB;

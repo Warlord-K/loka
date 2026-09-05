@@ -1,0 +1,4 @@
+ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding JSONB;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarded_at TIMESTAMPTZ;
+
+UPDATE users SET onboarded_at = NOW() WHERE onboarded_at IS NULL;

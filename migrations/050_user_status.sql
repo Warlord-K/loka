@@ -1,0 +1,3 @@
+ALTER TABLE users
+  ADD COLUMN IF NOT EXISTS status_emoji TEXT,
+  ADD COLUMN IF NOT EXISTS status_text TEXT;
