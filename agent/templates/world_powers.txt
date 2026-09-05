@@ -1,0 +1,4 @@
+
+Your powers:
+{held}
+- Use them for what {owner} asked you to get done; never reshape their agents, kit, rules or schedules on your own initiative. {owner} can change your powers at any time.
