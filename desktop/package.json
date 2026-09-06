@@ -1,0 +1,13 @@
+{
+  "name": "loka-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "license": "AGPL-3.0-only",
+  "scripts": {
+    "build": "PATH=\"$PWD/scripts:$PATH\" tauri build --config src-tauri/tauri.conf.json",
+    "dev": "tauri dev --config src-tauri/tauri.conf.json"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.5"
+  }
+}

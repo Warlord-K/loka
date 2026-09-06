@@ -1,0 +1,55 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Loka desktop window",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "allow-desktop-status",
+    "allow-pair-device",
+    "allow-pause-runner",
+    "allow-resume-runner",
+    "allow-disconnect-device",
+    "allow-choose-repository",
+    "allow-open-runner-logs",
+    "allow-set-start-at-login",
+    "allow-set-slack-capture",
+    "allow-wb-open",
+    "allow-wb-list",
+    "allow-wb-files",
+    "allow-wb-read",
+    "allow-wb-write",
+    "allow-wb-create",
+    "allow-wb-rename",
+    "allow-wb-delete",
+    "allow-wb-changes",
+    "allow-wb-base",
+    "allow-wb-find",
+    "allow-wb-watch",
+    "allow-wb-unwatch",
+    "allow-term-open",
+    "allow-home-term-open",
+    "allow-term-list",
+    "allow-term-write",
+    "allow-term-resize",
+    "allow-term-close",
+    "allow-folders-list",
+    "allow-folder-add",
+    "allow-folder-remove",
+    "allow-folder-for-path",
+    "allow-reveal-path",
+    "allow-update-status",
+    "allow-update-check",
+    "allow-update-install",
+    "allow-update-when-idle",
+    "allow-update-stop-waiting",
+    "allow-update-parts-apply",
+    "allow-update-parts-auto"
+  ],
+  "remote": {
+    "urls": [
+      "http://127.0.0.1:*/*"
+    ]
+  }
+}

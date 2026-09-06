@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>Loka</title>
+    <style>
+      @font-face { font-family: "Pixel"; src: url("pixel.woff2") format("woff2"); font-weight: 600; font-display: block; }
+      :root { --scrim: rgb(4 18 26); --on: rgb(238 244 244); --dim: rgb(238 244 244 / 0.55); --line: rgb(238 244 244 / 0.1); }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; margin: 0; }
+      body {
+        display: grid; place-items: center; padding: 24px; overflow: hidden;
+        background: radial-gradient(120% 80% at 50% 0%, rgb(15 163 163 / 0.14), transparent 60%), var(--scrim);
+        color: var(--on); font: 14px/1.6 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+        -webkit-font-smoothing: antialiased; -webkit-user-select: none; user-select: none; cursor: default;
+      }
+      main { display: flex; flex-direction: column; align-items: center; gap: 16px; max-width: 420px; text-align: center; animation: in 250ms cubic-bezier(0.22, 1, 0.36, 1) both; }
+      img { width: 56px; height: 56px; display: block; }
+      h1 { margin: 0; font: 600 24px/1 "Pixel", -apple-system, system-ui, sans-serif; letter-spacing: 0.01em; }
+      .status {
+        background: linear-gradient(100deg, var(--dim) 38%, var(--on) 50%, var(--dim) 62%);
+        background-size: 300% 100%; -webkit-background-clip: text; background-clip: text; color: transparent;
+        animation: shimmer 2.4s linear infinite;
+      }
+      p { margin: 0; color: var(--dim); max-width: 30ch; }
+      .failed { color: var(--on); }
+      code { color: var(--dim); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; -webkit-user-select: text; user-select: text; }
+      hr { width: 40px; height: 1px; border: 0; margin: 4px 0; background: var(--line); }
+      @keyframes shimmer { from { background-position: 100% 0; } to { background-position: 0% 0; } }
+      @keyframes in { from { opacity: 0; transform: scale(0.96); } to { opacity: 1; transform: none; } }
+      @media (prefers-reduced-motion: reduce) { main { animation: none; } .status { animation: none; background: none; color: var(--dim); } }
+    </style>
+  </head>
+  <body>
+    <main role="status" aria-live="polite">
+      <img src="icon.svg" alt="" />
+      <h1>Loka</h1>
+      <span class="status" id="status">Starting Loka</span>
+      <hr />
+      <p id="detail">Loka runs everything on this Mac. The first start takes a little longer while it sets up its database.</p>
+      <code id="log" hidden></code>
+    </main>
+    <script>
+      (function () {
+        var status = document.getElementById("status");
+        var detail = document.getElementById("detail");
+        var log = document.getElementById("log");
+        window.lokaShow = function (state) {
+          if (!state || state.state !== "starting" || document.body.dataset.failed) return;
+          status.textContent = state.message || "Starting Loka";
+        };
+        var params = new URLSearchParams(window.location.search);
+        var error = params.get("error");
+        if (error) {
+          document.body.dataset.failed = "1";
+          status.className = "failed";
+          status.textContent = "Loka could not start";
+          detail.textContent = error + " Choose Reload from the View menu to try again.";
+          var path = params.get("log");
+          if (path) {
+            log.hidden = false;
+            log.textContent = "Details are in " + path;
+          }
+        }
+      })();
+    </script>
+  </body>
+</html>
