@@ -2,6 +2,9 @@ import type { Config } from "tailwindcss";
 
 const config: Config = {
   darkMode: "class",
+  future: {
+    hoverOnlyWhenSupported: true,
+  },
   content: [
     "./app/**/*.{ts,tsx}",
     "./components/**/*.{ts,tsx}",
@@ -43,7 +46,44 @@ const config: Config = {
           DEFAULT: "hsl(var(--card))",
           foreground: "hsl(var(--card-foreground))",
         },
-        // Warm semantic grays (sun-touched)
+        w: {
+          paper: "rgb(var(--w-paper) / <alpha-value>)",
+          sand: "rgb(var(--w-sand) / <alpha-value>)",
+          card: "rgb(var(--w-card) / <alpha-value>)",
+          field: "rgb(var(--w-field) / <alpha-value>)",
+          line: "rgb(var(--w-line) / <alpha-value>)",
+          line2: "rgb(var(--w-line2) / <alpha-value>)",
+          ink: "rgb(var(--w-ink) / <alpha-value>)",
+          strong: "rgb(var(--w-strong) / <alpha-value>)",
+          text: "rgb(var(--w-text) / <alpha-value>)",
+          text2: "rgb(var(--w-text2) / <alpha-value>)",
+          muted: "rgb(var(--w-muted) / <alpha-value>)",
+          faint: "rgb(var(--w-faint) / <alpha-value>)",
+          danger: "rgb(var(--w-danger) / <alpha-value>)",
+          link: "rgb(var(--w-link) / <alpha-value>)",
+          ok: "rgb(var(--w-ok) / <alpha-value>)",
+          warn: "rgb(var(--w-warn) / <alpha-value>)",
+          teal: "rgb(var(--w-teal) / <alpha-value>)",
+          teal2: "rgb(var(--w-teal2) / <alpha-value>)",
+          gold: "rgb(var(--w-gold) / <alpha-value>)",
+          gold2: "rgb(var(--w-gold2) / <alpha-value>)",
+          crown: "rgb(var(--w-crown) / <alpha-value>)",
+          seafoam: "rgb(var(--w-seafoam) / <alpha-value>)",
+          seafoam2: "rgb(var(--w-seafoam2) / <alpha-value>)",
+          honey: "rgb(var(--w-honey) / <alpha-value>)",
+          coral: "rgb(var(--w-coral) / <alpha-value>)",
+          rose: "rgb(var(--w-rose) / <alpha-value>)",
+          mint: "rgb(var(--w-mint) / <alpha-value>)",
+          aqua: "rgb(var(--w-aqua) / <alpha-value>)",
+          lemon: "rgb(var(--w-lemon) / <alpha-value>)",
+          invert: "rgb(var(--w-invert) / <alpha-value>)",
+          oninvert: "rgb(var(--w-oninvert) / <alpha-value>)",
+          alert: "rgb(var(--w-alert) / <alpha-value>)",
+          onalert: "rgb(var(--w-onalert) / <alpha-value>)",
+          scrim: "rgb(var(--w-scrim) / <alpha-value>)",
+          onscrim: "rgb(var(--w-onscrim) / <alpha-value>)",
+          wood: "rgb(var(--w-wood) / <alpha-value>)",
+        },
         gray: {
           1: "#131210",
           2: "#1a1917",
@@ -58,7 +98,6 @@ const config: Config = {
           11: "#bab8b1",
           12: "#edece8",
         },
-        // Golden sun accent scale
         sun: {
           3: "#2b2213",
           4: "#3a2e18",
@@ -79,6 +118,14 @@ const config: Config = {
       },
       fontSize: {
         "2xs": ["0.6875rem", { lineHeight: "1rem" }],
+        "w-3xs": "0.625rem",
+        "w-2xs": "0.6875rem",
+        "w-xs": "0.75rem",
+        "w-sm": "0.8125rem",
+        "w-base": "0.875rem",
+        "w-md": "0.9375rem",
+        "w-lg": "1.0625rem",
+        "w-xl": "1.25rem",
       },
       boxShadow: {
         "card": "0 1px 3px rgba(0,0,0,0.25), 0 1px 2px rgba(0,0,0,0.15)",
@@ -92,13 +139,122 @@ const config: Config = {
           from: { opacity: "0", transform: "translateY(8px)" },
           to: { opacity: "1", transform: "translateY(0)" },
         },
+        "w-bar-grow": {
+          from: { transform: "scaleY(0)" },
+          to: { transform: "scaleY(1)" },
+        },
+        "w-grow-x": {
+          from: { transform: "scaleX(0)" },
+          to: { transform: "scaleX(1)" },
+        },
+        "w-draw": {
+          from: { strokeDashoffset: "1" },
+          to: { strokeDashoffset: "0" },
+        },
+        "w-splash-in": {
+          from: { opacity: "0", transform: "translateY(6px) scale(0.96)" },
+          to: { opacity: "1", transform: "translateY(0) scale(1)" },
+        },
+        "text-shimmer": {
+          from: { backgroundPosition: "100% 0" },
+          to: { backgroundPosition: "0% 0" },
+        },
+        "pop-in": {
+          "0%": { opacity: "0", transform: "scale(0.6)" },
+          "70%": { opacity: "1", transform: "scale(1.08)" },
+          "100%": { opacity: "1", transform: "scale(1)" },
+        },
+        "word-in": {
+          from: { opacity: "0", transform: "translateY(0.6em)" },
+          to: { opacity: "1", transform: "translateY(0)" },
+        },
+        "job-in": {
+          from: { opacity: "0", transform: "translateY(4px)" },
+          to: { opacity: "1", transform: "translateY(0)" },
+        },
+        "w-pop": {
+          from: { opacity: "0", transform: "translateY(-4px) scale(0.97)" },
+          to: { opacity: "1", transform: "translateY(0) scale(1)" },
+        },
+        "w-rise": {
+          from: { opacity: "0", transform: "translateY(6px)" },
+          to: { opacity: "1", transform: "translateY(0)" },
+        },
+        "w-fade": {
+          from: { opacity: "0" },
+          to: { opacity: "1" },
+        },
+        "tip-text": {
+          from: { opacity: "0.35" },
+          to: { opacity: "1" },
+        },
+        "w-menu-in": {
+          from: { opacity: "0", transform: "translateY(-4px) scale(0.97)" },
+          to: { opacity: "1", transform: "translateY(0) scale(1)" },
+        },
+        "w-menu-out": {
+          from: { opacity: "1", transform: "scale(1)" },
+          to: { opacity: "0", transform: "scale(0.98)" },
+        },
+        "w-modal-in": {
+          from: { opacity: "0", transform: "scale(0.96)" },
+          to: { opacity: "1", transform: "scale(1)" },
+        },
+        "w-modal-out": {
+          from: { opacity: "1", transform: "scale(1)" },
+          to: { opacity: "0", transform: "scale(0.96)" },
+        },
+        "w-scrim-in": {
+          from: { opacity: "0", backdropFilter: "blur(0px)" },
+          to: { opacity: "1", backdropFilter: "blur(2px)" },
+        },
+        "w-scrim-out": {
+          from: { opacity: "1", backdropFilter: "blur(2px)" },
+          to: { opacity: "0", backdropFilter: "blur(0px)" },
+        },
+        "w-slide-left": {
+          from: { opacity: "0", transform: "translateX(12px)" },
+          to: { opacity: "1", transform: "translateX(0)" },
+        },
+        "w-ring": {
+          "0%, 100%": { transform: "rotate(0deg)" },
+          "15%": { transform: "rotate(14deg)" },
+          "30%": { transform: "rotate(-12deg)" },
+          "45%": { transform: "rotate(8deg)" },
+          "60%": { transform: "rotate(-5deg)" },
+          "75%": { transform: "rotate(2deg)" },
+        },
+        "w-row-in": {
+          from: { opacity: "0", transform: "translateY(-4px)" },
+          to: { opacity: "1", transform: "translateY(0)" },
+        },
       },
       animation: {
         "card-enter": "card-enter 0.3s ease-out both",
+        "text-shimmer": "text-shimmer 2.4s linear infinite",
+        "w-bar-grow": "w-bar-grow 600ms cubic-bezier(0.22, 1, 0.36, 1) both",
+        "w-grow-x": "w-grow-x 600ms cubic-bezier(0.22, 1, 0.36, 1) both",
+        "w-draw": "w-draw 900ms cubic-bezier(0.22, 1, 0.36, 1) both",
+        "w-splash-in": "w-splash-in 500ms cubic-bezier(0.22, 1, 0.36, 1) both",
+        "pop-in": "pop-in 260ms cubic-bezier(0.2, 0.8, 0.2, 1) both",
+        "job-in": "job-in 220ms cubic-bezier(0.2, 0.8, 0.2, 1) both",
+        "w-pop": "w-pop 160ms cubic-bezier(0.2, 0.8, 0.2, 1) both",
+        "w-rise": "w-rise 220ms cubic-bezier(0.2, 0.8, 0.2, 1) both",
+        "w-fade": "w-fade 180ms ease-out both",
+        "tip-text": "tip-text 160ms ease-out both",
+        "w-menu-in": "w-menu-in 180ms cubic-bezier(0.22, 1, 0.36, 1) both",
+        "w-menu-out": "w-menu-out 120ms cubic-bezier(0.22, 1, 0.36, 1) both",
+        "w-modal-in": "w-modal-in 250ms cubic-bezier(0.22, 1, 0.36, 1) both",
+        "w-modal-out": "w-modal-out 150ms cubic-bezier(0.22, 1, 0.36, 1) both",
+        "w-scrim-in": "w-scrim-in 250ms cubic-bezier(0.22, 1, 0.36, 1) both",
+        "w-scrim-out": "w-scrim-out 150ms cubic-bezier(0.22, 1, 0.36, 1) both",
+        "w-slide-left": "w-slide-left 220ms cubic-bezier(0.2, 0.8, 0.2, 1) both",
+        "w-ring": "w-ring 700ms cubic-bezier(0.36, 0.07, 0.19, 0.97) 1 both",
+        "w-row-in": "w-row-in 240ms cubic-bezier(0.22, 1, 0.36, 1) both",
       },
     },
   },
-  plugins: [require("tailwindcss-animate"), require("@tailwindcss/typography")],
+  plugins: [require("tailwindcss-animate"), require("@tailwindcss/typography"), require("@tailwindcss/container-queries")],
 };
 
 export default config;
