@@ -1,0 +1,487 @@
+"use client";
+
+import { useEffect, useState, type ReactNode } from "react";
+import { ArrowSquareOut, CheckSquare, FileText, Hash, Square, Timer } from "@phosphor-icons/react";
+import { cn, safeDecode } from "@/lib/utils";
+import { messageTime, dayLabel, worldApi, type ChannelSummary, type TaskBrief, type Todo } from "@/lib/world";
+import { MessageLink, messageRefFromHref, worldRefFromHref } from "./message-links";
+import { SetupCard } from "./setup-hint";
+import { SlackMark } from "./panels";
+import { StatusIcon, statusLabel } from "./quest-ui";
+import { countdown, focusTodo, isTimerTodo } from "./todos-ui";
+import { openReport, REPORTS_STALE, reportsApi, type ReportBrief } from "@/lib/reports";
+
+const REF_SOURCE = "ch\\d{1,18}|[0-9a-fA-F][0-9a-fA-F-]{5,35}";
+const ID_SOURCE = "[0-9a-fA-F][0-9a-fA-F-]{5,35}";
+const ID = new RegExp(`^(?:${ID_SOURCE})$`);
+
+function matchesId(id: string, ref: string): boolean {
+  return id.replace(/-/g, "").startsWith(ref.replace(/-/g, ""));
+}
+
+export type Embed =
+  | { kind: "msg"; ref: string }
+  | { kind: "todo"; ref: string }
+  | { kind: "quest"; ref: string }
+  | { kind: "report"; ref: string }
+  | { kind: "setup"; key: string }
+  | { kind: "channel"; id: string }
+  | { kind: "slack"; url: string; workspace: string; thread: boolean }
+  | { kind: "linear"; url: string; key: string; title: string }
+  | { kind: "notion"; url: string; title: string; workspace: string; page: string; published: boolean };
+
+const SLACK = /^https:\/\/([a-z0-9-]+)\.slack\.com\/archives\/[A-Z0-9]+\/p\d{10,}/i;
+const NOTION = /^https:\/\/(?:www\.)?(?:([a-z0-9-]+)\.notion\.site|notion\.so)\/(?:([^/?#\s]+)\/)?([^/?#\s]*?)-?([0-9a-f]{32})(?:[/?#]|$)/i;
+const LINEAR = /^https:\/\/linear\.app\/[^/\s]+\/issue\/([A-Z][A-Z0-9]*-\d+)(?:\/([^/?#\s]+))?/i;
+
+function titleFromSlug(slug?: string): string {
+  if (!slug) return "";
+  const words = safeDecode(slug).split("-").filter(Boolean);
+  const text = words.join(" ");
+  return text ? text[0].toUpperCase() + text.slice(1) : "";
+}
+
+export function embedFromHref(href?: string | null): Embed | null {
+  if (!href) return null;
+  const msg = messageRefFromHref(href);
+  if (msg) return { kind: "msg", ref: msg };
+  const linked = worldRefFromHref(href);
+  if (linked) return linked;
+  const setup = href.match(SETUP);
+  if (setup) return { kind: "setup", key: setup[1].toLowerCase().replace(/-/g, "_") };
+  const scheme = href.match(/^(todo|quest|report):(.+)$/i);
+  if (scheme) return ID.test(scheme[2]) ? { kind: scheme[1].toLowerCase() as "todo" | "quest" | "report", ref: scheme[2].toLowerCase() } : null;
+  if (href.startsWith("#channel-")) return { kind: "channel", id: href.slice(9) };
+  const slack = href.match(SLACK);
+  if (slack) return { kind: "slack", url: href, workspace: slack[1], thread: /[?&]thread_ts=/.test(href) };
+  const notion = href.match(NOTION);
+  if (notion) return { kind: "notion", url: href, workspace: notion[1] ?? notion[2] ?? "", title: titleFromSlug(notion[3]), page: notion[4].toLowerCase(), published: Boolean(notion[1]) };
+  const linear = href.match(LINEAR);
+  if (linear) return { kind: "linear", url: href, key: linear[1].toUpperCase(), title: titleFromSlug(linear[2]) };
+  return null;
+}
+
+export function allowedEmbedUrl(url: string): boolean {
+  return /^(msg|todo|quest|report):/i.test(url) || SETUP.test(url) || url.startsWith("#channel-");
+}
+
+const SETUP = /^setup:([a-z][a-z_-]{1,31})$/i;
+const CARD_LINE = new RegExp(`^([ \\t]*)((?:msg|todo|quest|report):(?:${REF_SOURCE})|setup:[A-Za-z][A-Za-z_-]{1,31}|https?:\\/\\/\\S+)[ \\t]*$`, "gm");
+const BARE = new RegExp(`(^|[\\s(])(msg|todo|quest|report):(${REF_SOURCE})`, "gi");
+const CHANNEL = /(^|[\s(])#([A-Za-z][\w-]{0,79})/g;
+
+export function linkEmbeds(text: string, channels: Map<string, string>): string {
+  return text
+    .replace(CARD_LINE, (whole, lead: string, target: string) => {
+      const href = target.replace(/[.,;:!?)]+$/, "");
+      return embedFromHref(href) ? `${lead}[](${href} "card")` : whole;
+    })
+    .replace(BARE, (whole, lead: string, scheme: string, ref: string, offset: number, all: string) => {
+      if (lead === "(" && all[offset - 1] === "]") return whole;
+      return `${lead}[${scheme}:${ref}](${scheme.toLowerCase()}:${ref})`;
+    })
+    .replace(CHANNEL, (whole, lead: string, name: string) => {
+      const id = channels.get(name.toLowerCase());
+      return id ? `${lead}[#${name}](#channel-${id})` : whole;
+    });
+}
+
+type Cached<T> = (() => Promise<T>) & { peek: () => T | undefined };
+
+function cached<T>(load: () => Promise<T>, ttl: number, stale?: string): Cached<T> {
+  let at = 0;
+  let value: Promise<T> | null = null;
+  let last: T | undefined;
+  if (stale && typeof window !== "undefined") window.addEventListener(stale, () => (value = null));
+  const get = () => {
+    if (!value || Date.now() - at > ttl) {
+      at = Date.now();
+      value = load()
+        .then((v) => {
+          last = v;
+          return v;
+        })
+        .catch(() => {
+          value = null;
+          return last ?? ([] as unknown as T);
+        });
+    }
+    return value;
+  };
+  return Object.assign(get, { peek: () => last });
+}
+
+const todosOnce = cached<Todo[]>(() => worldApi.todos(), 15_000, "world:todos-stale");
+const questsOnce = cached<TaskBrief[]>(() => worldApi.tasks(), 15_000);
+const channelsOnce = cached<ChannelSummary[]>(() => worldApi.channels(), 60_000);
+const slackCache = new Map<string, Promise<SlackDetail | null>>();
+const slackSeen = new Map<string, SlackDetail | null>();
+
+type SlackDetail = { author: string | null; channel_name: string | null; team: string | null; kind: string | null; text: string | null; created_at: string };
+
+function useLoaded<T>(load: Cached<T>, key: string): T | undefined {
+  const [state, setState] = useState<{ key: string; value: T } | null>(() => {
+    const seen = load.peek();
+    return seen === undefined ? null : { key, value: seen };
+  });
+  useEffect(() => {
+    let live = true;
+    void load().then((value) => live && setState({ key, value }));
+    return () => {
+      live = false;
+    };
+  }, [key, load]);
+  return state?.key === key ? state.value : undefined;
+}
+
+export function useChannelNames(): Map<string, string> {
+  const toMap = (list: ChannelSummary[]) => new Map(list.filter((c) => c.kind === "channel").map((c) => [c.name.toLowerCase(), c.id]));
+  const [names, setNames] = useState<Map<string, string>>(() => toMap(channelsOnce.peek() ?? []));
+  useEffect(() => {
+    let live = true;
+    void channelsOnce().then((list) => {
+      if (!live) return;
+      setNames((cur) => {
+        const next = toMap(list);
+        return next.size === cur.size && [...next].every(([k, v]) => cur.get(k) === v) ? cur : next;
+      });
+    });
+    return () => {
+      live = false;
+    };
+  }, []);
+  return names;
+}
+
+const CHIP =
+  "inline-flex max-w-[min(22rem,80vw)] items-center gap-1 rounded-md border-2 border-w-ink bg-w-sand px-1.5 py-px align-middle text-w-xs font-semibold text-w-warn no-underline shadow-[0_2px_0_rgb(var(--w-ink))] transition-[transform,background-color] duration-100 hover:bg-w-field active:translate-y-px";
+const CARD =
+  "my-1 flex w-full max-w-lg flex-col gap-1 rounded-lg border-2 border-l-[6px] border-w-ink bg-w-card px-3 py-2 text-left no-underline shadow-[0_2px_0_rgb(var(--w-ink))] transition-[transform,background-color] duration-100 hover:bg-w-field active:translate-y-px";
+
+function Shell({
+  card,
+  icon,
+  label,
+  byline,
+  body,
+  onClick,
+  href,
+  muted,
+}: {
+  card: boolean;
+  icon: ReactNode;
+  label: string;
+  byline?: ReactNode;
+  body?: ReactNode;
+  onClick?: () => void;
+  href?: string;
+  muted?: boolean;
+}) {
+  const inner = card ? (
+    <>
+      <span className="flex min-w-0 items-center gap-1.5 text-w-xs font-semibold text-w-muted">
+        <span className="shrink-0">{icon}</span>
+        <span className="min-w-0 truncate">{byline ?? label}</span>
+      </span>
+      {body && <span className={cn("line-clamp-3 text-w-sm leading-snug text-w-text", muted && "text-w-muted line-through")}>{body}</span>}
+    </>
+  ) : (
+    <>
+      <span className="shrink-0">{icon}</span>
+      <span className={cn("truncate", muted && "line-through opacity-70")}>{label}</span>
+    </>
+  );
+  const cls = card ? CARD : CHIP;
+  if (href) {
+    return (
+      <a href={href} target="_blank" rel="noopener noreferrer" className={cls} onClick={(e) => e.stopPropagation()}>
+        {inner}
+      </a>
+    );
+  }
+  return (
+    <button
+      type="button"
+      className={cls}
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick?.();
+      }}
+    >
+      {inner}
+    </button>
+  );
+}
+
+function Missing({ label }: { label: string }) {
+  return <span className="rounded-md border-2 border-dashed border-w-line2 px-1.5 text-w-xs text-w-muted">{label}</span>;
+}
+
+function TodoEmbed({ refId, label, card }: { refId: string; label?: string; card: boolean }) {
+  const todos = useLoaded(todosOnce, "todos");
+  if (!todos) return <Shell card={card} icon={<Square size={12} weight="bold" />} label={label || "to-do"} />;
+  const todo = todos.find((t) => matchesId(t.id, refId));
+  if (!todo) return <Missing label={label || "a to-do you cannot open"} />;
+  const timer = isTimerTodo(todo);
+  const closed = todo.status !== "open";
+  const icon = timer ? <Timer size={12} weight="bold" /> : closed ? <CheckSquare size={12} weight="bold" /> : <Square size={12} weight="bold" />;
+  const left = todo.nudge_at ? Date.parse(todo.nudge_at) - Date.now() : null;
+  const when = timer && left !== null ? (left > 0 ? `goes off in ${countdown(left)}` : "went off") : todo.due_at ? `due ${dayLabel(todo.due_at)} ${messageTime(todo.due_at)}` : null;
+  const state = todo.status === "done" ? "done" : todo.status === "dismissed" ? "cancelled" : todo.started_at ? "in progress" : "to do";
+  return (
+    <Shell
+      card={card}
+      icon={icon}
+      label={label || todo.text}
+      muted={closed}
+      byline={[timer ? "Timer" : "To-do", state, when].filter(Boolean).join(" · ")}
+      body={todo.text}
+      onClick={() => focusTodo(todo.id)}
+    />
+  );
+}
+
+function QuestEmbed({ refId, label, card }: { refId: string; label?: string; card: boolean }) {
+  const quests = useLoaded(questsOnce, "quests");
+  if (!quests) return <Shell card={card} icon={<StatusIcon status="todo" size={12} />} label={label || "quest"} />;
+  const quest = quests.find((q) => matchesId(q.id, refId));
+  if (!quest) return <Missing label={label || "a quest you cannot open"} />;
+  return (
+    <Shell
+      card={card}
+      icon={<StatusIcon status={quest.status} size={12} />}
+      label={label || quest.title}
+      byline={["Quest", statusLabel(quest.status), quest.repo].filter(Boolean).join(" · ")}
+      body={quest.title}
+      onClick={() =>
+        window.dispatchEvent(new CustomEvent("world:open-quest", { detail: { taskId: quest.id, agentId: quest.assigned_agent_id } }))
+      }
+    />
+  );
+}
+
+const reportCache = new Map<string, Promise<ReportBrief | null>>();
+const reportSeen = new Map<string, ReportBrief | null>();
+if (typeof window !== "undefined")
+  window.addEventListener(REPORTS_STALE, () => {
+    reportCache.clear();
+  });
+
+function reportBrief(ref: string): Promise<ReportBrief | null> {
+  const hit = reportCache.get(ref);
+  if (hit) return hit;
+  const pending = reportsApi
+    .find(ref)
+    .catch(() => null)
+    .then((r) => {
+      reportSeen.set(ref, r);
+      return r;
+    });
+  reportCache.set(ref, pending);
+  return pending;
+}
+
+function plainExcerpt(text: string): string {
+  return text
+    .replace(/```[\s\S]*?(```|$)/g, " ")
+    .replace(/^#+\s.*$/gm, " ")
+    .replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_, t: string, a?: string) => a ?? t)
+    .replace(/[*`>|#]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function ReportEmbed({ refId, label, card }: { refId: string; label?: string; card: boolean }) {
+  const [state, setState] = useState<{ ref: string; report: ReportBrief | null } | null>(() => (reportSeen.has(refId) ? { ref: refId, report: reportSeen.get(refId) ?? null } : null));
+  useEffect(() => {
+    let live = true;
+    void reportBrief(refId).then((report) => live && setState({ ref: refId, report }));
+    return () => {
+      live = false;
+    };
+  }, [refId]);
+  const icon = <FileText size={12} weight="bold" />;
+  if (!state || state.ref !== refId) return <Shell card={card} icon={icon} label={label || "report"} />;
+  const report = state.report;
+  if (!report) return <Missing label={label || "a report you cannot open"} />;
+  return (
+    <Shell
+      card={card}
+      icon={icon}
+      label={label || report.title}
+      byline={["Report", report.folder || null, `${dayLabel(report.updated_at)} ${messageTime(report.updated_at)}`].filter(Boolean).join(" · ")}
+      body={
+        <>
+          <span className="block font-semibold">{report.title}</span>
+          <span className="block text-w-text2">{plainExcerpt(report.excerpt)}</span>
+        </>
+      }
+      onClick={() => openReport(report.id)}
+    />
+  );
+}
+
+function ChannelEmbed({ id, label }: { id: string; label?: string }) {
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation();
+        window.dispatchEvent(new CustomEvent("world:open-channel", { detail: { id } }));
+      }}
+      className="inline-flex items-center rounded-md bg-w-teal/20 px-0.5 font-medium text-w-link hover:bg-w-teal/35"
+    >
+      <Hash size={12} weight="bold" className="shrink-0" />
+      {(label ?? "").replace(/^#/, "") || "channel"}
+    </button>
+  );
+}
+
+function slackDetail(url: string): Promise<SlackDetail | null> {
+  const hit = slackCache.get(url);
+  if (hit) return hit;
+  const pending = fetch(`/api/world/embeds/slack?url=${encodeURIComponent(url)}`)
+    .then((r) => (r.ok ? (r.json() as Promise<SlackDetail>) : null))
+    .catch(() => null)
+    .then((d) => {
+      slackSeen.set(url, d);
+      return d;
+    });
+  slackCache.set(url, pending);
+  return pending;
+}
+
+function SlackEmbed({ url, workspace, thread, label, card }: { url: string; workspace: string; thread: boolean; label?: string; card: boolean }) {
+  const [detail, setDetail] = useState<SlackDetail | null>(() => slackSeen.get(url) ?? null);
+  useEffect(() => {
+    let live = true;
+    void slackDetail(url).then((d) => live && setDetail(d));
+    return () => {
+      live = false;
+    };
+  }, [url]);
+  const where = detail?.channel_name ? `#${detail.channel_name}` : thread ? "thread" : "message";
+  const team = detail?.team || workspace;
+  const fallback = `${team} · ${where}`;
+  const chip = label || (detail?.author ? `${detail.author} in ${where}${detail.text ? `: ${detail.text}` : ""}` : `Slack ${fallback}`);
+  return (
+    <Shell
+      card={card}
+      href={url}
+      icon={<SlackMark size={12} />}
+      label={chip}
+      byline={
+        <>
+          {detail?.author ? `${detail.author} in ${where}` : `Slack · ${fallback}`}
+          {detail && <span className="ml-1 font-normal normal-case tracking-normal">{`${dayLabel(detail.created_at)}, ${messageTime(detail.created_at)}`}</span>}
+        </>
+      }
+      body={detail?.text || (card ? "Open in Slack" : undefined)}
+    />
+  );
+}
+
+export function LinearMark({ size = 12 }: { size?: number }) {
+  return (
+    <svg viewBox="0 0 100 100" width={size} height={size} aria-hidden>
+      <circle cx="50" cy="50" r="50" fill="#5E6AD2" />
+      <path d="M18 58 42 82M14 44l42 42M18 30l52 52M28 20l52 52M42 14l44 44" stroke="#fff" strokeWidth="7" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+export function NotionMark({ size = 12 }: { size?: number }) {
+  return (
+    <svg viewBox="0 0 100 100" width={size} height={size} aria-hidden>
+      <rect x="6" y="6" width="88" height="88" rx="14" fill="#fff" stroke="#111" strokeWidth="8" />
+      <path d="M32 72V28h6l24 34V28h6v44h-6L38 38v34z" fill="#111" />
+    </svg>
+  );
+}
+
+function NotionEmbed({ url, title, workspace, page, published, label, card }: { url: string; title: string; workspace: string; page: string; published: boolean; label?: string; card: boolean }) {
+  const [open, setOpen] = useState(false);
+  const shell = (
+    <Shell
+      card={card}
+      href={url}
+      icon={<NotionMark size={12} />}
+      label={label || title || "Notion page"}
+      byline={
+        <>
+          Notion{workspace ? ` · ${workspace}` : ""}
+          <ArrowSquareOut size={11} weight="bold" className="ml-1 inline align-[-1px]" />
+        </>
+      }
+      body={title || "Open in Notion"}
+    />
+  );
+  if (!card || !published) return shell;
+  return (
+    <span className="my-1 flex w-full max-w-lg flex-col">
+      {shell}
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          setOpen((v) => !v);
+        }}
+        className="mt-1 self-start rounded-md border-2 border-w-ink bg-w-sand px-2 py-0.5 text-w-xs font-semibold text-w-text shadow-[0_2px_0_rgb(var(--w-ink))] hover:bg-w-field active:translate-y-px"
+      >
+        {open ? "Hide preview" : "Preview page"}
+      </button>
+      {open && (
+        <iframe
+          title={title || "Notion page"}
+          src={`https://${workspace}.notion.site/ebd/${page}`}
+          loading="lazy"
+          referrerPolicy="no-referrer"
+          sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+          className="mt-1 h-[28rem] w-full rounded-lg border-2 border-w-ink bg-w-card"
+          {...{ credentialless: "" }}
+        />
+      )}
+    </span>
+  );
+}
+
+function LinearEmbed({ url, issue, title, label, card }: { url: string; issue: string; title: string; label?: string; card: boolean }) {
+  return (
+    <Shell
+      card={card}
+      href={url}
+      icon={<LinearMark size={12} />}
+      label={label || (title ? `${issue} ${title}` : issue)}
+      byline={
+        <>
+          Linear · {issue}
+          <ArrowSquareOut size={11} weight="bold" className="ml-1 inline align-[-1px]" />
+        </>
+      }
+      body={title || "Open in Linear"}
+    />
+  );
+}
+
+export function EmbedView({ embed, label, card }: { embed: Embed; label?: string; card: boolean }) {
+  switch (embed.kind) {
+    case "msg":
+      return <MessageLink reference={embed.ref} label={label} card={card} />;
+    case "todo":
+      return <TodoEmbed refId={embed.ref} label={label} card={card} />;
+    case "quest":
+      return <QuestEmbed refId={embed.ref} label={label} card={card} />;
+    case "report":
+      return <ReportEmbed refId={embed.ref} label={label} card={card} />;
+    case "setup":
+      return <SetupCard featureKey={embed.key} />;
+    case "channel":
+      return <ChannelEmbed id={embed.id} label={label} />;
+    case "slack":
+      return <SlackEmbed url={embed.url} workspace={embed.workspace} thread={embed.thread} label={label} card={card} />;
+    case "notion":
+      return <NotionEmbed url={embed.url} title={embed.title} workspace={embed.workspace} page={embed.page} published={embed.published} label={label} card={card} />;
+    case "linear":
+      return <LinearEmbed url={embed.url} issue={embed.key} title={embed.title} label={label} card={card} />;
+  }
+}
