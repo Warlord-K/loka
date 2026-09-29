@@ -3,6 +3,47 @@
 @tailwind utilities;
 
 @layer base {
+  html { font-size: calc(100% * var(--w-text-scale, 1)); text-wrap: pretty; }
+  :where(h1, h2, h3, h4, h5, h6, dt, figcaption, button, summary, legend, .text-center) { text-wrap: balance; }
+  @media (min-width: 1440px) and (min-height: 760px) {
+    html { font-size: calc(17px * var(--w-text-scale, 1)); }
+  }
+  @media (min-width: 1680px) and (min-height: 880px) {
+    html { font-size: calc(18px * var(--w-text-scale, 1)); }
+  }
+  @media (min-width: 2200px) and (min-height: 1150px) {
+    html { font-size: calc(20px * var(--w-text-scale, 1)); }
+  }
+  @media (min-width: 2800px) and (min-height: 1450px) {
+    html { font-size: calc(22px * var(--w-text-scale, 1)); }
+  }
+  :where(svg[width="8"][height="8"]) { width: 0.5rem; height: 0.5rem; }
+  :where(svg[width="9"][height="9"]) { width: 0.5625rem; height: 0.5625rem; }
+  :where(svg[width="10"][height="10"]) { width: 0.625rem; height: 0.625rem; }
+  :where(svg[width="11"][height="11"]) { width: 0.6875rem; height: 0.6875rem; }
+  :where(svg[width="12"][height="12"]) { width: 0.75rem; height: 0.75rem; }
+  :where(svg[width="13"][height="13"]) { width: 0.8125rem; height: 0.8125rem; }
+  :where(svg[width="14"][height="14"]) { width: 0.875rem; height: 0.875rem; }
+  :where(svg[width="15"][height="15"]) { width: 0.9375rem; height: 0.9375rem; }
+  :where(svg[width="16"][height="16"]) { width: 1rem; height: 1rem; }
+  :where(svg[width="17"][height="17"]) { width: 1.0625rem; height: 1.0625rem; }
+  :where(svg[width="18"][height="18"]) { width: 1.125rem; height: 1.125rem; }
+  :where(svg[width="19"][height="19"]) { width: 1.1875rem; height: 1.1875rem; }
+  :where(svg[width="20"][height="20"]) { width: 1.25rem; height: 1.25rem; }
+  :where(svg[width="21"][height="21"]) { width: 1.3125rem; height: 1.3125rem; }
+  :where(svg[width="22"][height="22"]) { width: 1.375rem; height: 1.375rem; }
+  :where(svg[width="24"][height="24"]) { width: 1.5rem; height: 1.5rem; }
+  :where(svg[width="26"][height="26"]) { width: 1.625rem; height: 1.625rem; }
+  :where(svg[width="28"][height="28"]) { width: 1.75rem; height: 1.75rem; }
+  :where(svg[width="30"][height="30"]) { width: 1.875rem; height: 1.875rem; }
+  :where(svg[width="32"][height="32"]) { width: 2rem; height: 2rem; }
+  :where(svg[width="36"][height="36"]) { width: 2.25rem; height: 2.25rem; }
+  :where(svg[width="40"][height="40"]) { width: 2.5rem; height: 2.5rem; }
+  :where(svg[width="44"][height="44"]) { width: 2.75rem; height: 2.75rem; }
+  :where(svg[width="48"][height="48"]) { width: 3rem; height: 3rem; }
+}
+
+@layer base {
   :root {
     --background: 30 8% 4%;
     --foreground: 40 6% 92%;
@@ -35,6 +76,100 @@
 }
 
 @layer base {
+  :root,
+  :root:has([data-landing]) {
+    color-scheme: light;
+    --w-paper: 251 243 224;
+    --w-sand: 243 226 191;
+    --w-card: 255 248 234;
+    --w-field: 255 255 255;
+    --w-line: 231 211 166;
+    --w-line2: 217 191 138;
+    --w-ink: 38 24 34;
+    --w-strong: 38 24 34;
+    --w-text: 59 42 26;
+    --w-text2: 107 80 64;
+    --w-muted: 138 112 90;
+    --w-faint: 160 136 112;
+    --w-danger: 163 59 50;
+    --w-link: 11 111 111;
+    --w-ok: 14 143 99;
+    --w-warn: 138 90 43;
+    --w-teal: 15 163 163;
+    --w-teal2: 25 184 184;
+    --w-gold: 232 182 74;
+    --w-shimmer: 224 168 58;
+    --w-gold2: 242 198 106;
+    --w-crown: 246 194 62;
+    --w-seafoam: 126 224 210;
+    --w-seafoam2: 164 236 226;
+    --w-honey: 255 209 102;
+    --w-coral: 255 138 122;
+    --w-rose: 255 241 237;
+    --w-mint: 207 232 216;
+    --w-aqua: 233 248 243;
+    --w-lemon: 255 241 201;
+    --w-invert: 38 24 34;
+    --w-oninvert: 251 243 224;
+    --w-alert: 224 102 61;
+    --w-onalert: 255 255 255;
+    --w-scrim: 4 18 26;
+    --w-onscrim: 238 244 244;
+    --w-wood: 59 42 26;
+    --w-chart-1: 0 154 158;
+    --w-chart-2: 224 102 61;
+    --w-chart-3: 98 80 214;
+    --w-chart-4: 196 130 0;
+    --w-chart-5: 217 88 140;
+  }
+  :root[data-theme="dark"]:not(:has([data-landing])) {
+    color-scheme: dark;
+    --w-paper: 38 32 39;
+    --w-sand: 56 45 53;
+    --w-card: 46 38 45;
+    --w-field: 28 23 28;
+    --w-line: 70 57 67;
+    --w-line2: 92 74 86;
+    --w-ink: 11 7 10;
+    --w-strong: 251 243 230;
+    --w-text: 242 232 216;
+    --w-text2: 221 205 184;
+    --w-muted: 187 166 146;
+    --w-faint: 160 140 124;
+    --w-danger: 255 154 138;
+    --w-link: 111 214 204;
+    --w-ok: 116 217 168;
+    --w-warn: 240 196 106;
+    --w-teal: 11 110 110;
+    --w-teal2: 13 128 128;
+    --w-gold: 132 91 18;
+    --w-shimmer: 244 200 104;
+    --w-gold2: 150 106 24;
+    --w-crown: 240 182 52;
+    --w-seafoam: 31 110 102;
+    --w-seafoam2: 39 125 116;
+    --w-honey: 125 95 20;
+    --w-coral: 158 64 56;
+    --w-rose: 63 36 34;
+    --w-mint: 30 58 44;
+    --w-aqua: 24 54 52;
+    --w-lemon: 59 49 25;
+    --w-invert: 242 232 216;
+    --w-oninvert: 38 24 34;
+    --w-alert: 214 92 56;
+    --w-onalert: 255 255 255;
+    --w-scrim: 4 18 26;
+    --w-onscrim: 238 244 244;
+    --w-wood: 30 22 18;
+    --w-chart-1: 26 168 168;
+    --w-chart-2: 217 89 38;
+    --w-chart-3: 144 133 233;
+    --w-chart-4: 201 133 0;
+    --w-chart-5: 213 81 129;
+  }
+}
+
+@layer base {
   * {
     @apply border-border;
   }
@@ -49,6 +184,15 @@
     background: hsl(40 90% 56% / 0.25);
   }
 
+  ::highlight(loka-find) {
+    background-color: rgb(var(--w-gold) / 0.38);
+    color: inherit;
+  }
+  ::highlight(loka-find-now) {
+    background-color: rgb(var(--w-gold));
+    color: rgb(24 18 8);
+  }
+
   ::-webkit-scrollbar {
     width: 6px;
     height: 6px;
@@ -57,11 +201,17 @@
     background: transparent;
   }
   ::-webkit-scrollbar-thumb {
-    background: hsl(30 5% 20%);
-    border-radius: 3px;
+    background: hsl(30 6% 45% / 0.32);
+    background-clip: padding-box;
+    border: 1.5px solid transparent;
+    border-radius: 999px;
+    min-height: 32px;
   }
   ::-webkit-scrollbar-thumb:hover {
-    background: hsl(30 5% 28%);
+    background: hsl(30 6% 45% / 0.55);
+  }
+  ::-webkit-scrollbar-corner {
+    background: transparent;
   }
 
   select option {
@@ -232,5 +382,59 @@
     animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;
     scroll-behavior: auto !important;
+  }
+}
+
+@keyframes vt-fade-out {
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes vt-rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  @view-transition {
+    navigation: auto;
+  }
+
+  ::view-transition-old(.site-out) {
+    animation: 160ms cubic-bezier(0.4, 0, 1, 1) both vt-fade-out;
+  }
+
+  ::view-transition-new(.site-in) {
+    animation: 340ms cubic-bezier(0.22, 1, 0.36, 1) 60ms both vt-rise-in;
+  }
+
+  ::view-transition-old(.doc-out) {
+    animation: 120ms cubic-bezier(0.4, 0, 1, 1) both vt-fade-out;
+  }
+
+  ::view-transition-new(.doc-in) {
+    animation: 280ms cubic-bezier(0.22, 1, 0.36, 1) 40ms both vt-rise-in;
+  }
+
+  ::view-transition-group(.chrome) {
+    z-index: 10;
+    animation-duration: 340ms;
+    animation-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  ::view-transition-old(.chrome),
+  ::view-transition-new(.chrome) {
+    animation-duration: 200ms;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) {
+    animation: none !important;
   }
 }
