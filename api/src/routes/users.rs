@@ -1,4 +1,5 @@
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode, Extension, Json};
+use loka_shared::access::Viewer;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -11,16 +12,16 @@ pub struct UserSummary {
     pub email: Option<String>,
 }
 
-pub async fn list(State(state): State<AppState>) -> Result<Json<Vec<UserSummary>>, StatusCode> {
+pub async fn list(State(state): State<AppState>, Extension(viewer): Extension<Viewer>) -> Result<Json<Vec<UserSummary>>, StatusCode> {
     let rows = state
-        .db
-        .list_users()
+        .world
+        .people_in(viewer.org())
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
+    let admin = viewer.role == loka_shared::access::Role::Admin;
     let users = rows
         .into_iter()
-        .map(|(id, name, email)| UserSummary { id, name, email })
+        .map(|p| UserSummary { id: p.id, name: p.name, email: if admin || p.id == viewer.user { p.email } else { None } })
         .collect();
 
     Ok(Json(users))
