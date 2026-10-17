@@ -1,0 +1,22 @@
+export const qk = {
+  tokens: () => ["world", "tokens"] as const,
+  flags: () => ["world", "flags"] as const,
+  agents: () => ["world", "agents"] as const,
+  environment: (ownerId: string) => ["world", "environment", ownerId] as const,
+  commandRules: (ownerId: string) => ["world", "command-rules", ownerId] as const,
+  sharedKeys: () => ["world", "shared-keys"] as const,
+  github: () => ["world", "github"] as const,
+  backends: () => ["world", "backends"] as const,
+  mcpLibrary: () => ["world", "kit", "mcp-library"] as const,
+  skillLibrary: () => ["world", "kit", "skill-library"] as const,
+  agent: {
+    all: (id: string) => ["world", "agent", id] as const,
+    subscriptions: (id: string) => ["world", "agent", id, "subscriptions"] as const,
+    watches: (id: string) => ["world", "agent", id, "watches"] as const,
+    feeds: (id: string) => ["world", "agent", id, "feeds"] as const,
+    schedules: (id: string) => ["world", "agent", id, "schedules"] as const,
+    usage: (id: string) => ["world", "agent", id, "usage"] as const,
+    kit: (id: string) => ["world", "agent", id, "kit"] as const,
+    context: (id: string) => ["world", "agent", id, "context"] as const,
+  },
+};
