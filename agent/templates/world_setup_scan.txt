@@ -1,0 +1,28 @@
+[setup scan] Your owner asked you to look at how they already work with {sources} over the last {days} days and suggest a setup for them in Loka. You have no tools in this conversation. Below this message, the Loka app on their Mac added a local digest: their recent requests (repeats counted), the folders and repos they worked in, the tools and commands their CLIs ran, their instruction files (CLAUDE.md, AGENTS.md) and the MCP servers they already configured, with secret values already replaced. Read only that digest. If it is missing or empty, return an empty setup block.
+
+Infer, from evidence in the digest only:
+- How much work they do and of what kind: mostly coding, reviewing, research, writing, operations. Size the team to it. One coder is enough for light use; two coders only when they clearly run several things at once; add a reviewer when they review or test a lot. Never suggest a seat the digest gives no reason for.
+- Repeated workflows: requests they made three or more times in a similar shape (release notes, triaging failing CI, writing migrations, bumping versions, drafting PR descriptions). Each one can become a skill: a short SKILL.md with numbered steps the agent follows, written from what they actually did.
+- Rules: lasting preferences stated in their instruction files or repeated in their requests (style, testing, commit habits, things to never do). Keep each rule one or two plain sentences. Use scope "talk" for how to talk with them and "work" for how to do the work. Never copy a rule that only makes sense for one CLI's internals.
+- MCP servers they already use: suggest each one worth bringing over, keeping its command and args or url exactly as in the digest. Env and header values must stay as ${secret:NAME} references; never write any secret value.
+- Repos they work in most, as owner/name.
+- Starting notes: short facts an agent should know on day one (main languages, how they test and ship, which repo is the main one).
+
+Team seats you may use (use these exact seat keys):
+{seats}
+
+CLIs and models available to new agents (pick only from these; strongest model for coders, a different CLI or model for the reviewer when there is one, the cheapest for watchers):
+{models}
+
+Write in plain, friendly language. Every item gets a one line reason that names the evidence, like "You asked for release notes 7 times". Do not use em dashes. Suggest at most 5 seats, 5 skills, 6 rules, 8 MCP servers, 8 repos and 6 notes, fewer is better. Never include file contents, personal data or anything secret beyond what a suggestion needs. "agent" on a skill or note is "main" for their main agent or one of the seat keys above.
+
+Reply with only this block and nothing else:
+<!-- setup {
+  "summary": "One or two sentences on how they work.",
+  "team": [{"seat": "coder-1", "cli": "claude", "model": "opus", "repos": ["owner/name"], "reason": "..."}],
+  "skills": [{"name": "release-notes", "description": "One line on when to use it", "body": "Numbered steps in markdown", "agent": "main", "reason": "..."}],
+  "rules": [{"scope": "work", "text": "...", "source": "~/.claude/CLAUDE.md", "reason": "..."}],
+  "mcp_servers": [{"name": "linear", "definition": {"url": "https://...", "headers": {"Authorization": "${secret:LINEAR_API_KEY}"}}, "source": "Claude Code", "reason": "..."}],
+  "repos": [{"repo": "owner/name", "reason": "..."}],
+  "notes": [{"agent": "main", "text": "...", "reason": "..."}]
+} setup -->
