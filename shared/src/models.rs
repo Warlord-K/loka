@@ -52,28 +52,6 @@ impl std::str::FromStr for TaskStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-#[allow(dead_code)]
-pub enum TaskPriority {
-    Low,
-    Medium,
-    High,
-    Urgent,
-}
-
-#[allow(dead_code)]
-impl TaskPriority {
-    pub fn sort_order(&self) -> i32 {
-        match self {
-            Self::Urgent => 0,
-            Self::High => 1,
-            Self::Medium => 2,
-            Self::Low => 3,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
@@ -170,12 +148,10 @@ fn default_orchestrator_max_subtasks() -> usize {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OrchestratorConfig {
-    /// MCP tools the orchestrator may request with `run` actions.
     #[serde(default)]
     pub allowed_tools: Vec<String>,
     #[serde(default = "default_orchestrator_max_turns")]
     pub max_turns: u32,
-    /// Absolute RFC3339 timestamp OR relative duration (e.g. "2h").
     #[serde(default)]
     pub deadline: Option<String>,
     #[serde(default = "default_orchestrator_max_actions_per_turn")]
@@ -200,22 +176,16 @@ impl Default for OrchestratorConfig {
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub struct AgentTask {
     pub id: Uuid,
     pub user_id: Uuid,
-    /// NULL = picked up by the agent; set = assigned to a specific human, agent skips.
     pub assignee_user_id: Option<Uuid>,
     pub title: String,
     pub description: Option<String>,
     pub repo: Option<String>,
-    /// Task intent: code changes vs non-code workflows.
     pub kind: String,
-    /// Where a non-code artifact should be delivered.
     pub output_target: Option<String>,
-    /// URL/id/thread-ts of the final artifact destination.
     pub output_ref: Option<String>,
-    /// Task origin surface (e.g. "chat"); NULL keeps default board semantics.
     pub source: Option<String>,
     pub parent_task_id: Option<Uuid>,
     pub target_branch: Option<String>,
@@ -228,7 +198,6 @@ pub struct AgentTask {
     pub plan_content: Option<String>,
     pub result_content: Option<String>,
     pub feedback: Option<String>,
-    /// Gating timestamp for deferred orchestrator turns.
     pub not_before: Option<DateTime<Utc>>,
     pub agent_session_id: Option<String>,
     pub error_message: Option<String>,
@@ -236,34 +205,27 @@ pub struct AgentTask {
     pub model: Option<String>,
     pub task_number: Option<i32>,
     pub cost_usd: f64,
-    /// Origin system if ingested from outside (e.g. "linear", "clickup").
     pub external_source: Option<String>,
     pub external_id: Option<String>,
     pub external_url: Option<String>,
-    /// Slack thread mapping for control-plane interactions.
-    /// When present, task updates are posted into this channel/thread.
     pub slack_channel: Option<String>,
     pub slack_thread_ts: Option<String>,
-    /// NULL = any active agent profile may pick it up.
-    /// Set = only the named agent profile picks it up.
     pub assigned_agent_id: Option<Uuid>,
-    /// Per-stage agent profile overrides for the multi-agent flow. NULL falls
-    /// back to `assigned_agent_id`, then the config default (see
-    /// `agent::resolve_runtime`). Let a task run scope/implement/review on
-    /// different tools/models (e.g. planner=cursor, implementer=codex,
-    /// reviewer=grok).
     pub planner_agent_id: Option<Uuid>,
     pub implementer_agent_id: Option<Uuid>,
     pub reviewer_agent_id: Option<Uuid>,
-    /// Optional controls for task-level orchestration loops.
     pub orchestrator: Option<serde_json::Value>,
-    /// Policies that fired against this task's plan. Shape:
-    /// `[{policy_id, name, severity, message, paths: [...]}]`.
     pub policy_matches: Option<serde_json::Value>,
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+    #[sqlx(default)]
+    #[serde(default)]
+    pub time_limit_secs: Option<i32>,
+    #[sqlx(default)]
+    #[serde(default)]
+    pub org_id: Option<Uuid>,
 }
 
 impl AgentTask {
@@ -294,39 +256,37 @@ impl AgentTask {
     }
 
     pub fn agent_branch_name(&self) -> String {
-        let number = self.task_number.unwrap_or(0);
-
-        // Extract prefix from title if it matches "PREFIX-NNN: ..." pattern
-        // e.g., "Bug-001: Fix login" → prefix = "Bug", slug of the rest
-        let (prefix, slug_source) = if let Some(colon_pos) = self.title.find(':') {
-            let before_colon = &self.title[..colon_pos];
-            // Check if it's a PREFIX-NNN pattern
-            if let Some(dash_pos) = before_colon.rfind('-') {
-                let candidate = &before_colon[..dash_pos];
-                let after_dash = &before_colon[dash_pos + 1..];
-                if !candidate.is_empty()
-                    && candidate.chars().all(|c| c.is_alphanumeric() || c == '-')
-                    && after_dash.chars().all(|c| c.is_ascii_digit())
-                {
-                    let rest = self.title[colon_pos + 1..].trim();
-                    (candidate.to_lowercase(), rest.to_string())
-                } else {
-                    ("kar".to_string(), self.title.clone())
-                }
-            } else {
-                ("kar".to_string(), self.title.clone())
-            }
-        } else {
-            ("kar".to_string(), self.title.clone())
-        };
-
-        let title_slug = slug::slugify(&slug_source);
-        let truncated = if title_slug.len() > 40 {
-            &title_slug[..40]
-        } else {
-            &title_slug
-        };
-        format!("{prefix}-{number}/{truncated}")
+        let ticket = [
+            self.title.as_str(),
+            self.description.as_deref().unwrap_or(""),
+        ]
+        .into_iter()
+        .flat_map(|text| text.split(|c: char| !c.is_ascii_alphanumeric() && c != '-'))
+        .enumerate()
+        .find(|(index, word)| {
+            word.split_once('-').is_some_and(|(team, number)| {
+                team.len() >= 2
+                    && team
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || (*index == 0 && c.is_ascii_lowercase()))
+                    && number.len() >= 2
+                    && number.chars().all(|c| c.is_ascii_digit())
+            })
+        })
+        .map(|(_, word)| word);
+        let title = ticket.map_or(self.title.clone(), |ticket| self.title.replace(ticket, " "));
+        let slug = slug::slugify(title)
+            .split('-')
+            .skip_while(|word| *word == "retry")
+            .take(5)
+            .collect::<Vec<_>>()
+            .join("-");
+        match ticket {
+            Some(ticket) if !slug.is_empty() => format!("{}/{slug}", ticket.to_lowercase()),
+            Some(ticket) => ticket.to_lowercase(),
+            None if slug.is_empty() => format!("task-{}", &self.id.to_string()[..8]),
+            None => format!("{slug}-{}", &self.id.to_string()[..8]),
+        }
     }
 
     pub fn repos(&self) -> Vec<&str> {
@@ -335,20 +295,9 @@ impl AgentTask {
             None => Vec::new(),
         }
     }
-
-    #[allow(dead_code)]
-    pub fn is_parent(&self) -> bool {
-        self.repo.is_none() && self.parent_task_id.is_none()
-    }
-
-    #[allow(dead_code)]
-    pub fn is_subtask(&self) -> bool {
-        self.parent_task_id.is_some()
-    }
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub struct AgentLog {
     pub id: Uuid,
     pub task_id: Uuid,
@@ -359,10 +308,7 @@ pub struct AgentLog {
     pub created_at: Option<DateTime<Utc>>,
 }
 
-// --- Task attachment models ---
-
 #[derive(Debug, Clone, FromRow)]
-#[allow(dead_code)]
 pub struct TaskAttachment {
     pub id: Uuid,
     pub task_id: Uuid,
@@ -373,10 +319,7 @@ pub struct TaskAttachment {
     pub created_at: Option<DateTime<Utc>>,
 }
 
-// --- Schedule models ---
-
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub struct Schedule {
     pub id: Uuid,
     pub user_id: Uuid,
@@ -411,7 +354,6 @@ impl Schedule {
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub struct ScheduledRun {
     pub id: Uuid,
     pub schedule_id: Uuid,
@@ -425,7 +367,6 @@ pub struct ScheduledRun {
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub struct ScheduledRunLog {
     pub id: Uuid,
     pub run_id: Uuid,
@@ -434,15 +375,11 @@ pub struct ScheduledRunLog {
     pub created_at: Option<DateTime<Utc>>,
 }
 
-// --- Policy models ---
-
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct Policy {
     pub id: Uuid,
     pub name: String,
-    /// Repo glob: "owner/repo" exact, "owner/*" prefix, "*" all.
     pub repo_pattern: String,
-    /// Path glob (supports `**` and `*`) against files mentioned in plan_content.
     pub path_glob: String,
     pub message: String,
     pub severity: String,
@@ -451,11 +388,6 @@ pub struct Policy {
     pub updated_at: Option<DateTime<Utc>>,
 }
 
-// --- Agent profile models ---
-
-/// A named agent identity (e.g. "Sonnet", "Codex GPT-5.4"). Profiles are
-/// auto-seeded from config.yaml on agent startup, one per (cli, model) pair,
-/// and can be renamed / paused / extended by the user.
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct AgentProfile {
     pub id: Uuid,
@@ -465,15 +397,11 @@ pub struct AgentProfile {
     pub cli: String,
     pub model: String,
     pub system_prompt_addendum: Option<String>,
-    /// NULL = active. Set = paused with a human-readable reason; the worker
-    /// will not claim tasks assigned to this profile while paused.
     pub paused_reason: Option<String>,
     pub is_default: bool,
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
 }
-
-// --- Repo profile models ---
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct RepoProfile {
@@ -489,20 +417,14 @@ pub struct RepoProfile {
     pub error_message: Option<String>,
     pub cost_usd: f64,
     pub sync_issues: bool,
-    /// not_registered | registered | failed | unsupported
-    /// "unsupported" = no public webhook URL configured on the agent.
     pub webhook_status: String,
     pub webhook_error: Option<String>,
     pub webhook_url: Option<String>,
-    /// Opt-in: when TRUE, the agent reviews human-opened PRs on this repo.
     pub review_prs: bool,
-    /// Which agent profile reviews PRs for this repo. NULL = default agent profile.
     pub review_agent_id: Option<Uuid>,
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
 }
-
-// --- PR review records ---
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct PrReviewLog {
