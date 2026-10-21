@@ -1,0 +1,1 @@
+ALTER TABLE world_runners ADD COLUMN IF NOT EXISTS screen_access BOOLEAN NOT NULL DEFAULT false;
