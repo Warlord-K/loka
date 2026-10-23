@@ -1,22 +1,21 @@
 node_modules/
 .next/
+.next-*/
+next-env.d.ts
 dist/
 target/
 .env
 config.yaml
 *.log
 .DS_STORE
-backup.sql
 
-# Docker volumes
-pgdata/
-redisdata/
-workspace/
 
 # SSH signing keys (sensitive)
 signing/
 
-# Karna updater state
-.karna-updater.pid
-charts/karna/charts/
-Chart.lock
+.env.local
+
+
+*.tsbuildinfo
+.claude/launch.json
+.claude/worktrees/

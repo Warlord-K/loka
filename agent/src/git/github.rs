@@ -1,14 +1,14 @@
 use anyhow::{Context, Result};
 use std::path::Path;
-use tokio::process::Command;
 use tracing::info;
+
+use crate::cli::workspace_command;
 
 pub struct PrInfo {
     pub url: String,
     pub number: i32,
 }
 
-/// Create a pull request using `gh` CLI.
 pub async fn create_pr(
     worktree_path: &Path,
     repo: &str,
@@ -19,8 +19,8 @@ pub async fn create_pr(
 ) -> Result<PrInfo> {
     info!(repo, branch, "Creating PR");
 
-    let output = Command::new("gh")
-        .current_dir(worktree_path)
+    let output = workspace_command("gh", worktree_path)
+        .await
         .args([
             "pr",
             "create",
@@ -41,7 +41,6 @@ pub async fn create_pr(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // If PR already exists, get its URL
         if stderr.contains("already exists") {
             return get_existing_pr(worktree_path, repo, branch).await;
         }
@@ -60,10 +59,9 @@ pub async fn create_pr(
     })
 }
 
-/// Get an existing PR for a branch.
 async fn get_existing_pr(worktree_path: &Path, repo: &str, branch: &str) -> Result<PrInfo> {
-    let output = Command::new("gh")
-        .current_dir(worktree_path)
+    let output = workspace_command("gh", worktree_path)
+        .await
         .args(["pr", "view", branch, "--repo", repo, "--json", "url,number"])
         .output()
         .await?;
@@ -77,180 +75,122 @@ async fn get_existing_pr(worktree_path: &Path, repo: &str, branch: &str) -> Resu
     })
 }
 
-/// Get review comments from a PR.
-pub async fn get_pr_comments(
-    worktree_path: &Path,
-    repo: &str,
-    pr_number: i32,
-) -> Result<Vec<String>> {
-    let output = Command::new("gh")
-        .current_dir(worktree_path)
+pub async fn pr_state(worktree_path: &Path, repo: &str, number: i64) -> Result<Option<String>> {
+    let output = workspace_command("gh", worktree_path)
+        .await
         .args([
             "pr",
             "view",
-            &pr_number.to_string(),
+            &number.to_string(),
             "--repo",
             repo,
             "--json",
-            "reviews,comments",
+            "state",
         ])
         .output()
-        .await?;
-
+        .await
+        .context("Failed to run gh pr view")?;
     if !output.status.success() {
-        return Ok(vec![]);
+        return Ok(None);
     }
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    Ok(json["state"].as_str().map(str::to_string))
+}
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_default();
+pub fn is_final_pr_state(state: &str) -> bool {
+    matches!(state, "MERGED" | "CLOSED")
+}
 
-    let mut comments = Vec::new();
-
-    if let Some(reviews) = json["reviews"].as_array() {
-        for review in reviews {
-            if let Some(body) = review["body"].as_str() {
-                if !body.is_empty() {
-                    comments.push(body.to_string());
-                }
-            }
+pub async fn open_pr_containing_head(
+    worktree_path: &Path,
+    repo: &str,
+    base_branch: &str,
+) -> Result<Option<(PrInfo, String)>> {
+    let output = workspace_command("gh", worktree_path)
+        .await
+        .args([
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--author",
+            "@me",
+            "--state",
+            "open",
+            "--limit",
+            "200",
+            "--json",
+            "url,number,headRefName,headRefOid,isCrossRepository",
+        ])
+        .output()
+        .await
+        .context("Failed to run gh pr list")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "gh pr list failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let prs: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
+    let prs: Vec<serde_json::Value> = prs.into_iter().filter(|pr| !pr["isCrossRepository"].as_bool().unwrap_or(false)).collect();
+    if prs.is_empty() {
+        return Ok(None);
+    }
+    let base_ref = format!("origin/{base_branch}");
+    let unpublished = commits_only_in_head(worktree_path, &base_ref).await;
+    for pr in prs {
+        let head = pr["headRefOid"].as_str().unwrap_or("");
+        let contains = match &unpublished {
+            Some(commits) => commits.contains(head),
+            None => is_ancestor(worktree_path, head, "HEAD").await? && !is_ancestor(worktree_path, head, &base_ref).await?,
+        };
+        if contains {
+            let info = PrInfo {
+                url: pr["url"].as_str().unwrap_or("").to_string(),
+                number: pr["number"].as_i64().unwrap_or(0) as i32,
+            };
+            return Ok(Some((
+                info,
+                pr["headRefName"].as_str().unwrap_or("").to_string(),
+            )));
         }
     }
+    Ok(None)
+}
 
-    if let Some(issue_comments) = json["comments"].as_array() {
-        for comment in issue_comments {
-            if let Some(body) = comment["body"].as_str() {
-                if !body.is_empty() {
-                    comments.push(body.to_string());
-                }
-            }
-        }
-    }
+async fn commits_only_in_head(worktree_path: &Path, base_ref: &str) -> Option<std::collections::HashSet<String>> {
+    let output = workspace_command("git", worktree_path)
+        .await
+        .args(["rev-list", "HEAD", &format!("^{base_ref}"), "--"])
+        .output()
+        .await
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).lines().map(str::to_string).collect())
+}
 
-    Ok(comments)
+async fn is_ancestor(worktree_path: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let output = workspace_command("git", worktree_path)
+        .await
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .output()
+        .await?;
+    Ok(output.status.success())
 }
 
 fn extract_pr_number(url: &str) -> Option<i32> {
     url.rsplit('/').next()?.parse().ok()
 }
 
-/// Outcome of `ensure_repo_webhook` — distinguishes "we registered it" from
-/// "GitHub already had one." `matched_url` is the URL GitHub actually has
-/// registered, which may differ cosmetically from `webhook_url` (trailing
-/// slash, case in scheme/host).
-#[derive(Debug)]
-pub struct WebhookEnsureResult {
-    pub matched_url: String,
-    pub created: bool,
-}
-
-/// Compare two URLs in a forgiving way: case-insensitive scheme + host,
-/// trailing-slash insensitive on the path. Anything else must match exactly.
-fn webhook_urls_equivalent(a: &str, b: &str) -> bool {
-    fn normalize(u: &str) -> String {
-        let trimmed = u.trim_end_matches('/');
-        // Split scheme://host[:port]/path — fold the prefix lowercase.
-        if let Some(idx) = trimmed.find("://") {
-            let (scheme, rest) = trimmed.split_at(idx + 3);
-            if let Some(slash) = rest.find('/') {
-                let (host, path) = rest.split_at(slash);
-                format!("{}{}{}", scheme.to_lowercase(), host.to_lowercase(), path)
-            } else {
-                format!("{}{}", scheme.to_lowercase(), rest.to_lowercase())
-            }
-        } else {
-            trimmed.to_lowercase()
-        }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn final_pr_states_stop_publish() {
+        assert!(super::is_final_pr_state("MERGED"));
+        assert!(super::is_final_pr_state("CLOSED"));
+        assert!(!super::is_final_pr_state("OPEN"));
+        assert!(!super::is_final_pr_state(""));
     }
-    normalize(a) == normalize(b)
-}
-
-/// Ensure a GitHub webhook is registered on the repo for agent PR events.
-/// Idempotent — checks existing hooks first and skips if one already points
-/// to the same URL. Requires the PAT to have `admin:repo_hook` scope.
-pub async fn ensure_repo_webhook(
-    repo: &str,
-    webhook_url: &str,
-    secret: Option<&str>,
-) -> Result<WebhookEnsureResult> {
-    let hook_target = format!("{webhook_url}/webhooks/github");
-
-    // Check if a webhook already exists for this URL
-    let list_output = Command::new("gh")
-        .args([
-            "api",
-            &format!("repos/{repo}/hooks"),
-            "--jq",
-            ".[].config.url",
-        ])
-        .output()
-        .await
-        .context("Failed to list repo webhooks")?;
-
-    if list_output.status.success() {
-        let existing = String::from_utf8_lossy(&list_output.stdout);
-        for line in existing.lines() {
-            let url = line.trim();
-            if url.is_empty() {
-                continue;
-            }
-            if webhook_urls_equivalent(url, &hook_target) {
-                info!(repo, url, "Webhook already registered");
-                return Ok(WebhookEnsureResult {
-                    matched_url: url.to_string(),
-                    created: false,
-                });
-            }
-        }
-    }
-
-    // Create webhook via gh api with field flags
-    let mut args = vec![
-        "api".to_string(),
-        format!("repos/{repo}/hooks"),
-        "--method".to_string(),
-        "POST".to_string(),
-        "-f".to_string(),
-        format!("config[url]={hook_target}"),
-        "-f".to_string(),
-        "config[content_type]=json".to_string(),
-        "-f".to_string(),
-        "config[insecure_ssl]=0".to_string(),
-        "-F".to_string(),
-        "active=true".to_string(),
-        "-f".to_string(),
-        "events[]=pull_request_review".to_string(),
-        "-f".to_string(),
-        "events[]=issue_comment".to_string(),
-        "-f".to_string(),
-        "events[]=pull_request".to_string(),
-        "-f".to_string(),
-        "events[]=issues".to_string(),
-    ];
-    if let Some(s) = secret {
-        args.push("-f".to_string());
-        args.push(format!("config[secret]={s}"));
-    }
-
-    let result = Command::new("gh")
-        .args(&args)
-        .output()
-        .await
-        .context("Failed to create webhook via gh api")?;
-
-    if !result.status.success() {
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        if stderr.contains("Not Found") || stderr.contains("404") {
-            anyhow::bail!(
-                "Cannot create webhook on {repo}: 404. \
-                 Ensure GITHUB_TOKEN has admin:repo_hook scope."
-            );
-        }
-        anyhow::bail!("Failed to create webhook on {repo}: {stderr}");
-    }
-
-    info!(repo, url = %hook_target, "Webhook registered");
-    Ok(WebhookEnsureResult {
-        matched_url: hook_target,
-        created: true,
-    })
 }
