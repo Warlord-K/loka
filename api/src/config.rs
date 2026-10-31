@@ -3,14 +3,18 @@ use indexmap::IndexMap;
 use serde::Deserialize;
 use std::fs;
 
-/// Lightweight config for the API server — reads the same config.yaml as the agent
-/// but only extracts what's needed for the REST API.
 #[derive(Clone, Debug)]
 pub struct ApiConfig {
     pub repos: Vec<RepoRef>,
     pub backends: IndexMap<String, BackendConfig>,
     pub skills: Vec<SkillRef>,
     pub mcp_servers: Vec<McpServerRef>,
+}
+
+impl ApiConfig {
+    pub fn default_cli(&self) -> &str {
+        self.backends.keys().next().map(String::as_str).unwrap_or("claude")
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -34,8 +38,6 @@ pub struct SkillRef {
 pub struct McpServerRef {
     pub name: String,
 }
-
-// --- Raw YAML structs for deserialization ---
 
 #[derive(Deserialize, Default)]
 struct RawConfig {

@@ -1,2 +1,1 @@
-// Re-export from shared crate
-pub use karna_shared::db::*;
+pub use loka_shared::db::*;

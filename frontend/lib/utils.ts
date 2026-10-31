@@ -1,10 +1,5 @@
 export type ClassValue = string | number | null | false | undefined | ClassValue[];
 
-/**
- * Lightweight className combiner. Filters out falsy values and flattens arrays.
- * Intentionally dependency-free; variant maps in our primitives are authored so
- * classes don't conflict, so we don't need tailwind-merge here.
- */
 export function cn(...inputs: ClassValue[]): string {
   const out: string[] = [];
   const walk = (value: ClassValue) => {
@@ -17,4 +12,12 @@ export function cn(...inputs: ClassValue[]): string {
   };
   inputs.forEach(walk);
   return out.join(' ');
+}
+
+export function safeDecode(text: string): string {
+  try {
+    return decodeURIComponent(text);
+  } catch {
+    return text;
+  }
 }

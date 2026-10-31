@@ -2,12 +2,6 @@ use std::str::FromStr;
 
 use cron::Schedule as CronSchedule;
 
-/// Normalize a cron expression to the 6-field form the `cron` crate expects.
-///
-/// Karna's UI and most users write standard Unix 5-field cron
-/// (`min hour dom month dow`). The `cron` crate requires a leading seconds
-/// field (6 fields) or trailing year field (7). This prepends `0` so 5-field
-/// input parses; 6/7-field input is passed through unchanged.
 pub fn normalize(expr: &str) -> String {
     let trimmed = expr.trim();
     if trimmed.split_whitespace().count() == 5 {
@@ -17,8 +11,6 @@ pub fn normalize(expr: &str) -> String {
     }
 }
 
-/// Validate that a cron expression parses after normalization.
-/// Returns the underlying parser error message on failure.
 pub fn validate(expr: &str) -> Result<(), String> {
     let normalized = normalize(expr);
     CronSchedule::from_str(&normalized)
@@ -32,10 +24,8 @@ mod tests {
 
     #[test]
     fn five_field_patterns_parse_after_normalization() {
-        // Patterns the user asked about
         assert!(validate("0 9 * * 1,4").is_ok());
         assert!(validate("0 */5 * * *").is_ok());
-        // Patterns shipped in the frontend presets
         for preset in [
             "* * * * *",
             "*/5 * * * *",

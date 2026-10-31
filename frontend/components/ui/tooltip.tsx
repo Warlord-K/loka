@@ -20,11 +20,6 @@ const SIDE_CLASSES: Record<Side, string> = {
   right: 'left-full top-1/2 -translate-y-1/2 ml-1.5',
 };
 
-/**
- * Minimal, dependency-free tooltip. Shows on hover + keyboard focus, respects a
- * short open delay, and renders an accessible description. For complex anchored
- * menus prefer a real popover; this is for short hint labels.
- */
 export function Tooltip({ label, side = 'top', delay = 250, children, className }: TooltipProps) {
   const [open, setOpen] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
