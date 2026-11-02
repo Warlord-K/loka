@@ -1,8 +1,9 @@
 "use client";
 
+import { SOLO } from "@/lib/edition";
 import { AgentAvatar, AgentFace } from "./channel-ui";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Broom, Code, Crown, Desktop, GithubLogo, Star, Key, Keyboard, ListChecks, Microphone, Palette, Play, Plus, Scroll, ShareNetwork, SpeakerHigh, UserCircle } from "@phosphor-icons/react";
+import { ArrowsClockwise, Broom, Code, Crown, Desktop, GithubLogo, Star, Key, Keyboard, ListChecks, Microphone, Palette, Play, Plus, Scroll, ShareNetwork, SpeakerHigh, UserCircle } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
 import { ShortcutList } from "./shortcuts";
 import { worldApi, type WorldAgent, type WorldRule } from "@/lib/world";
@@ -23,6 +24,7 @@ import { ApiTokensSection } from "./api-tokens";
 import { StorageSection } from "./storage-ui";
 import { useThemeMode, type ThemeMode } from "./theme";
 import { previewSound, SOUND_KINDS, useSoundPrefs } from "./sounds";
+import { UpdatesPage, useUpdates } from "./updates-ui";
 import { GHOST_ICON_BTN, SettingsCard, SettingsGroup, SettingsRow, SettingsShell, Switch, type SettingsNavItem, EmptyState } from "./settings-shell";
 import { runtimeName } from "@/lib/model-names";
 import { escapeTaken } from "@/lib/escape";
@@ -273,6 +275,7 @@ export function YouPanel({
   const canWrite = me?.role === "write" || admin;
   const live = useFeature("live_voice");
 
+  const updates = useUpdates();
   const items = useMemo<SettingsNavItem[]>(
     () =>
       [
@@ -282,17 +285,18 @@ export function YouPanel({
         canWrite && { id: "setup", label: "Setup status", group: "Connections", icon: ListChecks, keywords: "ready readiness checklist" },
         canWrite && { id: "devices", label: "Devices", group: "Connections", icon: Desktop, keywords: "runner mac computer execution" },
         canWrite && me && { id: "keys", label: "Keys", group: "Connections", icon: Key, keywords: "environment provider api secrets values" },
-        admin && { id: "shared-keys", label: "Shared keys", group: "Connections", icon: ShareNetwork, keywords: "team world admin" },
+        admin && !SOLO && { id: "shared-keys", label: "Shared keys", group: "Connections", icon: ShareNetwork, keywords: "team world admin" },
         canWrite && { id: "github", label: "GitHub", group: "Connections", icon: GithubLogo, keywords: "notifications pull requests reviews ci feed gh" },
-        { id: "tokens", label: "API tokens", group: "Connections", icon: Code, keywords: "mcp claude cursor" },
+        { id: "tokens", label: SOLO ? "Connect other tools" : "API tokens", group: "Connections", icon: Code, keywords: "mcp claude cursor api tokens" },
         { id: "pro", label: "Loka Pro", group: "Account", icon: Crown, keywords: "pro team organizations iphone ipad watch share waitlist" },
         canWrite && { id: "storage", label: "Storage", group: "Account", icon: Broom, keywords: "space size cleanup clean delete old disk usage tidy" },
         { id: "appearance", label: "Appearance", group: "Preferences", icon: Palette, keywords: "theme dark light" },
         { id: "sounds", label: "Sounds", group: "Preferences", icon: SpeakerHigh, keywords: "volume audio" },
         canWrite && { id: "voice", label: "Voice", group: "Preferences", icon: Microphone, keywords: "speech dictate speak" },
         { id: "shortcuts", label: "Shortcuts", group: "Preferences", icon: Keyboard, keywords: "keys keyboard hotkeys" },
+        updates.view && { id: "updates", label: "Updates", group: "Preferences", icon: ArrowsClockwise, keywords: "version update upgrade automatic install restart" },
       ].filter(Boolean) as SettingsNavItem[],
-    [canWrite, admin, me],
+    [canWrite, admin, me, updates.view],
   );
   const [page, setPage] = useState<string>(() => {
     const target = focusSection ? focusPage(focusSection.id) : null;
@@ -515,7 +519,7 @@ export function YouPanel({
       )}
 
       {active === "tokens" && (
-        <SettingsGroup title="API tokens" description="Connect Claude Code, Cursor or any MCP client to your agents.">
+        <SettingsGroup title={SOLO ? "Connect other tools" : "API tokens"} description="Connect Claude Code, Cursor or any MCP client to your agents.">
           <SettingsCard>
             <ApiTokensSection canWrite={canWrite} />
           </SettingsCard>
@@ -525,6 +529,7 @@ export function YouPanel({
       {active === "storage" && canWrite && <StorageSection />}
       {active === "appearance" && <AppearancePage />}
       {active === "sounds" && <SoundsPage />}
+      {active === "updates" && <UpdatesPage state={updates} autoNote="Updates to only the server or the web app apply in place, with no restart." />}
 
       {active === "voice" && (
         <SettingsGroup title="Voice">

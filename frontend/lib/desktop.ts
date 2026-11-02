@@ -56,7 +56,8 @@ type DesktopCommand =
   | "update_when_idle"
   | "update_stop_waiting"
   | "update_parts_apply"
-  | "update_parts_auto";
+  | "update_parts_auto"
+  | "update_auto";
 
 export interface UpdateView {
   state: "idle" | "checking" | "downloading" | "ready" | "waiting" | "current" | "failed" | "installing";
@@ -66,6 +67,7 @@ export interface UpdateView {
   progress: number | null;
   error: string | null;
   busy?: number;
+  auto_install?: boolean;
   parts?: UpdateParts | null;
   auto_parts?: boolean;
   parts_enabled?: boolean;
@@ -137,6 +139,7 @@ export const desktopApi = {
   installUpdate: () => invoke<void>("update_install"),
   updateWhenIdle: () => invoke<void>("update_when_idle"),
   stopWaitingForUpdate: () => invoke<void>("update_stop_waiting"),
+  setAutoUpdate: (enabled: boolean) => invoke<UpdateView>("update_auto", { enabled }),
   applyUpdateParts: () => invoke<void>("update_parts_apply"),
   setAutoUpdateParts: (enabled: boolean) => invoke<UpdateView>("update_parts_auto", { enabled }),
 };

@@ -1,5 +1,6 @@
 "use client";
 
+import { SOLO } from "@/lib/edition";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ArrowCounterClockwise, ArrowLeft, CaretDown, CaretRight, Check, ClockCounterClockwise, FileText, Folder, FolderOpen, Globe, Link as LinkIcon, ListBullets, Lock, Code, Copy, DownloadSimple, PencilSimple, Plus, Trash, Clock, Files, FolderSimple, Hash, Notebook, PushPinSimple, UserCircle, type Icon as PhosphorIcon, SidebarSimple } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
@@ -841,7 +842,7 @@ export function ReportsPanel({
                       <span className="min-w-0 truncate">{r.folder}</span>
                     </>
                   )}
-                  {r.visibility === "public" && <Globe size={11} weight="bold" className="ml-auto shrink-0" aria-label="Public" />}
+                  {!SOLO && r.visibility === "public" && <Globe size={11} weight="bold" className="ml-auto shrink-0" aria-label="Public" />}
                 </span>
               </button>
             </li>
@@ -1136,21 +1137,23 @@ export function ReportsPanel({
               <RelativeTime at={report.updated_at} />
               <span className="text-w-muted">· {readMinutes(byteLength(report.body))} · revision {report.revision}</span>
             </Property>
-            <Property icon={report.visibility === "public" ? Globe : Lock} label="Access">
-              {detail.can_edit ? (
-                <button
-                  type="button"
-                  onClick={() => void patch({ visibility: report.visibility === "public" ? "private" : "public" })}
-                  title={report.visibility === "public" ? "Make private" : "Share with everyone"}
-                  className={cn(report.visibility === "public" ? PILL_INFO : PILL_NEUTRAL, "py-1 transition-colors hover:border-w-ink")}
-                >
-                  {report.visibility === "public" ? <Globe size={11} weight="bold" /> : <Lock size={11} weight="bold" />}
-                  {report.visibility === "public" ? "Everyone can read" : "Only you"}
-                </button>
-              ) : (
-                <span className={cn(report.visibility === "public" ? PILL_INFO : PILL_NEUTRAL, "py-1")}>{report.visibility === "public" ? "Everyone can read" : "Private"}</span>
-              )}
-            </Property>
+            {!SOLO && (
+              <Property icon={report.visibility === "public" ? Globe : Lock} label="Access">
+                {detail.can_edit ? (
+                  <button
+                    type="button"
+                    onClick={() => void patch({ visibility: report.visibility === "public" ? "private" : "public" })}
+                    title={report.visibility === "public" ? "Make private" : "Share with everyone"}
+                    className={cn(report.visibility === "public" ? PILL_INFO : PILL_NEUTRAL, "py-1 transition-colors hover:border-w-ink")}
+                  >
+                    {report.visibility === "public" ? <Globe size={11} weight="bold" /> : <Lock size={11} weight="bold" />}
+                    {report.visibility === "public" ? "Everyone can read" : "Only you"}
+                  </button>
+                ) : (
+                  <span className={cn(report.visibility === "public" ? PILL_INFO : PILL_NEUTRAL, "py-1")}>{report.visibility === "public" ? "Everyone can read" : "Private"}</span>
+                )}
+              </Property>
+            )}
             {report.tags.length > 0 && (
               <Property icon={Hash} label="Tags">
                 {report.tags.map((t) => (

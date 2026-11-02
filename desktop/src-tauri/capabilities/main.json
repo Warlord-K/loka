@@ -45,7 +45,8 @@
     "allow-update-when-idle",
     "allow-update-stop-waiting",
     "allow-update-parts-apply",
-    "allow-update-parts-auto"
+    "allow-update-parts-auto",
+    "allow-update-auto"
   ],
   "remote": {
     "urls": [

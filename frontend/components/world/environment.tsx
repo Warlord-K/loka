@@ -1,5 +1,6 @@
 "use client";
 
+import { SOLO } from "@/lib/edition";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { qk } from "@/lib/query-keys";
@@ -370,11 +371,11 @@ export function EnvironmentPanel({ ownerId, embedded = false }: { ownerId: strin
                     onChange={(event) => void setGrant(entry.name, agent.id, event.target.checked)}
                   />
                   {agent.name}
-                  {agent.visibility !== "private" && <span className="rounded-md bg-w-lemon px-1 text-w-2xs text-w-text2">public</span>}
+                  {!SOLO && agent.visibility !== "private" && <span className="rounded-md bg-w-lemon px-1 text-w-2xs text-w-text2">public</span>}
                 </label>
               ))}
             </div>
-            {ownAgents.some((agent) => agent.visibility !== "private" && entry.agent_ids.includes(agent.id)) && (
+            {!SOLO && ownAgents.some((agent) => agent.visibility !== "private" && entry.agent_ids.includes(agent.id)) && (
               <p className="mt-2 text-w-2xs text-w-warn">Public agents work for anyone who talks to them, so others can put this key to use through them. Work other people ask for still waits for your approval, unless you marked them trusted.</p>
             )}
             <KeyEnvironments

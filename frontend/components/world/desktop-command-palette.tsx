@@ -1,5 +1,6 @@
 "use client";
 
+import { SOLO } from "@/lib/edition";
 import { AgentFace } from "./channel-ui";
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
@@ -370,7 +371,7 @@ export function DesktopCommandPalette({
     { id: "set-rules", label: "Rules", hint: "", icon: Scroll, available: true, run: you("rules", "world-rules"), group: "Settings", keywords: "instructions talking working" },
     { id: "set-setup", label: "Setup status", hint: "", icon: ListChecks, available: canWrite, run: you("setup"), group: "Settings", keywords: "ready readiness checklist" },
     { id: "set-keys", label: "Keys and environment", hint: "", icon: Key, available: canWrite, run: you("keys", "world-environment"), group: "Settings", keywords: "api provider secrets openai anthropic values" },
-    { id: "set-tokens", label: "API tokens", hint: "", icon: Code, available: true, run: you("tokens", "world-tokens"), group: "Settings", keywords: "mcp claude cursor external" },
+    { id: "set-tokens", label: SOLO ? "Connect other tools" : "API tokens", hint: "", icon: Code, available: true, run: you("tokens", "world-tokens"), group: "Settings", keywords: "mcp claude cursor external" },
     { id: "set-appearance", label: "Appearance settings", hint: "", icon: CircleHalf, available: true, run: you("appearance"), group: "Settings", keywords: "theme dark light" },
     { id: "set-sounds", label: "Sound settings", hint: "", icon: SpeakerHigh, available: true, run: you("sounds"), group: "Settings", keywords: "volume audio effects" },
     { id: "set-voice", label: "Voice settings", hint: "", icon: Microphone, available: canWrite, run: you("voice"), group: "Settings", keywords: "speech dictate speak" },

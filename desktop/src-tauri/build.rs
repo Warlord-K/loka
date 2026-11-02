@@ -42,6 +42,7 @@ fn main() {
                 "update_stop_waiting",
                 "update_parts_apply",
                 "update_parts_auto",
+                "update_auto",
             ]),
         ),
     )

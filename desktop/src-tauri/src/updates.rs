@@ -22,6 +22,7 @@ pub(crate) struct UpdateView {
     progress: Option<f64>,
     error: Option<String>,
     busy: u32,
+    auto_install: bool,
     parts: Option<crate::components::PartsView>,
     auto_parts: bool,
     parts_enabled: bool,
@@ -74,6 +75,7 @@ pub(crate) fn announce(app: &AppHandle) {
 
 fn set(app: &AppHandle, view: UpdateView, announce: bool) {
     let mut view = with_parts(app, view);
+    view.auto_install = crate::native::auto_update(app) || view.auto_parts;
     view.busy = crate::native::runner_busy(app);
     let updates = app.state::<Updates>();
     if let Ok(mut current) = updates.view.lock() {
@@ -167,6 +169,9 @@ async fn check(app: &AppHandle, quiet: bool) {
                 *ready = Some((update, bytes));
             }
             set(app, UpdateView { state: "ready", progress: None, ..base }, true);
+            if crate::native::auto_update(app) {
+                let _ = update_when_idle(app.clone());
+            }
         }
         Err(error) => set(app, UpdateView { error: Some(error.to_string()), ..view(app, "failed") }, !quiet),
     }
@@ -177,7 +182,8 @@ pub(crate) fn update_status(app: AppHandle) -> UpdateView {
     let view = app.state::<Updates>().view.lock().map(|v| v.clone()).unwrap_or_default();
     let view = if view.state.is_empty() { UpdateView { state: "idle", current: current(&app), ..UpdateView::default() } } else { view };
     let view = with_parts(&app, view);
-    UpdateView { busy: crate::native::runner_busy(&app), ..view }
+    let auto_install = crate::native::auto_update(&app) || view.auto_parts;
+    UpdateView { busy: crate::native::runner_busy(&app), auto_install, ..view }
 }
 
 #[tauri::command]
@@ -187,14 +193,23 @@ pub(crate) async fn update_parts_apply(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub(crate) async fn update_parts_auto(app: AppHandle, enabled: bool) -> Result<UpdateView, String> {
-    let components = app.state::<Arc<Components>>().inner().clone();
-    components.set_auto(enabled)?;
-    if enabled && components.has_pending() && !components.applying() {
-        let applying = app.clone();
-        tauri::async_runtime::spawn(async move {
-            let _ = crate::components::apply(&applying).await;
-        });
+    update_auto(app, enabled)
+}
+
+#[tauri::command]
+pub(crate) fn update_auto(app: AppHandle, enabled: bool) -> Result<UpdateView, String> {
+    crate::native::set_auto_update(&app, enabled)?;
+    if let Some(components) = app.try_state::<Arc<Components>>() {
+        let components = components.inner().clone();
+        components.set_auto(enabled)?;
+        if enabled && components.has_pending() && !components.applying() {
+            let applying = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = crate::components::apply(&applying).await;
+            });
+        }
     }
+    install_when_ready(&app, enabled)?;
     Ok(update_status(app))
 }
 
@@ -249,6 +264,14 @@ pub(crate) fn update_stop_waiting(app: AppHandle) {
         let announce = updates.view.lock().map(|v| v.clone()).unwrap_or_default();
         set(&app, UpdateView { state: "ready", ..announce }, true);
     }
+}
+
+fn install_when_ready(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    let ready = app.state::<Updates>().ready.lock().map(|ready| ready.is_some()).unwrap_or(false);
+    if enabled && ready {
+        update_when_idle(app.clone())?;
+    }
+    Ok(())
 }
 
 async fn install(app: &AppHandle) -> Result<(), String> {

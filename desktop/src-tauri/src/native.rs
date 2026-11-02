@@ -19,7 +19,7 @@ const SLACK_KEY_FILE: &str = "slack-connection.key";
 const SLACK_STATUS_FILE: &str = "slack-capture.json";
 const SLACK_WATCH_REFRESH: Duration = Duration::from_secs(60);
 const SLACK_PYTHON: &str = "/usr/bin/python3";
-const FEATURES: &[&str] = &["workbench", "home_terminal", "folders", "local", "updates", "update_parts", "open_paths"];
+const FEATURES: &[&str] = &["workbench", "home_terminal", "folders", "local", "updates", "update_auto", "update_parts", "open_paths"];
 const DOCS_URL: &str = "https://loka.ygpt.dev/docs";
 
 struct NativeState {
@@ -40,6 +40,8 @@ struct NativeConfig {
     repositories: Vec<RepositoryView>,
     #[serde(default)]
     slack_enabled: bool,
+    #[serde(default)]
+    auto_update: bool,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -169,7 +171,8 @@ pub fn run() {
             crate::updates::update_when_idle,
             crate::updates::update_stop_waiting,
             crate::updates::update_parts_apply,
-            crate::updates::update_parts_auto
+            crate::updates::update_parts_auto,
+            crate::updates::update_auto
         ])
         .setup(|app| {
             let root = app.path().app_data_dir()?;
@@ -1421,6 +1424,17 @@ fn default_device_name() -> String {
         .and_then(|name| name.into_string().ok())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "My Mac".into())
+}
+
+pub(crate) fn auto_update(app: &AppHandle) -> bool {
+    app.state::<NativeState>().config.lock().map(|config| config.auto_update).unwrap_or(false)
+}
+
+pub(crate) fn set_auto_update(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    let state = app.state::<NativeState>();
+    let mut config = state.config.lock().map_err(lock_error)?;
+    config.auto_update = enabled;
+    save_config(&state.config_path, &config).map_err(display_error)
 }
 
 fn display_error(error: impl std::fmt::Display) -> String {
