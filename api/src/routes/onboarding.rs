@@ -170,13 +170,23 @@ pub async fn answer(state: &AppState, user: &UserId, agent_id: Uuid, text: &str)
                     return Ok(true);
                 }
             }
+            let mut handle = agent.slug.clone();
             if name != agent.name {
                 progress.changed.push("name".into());
+                for candidate in ob::handles_for(&name) {
+                    if candidate == agent.slug {
+                        break;
+                    }
+                    if apply(state, user, agent_id, AgentUpdate { handle: Some(candidate.clone()), ..Default::default() }).await?.is_ok() {
+                        handle = candidate;
+                        break;
+                    }
+                }
             }
             progress.step = Step::Persona;
             state.world.set_onboarding(user.0, &progress).await.map_err(internal)?;
             let body = format!(
-                "Nice to meet you, I am {name}. Last one: do you have a persona in mind for me? Tell me the vibe and what you want help with, or pick one below."
+                "Nice to meet you, I am {name}, and you can mention me as @{handle}. Last one: do you have a persona in mind for me? Tell me the vibe and what you want help with, or pick one below."
             );
             let mut options = vec![ob::KEEP_PERSONA.to_string()];
             options.extend(ob::PERSONAS.iter().map(|(label, _)| label.to_string()));

@@ -255,6 +255,23 @@ pub fn model_choices(default: &str, models: &[String]) -> Vec<String> {
     out
 }
 
+pub fn handles_for(name: &str) -> Vec<String> {
+    let mut base = String::new();
+    for ch in name.trim().to_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() {
+            base.push(ch);
+        } else if !base.is_empty() && !base.ends_with('-') {
+            base.push('-');
+        }
+    }
+    let base: String = base.trim_matches('-').chars().take(40).collect();
+    let base = base.trim_matches('-').to_string();
+    if base.is_empty() {
+        return Vec::new();
+    }
+    std::iter::once(base.clone()).chain((2..=9).map(|n| format!("{base}-{n}"))).collect()
+}
+
 pub fn pick_name(answer: &str, current: &str) -> Option<String> {
     let text = answer.trim().trim_matches(['"', '\'', '.', '!']).trim();
     let lower = text.to_lowercase();
@@ -348,6 +365,16 @@ impl WorldStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_name_gets_a_matching_handle() {
+        assert_eq!(handles_for("Nova")[..3], ["nova", "nova-2", "nova-3"]);
+        assert_eq!(handles_for("Captain Hook!")[0], "captain-hook");
+        assert_eq!(handles_for("  R2 D2 ")[0], "r2-d2");
+        assert!(handles_for("ñ").is_empty() || handles_for("ñ")[0].chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+        assert!(handles_for("🙂").is_empty());
+        assert_eq!(handles_for("Nova").len(), 9);
+    }
 
     #[test]
     fn tools_report_lists_what_to_install_and_who_is_ready() {
