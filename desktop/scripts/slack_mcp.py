@@ -1,22 +1,19 @@
 import http.client
-import hmac
 import json
 import logging
 import os
 import re
-import stat
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from pathlib import Path
 
-from slack_session import SlackSessionError, _opener, discover_sessions, recover_session
+from slack_session import SlackSessionError, _opener, discover_sessions, recover_session, verify_connection_key
 
 
 LOGGER = logging.getLogger("slack-mcp")
-CONNECTION_PATH = Path.home() / "Library/Application Support/dev.ygpt.loka.pro/slack-connection.key"
+CONNECTION_PATH = None
 METHODS = {
     "users.list",
     "users.info",
@@ -73,20 +70,7 @@ class SlackMCPServer:
     def _authorize(self):
         if self._authorized:
             return
-        try:
-            parent = CONNECTION_PATH.parent.stat()
-            connection = CONNECTION_PATH.stat()
-            local_key = CONNECTION_PATH.read_text().strip()
-        except OSError:
-            raise SlackMCPError("slack_connection_not_authorized") from None
-        if (
-            not self._connection_key
-            or parent.st_uid != os.getuid()
-            or connection.st_uid != os.getuid()
-            or stat.S_IMODE(parent.st_mode) != 0o700
-            or stat.S_IMODE(connection.st_mode) != 0o600
-            or not hmac.compare_digest(self._connection_key, local_key)
-        ):
+        if not verify_connection_key(self._connection_key, CONNECTION_PATH):
             raise SlackMCPError("slack_connection_not_authorized")
         self._connection_key = None
         self._authorized = True

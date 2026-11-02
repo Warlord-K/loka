@@ -313,6 +313,39 @@ fn slack(s: &Signals) -> Feature {
     if s.slack_recent {
         return ready(KEY, LABEL, "Slack notifications are reaching your agents.");
     }
+    let capturing: Vec<(&RunnerView, &Value)> = s
+        .own
+        .iter()
+        .filter(|r| desktop(r))
+        .filter_map(|r| r.capabilities.get("slack_capture").filter(|c| c["enabled"].as_bool() == Some(true)).map(|c| (r, c)))
+        .collect();
+    if let Some((mac, capture)) = capturing.iter().find(|(_, c)| c["error"].as_str().is_some_and(|e| !e.is_empty())) {
+        let error = capture["error"].as_str().unwrap_or_default();
+        return setup(
+            KEY,
+            LABEL,
+            format!("Slack capture is on in the Loka app on {}, but it is not working: {error}", mac.name),
+            "Follow that step on the Mac. Loka's Devices page shows the same message and clears it once capture works.",
+            Some(Action::Devices),
+        );
+    }
+    if let Some((mac, capture)) = capturing.iter().find(|(_, c)| c["running"].as_bool() == Some(true) && c["workspaces"].as_array().is_some_and(|w| !w.is_empty())) {
+        let teams = capture["workspaces"].as_array().map(|w| w.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+        return ready(
+            KEY,
+            LABEL,
+            format!("Slack capture is on for {teams} on {}. Notifications arrive when someone mentions you, sends you a direct message or replies in your threads.", mac.name),
+        );
+    }
+    if let Some((mac, _)) = capturing.first() {
+        return setup(
+            KEY,
+            LABEL,
+            format!("Slack capture on {} is starting and has not connected to Slack yet.", mac.name),
+            "Give it a minute with the Slack desktop app open and signed in. If it still has not connected, quit and reopen Loka.",
+            Some(Action::Devices),
+        );
+    }
     let macs: Vec<&RunnerView> = s.own.iter().filter(|r| desktop(r)).collect();
     if !macs.is_empty() {
         return setup(
@@ -552,6 +585,28 @@ mod tests {
         assert_eq!(state(&r, "browser"), State::Ready);
         assert_eq!(state(&r, "live_voice"), State::NeedsSetup);
         assert_eq!(r.clis, vec!["claude".to_string()]);
+    }
+
+    #[test]
+    fn slack_readiness_follows_the_capture_on_the_mac() {
+        let slack = |capture: Value| {
+            let mac = runner("Studio", "macos", "online", json!({ "slack_capture": capture }));
+            let r = evaluate(&Signals { own: vec![mac], ..Signals::default() });
+            r.features.into_iter().find(|f| f.key == "slack").unwrap()
+        };
+        let off = slack(json!({ "enabled": false, "running": false, "workspaces": [], "error": null }));
+        assert_eq!(off.state, State::NeedsSetup);
+        assert!(off.fix.is_some(), "capture that is off offers the switch");
+        let failing = slack(json!({ "enabled": true, "running": false, "workspaces": [], "error": "Open the Slack desktop app on this Mac and sign in." }));
+        assert_eq!(failing.state, State::NeedsSetup);
+        assert!(failing.reason.contains("not working: Open the Slack desktop app"), "{}", failing.reason);
+        assert!(failing.fix.is_none(), "capture that is already on is not offered the switch again");
+        let starting = slack(json!({ "enabled": true, "running": true, "workspaces": [], "error": null }));
+        assert_eq!(starting.state, State::NeedsSetup);
+        assert!(starting.reason.contains("starting"));
+        let working = slack(json!({ "enabled": true, "running": true, "workspaces": ["Acme"], "error": null }));
+        assert_eq!(working.state, State::Ready);
+        assert!(working.reason.contains("Acme"));
     }
 
     #[test]

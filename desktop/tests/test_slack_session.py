@@ -96,3 +96,14 @@ def test_recovers_when_a_restart_leaves_two_valid_tokens(monkeypatch, tmp_path):
 
     assert token == "xoxc-1111111111-aaaaaaaaaaaaaaaaaaaa"
     assert cookie == "xoxd-cookie"
+
+
+def test_slack_data_is_found_for_the_downloaded_and_the_app_store_app(tmp_path):
+    with pytest.raises(slack_session.SlackSessionError, match="slack_app_missing"):
+        slack_session.slack_data_root(tmp_path)
+    store = tmp_path / "Library/Containers/com.tinyspeck.slackmacgap/Data/Library/Application Support/Slack"
+    store.mkdir(parents=True)
+    assert slack_session.slack_data_root(tmp_path) == store
+    direct = tmp_path / "Library/Application Support/Slack"
+    direct.mkdir(parents=True)
+    assert slack_session.slack_data_root(tmp_path) == direct

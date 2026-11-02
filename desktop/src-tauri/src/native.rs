@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::local::{append_log, ensure_private_dir, write_private, Phase, Stack, Supervised};
 
 const SLACK_KEY_FILE: &str = "slack-connection.key";
+const SLACK_STATUS_FILE: &str = "slack-capture.json";
 const SLACK_WATCH_REFRESH: Duration = Duration::from_secs(60);
 const SLACK_PYTHON: &str = "/usr/bin/python3";
 const FEATURES: &[&str] = &["workbench", "home_terminal", "folders", "local", "updates", "update_parts", "open_paths"];
@@ -613,6 +614,7 @@ async fn set_slack_capture(window: WebviewWindow, enabled: bool) -> Result<Deskt
     if enabled {
         start_slack(app)?;
     }
+    publish_slack_status(app);
     status(&window).await
 }
 
@@ -884,6 +886,22 @@ fn set_slack_error(app: &AppHandle, error: Option<String>) {
     if let Ok(mut view) = app.state::<NativeState>().slack_status.lock() {
         view.last_error = error;
     }
+    publish_slack_status(app);
+}
+
+fn publish_slack_status(app: &AppHandle) {
+    let state = app.state::<NativeState>();
+    let enabled = state.config.lock().map(|config| config.slack_enabled).unwrap_or(false);
+    let Ok(view) = slack_view(app, enabled) else {
+        return;
+    };
+    let status = serde_json::json!({
+        "enabled": view.enabled,
+        "running": view.running,
+        "workspaces": view.workspaces,
+        "error": view.last_error,
+    });
+    let _ = save_json(&state.root.join("runner").join(SLACK_STATUS_FILE), &status);
 }
 
 fn start_slack(app: &AppHandle) -> Result<(), String> {
@@ -893,6 +911,7 @@ fn start_slack(app: &AppHandle) -> Result<(), String> {
         return Ok(());
     };
     if !config.slack_enabled {
+        publish_slack_status(app);
         return Ok(());
     }
     {
@@ -951,6 +970,7 @@ fn start_slack(app: &AppHandle) -> Result<(), String> {
     }
     let handle = app.clone();
     std::thread::spawn(move || relay_slack(handle, stdout, runner_id, runner_secret, pid));
+    publish_slack_status(app);
     Ok(())
 }
 
@@ -1017,6 +1037,7 @@ fn relay_slack(app: AppHandle, stdout: std::process::ChildStdout, runner_id: Str
                     }
                     view.last_error = error;
                 }
+                publish_slack_status(&app);
             }
             Some("notification") => {
                 let delivered = tauri::async_runtime::block_on(deliver_slack(
@@ -1025,11 +1046,15 @@ fn relay_slack(app: AppHandle, stdout: std::process::ChildStdout, runner_id: Str
                     &runner_secret,
                     &message,
                 ));
+                let failed = delivered.is_err();
                 if let Ok(mut view) = app.state::<NativeState>().slack_status.lock() {
                     match delivered {
                         Ok(()) => view.delivered += 1,
                         Err(error) => view.last_error = Some(error),
                     }
+                }
+                if failed {
+                    publish_slack_status(&app);
                 }
             }
             _ => {}
@@ -1038,7 +1063,8 @@ fn relay_slack(app: AppHandle, stdout: std::process::ChildStdout, runner_id: Str
     if !slack_child_is(&app, pid) {
         return;
     }
-    set_slack_error(&app, Some("The Slack watcher stopped. Retrying in 30 seconds.".into()));
+    let reason = app.state::<NativeState>().slack_status.lock().ok().and_then(|view| view.last_error.clone());
+    set_slack_error(&app, Some(stopped_text(reason.as_deref())));
     std::thread::sleep(Duration::from_secs(30));
     let state = app.state::<NativeState>();
     let enabled = state.config.lock().map(|config| config.slack_enabled).unwrap_or(false);
@@ -1081,20 +1107,38 @@ async fn deliver_slack(
     Err(last)
 }
 
+const RETRY_NOTE: &str = "Trying again in 30 seconds.";
+
+fn stopped_text(reason: Option<&str>) -> String {
+    match reason.map(|r| r.trim_end_matches(RETRY_NOTE).trim()).filter(|r| !r.is_empty()) {
+        Some(reason) => format!("{reason} {RETRY_NOTE}"),
+        None => format!("The Slack watcher stopped. {RETRY_NOTE}"),
+    }
+}
+
 fn slack_error_text(code: &str) -> String {
     match code {
+        "slack_app_missing" => "Install the Slack desktop app on this Mac and sign in. Loka reads your Slack notifications from it.".into(),
         "slack_not_signed_in" | "slack_token_not_found" | "slack_cookie_not_found" => {
-            "Sign in to the Slack desktop app on this Mac.".into()
+            "Open the Slack desktop app on this Mac and sign in. Capture picks it up within a minute.".into()
         }
-        "slack_storage_unavailable" => "Loka could not read the Slack desktop app's data.".into(),
+        "invalid_auth" | "token_revoked" | "not_authed" | "account_inactive" => {
+            "Slack signed this Mac out. Sign in again in the Slack desktop app and capture picks it up within a minute.".into()
+        }
+        "slack_storage_blocked" => {
+            "macOS is blocking Loka from reading the Slack app's data. Turn on Loka in System Settings, Privacy and Security, Full Disk Access, then quit and reopen Loka.".into()
+        }
+        "slack_storage_unavailable" => "Loka could not read the Slack app's data just now. It tries again every minute; quitting and reopening Slack usually helps.".into(),
         "keychain_lookup_failed" | "keychain_lookup_timed_out" => {
-            "Allow access to the Slack Safe Storage item in Keychain, then turn capture off and on.".into()
+            "When macOS asks about Slack Safe Storage, choose Always Allow. If you missed it, turn capture off and on to ask again.".into()
         }
+        code if code.starts_with("cookie_") => "Loka could not unlock the Slack sign-in. Quit and reopen Slack, then turn capture off and on.".into(),
         "slack_connection_not_authorized" => {
             "The Slack connection key is invalid. Turn capture off and on again.".into()
         }
-        "slack_network_failed" => "Slack is unreachable right now.".into(),
-        other => format!("Slack watcher error: {other}"),
+        "slack_network_failed" => "Slack is unreachable right now. Capture tries again by itself.".into(),
+        "slack_http_failed" | "slack_response_invalid" | "rate_limited" => "Slack is having trouble right now. Capture tries again by itself.".into(),
+        other => format!("Slack capture stopped: {other}"),
     }
 }
 
@@ -1203,7 +1247,11 @@ fn load_config(path: &Path) -> Result<NativeConfig, std::io::Error> {
 }
 
 fn save_config(path: &Path, config: &NativeConfig) -> Result<(), std::io::Error> {
-    let bytes = serde_json::to_vec_pretty(config).map_err(std::io::Error::other)?;
+    save_json(path, config)
+}
+
+fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), std::io::Error> {
+    let bytes = serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?;
     let temporary = path.with_extension("tmp");
     write_private(&temporary, &bytes)?;
     std::fs::rename(temporary, path)
@@ -1386,6 +1434,19 @@ fn lock_error<T>(_: std::sync::PoisonError<T>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stopped_watcher_keeps_its_reason() {
+        let keychain = slack_error_text("keychain_lookup_timed_out");
+        assert_eq!(stopped_text(Some(&keychain)), format!("{keychain} {RETRY_NOTE}"));
+        assert_eq!(stopped_text(Some(&stopped_text(Some(&keychain)))), format!("{keychain} {RETRY_NOTE}"));
+        assert_eq!(stopped_text(None), format!("The Slack watcher stopped. {RETRY_NOTE}"));
+        assert!(slack_error_text("slack_storage_blocked").contains("Full Disk Access"));
+        assert!(!slack_error_text("slack_not_signed_in").contains("Full Disk Access"));
+        for code in ["slack_app_missing", "invalid_auth", "cookie_decryption_failed", "rate_limited", "anything"] {
+            assert!(!slack_error_text(code).contains('\u{2014}'));
+        }
+    }
 
     #[test]
     fn every_command_is_allowed_for_the_world_window() {

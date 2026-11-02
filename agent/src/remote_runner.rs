@@ -2658,6 +2658,7 @@ fn capabilities() -> Value {
         "github_feed": github_feed::capability(),
         "provider_keys": loka_shared::providers::server_key_names(),
         "folders": shared_folders_view(),
+        "slack_capture": slack_capture_view(),
         "models": crate::model_catalog::snapshot(),
         "tools": crate::tools_check::snapshot()
     })
@@ -2675,6 +2676,26 @@ fn read_shared_folders(root: &Path) -> Vec<SharedFolder> {
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default()
+}
+
+fn slack_capture_view() -> Value {
+    let Ok(root) = std::env::var("WORLD_RUNNER_ROOT") else {
+        return Value::Null;
+    };
+    slack_capture_from(Path::new(&root))
+}
+
+fn slack_capture_from(root: &Path) -> Value {
+    let Some(status) = std::fs::read(root.join("slack-capture.json")).ok().and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok()) else {
+        return Value::Null;
+    };
+    let text = |v: &Value| v.as_str().map(|s| s.chars().take(300).collect::<String>());
+    json!({
+        "enabled": status["enabled"].as_bool().unwrap_or(false),
+        "running": status["running"].as_bool().unwrap_or(false),
+        "workspaces": status["workspaces"].as_array().map(|list| list.iter().filter_map(text).take(10).collect::<Vec<_>>()).unwrap_or_default(),
+        "error": text(&status["error"]),
+    })
 }
 
 fn shared_folders_view() -> Value {
@@ -2760,6 +2781,21 @@ async fn reconnect_delay() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slack_capture_status_comes_from_the_mac_app() {
+        let root = std::env::temp_dir().join(format!("loka-slack-status-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(slack_capture_from(&root), Value::Null);
+        std::fs::write(root.join("slack-capture.json"), r#"{"enabled":true,"running":false,"workspaces":["Acme"],"error":"Open the Slack desktop app on this Mac and sign in."}"#).unwrap();
+        let view = slack_capture_from(&root);
+        assert_eq!(view["enabled"], true);
+        assert_eq!(view["workspaces"], json!(["Acme"]));
+        assert_eq!(view["error"], "Open the Slack desktop app on this Mac and sign in.");
+        std::fs::write(root.join("slack-capture.json"), "not json").unwrap();
+        assert_eq!(slack_capture_from(&root), Value::Null);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn slack_sender_is_added_or_refreshed_with_the_current_key() {

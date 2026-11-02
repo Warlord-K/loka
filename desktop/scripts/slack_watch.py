@@ -10,13 +10,12 @@ from collections import deque
 import urllib.error
 import urllib.parse
 import urllib.request
-from pathlib import Path
 
 from slack_session import SlackSessionError, _opener, discover_sessions, verify_connection_key
 
 
 LOGGER = logging.getLogger("slack-watch")
-CONNECTION_PATH = Path.home() / "Library/Application Support/dev.ygpt.loka.pro/slack-connection.key"
+CONNECTION_PATH = None
 METHODS = {
     "client.counts",
     "conversations.history",

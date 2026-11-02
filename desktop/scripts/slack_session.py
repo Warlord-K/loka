@@ -291,11 +291,31 @@ def _auth_test(opener, token, cookie):
     return result if isinstance(result, dict) else {}
 
 
+SLACK_DATA = (
+    "Library/Application Support/Slack",
+    "Library/Containers/com.tinyspeck.slackmacgap/Data/Library/Application Support/Slack",
+)
+
+
+def slack_data_root(home=None):
+    home = home or Path.home()
+    for relative in SLACK_DATA:
+        candidate = home / relative
+        try:
+            if candidate.is_dir():
+                return candidate
+        except PermissionError:
+            raise SlackSessionError("slack_storage_blocked") from None
+    raise SlackSessionError("slack_app_missing")
+
+
 def _credentials(root):
-    root = root or Path.home() / "Library/Application Support/Slack"
+    root = root or slack_data_root()
     try:
         candidates = _find_tokens(root)
         cookie_row = _read_cookie(root)
+    except PermissionError:
+        raise SlackSessionError("slack_storage_blocked") from None
     except (OSError, sqlite3.Error):
         raise SlackSessionError("slack_storage_unavailable") from None
     if not candidates:
@@ -337,7 +357,15 @@ def discover_sessions(root=None):
     return list(sessions.values())
 
 
-def verify_connection_key(key, path):
+APP_FOLDER = "dev.ygpt.loka"
+CONNECTION_FILE = "slack-connection.key"
+
+
+def connection_key_paths(home=None):
+    return [(home or Path.home()) / "Library/Application Support" / APP_FOLDER / CONNECTION_FILE]
+
+
+def _key_matches(key, path):
     try:
         parent = path.parent.stat()
         connection = path.stat()
@@ -352,6 +380,14 @@ def verify_connection_key(key, path):
         and stat.S_IMODE(connection.st_mode) == 0o600
         and hmac.compare_digest(key, local_key)
     )
+
+
+def verify_connection_key(key, paths=None):
+    if paths is None:
+        paths = connection_key_paths()
+    elif isinstance(paths, Path):
+        paths = [paths]
+    return bool(key) and any(_key_matches(key, path) for path in paths)
 
 
 def recover_session(team_id, user_id, root=None):

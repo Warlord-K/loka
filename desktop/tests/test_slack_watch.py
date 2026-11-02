@@ -254,6 +254,24 @@ def test_connection_key_must_match_private_file(tmp_path):
     assert not slack_session.verify_connection_key("secret-key", key_path)
 
 
+def test_connection_key_is_found_in_the_loka_app_folder(monkeypatch, tmp_path):
+    support = tmp_path / "Library/Application Support"
+
+    def private_key(directory, key):
+        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+        os.chmod(directory, 0o700)
+        path = directory / "slack-connection.key"
+        path.write_text(key)
+        os.chmod(path, 0o600)
+
+    private_key(support / "dev.ygpt.loka", "free-key")
+    private_key(tmp_path / "elsewhere", "planted-key")
+    monkeypatch.setattr(slack_session.Path, "home", classmethod(lambda cls: tmp_path))
+    assert slack_session.verify_connection_key("free-key")
+    assert not slack_session.verify_connection_key("planted-key")
+    assert not slack_session.verify_connection_key(None)
+
+
 def test_discover_sessions_keeps_one_session_per_workspace(monkeypatch, tmp_path):
     monkeypatch.setattr(slack_session, "_find_tokens", lambda root: {b"xoxc-1111111111-aaaaaaaaaaaaaaaaaaaa", b"xoxc-2222222222-bbbbbbbbbbbbbbbbbbbb", b"xoxc-3333333333-cccccccccccccccccccc"})
     monkeypatch.setattr(slack_session, "_read_cookie", lambda root: (".slack.com", "xoxd-cookie", b"", 24))

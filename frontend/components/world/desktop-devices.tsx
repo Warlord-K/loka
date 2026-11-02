@@ -292,13 +292,16 @@ function DeviceAccess({ runner, onChanged }: { runner: RunnerView; onChanged: (r
 }
 
 function SlackCapture({ slack, busy, onToggle }: { slack: DesktopSlack; busy: boolean; onToggle: (enabled: boolean) => void }) {
+  const watching = slack.running && slack.workspaces.length > 0 && !slack.last_error;
   const state = !slack.enabled
     ? "Off"
-    : slack.running && slack.workspaces.length
+    : watching
       ? `Watching ${slack.workspaces.join(", ")}`
-      : slack.running
-        ? "Connecting to Slack..."
-        : "Not running";
+      : slack.last_error
+        ? "Not working yet"
+        : slack.running
+          ? "Connecting to Slack..."
+          : "Not running";
   return (
     <div className="rounded-lg border-2 border-w-line bg-w-card p-3">
       <label className="flex items-center gap-2 text-w-sm">
@@ -306,7 +309,7 @@ function SlackCapture({ slack, busy, onToggle }: { slack: DesktopSlack; busy: bo
         <ChatsCircle size={15} weight="bold" className="text-w-link" />
         <span className="font-semibold">Capture Slack notifications</span>
         <span className="ml-auto inline-flex items-center gap-1.5 text-w-xs text-w-text2">
-          <ConnectionMark state={!slack.enabled ? "disabled" : slack.running ? "ok" : "off"} />
+          <ConnectionMark state={!slack.enabled ? "disabled" : watching ? "ok" : slack.last_error || !slack.running ? "off" : "connecting"} />
           {state}
         </span>
       </label>
