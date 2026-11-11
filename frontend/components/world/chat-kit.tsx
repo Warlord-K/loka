@@ -6,6 +6,7 @@ import remarkGfm from "remark-gfm";
 import { ArrowCounterClockwise, Brain, Check, CheckCircle, Copy, File as FileIcon, GitPullRequest, Lightning, Paperclip, PencilSimple, Play, Scroll, Terminal, Trash, WarningCircle, X } from "@phosphor-icons/react";
 import { cn, safeDecode } from "@/lib/utils";
 import { useCopy } from "@/lib/copy";
+import { SCROLL_JUMP } from "@/lib/scroll";
 import { codeLocalPaths, LocalPathContext, parseLocalPath, PathLink } from "./local-path";
 import { causeLabel, dayLabel, draftDecision, messageTime, sameDay, worldApi, WorldApiError, type Attachment, type Draft, type BackendModels, type MessageMeta, type Person, type TurnOptions, type WorldAgent } from "@/lib/world";
 import { BTN_PRIMARY, BTN_PRIMARY_SM, BTN_SECONDARY_SM, CHUNKY, FOCUS } from "./styles";
@@ -429,6 +430,7 @@ export function useRefetchOnResume(refetch: () => void) {
 }
 
 const STICK_GAP = 48;
+const INTENT_MS = 1000;
 const PIN_GAP = 8;
 const UP_KEYS = new Set(["ArrowUp", "PageUp", "Home"]);
 
@@ -482,26 +484,37 @@ export function useFollowBottom(endRef: RefObject<HTMLElement | null>, last: unk
     let lastTop = box.scrollTop;
     let dragging = false;
     let touchY: number | null = null;
+    let intentAt = 0;
+    const intent = () => {
+      intentAt = performance.now();
+    };
     const release = () => {
+      intent();
       if (box.scrollTop <= 0) return;
       pinned.current = false;
       anchor.current = firstVisible(box);
     };
     const onWheel = (e: WheelEvent) => {
+      intent();
       if (e.deltaY < 0 && !e.ctrlKey) release();
     };
     const onTouchStart = (e: TouchEvent) => {
+      intent();
       touchY = e.touches[0]?.clientY ?? null;
     };
     const onTouchMove = (e: TouchEvent) => {
+      intent();
       const y = e.touches[0]?.clientY;
       if (touchY !== null && y !== undefined && y > touchY + 2) release();
       if (y !== undefined) touchY = y;
     };
     const onKey = (e: KeyboardEvent) => {
-      if (UP_KEYS.has(e.key) && !(e.target instanceof HTMLElement && (e.target.matches(TEXT_ENTRY) || e.target.isContentEditable))) release();
+      if (e.target instanceof HTMLElement && (e.target.matches(TEXT_ENTRY) || e.target.isContentEditable)) return;
+      intent();
+      if (UP_KEYS.has(e.key) || (e.key === " " && e.shiftKey)) release();
     };
     const onPointerDown = (e: PointerEvent) => {
+      intent();
       if (e.target === box) dragging = true;
     };
     const onPointerUp = () => {
@@ -511,8 +524,14 @@ export function useFollowBottom(endRef: RefObject<HTMLElement | null>, last: unk
       const gap = gapOf(box);
       const moved = box.scrollTop - lastTop;
       lastTop = box.scrollTop;
+      const meant = dragging || performance.now() - intentAt < INTENT_MS;
       if (gap <= PIN_GAP || (moved > 0 && gap <= STICK_GAP && !dragging)) pinned.current = true;
-      else if (moved < -1 && (dragging || gap > STICK_GAP)) pinned.current = false;
+      else if (moved < -1 && (dragging || (meant && gap > STICK_GAP))) pinned.current = false;
+      else if (pinned.current && !meant && !editingIn(box)) {
+        toBottom(box);
+        lastTop = box.scrollTop;
+        return;
+      }
       anchor.current = pinned.current ? null : firstVisible(box);
       setAway(!pinned.current && gap > box.clientHeight * 1.5);
       if (pinned.current) setUnseen(false);
@@ -548,6 +567,7 @@ export function useFollowBottom(endRef: RefObject<HTMLElement | null>, last: unk
     box.addEventListener("touchmove", onTouchMove, { passive: true });
     box.addEventListener("keydown", onKey);
     box.addEventListener("pointerdown", onPointerDown);
+    box.addEventListener(SCROLL_JUMP, intent);
     box.addEventListener("animationend", settle);
     box.addEventListener("transitionend", settle);
     window.addEventListener("pointerup", onPointerUp);
@@ -561,6 +581,7 @@ export function useFollowBottom(endRef: RefObject<HTMLElement | null>, last: unk
         box.removeEventListener("touchmove", onTouchMove);
         box.removeEventListener("keydown", onKey);
         box.removeEventListener("pointerdown", onPointerDown);
+        box.removeEventListener(SCROLL_JUMP, intent);
         box.removeEventListener("animationend", settle);
         box.removeEventListener("transitionend", settle);
         window.removeEventListener("pointerup", onPointerUp);

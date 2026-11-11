@@ -1,3 +1,5 @@
+export const SCROLL_JUMP = "loka:scroll-jump";
+
 type Block = "start" | "center" | "nearest" | "end";
 
 function scrollArea(el: Element): HTMLElement | null {
@@ -27,6 +29,7 @@ export function scrollWithin(el: Element | null | undefined, opts: { block?: Blo
   else if (delta < 0) top = area.scrollTop + delta;
   else if (delta + rect.height > view) top = area.scrollTop + delta + rect.height - view;
   else return;
+  area.dispatchEvent(new Event(SCROLL_JUMP));
   const calm = typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   area.scrollTo({ top: Math.max(0, top), behavior: opts.smooth && !calm ? "smooth" : "auto" });
 }
