@@ -467,19 +467,32 @@ function AgentDialog({
     };
   }, [agent.id, tab]);
   const lastMessageId = messages.length ? messages[messages.length - 1].id : null;
+  const inTalk = tab === "talk" && access.use;
+  const markSeen = useCallback(() => {
+    if (document.visibilityState !== "visible") return;
+    void worldApi
+      .seenAgent(agent.id)
+      .then(() => window.dispatchEvent(new Event("world:notes-stale")))
+      .catch(() => {});
+  }, [agent.id]);
   useEffect(() => {
-    if (tab !== "talk" || !access.use) return;
-    const mark = () => {
-      if (document.visibilityState !== "visible") return;
-      void worldApi
-        .seenAgent(agent.id)
-        .then(() => window.dispatchEvent(new Event("world:notes-stale")))
-        .catch(() => {});
+    if (inTalk && lastMessageId) markSeen();
+  }, [inTalk, lastMessageId, markSeen]);
+  useEffect(() => {
+    if (!inTalk) return;
+    const mark = markSeen;
+    const onEvent = (e: Event) => {
+      const ev = (e as CustomEvent<WorldEvent>).detail;
+      if (ev.type === "message.created" && ev.agent_id === agent.id) mark();
     };
-    mark();
     document.addEventListener("visibilitychange", mark);
-    return () => document.removeEventListener("visibilitychange", mark);
-  }, [tab, agent.id, access.use, lastMessageId]);
+    window.addEventListener("world-event", onEvent);
+    return () => {
+      document.removeEventListener("visibilitychange", mark);
+      window.removeEventListener("world-event", onEvent);
+      mark();
+    };
+  }, [inTalk, agent.id, markSeen]);
 
   const refresh = useCallback(() => {
     if (access.use)
@@ -2184,11 +2197,14 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
   const talkingToRef = useRef(talkingTo);
   talkingToRef.current = talkingTo;
   const notesSeen = useRef<number | null>(null);
+  const notesAsked = useRef(0);
   useEffect(() => unlockSounds(), []);
   const loadNotes = useCallback(() => {
+    const asked = ++notesAsked.current;
     worldApi
       .notifications()
       .then((n) => {
+        if (asked !== notesAsked.current) return;
         const prev = notesSeen.current;
         notesSeen.current = Math.max(prev ?? 0, ...n.events.map((e) => e.seq));
         if (prev !== null) {

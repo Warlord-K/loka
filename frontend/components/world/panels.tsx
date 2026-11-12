@@ -1404,6 +1404,14 @@ function notificationGroup(e: WorldEvent, names: Map<string, string>): string {
 }
 
 
+function keepNotes(prev: Notifications, next: Notifications): Notifications {
+  const items = new Map((prev.items ?? []).map((i) => [i.id, i]));
+  for (const i of next.items ?? []) items.set(i.id, i);
+  const events = new Map(prev.events.map((e) => [e.seq, e]));
+  for (const e of next.events) events.set(e.seq, e);
+  return { ...next, items: [...items.values()], events: [...events.values()].sort((a, b) => a.seq - b.seq) };
+}
+
 export function NotificationsPanel({
   notes,
   agents,
@@ -1440,8 +1448,13 @@ export function NotificationsPanel({
       live = false;
     };
   }, [view]);
-  useEffect(() => setGone(new Set()), [notes]);
-  const shown = view === "open" ? notes : history;
+  const [kept, setKept] = useState<Notifications>(notes);
+  useEffect(() => {
+    setKept((prev) => keepNotes(prev, notes));
+    const ids = (notes.items ?? []).filter((i) => i.kind !== "ask").map((i) => i.id);
+    if (ids.length) void worldApi.clearNotes({ ids }).then(onChanged).catch(() => {});
+  }, [notes, onChanged]);
+  const shown = view === "open" ? kept : history;
   const names = useMemo(() => new Map(agents.map((a) => [a.id, a.name])), [agents]);
   const byId = useMemo(() => new Map(agents.map((a) => [a.id, a])), [agents]);
   const itemOf = useMemo(() => new Map((shown?.items ?? []).map((i) => [i.seq, i.id])), [shown]);
@@ -1464,7 +1477,7 @@ export function NotificationsPanel({
     void worldApi.clearNotes({ ids }).then(onChanged).catch(onChanged);
   };
   const clearAll = () => {
-    setGone(new Set((notes.events ?? []).map((e) => e.seq)));
+    setGone(new Set((kept.events ?? []).map((e) => e.seq)));
     void worldApi.clearNotes({ all: true }).then(onChanged).catch(onChanged);
   };
   const open = (e: WorldEvent, seqs: number[]) => {
@@ -1500,7 +1513,7 @@ export function NotificationsPanel({
         {list.length === 0 && (
           <li className="p-4">
             {view === "open" ? (
-              <EmptyState icon={BellSimple} title="Nothing needs you" description="Questions, messages, mentions, reminders and failed quests wait here until you answer or open them." />
+              <EmptyState icon={BellSimple} title="Nothing needs you" description="Questions wait here until you answer them. Messages, mentions, reminders and quest results clear once you open the bell." />
             ) : (
               <EmptyState icon={ClockCounterClockwise} title="Nothing cleared yet" description="Items you answer, open or clear move here." />
             )}

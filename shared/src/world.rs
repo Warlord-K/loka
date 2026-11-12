@@ -3847,16 +3847,16 @@ impl WorldStore {
             .bind(&seqs)
             .fetch_all(&self.pool)
             .await?;
-        let counts = sqlx::query_as::<_, (Option<Uuid>, i64)>(
-            "SELECT agent_id, COUNT(*) FROM world_notifications
+        let counts = sqlx::query_as::<_, (Option<Uuid>, i64, i64)>(
+            "SELECT agent_id, COUNT(*), COUNT(*) FILTER (WHERE kind IN ('message', 'ask')) FROM world_notifications
               WHERE user_id = $1 AND org_id = $2 AND cleared_at IS NULL GROUP BY agent_id",
         )
         .bind(user_id)
         .bind(org)
         .fetch_all(&self.pool)
         .await?;
-        let unread = counts.iter().map(|(_, n)| *n).sum();
-        let by_agent = counts.into_iter().filter_map(|(agent, n)| agent.map(|a| (a, n))).collect();
+        let unread = counts.iter().map(|(_, n, _)| *n).sum();
+        let by_agent = counts.into_iter().filter(|(_, _, chat)| *chat > 0).filter_map(|(agent, _, chat)| agent.map(|a| (a, chat))).collect();
         let unread_seqs = if cleared { Vec::new() } else { seqs };
         Ok(Notifications { items, events, unread, unread_seqs, by_agent })
     }
