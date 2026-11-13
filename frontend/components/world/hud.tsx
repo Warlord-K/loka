@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useMemo } from "react";
-import { Bell, BellRinging, BookOpenText, GearSix, ChatsTeardrop, ClockCounterClockwise, CrownSimple, Hammer, IdentificationBadge, Lightning, Microphone, Notepad, Scroll, TerminalWindow, type Icon } from "@phosphor-icons/react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { AnimatePresence, MotionConfig, motion } from "framer-motion";
+import { Bell, BellRinging, BookOpenText, GearSix, ChatsTeardrop, ClockCounterClockwise, CrownSimple, Hammer, IdentificationBadge, Lightning, Microphone, Notepad, Scroll, TerminalWindow, X, type Icon } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
 import type { Progress } from "@/lib/loka";
 import { portraitUrl } from "./characters";
@@ -10,6 +11,7 @@ import { PLAYER_LOOK } from "./engine";
 import { BADGE, FOCUS, HUD_ICON, PIXEL } from "./styles";
 import { GlyphTile, eventGlyph } from "./event-glyphs";
 import Glide from "./glide";
+import { NOTICE_MOTION } from "./motion";
 
 export type Role = "view" | "read" | "write" | "admin";
 
@@ -184,31 +186,90 @@ export interface Toast {
   text: string;
   kind?: string;
   onClick?: () => void;
+  target?: string;
+  bell?: boolean;
+  at?: number;
+}
+
+const TOAST_MS = { info: 5000, action: 7000, urgent: 10000 };
+
+function toastLife(toast: Toast): number {
+  if (toast.kind === "attention.requested") return TOAST_MS.urgent;
+  return toast.onClick ? TOAST_MS.action : TOAST_MS.info;
+}
+
+function ToastCard({ toast, dismiss }: { toast: Toast; dismiss: (id: number) => void }) {
+  const [held, setHeld] = useState(false);
+  const [hidden, setHidden] = useState(() => typeof document !== "undefined" && document.hidden);
+  const left = useRef(toastLife(toast));
+  useEffect(() => {
+    const onVisibility = () => setHidden(document.hidden);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, []);
+  useEffect(() => {
+    if (held || hidden) return;
+    const started = performance.now();
+    const timer = window.setTimeout(() => dismiss(toast.id), Math.max(left.current, 0));
+    return () => {
+      window.clearTimeout(timer);
+      left.current -= performance.now() - started;
+    };
+  }, [held, hidden, dismiss, toast.id]);
+  return (
+    <motion.div
+      layout
+      {...NOTICE_MOTION}
+      onPointerEnter={() => setHeld(true)}
+      onPointerLeave={() => setHeld(false)}
+      onFocus={() => setHeld(true)}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setHeld(false);
+      }}
+      className="group/toast pointer-events-auto relative flex max-w-xl items-center rounded-xl border-[3px] border-w-ink bg-w-paper text-w-base shadow-[0_4px_0_rgb(var(--w-ink))]"
+    >
+      <button
+        type="button"
+        onClick={() => {
+          toast.onClick?.();
+          dismiss(toast.id);
+        }}
+        className={cn(
+          "flex min-w-0 flex-1 items-center gap-3 rounded-[0.55rem] py-2 pl-2 pr-9 text-left transition-colors duration-150",
+          toast.onClick ? "hover:bg-w-field" : "cursor-default",
+          FOCUS,
+        )}
+      >
+        <GlyphTile glyph={eventGlyph(toast.kind ?? "")} size={30} />
+        <span className="line-clamp-4 min-w-0 break-words">{toast.text}</span>
+      </button>
+      <button
+        type="button"
+        aria-label="Dismiss"
+        title="Dismiss"
+        onClick={() => dismiss(toast.id)}
+        className={cn(
+          "absolute right-1.5 top-1.5 grid h-6 w-6 place-items-center rounded-md text-w-muted opacity-0 transition-opacity duration-150 hover:bg-w-field hover:text-w-ink focus-visible:opacity-100 group-hover/toast:opacity-100 [@media(hover:none)]:opacity-100",
+          FOCUS,
+        )}
+      >
+        <X size={14} weight="bold" />
+      </button>
+    </motion.div>
+  );
 }
 
 export function Toasts({ toasts, dismiss }: { toasts: Toast[]; dismiss: (id: number) => void }) {
-  useEffect(() => {
-    if (!toasts.length) return;
-    const id = window.setTimeout(() => dismiss(toasts[0].id), 12000);
-    return () => window.clearTimeout(id);
-  }, [toasts, dismiss]);
   return (
-    <div role="status" aria-live="polite" className="pointer-events-none absolute inset-x-0 top-20 z-40 flex flex-col items-center gap-2 px-3">
-      {toasts.map((t) => (
-        <button
-          key={t.id}
-          type="button"
-          onClick={() => {
-            t.onClick?.();
-            dismiss(t.id);
-          }}
-          className="pointer-events-auto flex max-w-xl animate-w-pop items-center gap-3 rounded-xl border-[3px] border-w-ink bg-w-paper py-2 pl-2 pr-4 text-left text-w-base shadow-[0_4px_0_rgb(var(--w-ink))] transition-[transform,box-shadow,background-color] duration-150 hover:bg-w-field active:translate-y-[3px] active:shadow-none motion-reduce:animate-none motion-reduce:transform-none"
-        >
-          <GlyphTile glyph={eventGlyph(t.kind ?? "")} size={30} />
-          <span className="line-clamp-4 min-w-0 break-words">{t.text}</span>
-        </button>
-      ))}
-    </div>
+    <MotionConfig reducedMotion="user">
+      <div role="status" aria-live="polite" className="pointer-events-none absolute inset-x-0 top-20 z-40 flex flex-col items-center gap-2 px-3">
+        <AnimatePresence initial={false}>
+          {toasts.map((t) => (
+            <ToastCard key={t.id} toast={t} dismiss={dismiss} />
+          ))}
+        </AnimatePresence>
+      </div>
+    </MotionConfig>
   );
 }
 

@@ -2107,6 +2107,15 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
   const meRef = useRef<Me | null>(null);
   meRef.current = me;
   const [toasts, setToasts] = useState<Toast[]>([]);
+  const openTargetsRef = useRef<Set<string>>(new Set());
+  const pushToast = useCallback((toast: Toast) => {
+    if (toast.target && openTargetsRef.current.has(toast.target)) return;
+    setToasts((prev) => [...prev.filter((t) => !(t.target && t.target === toast.target && t.kind === toast.kind) && t.text !== toast.text).slice(-2), { ...toast, at: Date.now() }]);
+  }, []);
+  const dismissToasts = useCallback((gone: (toast: Toast) => boolean) => {
+    setToasts((prev) => (prev.some(gone) ? prev.filter((t) => !gone(t)) : prev));
+  }, []);
+  const dismissToast = useCallback((id: number) => dismissToasts((t) => t.id === id), [dismissToasts]);
   const [voiceReplies, setVoiceReplies] = useState(true);
   const voiceRepliesRef = useRef(true);
   voiceRepliesRef.current = voiceReplies;
@@ -2278,7 +2287,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     primeChangelog();
     const fresh = unseenChangelog();
     const text = fresh.length > 0 ? `What's new: ${fresh[0].title}` : null;
-    if (text) setToasts((prev) => (prev.some((t) => t.text === text) ? prev : [...prev.slice(-2), { id: Date.now(), text, kind: "changelog", onClick: () => setChangelogOpen(true) }]));
+    if (text) pushToast({ id: Date.now(), text, kind: "changelog", target: "changelog", onClick: () => setChangelogOpen(true) });
     return () => {
       window.removeEventListener("world:open-lists", openLists);
       window.removeEventListener("world:open-report", onOpenReport);
@@ -2332,6 +2341,32 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
 
   const [sheet, setSheet] = useState<PlaceSheet | null>(null);
   const [loka, setLoka] = useState<LokaSheet | null>(null);
+  const openTargets = useMemo(() => {
+    const open = new Set<string>();
+    if (dialog?.kind === "resident") open.add(`agent:${dialog.id}`);
+    if (chatOpen && chatAgent) open.add(`agent:${chatAgent}`);
+    if (chatOpen && chatChannel) open.add(`channel:${chatChannel}`);
+    if ((reports || listsOpen) && side.open && side.id) open.add(`agent:${side.id}`);
+    if (reports) open.add("reports");
+    if (listsOpen) open.add("lists");
+    if (loka?.kind === "academy") open.add("academy");
+    if (changelogOpen) open.add("changelog");
+    if (typeof history === "string") open.add(`history:${history}`);
+    return open;
+  }, [dialog, chatOpen, chatAgent, chatChannel, reports, listsOpen, side.open, side.id, loka, changelogOpen, history]);
+  openTargetsRef.current = openTargets;
+  useEffect(() => {
+    if (openTargets.size) dismissToasts((t) => !!t.target && openTargets.has(t.target));
+  }, [openTargets, dismissToasts]);
+  useEffect(() => {
+    if (notesOpen) dismissToasts((t) => !!t.bell);
+  }, [notesOpen, dismissToasts]);
+  useEffect(() => {
+    if (!notes.items) return;
+    const open = new Set(notes.items.filter((item) => !item.cleared_at).map((item) => item.seq));
+    const settled = Date.now() - 4000;
+    dismissToasts((t) => t.kind === "attention.requested" && (t.at ?? 0) < settled && !open.has(t.id));
+  }, [notes, dismissToasts]);
   const [mapOpen, setMapOpen] = useState(false);
   const [mapShown, setMapShown] = useState<boolean | null>(null);
   useEffect(() => {
@@ -2413,7 +2448,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       window.clearTimeout(release);
       traveling.current = false;
       const text = err instanceof LokaFailure && err.status === 404 ? `The road to ${label ?? "that region"} is closed to you.` : `Could not travel to ${label ?? "that region"} right now.`;
-      setToasts((prev) => [...prev.slice(-2), { id: Date.now(), text, kind: "travel" }]);
+      pushToast({ id: Date.now(), text, kind: "travel" });
     }
   }, []);
   const travelRef = useRef(travel);
@@ -2422,7 +2457,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     const onDownloaded = (e: Event) => {
       const name = (e as CustomEvent<{ name?: string }>).detail?.name;
       const text = name ? `Saved ${name} to Downloads` : "Saved to Downloads";
-      setToasts((prev) => [...prev.slice(-2), { id: Date.now(), text, kind: "download" }]);
+      pushToast({ id: Date.now(), text, kind: "download" });
     };
     window.addEventListener("world:downloaded", onDownloaded);
     return () => window.removeEventListener("world:downloaded", onDownloaded);
@@ -2650,18 +2685,18 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       if (ev.type.startsWith("report.")) window.dispatchEvent(new CustomEvent(REPORTS_STALE, { detail: ev.payload }));
       if (ev.type === "report.created" && ev.agent_id && !ev.payload.quiet && ev.payload.owner_user_id === meRef.current?.id) {
         const id = String(ev.payload.report_id ?? "");
-        setToasts((prev) => [...prev.slice(-2), { id: ev.seq, kind: "report.created", text: `New report: ${String(ev.payload.title ?? "")}`, onClick: () => setReports({ id }) }]);
+        pushToast({ id: ev.seq, kind: "report.created", target: "reports", bell: true, text: `New report: ${String(ev.payload.title ?? "")}`, onClick: () => setReports({ id }) });
       }
       if (ev.type === "todo.nudge" && ev.payload.owner_user_id === meRef.current?.id) {
         playSound("timer");
-        setToasts((prev) => [...prev.slice(-2), { id: ev.seq, kind: ev.payload.timer ? "timer.done" : "todo.nudge", text: `${ev.payload.timer ? "Time's up" : "Still open"}: ${String(ev.payload.text ?? "")}`, onClick: () => setListsOpen(true) }]);
+        pushToast({ id: ev.seq, kind: ev.payload.timer ? "timer.done" : "todo.nudge", target: "lists", bell: true, text: `${ev.payload.timer ? "Time's up" : "Still open"}: ${String(ev.payload.text ?? "")}`, onClick: () => setListsOpen(true) });
       }
       if (ev.type === "timer.done") {
         void loadItems();
         const mine = meRef.current?.id;
         if (!ev.payload.then && (!ev.payload.owner_user_id || ev.payload.owner_user_id === mine)) {
           playSound("timer");
-          setToasts((prev) => [...prev.slice(-2), { id: ev.seq, kind: "timer.done", text: `Timer done: ${String(ev.payload.label ?? "")}`, onClick: () => setListsOpen(true) }]);
+          pushToast({ id: ev.seq, kind: "timer.done", target: "lists", bell: true, text: `Timer done: ${String(ev.payload.label ?? "")}`, onClick: () => setListsOpen(true) });
         }
       }
       if (bellWorthy(ev, meRef.current?.id)) {
@@ -2695,31 +2730,33 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       const mentioned = Array.isArray(ev.payload.mentions_users) && mine && (ev.payload.mentions_users as string[]).includes(mine);
       if (ev.type === "channel.message" && mentioned) {
         const channelId = ev.payload.channel_id as string;
-        setToasts((prev) => [
-          ...prev.slice(-2),
-          {
-            id: ev.seq,
-            kind: "channel.message",
-            text: `${ev.payload.author as string} mentioned you in ${ev.payload.channel as string}: ${(ev.payload.body as string).slice(0, 120)}`,
-            onClick: () => {
-              setChatChannel(channelId);
-              setChatOpen(true);
-            },
+        pushToast({
+          id: ev.seq,
+          kind: "channel.message",
+          target: `channel:${channelId}`,
+          bell: true,
+          text: `${ev.payload.author as string} mentioned you in ${ev.payload.channel as string}: ${(ev.payload.body as string).slice(0, 120)}`,
+          onClick: () => {
+            setChatChannel(channelId);
+            setChatOpen(true);
           },
-        ]);
+        });
       }
       const askingAgent = ev.agent_id ? agentsRef.current.find((a) => a.id === ev.agent_id) : undefined;
       if (ev.type === "attention.requested" && askingAgent?.owner_user_id === mine) {
         const agentId = ev.agent_id;
-        setToasts((prev) => [
-          ...prev.slice(-2),
-          {
-            id: ev.seq,
-            kind: "attention.requested",
-            text: `${(ev.payload.agent as string) ?? "An agent"} needs your decision: ${(ev.payload.text as string).slice(0, 140)}`,
-            onClick: () => agentId && setDialog({ kind: "resident", id: agentId }),
-          },
-        ]);
+        pushToast({
+          id: ev.seq,
+          kind: "attention.requested",
+          target: agentId ? `agent:${agentId}` : undefined,
+          bell: true,
+          text: `${(ev.payload.agent as string) ?? "An agent"} needs your decision: ${(ev.payload.text as string).slice(0, 140)}`,
+          onClick: () => agentId && setDialog({ kind: "resident", id: agentId }),
+        });
+      }
+      if (ev.type === "message.created" && ev.agent_id && ev.payload.author_kind === "user" && askingAgent?.owner_user_id === mine) {
+        const target = `agent:${ev.agent_id}`;
+        dismissToasts((t) => t.kind === "attention.requested" && t.target === target);
       }
       if (ev.type === "run.activity" && ev.agent_id) {
         const runId = ev.run_id ?? (ev.payload.run_id as string | undefined);
@@ -2797,37 +2834,34 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       if (ev.type === "challenge.graded" && lokaRef.current?.kind !== "academy") {
         const challengeId = String(p.challenge_id ?? "");
         const xp = Number(p.xp_awarded) || 0;
-        setToasts((prev) => [
-          ...prev.slice(-2),
-          {
-            id: ev.seq,
-            kind: p.status === "passed" ? "challenge.passed" : "challenge.graded",
-            text: `${String(p.title ?? "Your answer")} was graded: ${p.status === "passed" ? "passed" : "not yet"}${xp ? `, +${xp} xp` : ""}${p.level_up ? `. Level ${String(p.level)}!` : ""}`,
-            onClick: () => setLoka({ kind: "academy", challengeId }),
-          },
-        ]);
+        pushToast({
+          id: ev.seq,
+          kind: p.status === "passed" ? "challenge.passed" : "challenge.graded",
+          target: "academy",
+          text: `${String(p.title ?? "Your answer")} was graded: ${p.status === "passed" ? "passed" : "not yet"}${xp ? `, +${xp} xp` : ""}${p.level_up ? `. Level ${String(p.level)}!` : ""}`,
+          onClick: () => setLoka({ kind: "academy", challengeId }),
+        });
       }
       if (ev.type === "academy.unlocked" && p.unlock && typeof p.unlock === "object" && lokaRef.current?.kind !== "academy") {
         const name = String((p.unlock as { name?: unknown }).name ?? "something new");
-        setToasts((prev) => [...prev.slice(-2), { id: ev.seq, kind: "academy.unlocked", text: `Unlocked ${name}. Equip it in the Academy.`, onClick: () => setLoka({ kind: "academy" }) }]);
+        pushToast({ id: ev.seq, kind: "academy.unlocked", target: "academy", text: `Unlocked ${name}. Equip it in the Academy.`, onClick: () => setLoka({ kind: "academy" }) });
       }
       if ((ev.type === "task.finished" || ev.type === "task.merged") && lokaRef.current?.kind === "academy" && ev.agent_id) {
         const agent = agentsRef.current.find((a) => a.id === ev.agent_id);
         if (!ownsAgent(agent, mine)) return;
         const agentId = ev.agent_id;
         const taskId = ev.task_id ?? (typeof p.task_id === "string" ? p.task_id : null);
-        setToasts((prev) => [
-          ...prev.slice(-2),
-          {
-            id: ev.seq,
-            kind: "task.finished",
-            text: `${agent?.name ?? "Your agent"} finished the quest${p.title ? `: ${String(p.title)}` : ""}. Your answer is saved. Tap to see it.`,
-            onClick: () => {
-              setHistory(agentId);
-              setHistoryFocus(taskId ? { taskId } : null);
-            },
+        pushToast({
+          id: ev.seq,
+          kind: "task.finished",
+          target: `history:${agentId}`,
+          bell: true,
+          text: `${agent?.name ?? "Your agent"} finished the quest${p.title ? `: ${String(p.title)}` : ""}. Your answer is saved. Tap to see it.`,
+          onClick: () => {
+            setHistory(agentId);
+            setHistoryFocus(taskId ? { taskId } : null);
           },
-        ]);
+        });
       }
     };
     window.addEventListener("world-event", onLoka);
@@ -3240,7 +3274,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
   const talk = useHoldToTalk((text) => {
     const target = talkTarget();
     if (!target) {
-      setToasts((prev) => [...prev.slice(-2), { id: Date.now(), text: "Walk up to someone, or summon your main agent, before talking." }]);
+      pushToast({ id: Date.now(), text: "Walk up to someone, or summon your main agent, before talking." });
       return;
     }
     speech().warm("tts");
@@ -3251,7 +3285,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
   const openVoice = (id?: string) => {
     const target = id ? agents.find((a) => a.id === id) ?? null : talkTarget();
     if (!target) {
-      setToasts((prev) => [...prev.slice(-2), { id: Date.now(), text: "Walk up to someone, or summon your main agent, before starting a voice chat." }]);
+      pushToast({ id: Date.now(), text: "Walk up to someone, or summon your main agent, before starting a voice chat." });
       return;
     }
     if (engineChoice() === "live") primeLiveAudio();
@@ -3261,7 +3295,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
   const talkRef = useRef(talk);
   talkRef.current = talk;
   useEffect(() => {
-    if (talk.error) setToasts((prev) => [...prev.slice(-2), { id: Date.now(), text: talk.error ?? "" }]);
+    if (talk.error) pushToast({ id: Date.now(), text: talk.error ?? "" });
   }, [talk.error]);
 
   useEffect(() => {
@@ -3833,7 +3867,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
 
       <AnimatePresence>{engineGen === 0 && <WorldSplash key="splash" exit />}</AnimatePresence>
 
-      <Toasts toasts={toasts} dismiss={(id) => setToasts((prev) => prev.filter((t) => t.id !== id))} />
+      <Toasts toasts={toasts} dismiss={dismissToast} />
 
       <AnimatePresence>
         {!started && (
@@ -4226,7 +4260,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
                   setBoard(false);
                   const ok = engineRef.current?.walkToPlacement(id) ?? false;
                   canvasRef.current?.focus();
-                  if (!ok) setToasts((prev) => [...prev.slice(-2), { id: Date.now(), text: "That spot could not fit on the map yet." }]);
+                  if (!ok) pushToast({ id: Date.now(), text: "That spot could not fit on the map yet." });
                   return ok;
                 }}
                 onClose={closeBoard}
