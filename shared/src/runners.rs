@@ -48,6 +48,14 @@ const FRESH_AGENT_SQL: &str = "NOT EXISTS (
                  WHERE s.agent_id = a.id AND (s.cli_session_id IS NOT NULL
                    OR EXISTS (SELECT 1 FROM session_runs r WHERE r.session_id = s.id)))";
 
+fn own_device_sql(agent: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM world_runners own
+                  WHERE own.owner_user_id = {agent}.owner_user_id AND own.status <> 'revoked'
+                    AND COALESCE((own.capabilities->'backends'->>{agent}.cli)::boolean, false))"
+    )
+}
+
 fn live_runner_sql(runner: &str) -> String {
     format!("{runner}.status = 'online' AND {runner}.last_seen_at > NOW() - INTERVAL '75 seconds'")
 }
@@ -1889,14 +1897,11 @@ impl RunnerStore {
                AND COALESCE((w.capabilities->'backends'->>a.cli)::boolean, false)
                AND EXISTS (SELECT 1 FROM agent_inbox i WHERE i.agent_id = a.id AND i.status = 'pending')
                AND {fresh}
-               AND (a.owner_user_id = w.owner_user_id OR NOT EXISTS (
-                 SELECT 1 FROM world_runners own
-                 WHERE own.owner_user_id = a.owner_user_id AND {live_own}
-                   AND COALESCE((own.capabilities->'backends'->>a.cli)::boolean, false)))
+               AND (a.owner_user_id = w.owner_user_id OR NOT {own})
              RETURNING a.id",
             serves = serves_sql("a", "w"),
             fresh = FRESH_AGENT_SQL,
-            live_own = live_runner_sql("own"),
+            own = own_device_sql("a"),
         ))
         .bind(runner_id)
         .bind(agent_id)
@@ -1918,12 +1923,15 @@ impl RunnerStore {
             "SELECT w.id FROM agent_profiles a
              JOIN world_runners w ON {serves}
              JOIN users u ON u.id = w.owner_user_id
-             WHERE a.id = $1 AND a.runner_id IS NULL AND {live}
+             WHERE a.id = $1 AND a.runner_id IS NULL
                AND u.world_role IN ('write', 'admin')
                AND COALESCE((w.capabilities->'backends'->>a.cli)::boolean, false)
-             ORDER BY (w.owner_user_id = a.owner_user_id) DESC, w.last_seen_at DESC LIMIT 1",
+               AND CASE WHEN w.owner_user_id = a.owner_user_id THEN w.status <> 'revoked'
+                        ELSE {live} AND NOT {own} END
+             ORDER BY (w.owner_user_id = a.owner_user_id) DESC, ({live}) DESC, w.last_seen_at DESC NULLS LAST LIMIT 1",
             serves = serves_sql("a", "w"),
             live = live_runner_sql("w"),
+            own = own_device_sql("a"),
         ))
         .bind(agent_id)
         .fetch_optional(&self.pool)
