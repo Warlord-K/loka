@@ -36,6 +36,7 @@ Git commit rules:\n\
 - NEVER add Signed-off-by trailers to commits\n\n\
 Permissions:\n\
 - When the person you work for, or one of their rules, allows something such as force-pushing or rewriting history, do it; that is the approval. Prefer --force-with-lease.\n\
+- Rewriting your own quest branch and pushing it with --force-with-lease needs no approval. Force pushing any other branch does.\n\
 - If a sandbox blocks a host your work needs, re-run the command with that host in allowed_domains.";
 
 pub async fn run(opts: CliOptions<'_>) -> Result<CliResult> {
@@ -156,6 +157,8 @@ pub(crate) async fn user_line(prompt: &str, paths: &[std::path::PathBuf]) -> Res
     let line = serde_json::json!({ "type": "user", "message": { "role": "user", "content": content } });
     Ok(format!("{line}\n"))
 }
+
+const OWN_BRANCH_FORCE_PUSH: &str = "Own Branch Force Push: Loka checked out this working directory's branch for this session's quest or folder session, and its owner expects history on that branch to be rewritten when the work needs it (rebasing onto the base branch, squashing, amending, removing files that should never have been committed). Running `git push --force-with-lease` (or `--force-with-lease --force-if-includes`) of the branch currently checked out here to the same-named branch on its own remote is ordinary and allowed, as long as that branch is not the repository's default branch or a release or deploy branch. This exception covers only the destination and the overwrite of that one branch: every content rule (credential leakage, sensitive data, exfiltration) still judges what the push carries, and plain `--force`, deleting branches or tags, and force pushing any other branch stay blocked.";
 
 const READ_ONLY_TOOLS: &str = "Read,Glob,Grep,LS,WebFetch,WebSearch,TodoWrite,Task,Bash(git status),Bash(ls:*)";
 
@@ -355,6 +358,9 @@ pub(crate) fn command(opts: &CliOptions<'_>, mcp_config_path: Option<&Path>, lau
     let settings = if (opts.lean && !lean_reads) || skip_user_settings { with_auth(&mut cmd, settings) } else { settings };
     if let Some(mut settings) = settings {
         sandbox::open_for_owner(&mut settings);
+        if mode == Permission::Auto {
+            settings["autoMode"] = serde_json::json!({ "allow": ["$defaults", OWN_BRANCH_FORCE_PUSH] });
+        }
         if mode == Permission::Bypass && opts.approval == crate::cli::Approval::Auto && settings.get("sandbox").is_some() {
             settings["sandbox"]["failIfUnavailable"] = serde_json::json!(true);
         }
@@ -1014,6 +1020,17 @@ mod tests {
             assert_eq!(settings["includeCoAuthoredBy"], serde_json::json!(false));
             assert_eq!(settings["attribution"], serde_json::json!({ "commit": "", "pr": "" }));
         }
+    }
+
+    #[test]
+    fn owner_auto_runs_may_force_push_their_own_branch() {
+        let auto = args(&options(false, Vec::new(), false, Approval::Auto, "sonnet"), &Launch::assume("claude"));
+        let settings: serde_json::Value = serde_json::from_str(after(&auto, "--settings").unwrap()).unwrap();
+        assert_eq!(after(&auto, "--permission-mode"), Some("auto"));
+        assert_eq!(settings["autoMode"]["allow"], serde_json::json!(["$defaults", super::OWN_BRANCH_FORCE_PUSH]));
+        let full = args(&options(false, Vec::new(), false, Approval::Full, "sonnet"), &Launch::assume("claude"));
+        let settings: serde_json::Value = serde_json::from_str(after(&full, "--settings").unwrap()).unwrap();
+        assert!(settings.get("autoMode").is_none());
     }
 
     #[cfg(unix)]
