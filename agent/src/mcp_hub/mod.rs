@@ -151,6 +151,52 @@ pub fn known_stateless(command: &str, args: &[String]) -> bool {
     })
 }
 
+pub const SIGN_IN_DIR_VAR: &str = "MCP_REMOTE_CONFIG_DIR";
+
+pub fn uses_mcp_remote(definition: &Value) -> bool {
+    let command = definition.get("command").and_then(Value::as_str).unwrap_or_default();
+    let args: Vec<String> = definition.get("args").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(String::from).collect();
+    std::iter::once(command).chain(args.iter().map(String::as_str)).any(|token| {
+        let base = without_version(token.rsplit('/').next().unwrap_or(token));
+        base == "mcp-remote"
+    })
+}
+
+fn folder_name(name: &str) -> String {
+    let clean: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '-' }).collect();
+    match clean.trim_matches('.') {
+        "" => "server".into(),
+        trimmed => trimmed.to_string(),
+    }
+}
+
+pub fn pin_sign_in_dirs(servers: &mut Map<String, Value>, home: &Path) {
+    for (name, server) in servers.iter_mut() {
+        if !uses_mcp_remote(server) {
+            continue;
+        }
+        let set = server.pointer(&format!("/env/{SIGN_IN_DIR_VAR}")).and_then(Value::as_str);
+        if set.is_some_and(|dir| Path::new(dir).is_absolute()) {
+            continue;
+        }
+        let dir = home.join(folder_name(name));
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            warn!(server = %name, %error, "Could not create the MCP sign-in folder");
+            continue;
+        }
+        for path in [home, dir.as_path()] {
+            if let Err(error) = cli::share_with_jobs(path, 0o2770) {
+                debug!(path = %path.display(), %error, "Could not share the MCP sign-in folder with jobs");
+            }
+        }
+        let Some(object) = server.as_object_mut() else { continue };
+        let env = object.entry("env").or_insert_with(|| Value::Object(Map::new()));
+        if let Some(env) = env.as_object_mut() {
+            env.insert(SIGN_IN_DIR_VAR.into(), Value::String(dir.to_string_lossy().into_owned()));
+        }
+    }
+}
+
 pub fn instance_key(isolation: &str, spec: &Spec, client: Option<ClientId>) -> String {
     match client.filter(|_| !spec.shared) {
         Some(client) => format!("{isolation}\u{0}conn:{client}\u{0}{}", spec.canonical()),

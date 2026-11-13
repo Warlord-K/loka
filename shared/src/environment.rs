@@ -247,6 +247,29 @@ pub fn secret_reference_names(definition: &Value) -> Result<BTreeSet<String>> {
     Ok(names)
 }
 
+pub const MASKED_VALUE: &str = "***";
+pub const SLACK_KEY_VAR: &str = "WORLD_SLACK_CONNECTION_KEY";
+
+pub fn is_mac_slack_server(definition: &Value) -> bool {
+    let named = |text: &str| text.ends_with("slack_mcp.py");
+    definition.get("command").and_then(Value::as_str).is_some_and(named)
+        || definition.get("args").and_then(Value::as_array).is_some_and(|args| args.iter().filter_map(Value::as_str).any(named))
+}
+
+pub fn runnable_definition(mut definition: Value) -> Value {
+    let slack = is_mac_slack_server(&definition);
+    for field in ["env", "headers"] {
+        if let Some(values) = definition.get_mut(field).and_then(Value::as_object_mut) {
+            values.retain(|name, value| value.as_str() != Some(MASKED_VALUE) && !(slack && field == "env" && name == SLACK_KEY_VAR));
+        }
+    }
+    definition
+}
+
+pub fn missing_secrets(definition: &Value, environment: &BTreeMap<String, String>) -> Result<Vec<String>> {
+    Ok(secret_reference_names(definition)?.into_iter().filter(|name| !environment.contains_key(name)).collect())
+}
+
 fn contains_secret_reference(value: &Value) -> bool {
     match value {
         Value::String(text) => text.contains("${secret:"),
@@ -894,6 +917,36 @@ fn decrypt(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn masked_values_and_the_runner_slack_key_never_reach_a_cli() {
+        let definition = runnable_definition(serde_json::json!({
+            "command": "npx",
+            "env": {"MCP_REMOTE_CONFIG_DIR": "***", "TEAM": "T1"},
+            "headers": {"Authorization": "***"},
+        }));
+        assert_eq!(definition["env"], serde_json::json!({"TEAM": "T1"}));
+        assert_eq!(definition["headers"], serde_json::json!({}));
+
+        let slack = runnable_definition(serde_json::json!({
+            "command": "python3",
+            "args": ["/app/slack_mcp.py"],
+            "env": {"WORLD_SLACK_CONNECTION_KEY": "${secret:SLACK_MAC_CONNECTION_KEY}", "WORLD_SLACK_TEAM_ID": "T1"},
+        }));
+        assert!(is_mac_slack_server(&slack));
+        assert_eq!(slack["env"], serde_json::json!({"WORLD_SLACK_TEAM_ID": "T1"}));
+        assert!(secret_reference_names(&slack).unwrap().is_empty());
+
+        let other = runnable_definition(serde_json::json!({"command": "npx", "env": {"WORLD_SLACK_CONNECTION_KEY": "kept"}}));
+        assert_eq!(other["env"]["WORLD_SLACK_CONNECTION_KEY"], "kept");
+    }
+
+    #[test]
+    fn missing_secrets_names_only_ungranted_keys() {
+        let definition = serde_json::json!({"command": "x", "env": {"A": "${secret:A}", "B": "${secret:B}"}});
+        let granted = BTreeMap::from([("A".to_string(), "1".to_string())]);
+        assert_eq!(missing_secrets(&definition, &granted).unwrap(), vec!["B".to_string()]);
+    }
     use super::*;
 
     #[tokio::test]

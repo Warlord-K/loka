@@ -2566,12 +2566,25 @@ impl RunnerCoordinator {
     ) -> Result<Value> {
         let mut servers = Map::new();
         for entry in self.store.mcp_servers_for(agent_id).await? {
-            let references = loka_shared::environment::secret_reference_names(&entry.definition)?;
-            if keyless && !references.is_empty() {
+            let definition = loka_shared::environment::runnable_definition(entry.definition);
+            let missing = match loka_shared::environment::secret_reference_names(&definition) {
+                Ok(references) if keyless && !references.is_empty() => continue,
+                Ok(_) => loka_shared::environment::missing_secrets(&definition, environment).unwrap_or_default(),
+                Err(error) => {
+                    tracing::warn!(%agent_id, server = %entry.name, %error, "Skipping an MCP server with an unreadable definition");
+                    continue;
+                }
+            };
+            if !missing.is_empty() {
+                tracing::warn!(%agent_id, server = %entry.name, keys = %missing.join(", "), "Skipping an MCP server whose keys are not granted");
                 continue;
             }
-            let definition = resolve_definition(entry.definition, environment)?;
-            servers.insert(entry.name, definition);
+            match resolve_definition(definition, environment) {
+                Ok(definition) => {
+                    servers.insert(entry.name, definition);
+                }
+                Err(error) => tracing::warn!(%agent_id, server = %entry.name, %error, "Skipping an MCP server that could not be prepared"),
+            }
         }
         Ok(Value::Object(servers))
     }

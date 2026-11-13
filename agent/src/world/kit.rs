@@ -53,10 +53,14 @@ pub fn without_duplicates(servers: Map<String, Value>) -> Map<String, Value> {
     out
 }
 
-pub async fn wire(servers: Map<String, Value>, owner: Option<Uuid>, agent: Uuid, cwd: &Path) -> Result<Wired> {
+pub async fn wire(mut servers: Map<String, Value>, owner: Option<Uuid>, agent: Uuid, cwd: &Path) -> Result<Wired> {
     let pids: crate::mcp_hub::Pids = Default::default();
     if servers.is_empty() {
         return Ok(Wired { mcp_json: None, _registration: None, pids });
+    }
+    if let Some(workspaces) = std::env::var_os("WORKSPACES_DIR").filter(|dir| !dir.is_empty()) {
+        let who = owner.unwrap_or(agent).to_string();
+        crate::mcp_hub::pin_sign_in_dirs(&mut servers, &Path::new(&workspaces).join(".mcp-auth").join(who));
     }
     let (servers, registration) = match crate::mcp_hub::get() {
         Some(hub) => {
@@ -84,20 +88,26 @@ pub async fn for_agent(ctx: &Ctx, agent_id: Uuid, include_world: bool) -> Result
     let mut has_secret_refs = false;
     let mut environment = None;
     for row in ctx.store.mcp_servers_for(agent_id).await? {
-        let mut definition = row.definition;
-        let secret_names = loka_shared::environment::secret_reference_names(&definition)?;
+        let mut definition = loka_shared::environment::runnable_definition(row.definition);
+        let secret_names = match loka_shared::environment::secret_reference_names(&definition) {
+            Ok(names) => names,
+            Err(error) => {
+                warn!(%agent_id, server = %row.name, %error, "Skipping an MCP server with an unreadable definition");
+                continue;
+            }
+        };
         if !secret_names.is_empty() {
             if row.scope == "global" {
-                bail!("MCP server {} cannot use environment secrets with global scope", row.name);
+                warn!(%agent_id, server = %row.name, "Skipping a global MCP server that uses environment secrets");
+                continue;
             }
             if environment.is_none() {
                 environment = Some(ctx.store.environment_for_agent(agent_id).await?);
             }
-            resolve_definition(
-                &row.name,
-                &mut definition,
-                environment.as_ref().expect("environment loaded"),
-            )?;
+            if let Err(error) = resolve_definition(&row.name, &mut definition, environment.as_ref().expect("environment loaded")) {
+                warn!(%agent_id, server = %row.name, %error, "Skipping an MCP server whose keys are not granted");
+                continue;
+            }
             has_secret_refs = true;
         }
         servers.insert(row.name, definition);
@@ -122,8 +132,9 @@ pub async fn for_review(ctx: &Ctx, agent_id: Uuid) -> Result<Kit> {
         .and_then(|value| value.get("mcpServers").and_then(Value::as_object).cloned())
         .unwrap_or_default();
     for row in ctx.store.mcp_servers_for(agent_id).await? {
-        if loka_shared::environment::secret_reference_names(&row.definition)?.is_empty() {
-            servers.insert(row.name, row.definition);
+        let definition = loka_shared::environment::runnable_definition(row.definition);
+        if loka_shared::environment::secret_reference_names(&definition).is_ok_and(|names| names.is_empty()) {
+            servers.insert(row.name, definition);
         }
     }
     let (skills_index, skill_files) = skills_index(ctx, agent_id).await;

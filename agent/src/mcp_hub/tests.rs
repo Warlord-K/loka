@@ -439,3 +439,24 @@ async fn live_hub_memory() {
     drop(keep);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn mcp_remote_servers_keep_one_sign_in_folder_per_server() {
+    let home = std::env::temp_dir().join(format!("mcp-auth-{}", Uuid::new_v4().simple()));
+    let mut servers = Map::new();
+    servers.insert("mac-notion".into(), json!({"command": "npx", "args": ["-y", "mcp-remote@latest", "https://mcp.notion.com/mcp"], "env": {"MCP_REMOTE_CONFIG_DIR": "***"}}));
+    servers.insert("mac notion/fnl".into(), json!({"command": "/opt/bin/mcp-remote", "args": ["https://mcp.notion.com/mcp"]}));
+    servers.insert("pinned".into(), json!({"command": "npx", "args": ["mcp-remote", "https://x"], "env": {"MCP_REMOTE_CONFIG_DIR": "/keep/me"}}));
+    servers.insert("other".into(), json!({"command": "npx", "args": ["some-server"]}));
+    pin_sign_in_dirs(&mut servers, &home);
+    let dir = |name: &str| servers[name]["env"]["MCP_REMOTE_CONFIG_DIR"].as_str().map(String::from);
+    assert_eq!(dir("mac-notion"), Some(home.join("mac-notion").to_string_lossy().into_owned()));
+    assert_eq!(dir("mac notion/fnl"), Some(home.join("mac-notion-fnl").to_string_lossy().into_owned()));
+    assert_eq!(dir("pinned").as_deref(), Some("/keep/me"));
+    assert_eq!(dir("other"), None);
+    assert!(home.join("mac-notion").is_dir() && home.join("mac-notion-fnl").is_dir());
+    let again = servers.clone();
+    pin_sign_in_dirs(&mut servers, &home);
+    assert_eq!(servers, again);
+    std::fs::remove_dir_all(&home).unwrap();
+}

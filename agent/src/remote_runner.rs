@@ -1558,6 +1558,7 @@ async fn execute_job_inner(
         None
     } else {
         let mut servers = runner_mcp_servers(job, root)?;
+        crate::mcp_hub::pin_sign_in_dirs(&mut servers, &sign_in_home(root, job));
         if let Some(hub) = crate::mcp_hub::get() {
             let prepared = hub
                 .prepare(
@@ -2078,6 +2079,13 @@ fn runner_mcp_servers(job: &RunnerJob, root: &Path) -> Result<serde_json::Map<St
     Ok(servers)
 }
 
+fn sign_in_home(root: &Path, job: &RunnerJob) -> PathBuf {
+    match job.owner_id {
+        Some(owner) => root.join("mcp-auth").join(owner.to_string()),
+        None => root.join("mcp-auth").join(job.agent_id.to_string()),
+    }
+}
+
 fn exposes_world_tools(job: &RunnerJob) -> bool {
     world_tools_for(&job.kind, job.world_tools)
 }
@@ -2092,6 +2100,7 @@ fn exposes_slack(kind: &str) -> bool {
 
 fn attach_slack(servers: &mut serde_json::Map<String, Value>) {
     let (Ok(script), Ok(key_file)) = (std::env::var("WORLD_SLACK_MCP_SCRIPT"), std::env::var("WORLD_SLACK_KEY_FILE")) else {
+        servers.retain(|_, server| !is_slack_server(server));
         return;
     };
     let Some(key) = std::fs::read_to_string(&key_file)
@@ -2099,16 +2108,14 @@ fn attach_slack(servers: &mut serde_json::Map<String, Value>) {
         .map(|key| key.trim().to_string())
         .filter(|key| !key.is_empty())
     else {
+        servers.retain(|_, server| !is_slack_server(server));
         return;
     };
     slack_servers(servers, &script, &key);
 }
 
 fn is_slack_server(server: &Value) -> bool {
-    server
-        .get("args")
-        .and_then(Value::as_array)
-        .is_some_and(|args| args.iter().filter_map(Value::as_str).any(|arg| arg.ends_with("slack_mcp.py")))
+    loka_shared::environment::is_mac_slack_server(server)
 }
 
 fn slack_servers(servers: &mut serde_json::Map<String, Value>, script: &str, key: &str) {
