@@ -601,7 +601,7 @@ pub async fn run() -> Result<()> {
     let outbox = Outbox::open(&root, Arc::new(api.clone()))?;
     listen_for_mcp(api.clone(), &root).await?;
     if crate::mcp_hub::enabled() {
-        crate::mcp_hub::start(root.join(MCP_HUB_SOCKET)).await?;
+        crate::mcp_hub::start(cli::socket_path(&root.join(MCP_HUB_SOCKET))?).await?;
     }
     if crate::key_proxy::enabled() {
         crate::key_proxy::start().await?;
@@ -1957,9 +1957,9 @@ pub(crate) fn redact(text: &str, values: &[String]) -> String {
 }
 
 async fn listen_for_mcp(api: RunnerApi, root: &Path) -> Result<()> {
-    let path = root.join(MCP_SOCKET);
+    let path = cli::socket_path(&root.join(MCP_SOCKET))?;
     let _ = tokio::fs::remove_file(&path).await;
-    let listener = tokio::net::UnixListener::bind(&path)?;
+    let listener = tokio::net::UnixListener::bind(&path).with_context(|| format!("could not open the runner MCP socket {}", path.display()))?;
     cli::share_with_jobs(&path, 0o666)?;
     tokio::spawn(async move {
         loop {
@@ -2071,7 +2071,7 @@ fn runner_mcp_servers(job: &RunnerJob, root: &Path) -> Result<serde_json::Map<St
             json!({
                 "command": executable,
                 "args": ["mcp", "runner"],
-                "env": { "WORLD_RUNNER_SOCKET": root.join(MCP_SOCKET).to_string_lossy() },
+                "env": { "WORLD_RUNNER_SOCKET": cli::socket_path(&root.join(MCP_SOCKET))?.to_string_lossy() },
             }),
         );
     }

@@ -443,6 +443,37 @@ pub(crate) fn share_with_jobs(path: &Path, mode: u32) -> std::io::Result<()> {
     Ok(())
 }
 
+const SOCKET_PATH_MAX: usize = 100;
+
+pub(crate) fn socket_path(wanted: &Path) -> std::io::Result<PathBuf> {
+    let text = wanted.to_string_lossy();
+    if text.len() <= SOCKET_PATH_MAX && !text.chars().any(char::is_whitespace) {
+        return Ok(wanted.to_path_buf());
+    }
+    let hash = text.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+    let dir = std::env::temp_dir().join(format!("loka-{:012x}", hash & 0xffff_ffff_ffff));
+    match std::fs::create_dir(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let meta = std::fs::symlink_metadata(&dir)?;
+        if !meta.is_dir() || meta.uid() != runner_uid() {
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("{} is not a folder this runner owns", dir.display())));
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o711))?;
+    }
+    let name = wanted.file_name().map(|n| n.to_owned()).unwrap_or_else(|| "socket".into());
+    let short = dir.join(name);
+    if short.as_os_str().len() > SOCKET_PATH_MAX {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("no short enough place for the socket {}", wanted.display())));
+    }
+    Ok(short)
+}
+
 #[cfg(unix)]
 pub(crate) fn runner_uid() -> u32 {
     unsafe { libc::geteuid() }
@@ -1364,6 +1395,24 @@ fn shorten_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    #[test]
+    fn long_runner_roots_get_short_socket_paths() {
+        let short = Path::new("/tmp/runner/leases/mcp.sock");
+        assert_eq!(super::socket_path(short).unwrap(), short);
+        let root = Path::new("/Users/someone-with-a-very-long-account-name-on-this-mac/Library/Application Support/dev.ygpt.loka/runner");
+        let long = root.join("leases/mcp.sock");
+        let moved = super::socket_path(&long).unwrap();
+        assert!(moved.as_os_str().len() <= 100, "{}", moved.display());
+        assert_eq!(moved.file_name().unwrap(), "mcp.sock");
+        assert_eq!(super::socket_path(&long).unwrap(), moved);
+        assert_ne!(super::socket_path(&root.join("leases/mcp-hub.sock")).unwrap(), moved);
+        let listener = std::os::unix::net::UnixListener::bind(&moved).unwrap();
+        drop(listener);
+        let _ = std::fs::remove_file(&moved);
+    }
+
     use super::{
         collect_stderr, session_id_from_init, summarize_tool_output, truncate_for_log, JobUid,
         FREE_JOB_UIDS, JOB_UID, TOOL_OUTPUT_MAX_CHARS,
