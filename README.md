@@ -1,526 +1,174 @@
 <p align="center">
-  <img src="frontend/public//logo-192.png" alt="Karna" width="120" />
+  <img src="frontend/public/icon-192.png" alt="Loka" width="120" />
 </p>
 
-<h1 align="center">Karna</h1>
+<h1 align="center">Loka</h1>
 
-<p align="center">Agent for programmers who like to touch grass. Create tasks on a kanban board, Karna plans and implements them, opens PRs on GitHub, and can notify via Slack/email.</p>
+<p align="center"><b>Stop chatting with agents. Start working with them.</b></p>
 
-```
-You create a task → Agent writes a plan → You review → Agent implements → Opens PR → You merge
-```
+<p align="center">Loka is a workspace for you and your agents, not another chat window with bots in a sidebar. Quests end in pull requests, findings become reports you can talk to, and agents wake when a pull request, Slack thread, feed or schedule changes. Free and open source, running entirely on your Mac.</p>
 
-## Quick Start
+<p align="center"><a href="https://loka.ygpt.dev/download"><b>Download for Mac</b></a></p>
 
-One command — it clones the repo, asks for your tokens, configures everything, and starts the server:
+<p align="center"><img src="docs/screens/town.jpg" alt="The home town of Loka" width="900" /></p>
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/Warlord-K/karna/main/install.sh | bash
-```
+Loka runs persistent coding agents on top of the CLIs you already use (Claude Code, Codex, Cursor, oh-my-pi, OpenCode). Each agent lives in a pixel town and keeps one long-running **main session** that remembers your conversations. When it takes on a quest it forks that session into a task session with full tools in its own git worktree, optionally gets an independent review, and the runtime commits, pushes, opens the pull request and reports back.
 
-You'll need:
-- A **GitHub PAT** with `repo` + `workflow` scopes ([create one](https://github.com/settings/tokens))
-- Auth for at least one enabled backend (for example `claude`, `codex`, `cursor-agent`, `grok`, or `opencode`)
+Loka is one person, one Mac, everything local. The app bundles its own Postgres, the Loka API, the web app and a runner that drives the agent CLIs on your machine. There is no sign-in, and nothing leaves your Mac except the calls your agent CLIs and `gh` make themselves.
 
-That's it. Open [localhost:3000](http://localhost:3000) and create your first task.
+## Requirements
 
-<details>
-<summary>Manual setup</summary>
+- macOS 13 or later.
+- At least one agent CLI installed and signed in: `claude` (Claude Code), `codex`, `cursor-agent`, `omp` or `opencode`. Loka uses the logins you already have.
+- [`gh`](https://cli.github.com) signed in (`gh auth login`) if you want agents to push branches and open pull requests.
 
-```bash
-git clone https://github.com/Warlord-K/karna.git
-cd karna
-cp .env.example .env
-cp config.example.yaml config.yaml
-```
+Open the DMG, drag Loka to Applications and open it. Onboarding creates your main agent and walks you through picking its CLI and model.
 
-Add your tokens to `.env`:
+## More time for the work only you can do
 
-```bash
-GITHUB_TOKEN=ghp_...
-CLAUDE_CODE_OAUTH_TOKEN=...
-AUTH_SECRET=$(openssl rand -hex 32)
-```
+- **Remembers.** Say it once. It keeps your project, your people and last week's decisions, and the work goes to whoever knows it best.
+- **Reacts.** It watches the pull requests, threads, checks and inboxes you point it at, and starts when something changes.
+- **Follows through.** Every quest runs to the end. Reviews, failing checks and the merge watch are set up by asking.
+- **Brings decisions back.** Plans, drafts and next steps arrive as cards with buttons. One click and it carries on.
+- **Safe.** Your keys stay yours. Grant one where it is needed, take it back any time.
+- **Within budget.** Set a daily limit. Work pauses at the line and picks up tomorrow.
+- **Fun.** Every agent has a face, a house and a walk home.
 
-Add repos to `config.yaml`:
+## Good on day one. Better every week after.
 
-```yaml
-repos:
-  - repo: you/my-app
-    branch: main
-```
+Everything your agents learn stays with you, on your Mac, whichever model you use next.
 
-```bash
-docker compose up
-```
+- **Memory you keep.** Each agent has one long conversation, its own notes and notes per repository, stored on your Mac and exportable as a file.
+- **Any CLI, one team.** Claude Code, Codex, Cursor, omp and OpenCode agents work side by side, and an agent keeps its memory when you switch its CLI or model.
+- **Wired to your work.** Every watch, feed, schedule and skill you set up by asking stays in place, so more work starts on its own each week.
+- **Learns how you work.** Lessons from finished quests become notes and skills, and a permission you grant once becomes a rule for every later quest.
 
-</details>
+## Everything inside
 
-## Features
+- **Persistent agents.** Each agent has a persona, a CLI and model, powers, and a main session that keeps its memory. Switch models any time; switching CLIs hands the memory over.
+- **Quests.** Agents work in their own git worktrees, report back with the checks they ran, and open pull requests. Optional per quest: an independent review with a fix loop, plan first (approve or redirect before any code is written), best of up to three attempts, CI feedback, pace and time limits.
+- **Quest rooms.** Every quest shows its executor, report, review verdict, milestones, PR watch and live steering. Steer a running quest, stop it, or rewind a session.
+- **Chat that does things.** Agents reply with clickable cards, ask questions with buttons, draft review comments you approve before they post, and file to-dos with suggested replies and quests.
+- **Reports.** A linked notebook with folders, tags, backlinks, revisions and live cards.
+- **Lists, timers, schedules and feeds.** Sticky-note lists, reminders, cron schedules, heartbeats, RSS feeds and inbound webhooks that wake agents.
+- **Agent teams.** Group agents under a lead who splits quests into parts, or set up a starter team (two coders and a reviewer) in one step.
+- **Kit.** Give agents MCP servers and skills. Keys you save are encrypted, granted per agent and never shown back.
+- **Your Mac as the workshop.** A terminal, a file workbench, folder sessions in any folder you share, a browser for agents, and Slack capture whose tokens never leave the Mac.
+- **Budgets and usage.** Daily dollar and token budgets per agent, cost per run, and a usage report agents can read to suggest cheaper models.
+- **Connect other tools.** Talk to your agents from Claude Code, Cursor or any MCP client through Loka's MCP endpoint, with a token from You > Connect other tools.
+- **GitHub and Slack, as they happen.** Your GitHub notifications reach the agents that watch them, using the gh login on your Mac, and agents can watch one pull request, Slack channel or thread instead of polling.
+- **Threads, typing and read receipts** in agent chats and channels, and a microphone in every message box.
+- **Linear and ClickUp webhooks** that turn issues into quests.
+- **The world itself.** Districts to walk, an academy with challenges, background music and live voice.
 
-- Code task pipeline with stage gates: `todo -> planning -> plan_review -> in_progress -> review -> done` (+ `failed`/`cancelled`)
-- Per-stage agent profiles (`planner`, `implementer`, `reviewer`) with backend/model routing
-- Built-in self-review loop (bounded implement <-> review rounds before PR)
-- Non-code task kinds (`doc`, `research`, `ops`) with generic MCP-enabled execution
-- Orchestrator tasks with `<!-- actions -->` contract (`reply`, `run`, `defer`, `subtask`, `escalate`, `close`)
-- Chat UI backed by orchestrator tasks (`source='chat'`) with SSE log streaming and polling fallback
-- Slack Socket Mode control plane (allowlisted commands, gates, and thread steering)
-- Optional mem0 memory injection + write-back namespaces (`repo`, `agent`, `user`)
+## Loka in pictures
 
-## Documentation
+### Reports you can talk to
 
-- [`docs/architecture.md`](docs/architecture.md) - runtime architecture, task flow, orchestrator/memory/slack behavior, module map
-- [`docs/configuration.md`](docs/configuration.md) - `config.yaml` reference, secrets/auth, local/docker/helm deployment, soft-task/orchestrator API usage
+Organized write-ups with charts, tables and live cards. Open the chat beside a report to ask about it, and the agent updates the page.
 
-## How It Works
+<p align="center"><img src="docs/screens/report-card.jpg" alt="Reports you can talk to" width="900" /></p>
 
-```
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│   Frontend   │────▶│  Rust API     │────▶│ Postgres/Redis│
-│  Next.js     │     │   (Axum)      │     │ task+log state│
-│  :3000       │     │   :8081        │     │ + locks/cache │
-└──────────────┘     └──────────────┘     └──────▲─────────┘
-                                                  │
-                                       ┌──────────┴──────────┐
-                                       │    Rust Agent       │
-                                       │ polls + executes    │
-                                       │ flow/orchestrator   │
-                                       └──────┬──────────────┘
-                                              │
-                             ┌────────────────┼────────────────┐
-                             ▼                ▼                ▼
-                      CLI backends       git/gh PR flow   Slack/Email
-             (claude/codex/cursor/grok/opencode)         notifications
-```
+### Follow-ups come drafted
 
-**Task lifecycle:**
+Agents file to-dos with replies and next steps already written. Pick, tweak and approve.
 
-| Status | What happens |
-|--------|-------------|
-| **Todo** | You create a task with title, description, repo, priority |
-| **Planning** | Agent picks it up, explores the codebase, writes a plan |
-| **Plan Review** | You read the plan, approve or request changes |
-| **In Progress** | Agent implements the approved plan |
-| **Review** | Agent opens a PR on GitHub |
-| **Done** | You merge the PR |
+<p align="center"><img src="docs/screens/todo-proposals.jpg" alt="Follow-ups come drafted" width="900" /></p>
 
-You can send feedback at any stage — the agent re-plans or updates the PR.
+### Watch the work in one place
 
-### Multi-Repo Tasks
+Every quest has a room: each step, the review and the fixes. Send a follow-up mid-run or stop any step.
 
-Tasks can span multiple repositories. Create a task without selecting a specific repo and the agent will:
+<p align="center"><img src="docs/screens/quest-room.jpg" alt="Every quest has a room" width="900" /></p>
 
-1. Explore all configured repos and generate a plan with per-repo subtasks
-2. You approve the plan — subtasks are created automatically
-3. Each subtask goes through the normal lifecycle independently
-4. Parent task auto-completes when all subtasks finish
+### Plan first for bigger changes
 
-### CLI Backends
+A plan-first quest waits for Approve or Redirect, then you follow it step by step.
 
-Pick backend + model per task (or per stage via agent profiles).
+<p align="center"><img src="docs/screens/plan-approval.jpg" alt="Plan first, then build" width="900" /></p>
 
-| Backend | Auth mode | Notes |
-|---------|-----------|------|
-| `claude` | `claude login` or `CLAUDE_CODE_OAUTH_TOKEN` | Stream-json events + cost tracking |
-| `codex` | `codex login` | JSON event parsing, session resume support |
-| `cursor` | `cursor-agent login` | Stream-json parsing, no image input |
-| `grok` | `grok login` | Streaming text deltas, no discrete tool-call events |
-| `opencode` | `OPENROUTER_API_KEY` | OpenRouter models, reads MCP from `~/.config/opencode/opencode.json` |
+### One board for every agent
 
-## Services
+Every quest from to do to merged, with who has it and what it cost.
 
-| Port | Service | Purpose |
-|------|---------|---------|
-| [localhost:3000](http://localhost:3000) | Frontend | Kanban board + task management |
-| [localhost:8081](http://localhost:8081) | API | REST API (Rust/Axum) — all data operations |
-| [localhost:8080](http://localhost:8080) | Agent | Webhooks + health check |
-| [localhost:8443](http://localhost:8443) | code-server | Browser IDE — watch the agent work live |
+<p align="center"><img src="docs/screens/quest-board.jpg" alt="One board for every agent" width="900" /></p>
 
-## Scaling
+### Chat with cards and charts
 
-Run multiple agents in parallel:
+Talk to your agents like teammates. Replies carry charts, tables and buttons you act on in one click.
+
+<p align="center"><img src="docs/screens/chat-ui-card.jpg" alt="Chat with cards and charts" width="900" /></p>
+
+### Reviews you approve before they post
+
+Agents review each other's work and draft GitHub comments pinned to the diff. Edit, skip or send them all.
+
+<p align="center"><img src="docs/screens/review-drafts.jpg" alt="Reviews you approve before they post" width="900" /></p>
+
+### Only what needs you
+
+Decisions, finished work and to-do nudges, with quick answers.
+
+<p align="center"><img src="docs/screens/bell.jpg" alt="Only what needs you" width="420" /></p>
+
+### Lists and timers
+
+Sticky notes agents create, colour and tick off.
+
+<p align="center"><img src="docs/screens/sticky-lists.jpg" alt="Lists and timers" width="900" /></p>
+
+## Loka Pro
+
+Loka Pro is coming soon. It adds organizations and team collaboration, the iPhone, iPad and Apple Watch apps, several Macs and cloud runners. Join the waitlist at [loka.ygpt.dev](https://loka.ygpt.dev/#pro).
+
+## Supported CLIs
+
+Each agent picks a CLI and a model, and can switch later. Models are discovered from each CLI at runtime, so new ones need no code change. [docs/backends.md](docs/backends.md) compares them on speed, cost and features.
+
+| CLI | Sign in | Notes |
+|---|---|---|
+| `claude` (Claude Code) | `claude login` | Forks with `--fork-session`, runs inside Claude Code's Bash sandbox, warm processes for fast replies |
+| `codex` | `codex login` | `codex exec` or `codex app-server`, steering and rewind |
+| `cursor` | `cursor-agent login` | Forks by copying the chat store, warm turns over ACP |
+| `omp` (oh-my-pi) | provider keys in `models.yml` | Per-agent model configs with secret references |
+| `opencode` | `OPENROUTER_API_KEY` | Off unless `WORLD_ENABLE_OPENCODE=1` |
+
+## Building from source
+
+You need Rust (stable), Node 20 or later and the Xcode command line tools.
 
 ```bash
-docker compose up --scale agent=3
+cd desktop && npm ci && npm run build
 ```
 
-Each agent competes for tasks via Redis distributed locks. No double-work. Dead workers auto-release after 30 minutes.
-
-## Repo Onboarding
-
-When repos are added, the agent automatically profiles them — detecting language, framework, test commands, build tools, and key directories. These profiles power smarter planning for multi-repo tasks. Manage repos from the UI or `config.yaml`.
-
-## Schedules
-
-Automated agent runs on a cron or one-shot basis. The agent explores your repos and optionally creates tasks on the board.
-
-Two built-in schedules ship disabled by default:
-
-| Schedule | Cron | What it does |
-|----------|------|-------------|
-| **Bug Hunter** | Every 6 hours | Scans for bugs, security issues, race conditions |
-| **Feature Scout** | Monday 9am | Finds TODOs, dead code, performance bottlenecks |
-
-Create custom schedules from the UI or `config.yaml`. Each run gets its own logs and can auto-create tasks with configurable limits.
-
-## Skills
-
-9 built-in skills ship in `skills/` (auto-loaded):
-
-| Skill | What it does |
-|-------|-------------|
-| `test` | Auto-detect test framework, run tests |
-| `lint` | Auto-detect linter, run with auto-fix |
-| `typecheck` | Run static type checking |
-| `commit` | Conventional commit format |
-| `review` | Self-review checklist before PR |
-| `build` | Auto-detect build system, verify build |
-| `migrate` | Database migration guidance |
-| `security` | Security scan + dependency audit |
-| `add-repo` | Onboard a repository — explore and generate profile |
-
-**Add custom skills** — drop a markdown file in `skills/`:
-
-```markdown
----
-description: Deploy to staging
-command: gh workflow run deploy.yml -f environment=staging
-phase: implement
----
-Run this after all tests pass to deploy the changes.
-```
-
-Repos can also ship their own `skills/` directory — auto-discovered when the agent clones them.
-
-## MCP Servers
-
-MCP servers are configured in `config.yaml` (`mcp_servers`) and merged with per-repo `.mcp.json` files at runtime.
-
-`config.example.yaml` includes common server definitions; secrets should be passed via `${VAR}` placeholders resolved from environment variables.
-
-For deployment-safe secret wiring patterns, see [`docs/configuration.md`](docs/configuration.md).
-
-## Agent Instructions
-
-Give the agent persistent context across all tasks with a markdown instructions file:
-
-```yaml
-agent:
-  instructions: instructions.md
-```
-
-Use this for agent identity, a map of your repos, cross-repo conventions, and architectural context. See `instructions.example.md` for the recommended format.
-
-## Self-Iteration
-
-Karna can manage its own repository — modifying config, skills, instructions, and its own code:
-
-```yaml
-repos:
-  - repo: user/karna-fork
-    branch: main
-    self: true
-```
-
-The agent implements changes and opens PRs like any other task. Config and skill changes hot-reload instantly. Code changes trigger an automatic rebuild with graceful drain (no mid-task interruption).
-
-## GitHub Webhooks
-
-Connect GitHub webhooks so the agent picks up PR reviews and comments in real-time.
-
-**Setup:** Make the agent reachable from GitHub (Cloudflare Tunnel, public IP, or ngrok), then set `AGENT_WEBHOOK_URL` or `TUNNEL_AGENT_HOSTNAME` in `.env`. Webhooks are auto-registered on repos during onboarding. Optionally set `GITHUB_WEBHOOK_SECRET` for HMAC-SHA256 signature verification.
-
-| You do this on GitHub | Agent does this |
-|----------------------|----------------|
-| Request changes on a PR | Reads your review, pushes fixes |
-| Comment on a PR | Addresses your feedback |
-| Approve + merge a PR | Marks the task as done |
-
-**Without webhooks:** Post feedback through the Activity tab in the UI. The agent also gathers PR comments via `gh pr view` when it starts working on feedback.
-
-## Commit Signing
-
-Sign agent commits with an SSH key so they show as "Verified" on GitHub:
-
-```bash
-mkdir -p signing
-cp ~/.ssh/id_ed25519 signing/signing_key
-```
-
-Add the **public** key to [GitHub SSH settings](https://github.com/settings/ssh/new) as a "Signing Key". The agent auto-detects keys in `signing/` at startup. If empty, signing is skipped.
-
-## Public Access (Cloudflare Tunnel)
-
-Expose your instance to the internet without port forwarding:
-
-**Token-based** (routes managed in CF dashboard):
-```bash
-CLOUDFLARE_TUNNEL_TOKEN=your-token
-docker compose --profile tunnel up
-```
-
-**Credentials-based** (routes defined locally):
-```bash
-cloudflared tunnel create karna
-cloudflared tunnel route dns karna app.yourdomain.com
-cloudflared tunnel route dns karna code.yourdomain.com
-
-# Add to .env:
-CLOUDFLARE_TUNNEL_ID=...
-CLOUDFLARE_TUNNEL_CREDENTIALS=...   # base64 of ~/.cloudflared/<TUNNEL_ID>.json
-TUNNEL_FRONTEND_HOSTNAME=app.yourdomain.com
-TUNNEL_CODE_SERVER_HOSTNAME=code.yourdomain.com
-```
-
-## CLI
-
-```bash
-./karna start      # Start all services + background auto-updater
-./karna stop       # Graceful shutdown (10min drain)
-./karna restart    # Stop + start
-./karna update     # Manual update check
-./karna status     # Service health + updater state
-./karna setup      # Validate config, test connections
-./karna logs       # Tail logs (optionally: ./karna logs agent)
-```
-
-## Configuration Reference
-
-See [`docs/configuration.md`](docs/configuration.md) for the complete, current operator reference.
-
-Minimum environment variables for a working agent+API setup:
-
-| Variable | Required | Purpose |
-|----------|----------|---------|
-| `DATABASE_URL` | Yes | Postgres connection string |
-| `REDIS_URL` | Yes | Redis connection string |
-| `GITHUB_TOKEN` | Yes | Git operations + PR creation |
-| `AUTH_SECRET` | Yes (unless `AUTH_DISABLED=true`) | Auth/session secret |
-| Backend auth | Yes (at least one backend) | `CLAUDE_CODE_OAUTH_TOKEN` or `codex login` / `cursor-agent login` / `grok login` / `OPENROUTER_API_KEY` |
-
-## Backup & Restore
-
-### Backup (on old machine)
-
-```bash
-cd ~/karna
-
-# 1. Database (tasks, users, logs, schedules, repo profiles)
-docker compose exec postgres pg_dump -U karna karna > backup.sql
-
-# 2. Bundle config + secrets + signing keys
-tar czf karna-config.tar.gz .env config.yaml signing/ instructions.md skills/ 2>/dev/null
-```
-
-### Restore (on new machine)
-
-```bash
-# 1. Install Karna
-curl -fsSL https://raw.githubusercontent.com/Warlord-K/karna/main/install.sh | bash
-# (or: git clone https://github.com/Warlord-K/karna.git ~/karna)
-
-# 2. Stop services, restore config
-cd ~/karna
-docker compose down
-tar xzf /path/to/karna-config.tar.gz
-
-# 3. Start Postgres, wait for migrations, restore data
-docker compose up -d postgres
-sleep 5
-docker compose exec -T postgres psql -U karna karna < backup.sql
-
-# 4. Start everything
-docker compose up -d
-```
-
-### What's backed up where
-
-| Data | Backed up by | Notes |
-|------|-------------|-------|
-| Tasks, logs, users, schedules | `backup.sql` | All stateful data |
-| Tokens + secrets | `.env` | GITHUB_TOKEN, CLAUDE_CODE_OAUTH_TOKEN, AUTH_SECRET |
-| Repos + agent config | `config.yaml` | Tracked in git if using self-iteration |
-| Signing keys | `signing/` | Only if using commit signing |
-| Agent instructions | `instructions.md` | Only if configured |
-| Custom skills | `skills/` | Built-in skills are in git, custom ones need backup |
-
-### Migrate to external Postgres
-
-```bash
-# Dump from local
-docker compose exec postgres pg_dump -U karna karna > backup.sql
-
-# Restore to remote (Supabase, Neon, RDS, etc.)
-psql "$REMOTE_DATABASE_URL" < backup.sql
-```
+The prepare step (`desktop/src-tauri/scripts/prepare-sidecar.sh`) builds `loka-agent` and `loka-api` in release mode, builds the frontend as a standalone Next app, and downloads pinned, checksummed Postgres 17 and Node runtimes. The app and DMG land in `desktop/src-tauri/target/release/bundle/`.
 
 ## Development
 
-```bash
-# Infrastructure only
-docker compose up -d postgres redis
-
-# API (serves all REST endpoints)
-export DATABASE_URL="postgres://karna:karna@localhost:5432/karna"
-export REDIS_URL="redis://localhost:6379"
-export AUTH_DISABLED=true
-export CONFIG_PATH="../config.yaml"
-cargo run -p karna-api
-
-# Frontend (hot reload) — proxies /api/* to the API
-cd frontend && npm install && npm run setup && npm run dev
-
-# Agent
-export DATABASE_URL="postgres://karna:karna@localhost:5432/karna"
-export REDIS_URL="redis://localhost:6379"
-export CONFIG_PATH="../config.yaml"
-export REPOS_DIR="$HOME/karna-repos"
-export WORKSPACES_DIR="$HOME/karna-workspaces"
-cargo run -p karna-agent
-```
-
-CI runs on all PRs: `cargo check` + `cargo clippy` for the agent, `npm run build` for the frontend, and Docker build verification.
-
-## Cloud Deployment
-
-Karna can be split across managed services for production use. Each component runs where it fits best:
-
-```
-Vercel (Frontend)  ──rewrite──▶  Render (API)  ──▶  Supabase (Postgres)
-                                     ↕                       ↑
-                                Redis Cloud             Render (Agent)
-                                     ↑───────────────────────/
-```
-
-| Component | Service | Why |
-|-----------|---------|-----|
-| Postgres | [Supabase](https://supabase.com) | Managed Postgres, free tier, dashboard |
-| Redis | [Redis Cloud](https://redis.io/cloud) | Managed Redis, free 30MB tier |
-| API | [Render](https://render.com) Web Service | Rust binary, fast cold starts, auto-deploy from Docker |
-| Agent | [Render](https://render.com) Background Worker | Docker container, scales by adding workers |
-| Frontend | [Vercel](https://vercel.com) | Next.js native, zero-config, edge rewrites |
-
-### 1. Supabase (Postgres)
-
-Create a new Supabase project and run the migrations:
-
-```bash
-# Concatenate all migrations in order
-cat migrations/001_initial.sql \
-    migrations/002_add_password.sql \
-    migrations/003_subtasks.sql \
-    migrations/004_cli_model.sql \
-    migrations/005_task_number.sql \
-    migrations/006_log_type_tool.sql \
-    migrations/007_cost_usd.sql \
-    migrations/008_comment_log_type.sql \
-    migrations/009_schedules.sql \
-    migrations/010_repo_profiles.sql \
-    migrations/011_cancelled_status.sql \
-  | psql "$SUPABASE_DATABASE_URL"
-```
-
-Save your connection string — you'll use it for both the API and agent.
-
-### 2. Redis Cloud
-
-Create a free Redis Cloud instance at [redis.io/cloud](https://redis.io/cloud). Copy the connection URL (format: `redis://default:password@host:port`).
-
-### 3. Render — API Service
-
-Create a **Web Service** on Render:
-
-- **Root Directory**: `.` (repo root)
-- **Dockerfile Path**: `api/Dockerfile`
-- **Environment variables**:
-
-| Variable | Value |
-|----------|-------|
-| `DATABASE_URL` | Your Supabase connection string |
-| `REDIS_URL` | Your Redis Cloud URL |
-| `AUTH_SECRET` | Same value as your frontend (generate with `openssl rand -hex 32`) |
-| `AUTH_DISABLED` | `true` for single-user, omit for auth |
-| `CONFIG_PATH` | `/etc/karna/config.yaml` (mount your config, or omit for defaults) |
-| `PORT` | `8081` |
-
-The API exposes `/health` for Render's health checks.
-
-### 4. Render — Agent Worker(s)
-
-Create a **Background Worker** on Render:
-
-- **Root Directory**: `.` (repo root)
-- **Dockerfile Path**: `agent/Dockerfile`
-- **Environment variables**:
-
-| Variable | Value |
-|----------|-------|
-| `DATABASE_URL` | Your Supabase connection string |
-| `REDIS_URL` | Your Redis Cloud URL |
-| `GITHUB_TOKEN` | GitHub PAT with `repo` + `workflow` scopes |
-| `CLAUDE_CODE_OAUTH_TOKEN` | From `claude setup-token` |
-| `CONFIG_PATH` | `/etc/karna/config.yaml` |
-| `REPOS_DIR` | `/workspace` |
-| `WORKSPACES_DIR` | `/workspace/.workspaces` |
-| `GIT_AUTHOR_NAME` | `Karna Agent` |
-| `GIT_AUTHOR_EMAIL` | `agent@karna.dev` |
-
-**Scaling:** Each background worker is an independent agent. They coordinate via Redis locks — add more workers to process tasks in parallel. No config changes needed.
-
-**Webhooks:** Set `AGENT_WEBHOOK_URL` to the agent's Render URL if you want real-time GitHub PR feedback. Otherwise, use the Activity tab in the UI.
-
-### 5. Vercel (Frontend)
-
-Import the repo on Vercel:
-
-- **Root Directory**: `frontend`
-- **Framework Preset**: Next.js
-- **Environment variables**:
-
-| Variable | Value |
-|----------|-------|
-| `DATABASE_URL` | Your Supabase connection string (needed for NextAuth login/signup only) |
-| `AUTH_SECRET` | Same value as the API service |
-| `API_URL` | Your Render API URL (e.g. `https://karna-api.onrender.com`) |
-| `AUTH_DISABLED` | `true` for single-user, omit for auth |
-
-The frontend proxies all `/api/*` requests (except auth) to the Rust API via Next.js rewrites. No CORS configuration needed.
-
-### Verify
-
-1. Open your Vercel URL — you should see the login page (or the board if `AUTH_DISABLED=true`)
-2. Create a task — it should appear on the board
-3. Watch the agent worker logs on Render — it should pick up the task within 30 seconds
-4. The agent plans, implements, and opens a PR on GitHub
-
-### Cost Estimate (free tiers)
-
-| Service | Tier | Limit |
-|---------|------|-------|
-| Supabase | Free | 500MB database, 2 projects |
-| Redis Cloud | Free | 30MB, 1 database |
-| Render API | Free | 750 hours/month, spins down on idle |
-| Render Agent | Starter ($7/mo) | Background workers need a paid plan |
-| Vercel | Hobby | 100GB bandwidth, unlimited deploys |
+[CONTRIBUTING.md](CONTRIBUTING.md) shows how to run the API, the web app and a runner straight from source against a local Postgres, and lists the tests and house rules.
 
 ## Architecture
 
 ```
-docker-compose.yml
-├── postgres:16       — Auth sessions + tasks + logs
-├── redis:7           — Task queue + distributed locks
-├── api (Rust/Axum)   — REST API, serves all data to the frontend
-├── agent (Rust)      — Polls DB, invokes configured CLI backend(s), git/gh operations
-├── frontend (Next.js)— Kanban board, Auth.js with credentials auth, proxies /api to Rust API
-├── code-server       — Browser IDE to watch agent edit files
-├── tunnel            — Optional Cloudflare Tunnel for public access
-└── autoheal          — Auto-restarts unhealthy containers
+web app (Next.js)  ──/api──▶  loka-api (Rust, Axum)  ──▶  Postgres
+       ▲                          │      ▲
+       └────────── SSE ───────────┘      │ /api/runner/{id}/poll
+                                  loka-agent runner (this Mac)
+                                          │
+                        claude / codex / cursor / omp / opencode
 ```
 
-The API and agent share a `karna-shared` Rust crate (database client + domain models). The frontend contains no database queries — it proxies all data requests to the Rust API via Next.js rewrites.
+- **`shared/`** (`loka-shared`) is all database access and domain logic.
+- **`api/`** (`loka-api`) serves REST, server-sent events, the runner API, the external MCP endpoint and webhooks, and applies `migrations/` at startup.
+- **`agent/`** (`loka-agent`) is the runner that leases jobs and drives the CLIs, plus the stdio MCP server agents use for World tools.
+- **`frontend/`** is the pixel world, chat, quests, reports and settings.
+- **`desktop/`** is the Tauri app that starts and supervises everything.
+- Nothing polls: writers insert rows and Postgres triggers `pg_notify` the listeners.
 
-**Tech stack:** Rust (Tokio, Axum, sqlx, redis) · Next.js 15, React 19, Auth.js v5, Tailwind, dnd-kit, Framer Motion · PostgreSQL 16 · Redis 7 · CLI backends (`claude`, `codex`, `cursor`, `grok`, `opencode`)
+More in [docs/architecture.md](docs/architecture.md); [CLAUDE.md](CLAUDE.md) maps every subsystem and its invariants. Security notes are in [SECURITY.md](SECURITY.md).
 
 ## License
 
-MIT
+Loka is licensed under the [GNU Affero General Public License v3.0 only](LICENSE) (`AGPL-3.0-only`). You can use, change and run it freely. If you run a modified version as a service other people use over a network, you must offer those users the source of your modified version under the same license.
+
+Contributions are welcome. Contributors will need to agree to a Contributor License Agreement, which will be added to this repository; see [CONTRIBUTING.md](CONTRIBUTING.md).

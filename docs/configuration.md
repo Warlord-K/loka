@@ -1,401 +1,98 @@
-# Karna Configuration and Operations
+# Configuration
 
-This is an operator/developer reference for running Karna as currently implemented.
+The Mac app sets everything up itself, so most people never need this page. It covers where the app keeps its data, how saved keys work, and the settings you can change when you run the pieces by hand for development.
 
-## Configuration Sources
+## Your data
 
-Karna reads settings from:
+Everything the app keeps lives in `~/Library/Application Support/dev.ygpt.loka`:
 
-1. Environment variables
-2. `config.yaml` (path from `CONFIG_PATH`, default `/etc/karna/config.yaml`)
-3. Runtime DB state (for schedules/repo profiles/tasks)
+- the Postgres data folder (agents, sessions, quests, reports, saved keys)
+- `local.json`, with the generated `AUTH_SECRET` and `WORLD_SECRETS_KEY` (saved keys cannot be read without it)
+- `config.yaml`, optional, see below
+- logs, and the runner's workspaces and worktrees
 
-The agent and API both read the same `config.yaml` path, but the agent uses the full schema while API reads a lightweight subset.
+To back up, quit Loka and copy the whole folder. To restore, quit Loka, put the folder back and open Loka again.
 
-## `config.yaml` Reference
+Settings the app reads from your login shell (CLI tokens, `WORLD_BROWSER_LOCAL` and similar) are picked up when the app starts, so restart Loka after changing your shell profile.
 
-The canonical shape is shown in `config.example.yaml`.
+## Saved keys
 
-## `repos`
+Keys are entered under **You > Environment**, outside agent chat. The app lists only each name, when it changed and which agents may use it; values are never shown again. Grant a key to an agent, then tell the agent to use `${secret:NAME}` in an MCP server's environment or headers. The value is resolved only for that agent's runs.
+
+Values are encrypted with `WORLD_SECRETS_KEY` (32 random bytes, base64). The app generates one on first start. To rotate it, set the new key as `WORLD_SECRETS_KEY` and the old one as `WORLD_SECRETS_KEY_PREVIOUS` (comma separated when there are several); the API re-encrypts every saved key on startup.
+
+Provider credential names such as `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `OPENROUTER_API_KEY` and `XAI_API_KEY` are reserved, so a task cannot switch an agent's provider account.
+
+## `config.yaml`
+
+Optional. The API and runner read it from `CONFIG_PATH` (the app points it at its data folder). Agents, repos, schedules and kit normally live in the database and are managed in the app.
 
 ```yaml
 repos:
   - repo: owner/repo
     branch: main
-    sync_issues: true
-    self: false
-```
 
-- `repo`: GitHub repo in `owner/repo` format
-- `branch`: base branch for planning/worktrees (default `main`)
-- `sync_issues`: if true, new GitHub issues can be ingested as tasks
-- `self`: marks Karna's own repo for self-update checks
-
-## `agent`
-
-```yaml
 agent:
-  max_turns: 100
-  poll_interval_secs: 30
-  max_review_rounds: 3
-  instructions: instructions.md
   backends:
-    claude:
-      models: [opus, sonnet, haiku]
-      default_model: sonnet
-```
+    claude: {}
+    codex: {}
 
-- `max_turns`: max CLI turns for implement/feedback/generic runs
-- `poll_interval_secs`: worker poll interval
-- `max_review_rounds`: implement <-> self-review loops (`0` disables self-review)
-- `instructions`: markdown file loaded and injected as system prompt context
-- `backends`: ordered backend map; first key is default CLI
-
-Notes:
-
-- `instructions` path resolves relative to the config file directory unless absolute.
-- Repo/local `skills/*.md` and repo `.mcp.json` are discovered at runtime and merged into prompts/MCP config.
-
-## `memory`
-
-```yaml
-memory:
-  enabled: false
-  url: http://localhost:8888
-  max_items: 8
-  max_chars: 2000
-```
-
-- `enabled`: toggle mem0 usage
-- `url`: mem0 API base URL
-- `max_items`: max snippets injected
-- `max_chars`: budget for injected `## Memory` section
-
-### mem0 provider configuration (Docker/Helm)
-
-Karna's `memory` feature is only an HTTP client. LLM + embedding inference is done by the mem0 server container, configured via mem0 env vars.
-
-Default behavior now routes both mem0 chat + embeddings through OpenRouter's OpenAI-compatible endpoint:
-
-- `LLM_PROVIDER=openai`
-- `LLM_MODEL=openai/gpt-4o-mini`
-- `LLM_BASE_URL=https://openrouter.ai/api/v1`
-- `EMBEDDER_PROVIDER=openai`
-- `EMBEDDER_MODEL=openai/text-embedding-3-small`
-- `EMBEDDER_BASE_URL=https://openrouter.ai/api/v1`
-
-Notes:
-
-- `openai/text-embedding-3-small` is a 1536-dimensional embedding model in mem0/OpenAI-compatible flows.
-- API keys default to `OPENROUTER_API_KEY` (compose) or `openrouter.*` Helm secret values; Helm can override mem0-specific routing with `mem0.openrouterApiKey` / `mem0.openrouterExistingSecret`.
-- Everything remains overrideable for non-OpenRouter setups (OpenAI/Ollama/etc.) by changing provider/model/base URL and key source.
-
-## `slack`
-
-```yaml
-slack:
-  enabled: false
-  default_channel: C0123456789
-  dm_user_ids: []
-  allowed_user_ids: []
-  user_map:
-    U0123456789: 00000000-0000-0000-0000-000000000000
-```
-
-- `enabled`: enables Slack notifications + Socket Mode command surface
-- `default_channel`: fallback channel when task has no mapped thread
-- `dm_user_ids`: optional DM notification targets (matched via `user_map`)
-- `allowed_user_ids`: allowlist for command surface
-- `user_map`: Slack user ID -> Karna user UUID mapping
-
-## `mcp_servers`
-
-```yaml
 mcp_servers:
   - name: linear
     command: npx
     args: ["-y", "@linear/mcp-server"]
     env:
       LINEAR_API_KEY: "${LINEAR_API_KEY}"
-```
 
-`${VAR}` placeholder behavior (implemented in `agent/src/config.rs`):
-
-- if value is exactly `${VAR}` and env var exists -> replaced with env var value
-- if env var is missing -> placeholder string is kept as-is
-
-This is why secrets should be delivered through environment variables/Secrets, not literal tokens in ConfigMaps.
-
-## `instructions`
-
-The instructions file content is loaded once into config and merged into each stage prompt (plus optional per-profile addendum).
-
-## `schedules`
-
-```yaml
-schedules:
-  - name: Bug Hunter
-    prompt: "...markdown..."
-    cron_expression: "0 */6 * * *"
-    task_prefix: BUG
-    max_open_tasks: 3
-    priority: high
-    enabled: false
-```
-
-Key points:
-
-- config schedules are seeded into DB by name
-- if schedule already exists in DB, config does not overwrite it
-- after seeding, DB row is operational source of truth
-- one-shot schedules use `run_at`, then auto-disable after running
-
-## `signing`
-
-```yaml
 signing:
   ssh_key_path: /path/to/key
   allowed_signers_path: /path/to/allowed_signers
 ```
 
-Resolution order:
+- `backends` lists the CLIs checked at startup; the first one is the default. Models are discovered from each CLI.
+- A value that is exactly `${VAR}` is replaced with that environment variable when it is set.
+- Commit signing uses the `signing` block, or `GIT_SIGNING_KEY` and `GIT_ALLOWED_SIGNERS`.
 
-1. explicit `signing` block in config
-2. env vars `GIT_SIGNING_KEY` / `GIT_ALLOWED_SIGNERS`
-3. auto-detect in `/home/agent/.ssh/signing` (`signing_key`, `id_ed25519`, etc.)
+## CLI sign-in
 
-## Secrets: File vs Environment
+Loka uses the logins you already have:
 
-### Comes from `config.yaml`
-
-- repo list and branches
-- backend/model catalog
-- memory/slack toggles and non-secret settings
-- MCP server definitions (with placeholders)
-- schedules
-- instructions path
-
-### Comes from environment / Kubernetes Secret
-
-Required for worker startup:
-
-- `DATABASE_URL`
-- `GITHUB_TOKEN`
-
-Common optional secrets:
-
-- `CLAUDE_CODE_OAUTH_TOKEN`
-- `OPENROUTER_API_KEY`
-- `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`
-- `RESEND_API_KEY`
-- `GITHUB_WEBHOOK_SECRET`
-
-API/frontend auth:
-
-- `AUTH_SECRET`
-- optional `AUTH_DISABLED`, `SIGNUP_DISABLED`
-
-## Agent Profiles and Stage Assignment
-
-Agent profiles are auto-seeded on startup (`agent/src/profiles.rs`) from `agent.backends`:
-
-- one profile per `cli x model`
-- default profile corresponds to default backend/model
-
-Task assignment controls:
-
-- `assigned_agent_id`: task-level profile
-- `planner_agent_id`, `implementer_agent_id`, `reviewer_agent_id`: per-stage overrides
-
-Runtime precedence:
-
-1. stage profile ID
-2. task `cli`/`model`
-3. `assigned_agent_id`
-4. config default backend/model
-
-## Backend Authentication and Preflight
-
-Preflight (`agent/src/preflight.rs`) probes configured backends on startup and logs warnings; it is non-fatal.
-
-Expected auth mode:
-
-- `claude`: CLI installed (`claude`), login or `CLAUDE_CODE_OAUTH_TOKEN`
+- `claude`: `claude login`, or `CLAUDE_CODE_OAUTH_TOKEN`
 - `codex`: `codex login`
 - `cursor`: `cursor-agent login`
-- `grok`: `grok login`
-- `opencode`: `OPENROUTER_API_KEY` env
+- `omp`: provider keys in its `models.yml`
+- `opencode`: `OPENROUTER_API_KEY`, and only with `WORLD_ENABLE_OPENCODE=1`
 
-## MCP Secret Delivery Patterns
+Missing or signed-out CLIs show up in the app with the next step to fix them.
 
-### Local development (`.env`)
+## Settings
 
-Use placeholders in `config.yaml`:
+Everything has a working default.
 
-```yaml
-env:
-  LINEAR_API_KEY: "${LINEAR_API_KEY}"
-```
+| Variable | Default | Effect |
+|---|---|---|
+| `WORLD_TASK_TIMEOUT_SECS` | 3600 | Default time limit for task, follow-up and review runs |
+| `WORLD_TASK_SANDBOX` | `auto` | `auto`, `strict` (fail if the sandbox cannot start) or `off` |
+| `WORLD_CLAUDE_EFFORT` | `medium` for chat, `high` for work | Claude Code effort when a message does not pick one |
+| `WORLD_REVIEWS` | on | `off` disables independent reviews |
+| `WORLD_MAX_REVIEW_ROUNDS` | 2 | Fix rounds after a review asks for changes |
+| `WORLD_COMPACT_TOKENS` | 120000 | Context size after which a main session compacts |
+| `WORLD_WARM_SESSIONS`, `WORLD_WARM_IDLE_SECS` | sized from CPU and memory, 1800 | Long-lived main-session processes and their idle timeout |
+| `WORLD_INBOX_CONCURRENCY`, `WORLD_RUN_CONCURRENCY` | sized from CPU and memory | Agents answering at once, and tasks running at once |
+| `WORLD_STEER_INTERRUPT_SECS`, `WORLD_TOOL_HANG_SECS` | 180, 900 | When a steer interrupts a running tool, and when a hung tool is stopped |
+| `WORLD_MERGE_CHECK_SECS` | 1800 | How often open pull requests are checked for merges and feedback |
+| `WORLD_CI_FEEDBACK` | off | `on` sends failing CI back to every quest, not only those that ask |
+| `WORLD_SILENT_SECS` | 600 | A Cursor run that prints nothing for this long is retried once (0 turns it off) |
+| `WORLD_MCP_HUB`, `WORLD_MCP_HUB_IDLE_SECS` | on, 60 | One shared process per MCP server, and how long an unused one keeps running |
+| `WORLD_BROWSER`, `WORLD_BROWSER_ENGINE` | on, Chrome | Browser tool for agents |
+| `WORLD_BROWSER_LOCAL` | off | `on` lets the agent browser open localhost and private addresses |
+| `WORLD_FEEDS_ALLOW_PRIVATE` | off | Lets feeds and skill downloads reach private addresses |
+| `WORLD_ENABLE_OPENCODE` | off | Offers the OpenCode CLI |
+| `WORLD_PRICING`, `WORLD_PRICING_FETCH` | built in, on | List price overrides for CLIs that report tokens but not dollars, and the twice-daily refresh from OpenRouter's public model list |
+| `WORLD_DOCS_URL` | `https://loka.ygpt.dev` | Where the `read_docs` agent tool reads Loka's docs |
+| `WORLD_SEARCH_INDEX` | on | `off` skips building search indexes; search still works by scanning |
+| `LINEAR_WEBHOOK_SECRET`, `CLICKUP_WEBHOOK_SECRET` | none | Webhooks without a secret are rejected |
 
-Then define `LINEAR_API_KEY=...` in shell or `.env`.
+## Running the pieces by hand
 
-### Helm
-
-Use any combination of:
-
-- `mcpSecrets.inline`: creates key/value entries in chart-managed Secret
-- `mcpSecrets.existingSecrets`: `envFrom` bulk import from existing Secrets
-- `agent.extraEnv` / `agent.extraEnvFrom`: custom env wiring
-
-Important: `config.yaml` rendered by ConfigMap should hold placeholders (`${VAR}`), not plaintext secrets.
-
-## Deployment
-
-### A) Local without Docker
-
-1. Run PostgreSQL + Redis locally.
-2. Set env vars (minimum):
-
-```bash
-export DATABASE_URL="postgres://karna:karna@localhost:5432/karna"
-export REDIS_URL="redis://localhost:6379"
-export GITHUB_TOKEN="ghp_..."
-export AUTH_SECRET="$(openssl rand -hex 32)"
-export CONFIG_PATH="$(pwd)/config.yaml"
-export REPOS_DIR="$HOME/karna-repos"
-export WORKSPACES_DIR="$HOME/karna-workspaces"
-```
-
-3. Apply migrations in order:
-
-```bash
-for f in migrations/[0-9]*.sql; do
-  psql "$DATABASE_URL" -f "$f"
-done
-```
-
-4. Run services:
-
-```bash
-# API
-cargo run -p karna-api
-
-# Agent (separate shell)
-cargo run -p karna-agent
-
-# Frontend (separate shell)
-cd frontend
-npm install
-npm run setup
-npm run dev
-```
-
-### B) Docker Compose
-
-Standard:
-
-```bash
-docker compose up
-```
-
-With in-cluster mem0 stack:
-
-```bash
-docker compose --profile memory up -d mem0
-```
-
-Optional mem0 env overrides for compose:
-
-```bash
-# provider/model/base URL overrides
-MEM0_LLM_PROVIDER=openai
-MEM0_LLM_MODEL=openai/gpt-4o-mini
-MEM0_LLM_BASE_URL=https://openrouter.ai/api/v1
-MEM0_EMBEDDER_PROVIDER=openai
-MEM0_EMBEDDER_MODEL=openai/text-embedding-3-small
-MEM0_EMBEDDER_BASE_URL=https://openrouter.ai/api/v1
-
-# key precedence:
-# MEM0_LLM_API_KEY / MEM0_EMBEDDER_API_KEY -> MEM0_API_KEY -> MEM0_OPENROUTER_API_KEY -> OPENROUTER_API_KEY
-OPENROUTER_API_KEY=sk-or-...
-```
-
-Compose stack includes `postgres`, `redis`, migration job, `api`, `agent`, `frontend`, optional `code-server`, and optional tunnel.
-
-### C) Helm
-
-Primary values:
-
-- `config.repos`
-- `config.backends`
-- `auth.*`
-- `github.*`
-- `claude.*` / `openrouter.*`
-- `config.memory.*` and `mem0.enabled`
-- `mem0.llm.*`, `mem0.embedder.*`, and mem0 key source (`mem0.apiKey` / `mem0.existingSecret`, `mem0.openrouterApiKey` / `mem0.openrouterExistingSecret`, or global `openrouter.*`)
-- `config.slack.*` and `slack.*`
-- `mcpSecrets.*`
-- `ingress.*`
-
-Chart templates to inspect:
-
-- `charts/karna/templates/configmap.yaml`
-- `charts/karna/templates/secret.yaml`
-- `charts/karna/templates/agent/deployment.yaml`
-- `charts/karna/templates/mem0/deployment.yaml`
-- `charts/karna/templates/migration-job.yaml`
-
-## Release flow (`vX.Y.Z`)
-
-`/.github/workflows/release.yml`:
-
-- trigger on `v*` tag
-- build/push multi-arch images (`karna-agent`, `karna-api`, `karna-frontend`, `karna-code-server`) to GHCR
-- package/push OCI Helm chart
-- stamp chart version/appVersion from tag
-
-## Soft Tasks and Orchestrator Usage
-
-### Create non-code task (`kind=doc|research|ops`)
-
-`POST /api/tasks`
-
-```json
-{
-  "title": "Write rollout notes",
-  "description": "Summarize deploy risk and rollback plan",
-  "kind": "doc",
-  "output_target": "notification",
-  "priority": "medium"
-}
-```
-
-### Create orchestrator task
-
-`POST /api/orchestrator-tasks`
-
-```json
-{
-  "title": "Provider verification loop",
-  "description": "Track thread replies and defer checks",
-  "repo": "owner/repo",
-  "priority": "high",
-  "slack_channel": "C0123456789",
-  "thread_ts": "1720000000.123456",
-  "orchestrator": {
-    "allowed_tools": ["node-watchman/*"],
-    "max_turns": 12,
-    "deadline": "2h",
-    "max_actions_per_turn": 10,
-    "max_subtasks": 5,
-    "accepts_external_replies": true
-  }
-}
-```
-
-Chat UI calls the same endpoint with:
-
-- `source: "chat"`
-- `kind` forced to `ops` server-side
-- read-only orchestrator execution surface
-
+For development only; see [CONTRIBUTING.md](../CONTRIBUTING.md). The API needs `DATABASE_URL`, `AUTH_DISABLED=true` and `API_BIND_HOST=127.0.0.1`. The runner needs `WORLD_RUNNER_URL`, `WORLD_RUNNER_ID`, `WORLD_RUNNER_TOKEN` and `WORLD_RUNNER_ROOT`. `AUTH_DISABLED=true` makes every request the one local user, which is safe only while the API listens on `127.0.0.1`.
