@@ -33,6 +33,7 @@ const SCOPES = [
   { value: "all", label: "Always", hint: "talking and working" },
   { value: "talk", label: "When talking", hint: "how they reply to you" },
   { value: "work", label: "When working", hint: "how they do quests" },
+  { value: "allow", label: "Approved action", hint: "quests may do it without being stopped" },
 ];
 
 const STATUS_PRESETS: [string, string][] = [
@@ -422,7 +423,7 @@ export function YouPanel({
         <>
           <SettingsGroup
             title="Rules"
-            description="Instructions every one of your agents follows. When talking rules shape how they reply to you; when working rules apply to quests, code and reviews, and the reviewer checks them too. Changes reach agents on their next turn."
+            description="Instructions every one of your agents follows. When talking rules shape how they reply to you; when working rules apply to quests, code and reviews, and the reviewer checks them too. Approved actions are things you allow for good, like cleaning up their own temp folders or running the scripts in a repo, so the safety check stops blocking them. Changes reach agents on their next turn."
           >
             {canWrite && (
               <SettingsCard>

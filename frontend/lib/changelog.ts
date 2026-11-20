@@ -6,6 +6,18 @@ export type ChangelogEntry = {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    date: "2026-11-20",
+    title: "Quote anything into your reply",
+    items: [
+      "**Quote what you select**: select part of a message, channel post or report and press Quote to ask about exactly that. Your agent sees the quote and the text around it; quotes from a report go to your main agent, and to-dos have Ask about it.",
+      "**Approved actions**: tell your main agent what it may always do, like cleaning up its own temp folders or running a repo's scripts, and quests stop getting blocked on it. When a quest is blocked, your agent asks once whether to allow it for good.",
+      "**More accurate spending**: an agent's spend no longer jumps after the app restarts or a run is stopped, and starting a quest no longer counts the turn that started it twice. Dollar figures now say they are API list prices, which a Claude or ChatGPT plan does not bill.",
+      "Table columns in reports can be dragged wider or narrower, and keep the widths you pick. Double-click the edge to reset.",
+      "Sending a channel message no longer shows an error and puts your text back after it was already sent.",
+      "Smaller UI fixes and polish, like short chats starting at the bottom next to the message box.",
+    ],
+  },
+  {
     date: "2026-11-14",
     title: "Guides for running Loka from source",
     items: [

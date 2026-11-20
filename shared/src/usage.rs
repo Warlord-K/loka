@@ -216,7 +216,7 @@ fn estimate_unpriced(mut row: UsageRow) -> UsageRow {
 }
 
 fn cost_note(report: &UsageReport) -> String {
-    let mut notes = vec!["Claude and omp report their own dollars.".to_string()];
+    let mut notes = vec!["Claude and omp report their own dollars, priced at API list prices: when Claude Code is signed in with a Claude plan, the plan is billed, not these dollars.".to_string()];
     let tokens_only: Vec<&UsageRow> = report.rows.iter().filter(|r| crate::backends::tokens_only(&r.cli)).collect();
     if !tokens_only.is_empty() {
         notes.push("Cursor and Codex report only tokens, so their dollars are estimates at public API list prices, not the bill of a Cursor or ChatGPT plan, which spends plan quota instead; rows marked (est.) were estimated now for runs recorded before prices were known.".to_string());

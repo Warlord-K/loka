@@ -290,16 +290,17 @@ impl RunnerUsage {
             output_tokens: before("output_tokens"),
             context_tokens: 0,
         };
-        let new_thread = self.input_tokens < previous.input_tokens
+        let lower = self.input_tokens < previous.input_tokens
             || self.cached_input_tokens < previous.cached_input_tokens
             || self.output_tokens < previous.output_tokens;
-        if new_thread {
+        let all = |u: &RunnerUsage| u.input_tokens.saturating_add(u.cached_input_tokens).saturating_add(u.output_tokens);
+        if lower && all(self).saturating_mul(2) < all(&previous) {
             return *self;
         }
         RunnerUsage {
-            input_tokens: self.input_tokens - previous.input_tokens,
-            cached_input_tokens: self.cached_input_tokens - previous.cached_input_tokens,
-            output_tokens: self.output_tokens - previous.output_tokens,
+            input_tokens: self.input_tokens.saturating_sub(previous.input_tokens),
+            cached_input_tokens: self.cached_input_tokens.saturating_sub(previous.cached_input_tokens),
+            output_tokens: self.output_tokens.saturating_sub(previous.output_tokens),
             context_tokens: self.context_tokens,
         }
     }
@@ -366,6 +367,8 @@ pub struct RunnerJob {
     pub omp_secrets: Vec<String>,
     #[serde(default)]
     pub command_rules: Option<crate::command_rules::Policy>,
+    #[serde(default)]
+    pub approved_actions: Vec<String>,
     #[serde(default)]
     pub owner_id: Option<Uuid>,
     #[serde(default)]
@@ -2291,6 +2294,7 @@ mod tests {
         let stale = json!({ "input_tokens": 900000, "cached_input_tokens": 4000000, "output_tokens": 30000 });
         assert_eq!(usage(12000, 8000, 300).since(&stale), usage(12000, 8000, 300));
         assert_eq!(usage(950000, 3000, 31000).since(&stale), usage(950000, 3000, 31000));
+        assert_eq!(usage(905000, 4000000, 29990).since(&stale), usage(5000, 0, 0), "a lost tail on the same thread is not a new thread");
         let mut baseline = Value::Null;
         usage(1, 2, 3).record(&mut baseline);
         assert_eq!(baseline, json!({ "input_tokens": 1, "cached_input_tokens": 2, "output_tokens": 3 }));

@@ -408,13 +408,14 @@ fn render_event(item: &InboxItem, tasks: &[AgentTask]) -> String {
             s("transcript")
         ),
         "message" => format!(
-            "[event] message from {}{}{}{}{}:\n{}{}{}{}{}",
+            "[event] message from {}{}{}{}{}:\n{}{}{}{}{}{}",
             sender(p),
             msg_tag(p),
             via_npc(p),
             if loka_shared::voice::spoken(p) { " by voice" } else { "" },
             if !threaded(p) { "" } else { " in a thread" },
             answered_quote(p),
+            loka_shared::quotes::render(p),
             s("body"),
             attached(p),
             linked(p),
@@ -549,11 +550,12 @@ fn render_event(item: &InboxItem, tasks: &[AgentTask]) -> String {
             channel_thread_hint(p)
         ),
         "channel.mention" => format!(
-            "[event] {} mentioned you in {}{}{}:\n{}{}{}\n\nRecent messages {}:\n{}\n\nAnswer in the channel with post_to_channel (channel: {}{}). Mention people or agents with @name when you need them. Do not use the reply action for this; your direct thread is a different conversation.",
+            "[event] {} mentioned you in {}{}{}:\n{}{}{}{}\n\nRecent messages {}:\n{}\n\nAnswer in the channel with post_to_channel (channel: {}{}). Mention people or agents with @name when you need them. Do not use the reply action for this; your direct thread is a different conversation.",
             sender(p),
             s("channel"),
             msg_tag(p),
             if !threaded(p) { "" } else { " (in a thread)" },
+            loka_shared::quotes::render(p),
             s("body"),
             attached(p),
             linked(p),
@@ -702,10 +704,20 @@ pub fn rules(rules: &[WorldRule], scope: &str, owner: &str) -> String {
         .filter(|r| r.scope == "all" || r.scope == scope)
         .map(|r| format!("- {}", r.body.trim()))
         .collect();
-    if lines.is_empty() {
-        return String::new();
+    let approved = loka_shared::approvals::from_rules(rules);
+    let mut blocks = Vec::new();
+    if !lines.is_empty() {
+        blocks.push(format!("Rules from {owner}. Always follow them; they override any other style guidance:\n{}", lines.join("\n")));
     }
-    format!("Rules from {owner}. Always follow them; they override any other style guidance:\n{}", lines.join("\n"))
+    if !approved.is_empty() {
+        let intro = if scope == "talk" {
+            format!("Actions {owner} approved for good. Quests may do them without asking, so never ask {owner} about them again:")
+        } else {
+            format!("Actions {owner} approved for good. Do them without asking whenever the work needs them, within the limits each one names:")
+        };
+        blocks.push(format!("{intro}\n{}", approved.iter().map(|a| format!("- {a}")).collect::<Vec<_>>().join("\n")));
+    }
+    blocks.join("\n\n")
 }
 
 pub fn teams(teams: &[TeamContext], agent_id: Uuid, scope: &str) -> String {

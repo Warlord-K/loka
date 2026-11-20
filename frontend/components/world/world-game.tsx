@@ -106,6 +106,7 @@ import {
   useAttachments,
   useTurnOptions,
 } from "./chat-kit";
+import { MAIN_TARGET, QUOTE_EVENT, QuoteSelection, QuotedBlock, QuotePreview, quoteProps, sendQuote, useQuote, type MessageQuote } from "./quote";
 import { RepliesButton, ThreadPanel, type ThreadItem } from "./thread-panel";
 import { MessageAuthor, MessageRow, MessageToolbar, type MessageActions } from "./message-row";
 import { AgentStatus, JobList, LiveJobLine, Shimmer, STATUS_LABEL, StatusMark } from "./work-ui";
@@ -587,14 +588,20 @@ function AgentDialog({
   const turn = useTurnOptions(agent);
   const asideChoice = useAsideChoice(agent);
 
-  const deliver = async (text: string, withFiles: boolean) => {
+  const [quote, setQuote] = useQuote(access.use ? `agent:${agent.id}` : null);
+  useEffect(() => {
+    if (quote) setTab((t) => (t === "talk" || t === "aside" ? t : "talk"));
+  }, [quote]);
+
+  const deliver = async (text: string, withFiles: boolean, quoted: MessageQuote | null) => {
     if (tab === "aside") {
-      const res = await worldApi.aside(agent.id, text, asideChoice.effective, dictated || undefined);
+      const asked = quoted ? `> ${quoted.text.split("\n").join("\n> ")}\n\n${text}` : text;
+      const res = await worldApi.aside(agent.id, asked, asideChoice.effective, dictated || undefined);
       onAside(res.session_id);
       setAsking(true);
       if (dictated) onVoiceSent(agent.id);
     } else {
-      await worldApi.send(agent.id, text, withFiles ? files.ready : [], turn.effective, undefined, dictated || undefined);
+      await worldApi.send(agent.id, text, withFiles ? files.ready : [], turn.effective, undefined, dictated || undefined, undefined, undefined, quoted);
       if (dictated) onVoiceSent(agent.id);
     }
   };
@@ -618,6 +625,8 @@ function AgentDialog({
     setBusy(true);
     setError(null);
     const talking = tab === "talk";
+    const quoted = preset ? null : quote;
+    if (quoted) setQuote(null);
     const known = new Set(messagesRef.current.map((m) => m.id));
     if (talking) {
       setOutgoing({ text, files: files.ready.length });
@@ -628,7 +637,7 @@ function AgentDialog({
     try {
       for (let attempt = 0; ; attempt++) {
         try {
-          await deliver(text, talking);
+          await deliver(text, talking, quoted);
           break;
         } catch (err) {
           if (!talking || attempt >= SEND_RETRY_DELAYS.length || !retryableSend(err)) throw err;
@@ -647,6 +656,7 @@ function AgentDialog({
         setInput((cur) => (cur.trim() ? `${text}\n${cur}` : text));
         setWaiting(null);
       }
+      if (quoted) setQuote(quoted);
       setError(
         tab === "aside"
           ? `${agent.name} could not be pulled aside. If you have never talked to them, say hi in Talk first.`
@@ -700,6 +710,7 @@ function AgentDialog({
 
   const visible = messages.filter((m) => {
     if (m.meta?.voice_request || m.meta?.hidden) return false;
+    if (m.author_kind === "system" && NOT_ASSIGNED_NOTE.test(m.body)) return false;
     const isAside = m.session_role === "aside" || (m.session_id ? asides.has(m.session_id) : false);
     return tab === "aside" ? isAside : !isAside;
   });
@@ -929,7 +940,7 @@ function AgentDialog({
           )}
       </div>
 
-      <div key={tab} className="min-h-[12.5rem] flex-1 overflow-y-auto px-4 pb-2 pt-4 @lg:px-5 @lg:pt-5">
+      <div key={tab} className={cn("min-h-[12.5rem] flex-1 overflow-y-auto px-4 pb-2 pt-4 @lg:px-5 @lg:pt-5", (tab === "talk" || tab === "aside") && "flex flex-col")}>
         {!access.read && !access.use ? (
           <p className="text-w-md text-w-text2">You can watch {agent.name} around Loka. Ask an admin for more access to see their quests or talk to them.</p>
         ) : tab === "settings" ? (
@@ -1016,7 +1027,7 @@ function AgentDialog({
             />
           </div>
         ) : visible.length || (tab === "talk" && (outgoing || waiting)) ? (
-          <div className="flex flex-col" aria-live="polite">
+          <div className="mt-auto flex flex-col" aria-live="polite">
             {visible.map((m, i) => {
               const sender = m.author_agent_id && m.author_agent_id !== agent.id ? agents.find((a) => a.id === m.author_agent_id) : null;
               const divider = <DayDivider at={m.created_at} previous={visible[i - 1]?.created_at} />;
@@ -1121,7 +1132,12 @@ function AgentDialog({
                       {editing === m.id ? (
                         <MessageEditor rewind initial={m.body} onSave={(text) => saveEdit(m, text)} onCancel={() => setEditing(null)} />
                       ) : (
-                        <RichText text={m.body} handles={handles} onOpenAgent={onOpenAgent} className="text-w-text" />
+                        <>
+                          {m.meta?.quote && <QuotedBlock quote={m.meta.quote} />}
+                          <div {...quoteProps(`msg:${m.id}`, "Your message", `agent:${agent.id}`)}>
+                            <RichText text={m.body} handles={handles} onOpenAgent={onOpenAgent} className="text-w-text" />
+                          </div>
+                        </>
                       )}
                       <AttachmentGrid items={m.meta?.attachments ?? []} />
                     </div>
@@ -1189,7 +1205,9 @@ function AgentDialog({
                   ) : (
                     <RunCommandContext.Provider value={ownsAgent && tab === "talk" && m.author_kind === "agent" ? runCommand : null}>
                       <LocalPathContext.Provider value={ownsAgent ? agent : null}>
-                        <RichText text={m.body} handles={handles} onOpenAgent={onOpenAgent} className={m.author_kind === "system" ? "text-w-muted" : "text-w-text"} />
+                        <div {...quoteProps(`msg:${m.id}`, `${m.author_kind === "agent" ? agent.name : "Loka"}'s message`, `agent:${agent.id}`)}>
+                          <RichText text={m.body} handles={handles} onOpenAgent={onOpenAgent} className={m.author_kind === "system" ? "text-w-muted" : "text-w-text"} />
+                        </div>
                       </LocalPathContext.Provider>
                     </RunCommandContext.Provider>
                   )}
@@ -1267,7 +1285,7 @@ function AgentDialog({
           </p>
         ) : null}
         {!visible.length && tab === "talk" && access.use && historyFor === agent.id && !outgoing && !waiting && (
-          <div className="flex flex-wrap gap-2 motion-safe:animate-w-rise">
+          <div className="mt-auto flex flex-wrap justify-end gap-2 motion-safe:animate-w-rise">
             {[`Hi ${agent.name}!`, "What can you help me with?", "What are you working on?"].map((starter) => (
               <button key={starter} type="button" disabled={busy} onClick={() => void send(undefined, starter)} className={cn(BTN_SECONDARY_SM, "font-medium")}>
                 {starter}
@@ -1284,6 +1302,7 @@ function AgentDialog({
         <div className="rounded-xl border-2 border-w-line2 bg-w-card transition-colors focus-within:border-w-teal focus-within:ring-2 focus-within:ring-w-teal/25">
         {tab === "talk" && <TurnControls agent={agent} options={turn.options} onChange={turn.update} onAgentUpdated={access.manage ? onAgentUpdated : undefined} />}
         {tab === "aside" && <AsideControls agent={agent} choice={asideChoice.choice} onChange={asideChoice.update} />}
+        {quote && (tab === "talk" || tab === "aside") && <QuotePreview quote={quote} onClear={() => setQuote(null)} />}
         {tab === "talk" && <PendingStrip pending={files.pending} onRemove={files.remove} />}
         <form onSubmit={send} className="flex items-end gap-2 p-2">
           {tab === "talk" && <AttachButton onFiles={files.add} />}
@@ -1980,6 +1999,8 @@ function PlotDialog({ hasAssistant, canCreate, onCreate, onAsk, onClose }: { has
     </div>
   );
 }
+
+const NOT_ASSIGNED_NOTE = /^Could not start task \S+: task is not assigned to this agent$/;
 
 export default function WorldGame() {
   const [gate, setGate] = useState<{ checked: boolean; me: Me | null }>({ checked: false, me: null });
@@ -2950,6 +2971,29 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     setDialog({ kind: "resident", id });
   }, [closePanels]);
 
+  const sideHostRef = useRef(false);
+  sideHostRef.current = !!reports || listsOpen;
+  useEffect(() => {
+    const onQuote = (e: Event) => {
+      const detail = (e as CustomEvent<{ target: string; quote: MessageQuote }>).detail;
+      if (detail?.target !== MAIN_TARGET) return;
+      const main = meRef.current?.main_agent_id;
+      const wide = window.matchMedia("(min-width: 1024px)").matches;
+      if (sideHostRef.current && wide) {
+        const id = sideRef.current.open && sideRef.current.id ? sideRef.current.id : main;
+        if (!id) return;
+        setSide({ id, open: true, auto: !sideRef.current.open || sideRef.current.auto });
+        sendQuote(`agent:${id}`, detail.quote);
+        return;
+      }
+      if (!main) return;
+      openAgent(main);
+      sendQuote(`agent:${main}`, detail.quote);
+    };
+    window.addEventListener(QUOTE_EVENT, onQuote);
+    return () => window.removeEventListener(QUOTE_EVENT, onQuote);
+  }, [openAgent, setSide]);
+
   const linkedAgent = useRef<string | null | undefined>(undefined);
   useEffect(() => {
     if (linkedAgent.current === undefined) linkedAgent.current = new URLSearchParams(window.location.search).get("agent");
@@ -3868,6 +3912,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       <AnimatePresence>{engineGen === 0 && <WorldSplash key="splash" exit />}</AnimatePresence>
 
       <Toasts toasts={toasts} dismiss={dismissToast} />
+      <QuoteSelection />
 
       <AnimatePresence>
         {!started && (

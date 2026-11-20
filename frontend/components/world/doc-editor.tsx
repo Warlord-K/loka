@@ -63,6 +63,7 @@ export const DOC_PROSE = cn(
   "[&_hr]:my-7 [&_hr]:border-dashed [&_hr]:border-w-line2 [&_hr.ProseMirror-selectednode]:border-w-teal",
   "[&_.tableWrapper]:my-5 [&_.tableWrapper]:overflow-x-auto [&_table]:w-full [&_table]:border-collapse [&_table]:text-w-base",
   "[&_th]:border [&_th]:border-w-line [&_th]:bg-w-sand/60 [&_th]:px-3 [&_th]:py-2 [&_th]:text-left [&_th]:text-w-sm [&_th]:font-semibold [&_th]:text-w-text2",
+  "[&_th]:min-w-[4.5rem] [&_td]:min-w-[4.5rem] [&_th]:[overflow-wrap:break-word] [&_td]:[overflow-wrap:break-word]",
   "[&_td]:border [&_td]:border-w-line [&_td]:px-3 [&_td]:py-2 [&_td]:align-top [&_td_p]:my-0 [&_th_p]:my-0 [&_.selectedCell]:bg-w-teal/15",
   "[&_img]:my-3 [&_img]:max-h-96 [&_img]:rounded-lg [&_img]:border-2 [&_img]:border-w-ink [&_img.ProseMirror-selectednode]:ring-2 [&_img.ProseMirror-selectednode]:ring-w-teal",
   "[&_.is-empty]:before:pointer-events-none [&_.is-empty]:before:float-left [&_.is-empty]:before:h-0 [&_.is-empty]:before:text-w-faint [&_.is-empty]:before:content-[attr(data-placeholder)]",

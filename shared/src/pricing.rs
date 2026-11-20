@@ -129,6 +129,13 @@ pub fn cost(model: &str, input: u64, cached: u64, output: u64) -> f64 {
     (input as f64 * i + cached as f64 * c + output as f64 * o) / 1_000_000.0
 }
 
+pub fn session_cost_delta(reported: f64, previous: f64, model: &str, input: u64, cached: u64, output: u64) -> f64 {
+    if reported >= previous {
+        return reported - previous;
+    }
+    cost(model, input, cached, output).min(reported)
+}
+
 pub fn has_price(model: &str) -> bool {
     rates(model).is_some()
 }
@@ -225,6 +232,16 @@ mod tests {
         assert_eq!(canonical("claude-sonnet-4-5-20250929"), "claude-sonnet-4.5");
         assert_eq!(canonical("fal/kimi-k3"), "kimi-k3");
         assert_eq!(canonical("gpt-5.3-codex"), "gpt-5.3-codex");
+    }
+
+    #[test]
+    fn a_session_total_that_drops_is_not_counted_again_in_full() {
+        assert!((session_cost_delta(12.5, 10.0, "claude-opus-5-5", 0, 0, 0) - 2.5).abs() < 1e-9);
+        assert!((session_cost_delta(0.4, 0.0, "claude-opus-5-5", 0, 0, 0) - 0.4).abs() < 1e-9);
+        let after_kill = session_cost_delta(79.29, 79.44, "claude-opus-5-5", 2_000, 150_000, 1_000);
+        assert!((after_kill - cost("claude-opus-5-5", 2_000, 150_000, 1_000)).abs() < 1e-9);
+        assert!(after_kill < 0.1);
+        assert!((session_cost_delta(0.01, 5.0, "claude-opus-5-5", 2_000_000, 0, 0) - 0.01).abs() < 1e-9);
     }
 
     #[test]

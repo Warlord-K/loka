@@ -466,11 +466,15 @@ impl RunnerCoordinator {
         if runner.owner_user_id != claimed.owner_user_id {
             bail!("runs only go to their owner's own device");
         }
-        let quick_fork = if claimed.kind == "quick" && claimed.fork_from.is_none() && claimed.cli_session_id.is_none() {
-            self.store.quick_fork_source(&session).await?.map(|(_, cli)| cli)
+        let quick_source = if claimed.kind == "quick" && claimed.fork_from.is_none() && claimed.cli_session_id.is_none() {
+            self.store.quick_fork_source(&session).await?
         } else {
             None
         };
+        let quick_fork = quick_source.as_ref().map(|(_, cli)| cli.clone());
+        if let Some(parent) = claimed.fork_from.filter(|_| parent_cli.is_some()).or(quick_source.as_ref().map(|(id, _)| *id)) {
+            self.store.take_fork_baseline(claimed.session_id, parent).await?;
+        }
         let parent_cli = parent_cli.or(quick_fork.clone());
         let workspace = workspace_for(
             &session,
@@ -571,6 +575,11 @@ impl RunnerCoordinator {
         } else {
             None
         };
+        let approved_actions = if !lean && matches!(claimed.kind.as_str(), "task" | "followup" | "direct" | "review" | "quick") {
+            loka_shared::approvals::from_rules(&self.store.rules_for(agent.owner_user_id, agent.org_id).await?)
+        } else {
+            Vec::new()
+        };
         let (omp_models, omp_secrets) = match omp {
             Some(omp) => (Some(omp.models_yml), omp.secrets),
             None => (None, Vec::new()),
@@ -611,6 +620,7 @@ impl RunnerCoordinator {
             omp_models,
             omp_secrets,
             command_rules,
+            approved_actions,
             owner_id: agent.owner_user_id,
             keys_version,
             metered: self.store.metered(agent.id).await?,
@@ -951,6 +961,9 @@ impl RunnerCoordinator {
                         continue;
                     };
                     let choice = reviewer.as_ref().and_then(ReviewerChoice::from_value);
+                    if crate::quests::assigned_elsewhere(&self.store, task_id, agent.id).await {
+                        continue;
+                    }
                     if started.insert(task_id) {
                         if let Err(error) = crate::quests::apply_choice(&self.store, task_id, &quest).await {
                             self.system_note(agent, &format!("Could not set the quest options on task {task_id}: {error}")).await?;
@@ -1022,7 +1035,11 @@ impl RunnerCoordinator {
             else {
                 continue;
             };
-            if started.contains(&task_id) || replied || self.store.quest_has_parts(task_id).await.unwrap_or(false) {
+            if started.contains(&task_id)
+                || replied
+                || self.store.quest_has_parts(task_id).await.unwrap_or(false)
+                || crate::quests::assigned_elsewhere(&self.store, task_id, agent.id).await
+            {
                 continue;
             }
             let brief = (!text.trim().is_empty()).then_some(text.as_str());
@@ -2674,11 +2691,7 @@ fn account_usage(session: &AgentSession, reported_cost: f64, reported: RunnerUsa
         if let Some(object) = baseline.as_object_mut() {
             object.insert("cost_usd".into(), json!(reported_cost));
         }
-        if reported_cost >= previous {
-            reported_cost - previous
-        } else {
-            reported_cost
-        }
+        loka_shared::pricing::session_cost_delta(reported_cost, previous, &session.model, input_tokens, cached_input_tokens, output_tokens)
     } else {
         loka_shared::pricing::cost(&session.model, input_tokens, cached_input_tokens, output_tokens)
     };

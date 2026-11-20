@@ -548,6 +548,8 @@ pub struct PostMessage {
     share_output: bool,
     #[serde(default)]
     run_on: Option<Uuid>,
+    #[serde(default)]
+    quote: Option<Value>,
 }
 
 #[derive(Deserialize, Serialize, Default)]
@@ -852,6 +854,7 @@ pub async fn post_message(
         .await
         .map_err(internal)?
         .unwrap_or_else(|| "someone".to_string());
+    let quote = loka_shared::quotes::clean(body.quote.as_ref());
     let setup_card = match text.is_empty() {
         true => None,
         false => crate::routes::setup_scan::card_kind(&state, id, body.answers).await?,
@@ -886,6 +889,9 @@ pub async fn post_message(
                 if let Some(task) = body.task_id {
                     meta["task_id"] = json!(task);
                 }
+                if let Some(quote) = &quote {
+                    meta["quote"] = quote.clone();
+                }
                 meta
             },
         }, reply_to)
@@ -911,6 +917,7 @@ pub async fn post_message(
                     "onboarding": onboarding,
                     "answers": question,
                     "spoken": body.spoken,
+                    "quote": quote,
                     "reply_to": reply_to,
                     "thread": match reply_to {
                         Some(root) => state.world.agent_thread_transcript(id, root, 12).await.map_err(internal)?,
@@ -1394,7 +1401,7 @@ pub struct CreateRule {
 }
 
 fn valid_scope(scope: &str) -> bool {
-    matches!(scope, "all" | "talk" | "work")
+    matches!(scope, "all" | "talk" | "work" | "allow")
 }
 
 pub async fn create_rule(
@@ -2370,6 +2377,8 @@ pub struct PostChannel {
     reply_to: Option<i64>,
     #[serde(default)]
     spoken: bool,
+    #[serde(default)]
+    quote: Option<Value>,
 }
 
 pub async fn post_channel(
@@ -2392,6 +2401,9 @@ pub async fn post_channel(
                 let mut meta = json!({ "attachments": attachments, "links": links });
                 if body.spoken {
                     meta["spoken"] = json!(true);
+                }
+                if let Some(quote) = loka_shared::quotes::clean(body.quote.as_ref()) {
+                    meta["quote"] = quote;
                 }
                 meta
             },

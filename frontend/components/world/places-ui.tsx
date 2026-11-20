@@ -193,7 +193,10 @@ function AgentsSheet({
       {surface === "usage" && mine.length > 0 && (
         <div className="mb-4 rounded-lg border-2 border-w-line bg-w-field/50 p-3 text-w-sm">
           <p>
-            Your agents have spent <span className="font-semibold">${total.toFixed(2)}</span> in total.
+            Your agents have used <span className="font-semibold">${total.toFixed(2)}</span> in total at API list prices.
+          </p>
+          <p className="mt-1 text-w-xs text-w-muted">
+            That is what the same tokens would cost on a pay as you go API key. When Claude Code or Codex is signed in with a plan (Claude Pro, Max, Team or Enterprise, or ChatGPT), the plan is what you pay, not this amount.
           </p>
           {paused.length > 0 && <p className="mt-1 text-w-warn">Paused by their daily budget: {paused.map((a) => a.name).join(", ")}.</p>}
         </div>

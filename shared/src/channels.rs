@@ -430,7 +430,8 @@ impl WorldStore {
             "UPDATE world_notifications n SET cleared_at = NOW()
                FROM world_events e
               WHERE n.user_id = $1 AND n.kind = 'mention' AND n.ref = $2::text AND n.cleared_at IS NULL
-                AND e.seq = n.event_seq AND (e.payload->>'message_id')::bigint <= $3",
+                AND e.seq = n.event_seq
+                AND CASE WHEN e.payload->>'message_id' ~ '^[0-9]{1,18}$' THEN (e.payload->>'message_id')::bigint END <= $3",
         )
         .bind(user_id)
         .bind(channel_id)
@@ -685,6 +686,7 @@ impl WorldStore {
             "team_id": team.as_ref().map(|t| t.id),
             "reply_to": reply_to,
             "spoken": spoken,
+            "quote": meta.get("quote"),
         }));
         if let Some(a) = author_agent {
             event = event.agent(a);
@@ -737,6 +739,7 @@ impl WorldStore {
                 "reply_to": reply_to,
                 "broadcast": broadcast_agents.contains(&agent.id).then_some(broadcast).flatten(),
                 "spoken": spoken,
+                "quote": meta.get("quote"),
             }));
             self.emit(wake, Some((agent.id, "channel.mention"))).await?;
         }

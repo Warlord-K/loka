@@ -1524,6 +1524,9 @@ async fn execute_job_inner(
     {
         environment.insert(loka_shared::command_rules::ENV.to_string(), serde_json::to_string(policy)?);
     }
+    if !job.lean && !job.approved_actions.is_empty() {
+        environment.insert(loka_shared::approvals::ENV.to_string(), serde_json::to_string(&job.approved_actions)?);
+    }
     let provided = provided_environment();
     for (name, value) in &provided {
         environment.entry(name.clone()).or_insert_with(|| value.clone());

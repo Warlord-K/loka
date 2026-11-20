@@ -24,6 +24,7 @@ import { PushToTalkKeys, SpokenMark, VoiceField } from "./voice-ui";
 import { expectSpokenReply } from "./speech";
 import { useDraft, useDraftKeys } from "./drafts";
 import { channelRef, useMessageJump } from "./message-links";
+import { QuotedBlock, QuotePreview, quoteProps, useQuote } from "./quote";
 import { AttachButton, AttachmentGrid, DayDivider, MessageEditor, NewMessagesPill, PendingStrip, RichText, useAgentHandles, useAttachments, useFollowBottom, usePersonHandles, useRefetchOnResume } from "./chat-kit";
 import { AgentAvatar, AgentFace, PersonAvatar, portraitOf, startsGroup } from "./channel-ui";
 import { mentionHandle, useMentionPicker, type MentionCandidate } from "./mention-picker";
@@ -284,6 +285,8 @@ export function ChatPanel({
 
   const files = useAttachments();
   const [dictated, setDictated] = useState(false);
+  const [quote, setQuote] = useQuote(current ? `channel:${current}` : null);
+
   const send = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!current || (!draft.trim() && !files.ready.length) || files.uploading) return;
@@ -294,8 +297,11 @@ export function ChatPanel({
     follow.stick();
     const spoken = dictated;
     setDictated(false);
-    const sent = await worldApi.postChannel(current, body, attached, undefined, spoken || undefined).catch(() => {
+    const quoted = quote;
+    setQuote(null);
+    const sent = await worldApi.postChannel(current, body, attached, undefined, spoken || undefined, quoted).catch(() => {
       setDraft(body);
+      setQuote(quoted);
       return null;
     });
     if (sent && spoken) expectSpokenReply(`channel:${current}`);
@@ -693,9 +699,9 @@ export function ChatPanel({
                   )}
                 </div>
               </header>
-              <div className="min-h-0 flex-1 overflow-y-auto pb-2 pt-3">
+              <div className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-2 pt-3 [&>:first-child]:mt-auto">
                 {visibleMessages.length === 0 && (
-                  <div className="mx-auto mt-10 max-w-sm px-4 text-center">
+                  <div className="mx-auto mb-6 max-w-sm px-4 text-center">
                     <span className="mx-auto mb-4 grid h-14 w-14 place-items-center rounded-2xl bg-w-aqua text-w-link">
                       {detail.kind === "dm" ? <UserCircle size={28} weight="duotone" /> : <Hash size={28} weight="bold" />}
                     </span>
@@ -748,7 +754,10 @@ export function ChatPanel({
                           <MessageEditor initial={m.body} onSave={(text) => saveEdit(m.id, text)} onCancel={() => setEditing(null)} />
                         ) : (
                           <>
-                            <RichText text={m.body} handles={agentsByHandle} people={peopleByHandle} onOpenAgent={openAgentChat} onOpenPerson={openPerson} className="select-text text-w-text" />
+                            {m.meta?.quote && <QuotedBlock quote={m.meta.quote} />}
+                            <div {...quoteProps(`msg:${channelRef(m.id)}`, `${name}'s message${detail.kind === "dm" ? "" : ` in #${detail.name}`}`, `channel:${m.channel_id}`)}>
+                              <RichText text={m.body} handles={agentsByHandle} people={peopleByHandle} onOpenAgent={openAgentChat} onOpenPerson={openPerson} className="select-text text-w-text" />
+                            </div>
                             {!first && m.edited_at && <span className="text-w-3xs text-w-faint">(edited)</span>}
                             {!first && m.meta?.spoken && <SpokenMark className="ml-1.5" />}
                           </>
@@ -784,6 +793,7 @@ export function ChatPanel({
                   <TypingLine channelId={detail.id} replyTo={null} />
                   <div className="relative rounded-xl border-2 border-w-line2 bg-w-card transition-colors focus-within:border-w-teal focus-within:ring-2 focus-within:ring-w-teal/25">
                     {picker.popover}
+                    {quote && <QuotePreview quote={quote} onClear={() => setQuote(null)} />}
                     <PendingStrip pending={files.pending} onRemove={files.remove} />
                     <form onSubmit={send} className="flex items-end gap-2 p-2">
                       <AttachButton onFiles={files.add} />

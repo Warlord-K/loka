@@ -1,5 +1,6 @@
 "use client";
 
+import { quoteProps } from "./quote";
 import { SOLO } from "@/lib/edition";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ArrowCounterClockwise, ArrowLeft, CaretDown, CaretRight, Check, ClockCounterClockwise, FileText, Folder, FolderOpen, Globe, Link as LinkIcon, ListBullets, Lock, Code, Copy, DownloadSimple, PencilSimple, Plus, Trash, Clock, Files, FolderSimple, Hash, Notebook, PushPinSimple, UserCircle, type Icon as PhosphorIcon, SidebarSimple } from "@phosphor-icons/react";
@@ -1239,7 +1240,9 @@ export function ReportsPanel({
           {body.trim() ? (
             <RunCommandContext.Provider value={reportRunner}>
               <LocalPathContext.Provider value={reportAuthor && meId && reportAuthor.owner_user_id === meId ? reportAuthor : null}>
-                <RichText text={wikify(withoutTitle(body, revision ? revision.title : report.title), known)} handles={handles} onOpenAgent={onOpenAgent} onWiki={openWiki} renderUi={liveCard} prose />
+                <div {...quoteProps(`report:${report.id}`, `Report "${revision ? revision.title : report.title}"`)}>
+                  <RichText text={wikify(withoutTitle(body, revision ? revision.title : report.title), known)} handles={handles} onOpenAgent={onOpenAgent} onWiki={openWiki} renderUi={liveCard} prose />
+                </div>
               </LocalPathContext.Provider>
             </RunCommandContext.Provider>
           ) : (

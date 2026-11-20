@@ -1264,7 +1264,7 @@ export function UsageSection({ agent, canChange, onUpdated }: { agent: WorldAgen
   return (
     <section className={SECTION}>
       <p className="text-w-sm font-semibold text-w-strong">Usage</p>
-      <p className="text-w-xs text-w-muted">What {agentName} burned in tokens and cost, last {usage?.days ?? 14} days.</p>
+      <p className="text-w-xs text-w-muted">What {agentName} used in tokens, and what that costs at API list prices, last {usage?.days ?? 14} days.</p>
       {failed && <p className="text-w-sm text-w-danger">Could not load usage.</p>}
       {usage && usage.total.runs === 0 && <EmptyState icon={ChartBar} title="No runs in this window" description="Try a longer time range." />}
       {usage && usage.total.runs > 0 && (
@@ -1293,7 +1293,7 @@ export function UsageSection({ agent, canChange, onUpdated }: { agent: WorldAgen
             </button>
           </div>
           <p className="text-w-xs text-w-muted">
-            Every CLI counts. Claude, omp and OpenCode report dollars; Cursor and Codex are priced from public list prices. Tokens are new input plus output, and also cover models with no known price. {agentName} warns you at 80%, and at 100% its running work stops and it pauses until 00:00 UTC.
+            Every CLI counts. Dollars are API list prices: Claude, omp and OpenCode report them, Cursor and Codex are priced from public lists. With a Claude or ChatGPT plan you pay the plan, not these dollars, but the budget still counts them. Tokens are new input plus output, and also cover models with no known price. {agentName} warns you at 80%, and at 100% its running work stops and it pauses until 00:00 UTC.
           </p>
           {budgetError && <p className="text-w-sm text-w-danger">{budgetError}</p>}
         </form>

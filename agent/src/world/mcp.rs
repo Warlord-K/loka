@@ -678,7 +678,7 @@ impl Server {
             tools.push(tool("set_rule", "Add, change, turn off or delete a rule your owner's agents follow. Without id it adds a rule; with id (from rules) it changes that rule. Global rules need an admin owner. Only do this when your owner asks.", json!({
                 "id": s("Rule id or its first 8 characters, to change an existing rule"),
                 "body": s("Rule text"),
-                "scope": s("talk (conversations), work (task sessions and reviews) or all"),
+                "scope": s("talk (conversations), work (task sessions and reviews), all, or allow: an action your owner approved for good, such as \"Delete folders under /tmp that the quest created\" or \"Run the shell scripts in a repo's scripts folder\". Allow rules reach quests and the CLI's safety check, so it stops blocking that action. Write the action and its limits plainly, and only save one your owner granted in this conversation"),
                 "enabled": { "type": "boolean" },
                 "delete": { "type": "boolean" }
             }), &[]));
@@ -1939,7 +1939,7 @@ impl Server {
                 Ok(if a.id == self.caller.id {
                     format!("Created task {} and assigned it to you.{part_note} Start it now with a start_task action on task_id {} in this reply.", task.id, task.id)
                 } else {
-                    format!("Created task {} and assigned it to {}.{part_note}", task.id, a.name)
+                    format!("Created task {} and assigned it to {}.{part_note} {} starts it on their own, so do not start_task it yourself.", task.id, a.name, a.name)
                 })
             }
             "create_agent" => {
@@ -2398,9 +2398,12 @@ impl Server {
                 let owner = self.owner()?;
                 let scope = arg("scope");
                 if let Some(scope) = scope {
-                    if !matches!(scope, "talk" | "work" | "all") {
-                        bail!("scope must be talk, work or all");
+                    if !matches!(scope, "talk" | "work" | "all" | "allow") {
+                        bail!("scope must be talk, work, all or allow");
                     }
+                }
+                if scope == Some(loka_shared::approvals::SCOPE) {
+                    self.require_owner_asked().await?;
                 }
                 let admin = false;
                 let Some(prefix) = arg("id") else {

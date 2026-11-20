@@ -644,7 +644,7 @@ async fn apply_actions(
                 replied = true;
             }
             Action::StartTask { task_id, brief, review, reviewer, time_limit_minutes, milestones, quest } => match task_id.parse::<Uuid>() {
-                Ok(id) if !started.contains(&id) => {
+                Ok(id) if !started.contains(&id) && !super::quests::assigned_elsewhere(&ctx.store, id, agent.id).await => {
                     if let Err(e) = super::quests::apply_choice(&ctx.store, id, quest).await {
                         system_note(ctx, agent, &format!("Could not set the quest options on task {id}: {e}")).await?;
                         continue;
@@ -743,7 +743,11 @@ async fn apply_actions(
         let Some(id) = item.payload.get("task_id").and_then(Value::as_str).and_then(|s| s.parse::<Uuid>().ok()) else {
             continue;
         };
-        if started.contains(&id) || replied || ctx.store.quest_has_parts(id).await.unwrap_or(false) {
+        if started.contains(&id)
+            || replied
+            || ctx.store.quest_has_parts(id).await.unwrap_or(false)
+            || super::quests::assigned_elsewhere(&ctx.store, id, agent.id).await
+        {
             continue;
         }
         let brief = (!text.trim().is_empty()).then_some(text);

@@ -4410,6 +4410,19 @@ impl WorldStore {
         .await?)
     }
 
+    pub async fn take_fork_baseline(&self, child: Uuid, parent: Uuid) -> Result<Option<Value>> {
+        Ok(sqlx::query_scalar::<_, Value>(
+            "UPDATE agent_sessions c SET usage_baseline = p.usage_baseline, updated_at = NOW()
+             FROM agent_sessions p
+             WHERE c.id = $1 AND p.id = $2 AND c.cli_session_id IS NULL AND c.backend = p.backend
+             RETURNING c.usage_baseline",
+        )
+        .bind(child)
+        .bind(parent)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     pub async fn update_session_after_run(
         &self,
         id: Uuid,
@@ -6944,6 +6957,88 @@ mod tests {
         assert_eq!(store.update_agent(agent, &clear).await?.unwrap().daily_budget_usd, None);
         sqlx::query("UPDATE agent_profiles SET paused_reason = 'Paused by Ana' WHERE id = $1").bind(agent).execute(&pool).await?;
         assert!(store.release_budget_pauses(None).await?.is_empty(), "manual pauses are left alone");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn usage_is_never_counted_twice() -> anyhow::Result<()> {
+        let Ok(url) = std::env::var("LIMITS_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new().max_connections(4).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let org: Uuid = sqlx::query_scalar("INSERT INTO orgs (slug, name) VALUES ($1, 'Twice') RETURNING id")
+            .bind(format!("twice-{tag}"))
+            .fetch_one(&pool)
+            .await?;
+        let agent: Uuid = sqlx::query_scalar("INSERT INTO agent_profiles (slug, name, cli, model, org_id) VALUES ($1, 'Twice', 'codex', 'gpt-5.5', $2) RETURNING id")
+            .bind(format!("twice-{tag}"))
+            .bind(org)
+            .fetch_one(&pool)
+            .await?;
+        let session = |role: &'static str, backend: &'static str, cli: Option<&'static str>, baseline: Value| {
+            let pool = pool.clone();
+            async move {
+                anyhow::Ok(
+                    sqlx::query_scalar::<_, Uuid>(
+                        "INSERT INTO agent_sessions (agent_id, role, backend, model, status, cli_session_id, usage_baseline)
+                         VALUES ($1, $2, $3, 'gpt-5.5', 'active', $4, $5) RETURNING id",
+                    )
+                    .bind(agent)
+                    .bind(role)
+                    .bind(backend)
+                    .bind(cli)
+                    .bind(baseline)
+                    .fetch_one(&pool)
+                    .await?,
+                )
+            }
+        };
+        let baseline_of = |id: Uuid| {
+            let pool = pool.clone();
+            async move { anyhow::Ok(sqlx::query_scalar::<_, Value>("SELECT usage_baseline FROM agent_sessions WHERE id = $1").bind(id).fetch_one(&pool).await?) }
+        };
+
+        let main = session("main", "codex", Some("main-thread"), serde_json::json!({ "input_tokens": 1000, "cached_input_tokens": 0, "output_tokens": 10 })).await?;
+        let task = session("task", "codex", None, serde_json::json!({ "input_tokens": 400, "output_tokens": 4 })).await?;
+        let other_cli = session("task", "claude", None, serde_json::json!({})).await?;
+        let started = session("task", "codex", Some("own-thread"), serde_json::json!({ "input_tokens": 7 })).await?;
+        assert_eq!(store.take_fork_baseline(task, main).await?, Some(baseline_of(main).await?), "a fork starts from the parent as it is when the fork runs");
+        assert_eq!(store.take_fork_baseline(other_cli, main).await?, None, "another CLI starts its own count");
+        assert_eq!(store.take_fork_baseline(started, main).await?, None, "a session that already runs keeps its own count");
+        assert_eq!(baseline_of(started).await?, serde_json::json!({ "input_tokens": 7 }));
+
+        let failed = |session: Uuid| {
+            let pool = pool.clone();
+            async move {
+                anyhow::Ok(
+                    sqlx::query_scalar::<_, Uuid>("INSERT INTO session_runs (session_id, agent_id, kind, status, prompt) VALUES ($1, $2, 'followup', 'running', 'go') RETURNING id")
+                        .bind(session)
+                        .bind(agent)
+                        .fetch_one(&pool)
+                        .await?,
+                )
+            }
+        };
+        let thread = session("task", "codex", Some("thread"), serde_json::json!({ "input_tokens": 100, "cached_input_tokens": 50, "output_tokens": 5, "cost_usd": 0.0 })).await?;
+        let run = failed(thread).await?;
+        store.record_live_usage(run, 0.2, 40, 10, 3).await?;
+        let stop = |cost: f64, input: i64, output: i64| super::RunOutcome { status: "failed", output: None, error: Some("stopped"), cost_usd: cost, input_tokens: input, cached_input_tokens: 0, output_tokens: output };
+        assert!(store.finish_run(run, stop(0.0, 0, 0)).await?);
+        assert_eq!(
+            baseline_of(thread).await?,
+            serde_json::json!({ "input_tokens": 140, "cached_input_tokens": 60, "output_tokens": 8, "cost_usd": 0.0 }),
+            "the next run of the thread does not count what the stopped run already recorded"
+        );
+        assert!(!store.finish_run(run, stop(0.0, 55, 3)).await?);
+        assert_eq!(baseline_of(thread).await?["input_tokens"], 155, "a late larger figure adds only the difference");
+
+        let claude = session("task", "claude", Some("claude-session"), serde_json::json!({ "cost_usd": 3.0 })).await?;
+        let run = failed(claude).await?;
+        store.record_live_usage(run, 0.4, 900, 0, 30).await?;
+        assert!(store.finish_run(run, stop(0.0, 0, 0)).await?);
+        assert_eq!(baseline_of(claude).await?, serde_json::json!({ "cost_usd": 3.0 }), "Claude keeps a killed run out of its own total, so nothing is folded in");
         Ok(())
     }
 

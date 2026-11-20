@@ -1,4 +1,6 @@
 pub mod academy;
+pub mod approvals;
+pub mod quotes;
 pub mod features;
 pub mod parts;
 pub mod app_control;

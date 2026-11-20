@@ -158,7 +158,19 @@ pub(crate) async fn user_line(prompt: &str, paths: &[std::path::PathBuf]) -> Res
     Ok(format!("{line}\n"))
 }
 
+const OWN_TEMP_CLEANUP: &str = "Own Temp Cleanup: deleting files and folders this session created for its own work is ordinary cleanup and allowed, including with `rm -rf` or `find -delete`, when the paths are inside this working directory, inside this session's own TMPDIR, or exact /tmp or /var/folders paths this session made earlier (scratch clones, build output, test fixtures, logs, downloaded archives). Name the paths literally. A glob over all of /tmp, the home directory, other people's or processes' files, and anything outside those places stay blocked.";
+
+const REPO_SCRIPTS: &str = "Repository Scripts: running scripts that belong to the repository checked out in this working directory (for example `bash ./scripts/setup.sh`, `./bin/test`, make targets, package.json scripts) or that this session wrote itself for the task is ordinary development work and allowed. Every rule about what a script does (deleting outside the workspace, reading credentials, exfiltration, changing production) still judges the script's effects.";
+
 const OWN_BRANCH_FORCE_PUSH: &str = "Own Branch Force Push: Loka checked out this working directory's branch for this session's quest or folder session, and its owner expects history on that branch to be rewritten when the work needs it (rebasing onto the base branch, squashing, amending, removing files that should never have been committed). Running `git push --force-with-lease` (or `--force-with-lease --force-if-includes`) of the branch currently checked out here to the same-named branch on its own remote is ordinary and allowed, as long as that branch is not the repository's default branch or a release or deploy branch. This exception covers only the destination and the overwrite of that one branch: every content rule (credential leakage, sensitive data, exfiltration) still judges what the push carries, and plain `--force`, deleting branches or tags, and force pushing any other branch stay blocked.";
+
+fn owner_allow(environment: &std::collections::BTreeMap<String, String>) -> Vec<String> {
+    let mut allow: Vec<String> = ["$defaults", OWN_BRANCH_FORCE_PUSH, OWN_TEMP_CLEANUP, REPO_SCRIPTS].map(String::from).to_vec();
+    if let Some(raw) = environment.get(loka_shared::approvals::ENV) {
+        allow.extend(loka_shared::approvals::parse_env(raw).iter().map(|action| loka_shared::approvals::classifier_entry(action)));
+    }
+    allow
+}
 
 const READ_ONLY_TOOLS: &str = "Read,Glob,Grep,LS,WebFetch,WebSearch,TodoWrite,Task,Bash(git status),Bash(ls:*)";
 
@@ -359,7 +371,7 @@ pub(crate) fn command(opts: &CliOptions<'_>, mcp_config_path: Option<&Path>, lau
     if let Some(mut settings) = settings {
         sandbox::open_for_owner(&mut settings);
         if mode == Permission::Auto {
-            settings["autoMode"] = serde_json::json!({ "allow": ["$defaults", OWN_BRANCH_FORCE_PUSH] });
+            settings["autoMode"] = serde_json::json!({ "allow": owner_allow(&opts.environment) });
         }
         if mode == Permission::Bypass && opts.approval == crate::cli::Approval::Auto && settings.get("sandbox").is_some() {
             settings["sandbox"]["failIfUnavailable"] = serde_json::json!(true);
@@ -1027,7 +1039,14 @@ mod tests {
         let auto = args(&options(false, Vec::new(), false, Approval::Auto, "sonnet"), &Launch::assume("claude"));
         let settings: serde_json::Value = serde_json::from_str(after(&auto, "--settings").unwrap()).unwrap();
         assert_eq!(after(&auto, "--permission-mode"), Some("auto"));
-        assert_eq!(settings["autoMode"]["allow"], serde_json::json!(["$defaults", super::OWN_BRANCH_FORCE_PUSH]));
+        assert_eq!(settings["autoMode"]["allow"], serde_json::json!(["$defaults", super::OWN_BRANCH_FORCE_PUSH, super::OWN_TEMP_CLEANUP, super::REPO_SCRIPTS]));
+        let mut approved = options(false, Vec::new(), false, Approval::Auto, "sonnet");
+        approved.environment.insert(loka_shared::approvals::ENV.into(), serde_json::json!(["Delete the build cache in ~/Library/Caches/acme"]).to_string());
+        let with = args(&approved, &Launch::assume("claude"));
+        let settings: serde_json::Value = serde_json::from_str(after(&with, "--settings").unwrap()).unwrap();
+        let allow = settings["autoMode"]["allow"].as_array().unwrap();
+        assert_eq!(allow.len(), 5);
+        assert!(allow[4].as_str().unwrap().starts_with("Owner Approved:") && allow[4].as_str().unwrap().contains("~/Library/Caches/acme"));
         let full = args(&options(false, Vec::new(), false, Approval::Full, "sonnet"), &Launch::assume("claude"));
         let settings: serde_json::Value = serde_json::from_str(after(&full, "--settings").unwrap()).unwrap();
         assert!(settings.get("autoMode").is_none());

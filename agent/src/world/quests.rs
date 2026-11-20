@@ -24,6 +24,17 @@ pub async fn seed_milestones(store: &WorldStore, agent_id: Uuid, task_id: Uuid, 
     }
 }
 
+pub async fn assigned_elsewhere(store: &WorldStore, task_id: Uuid, agent_id: Uuid) -> bool {
+    sqlx::query_scalar::<_, Option<Uuid>>("SELECT assigned_agent_id FROM agent_tasks WHERE id = $1")
+        .bind(task_id)
+        .fetch_optional(store.pool())
+        .await
+        .ok()
+        .flatten()
+        .flatten()
+        .is_some_and(|assignee| assignee != agent_id)
+}
+
 pub const REPO_NOTES_PROMPT_CAP: usize = 4096;
 
 pub struct Wrapup {

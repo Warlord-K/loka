@@ -1,7 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alarm, BellRinging, CalendarBlank, CheckSquare, Clock, Copy, LinkSimple, Plus, Sparkle, Square, X, Check } from "@phosphor-icons/react";
+import { Alarm, BellRinging, CalendarBlank, CheckSquare, Clock, Copy, LinkSimple, Plus, Quotes, Sparkle, Square, X, Check } from "@phosphor-icons/react";
+import { MAIN_TARGET, sendQuote } from "./quote";
 import { AnimatePresence, motion } from "framer-motion";
 import { MODAL_MOTION, scrimMotion } from "./motion";
 import { cn } from "@/lib/utils";
@@ -429,6 +430,19 @@ function TodoDetail({
             >
               {copied ? <Check size={15} weight="bold" className="text-w-ok" /> : <Copy size={15} weight="bold" />}
               {copied ? "Copied" : "Copy"}
+            </button>
+            <button
+              type="button"
+              title="Quote this to-do in a message to your main agent"
+              onClick={() => {
+                save();
+                onClose();
+                sendQuote(MAIN_TARGET, { text: (text.trim() || todo.text).slice(0, 2000), label: "To-do", source: `todo:${todo.id}` });
+              }}
+              className={BTN_SECONDARY}
+            >
+              <Quotes size={15} weight="bold" />
+              Ask about it
             </button>
             <button
               type="button"

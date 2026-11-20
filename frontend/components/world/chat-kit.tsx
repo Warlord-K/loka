@@ -135,6 +135,141 @@ export function PrChip({ url }: { url: string }) {
   );
 }
 
+const MIN_COLUMN_REM = 4;
+
+function tableKey(table: HTMLTableElement): string | null {
+  const head = table.tHead?.rows[0] ?? table.rows[0];
+  if (!head) return null;
+  const text = Array.from(head.cells, (cell) => cell.textContent?.trim() ?? "").join("\u0001");
+  let hash = 5381;
+  for (let i = 0; i < text.length; i++) hash = ((hash << 5) + hash + text.charCodeAt(i)) | 0;
+  return `world.table.${head.cells.length}.${(hash >>> 0).toString(36)}`;
+}
+
+function rootRem(): number {
+  return parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+}
+
+function savedWidths(key: string, columns: number): number[] | null {
+  try {
+    const value = JSON.parse(localStorage.getItem(key) ?? "null");
+    return Array.isArray(value) && value.length === columns && value.every((w) => typeof w === "number" && w >= MIN_COLUMN_REM) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function ResizableTable({ children, prose }: { children: ReactNode; prose: boolean }) {
+  const ref = useRef<HTMLTableElement>(null);
+  const keyRef = useRef<string | null>(null);
+  const [widths, setWidths] = useState<number[] | null>(null);
+  const [edges, setEdges] = useState<number[]>([]);
+  const [dragging, setDragging] = useState<number | null>(null);
+
+  useLayoutEffect(() => {
+    const table = ref.current;
+    if (!prose || !table) return;
+    const key = tableKey(table);
+    keyRef.current = key;
+    const columns = (table.tHead?.rows[0] ?? table.rows[0])?.cells.length ?? 0;
+    if (key && columns) setWidths(savedWidths(key, columns));
+  }, [prose]);
+
+  useLayoutEffect(() => {
+    const table = ref.current;
+    if (!prose || !table) return;
+    const measure = () => {
+      const head = table.tHead?.rows[0] ?? table.rows[0];
+      if (!head) return;
+      const cells = Array.from(head.cells);
+      setEdges(cells.slice(0, -1).map((cell) => cell.offsetLeft + cell.offsetWidth));
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(table);
+    return () => observer.disconnect();
+  }, [prose, widths]);
+
+  const start = (index: number, event: React.PointerEvent<HTMLDivElement>) => {
+    const table = ref.current;
+    const head = table && (table.tHead?.rows[0] ?? table.rows[0]);
+    if (!head) return;
+    event.preventDefault();
+    const rem = rootRem();
+    const begin = Array.from(head.cells, (cell) => cell.getBoundingClientRect().width / rem);
+    const x = event.clientX;
+    let next = begin;
+    setDragging(index);
+    const move = (e: PointerEvent) => {
+      next = begin.map((w, i) => (i === index ? Math.max(MIN_COLUMN_REM, w + (e.clientX - x) / rem) : w));
+      setWidths(next);
+    };
+    const end = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", end);
+      window.removeEventListener("pointercancel", end);
+      setDragging(null);
+      const key = keyRef.current;
+      if (!key) return;
+      try {
+        localStorage.setItem(key, JSON.stringify(next.map((w) => Math.round(w * 100) / 100)));
+      } catch {}
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", end);
+    window.addEventListener("pointercancel", end);
+  };
+
+  const reset = () => {
+    setWidths(null);
+    const key = keyRef.current;
+    if (!key) return;
+    try {
+      localStorage.removeItem(key);
+    } catch {}
+  };
+
+  const fixed = prose && widths;
+  return (
+    <div className={cn("overflow-x-auto rounded-lg border-2 border-w-line", prose ? "my-5" : "my-2")}>
+      <div className="relative w-fit min-w-full">
+        <table
+          ref={ref}
+          style={fixed ? { tableLayout: "fixed", width: `${widths.reduce((a, b) => a + b, 0)}rem` } : undefined}
+          className={cn("border-collapse [&_tr:last-child>td]:border-b-0 [&_tr>*:last-child]:border-r-0", !fixed && "w-full", prose ? "text-w-base" : "text-w-sm")}
+        >
+          {fixed && (
+            <colgroup>
+              {widths.map((w, i) => (
+                <col key={i} style={{ width: `${w}rem` }} />
+              ))}
+            </colgroup>
+          )}
+          {children}
+        </table>
+        {prose &&
+          edges.map((left, i) => (
+            <div
+              key={i}
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize column"
+              title="Drag to resize the column. Double-click to reset."
+              onPointerDown={(e) => start(i, e)}
+              onDoubleClick={reset}
+              style={{ left }}
+              className={cn(
+                "group/col absolute inset-y-0 z-10 -ml-1.5 w-3 cursor-col-resize touch-none select-none",
+                "after:absolute after:inset-y-0 after:left-1/2 after:w-0.5 after:-translate-x-1/2 after:transition-colors",
+                dragging === i ? "after:bg-w-teal" : "hover:after:bg-w-teal/60",
+              )}
+            />
+          ))}
+      </div>
+    </div>
+  );
+}
+
 export function RichText({
   text,
   handles,
@@ -272,13 +407,9 @@ export function RichText({
         const source = uiRef.current ? uiSource(node) : null;
         return source !== null && uiRef.current ? uiRef.current(source, uiIndex(markdownRef.current, node)) : <CodeBlock command={runnableCommand(node)}>{children}</CodeBlock>;
       },
-      table: ({ children }) => (
-        <div className={cn("overflow-x-auto rounded-lg border-2 border-w-line", prose ? "my-5" : "my-2")}>
-          <table className={cn("min-w-full border-collapse [&_tr:last-child>td]:border-b-0 [&_tr>*:last-child]:border-r-0", prose ? "text-w-base" : "text-w-sm")}>{children}</table>
-        </div>
-      ),
-      th: ({ children }) => <th className="border-b-2 border-r border-w-line bg-w-sand/60 px-3 py-2 text-left text-w-sm font-semibold text-w-text2">{children}</th>,
-      td: ({ children }) => <td className="border-b border-r border-w-line px-3 py-2 align-top">{children}</td>,
+      table: ({ children }) => <ResizableTable prose={prose}>{children}</ResizableTable>,
+      th: ({ children }) => <th className="min-w-[4.5rem] border-b-2 border-r border-w-line bg-w-sand/60 px-3 py-2 text-left text-w-sm font-semibold text-w-text2 [overflow-wrap:break-word]">{children}</th>,
+      td: ({ children }) => <td className="min-w-[4.5rem] border-b border-r border-w-line px-3 py-2 align-top [overflow-wrap:break-word]">{children}</td>,
       img: ({ src, alt }) =>
         typeof src !== "string" ? null : localImage(src) ? (
           <span className="my-1 inline-block">

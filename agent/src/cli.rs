@@ -1079,7 +1079,7 @@ fn inherits(name: &str, provider_names: &[&str], share_server_keys: bool) -> boo
 }
 
 fn runtime_name(name: &str) -> bool {
-    [crate::browser::LAUNCHER_ENV, crate::screen::LAUNCHER_ENV, crate::apps::LAUNCHER_ENV, crate::apps::LEASE_ENV, loka_shared::command_rules::ENV].contains(&name)
+    [crate::browser::LAUNCHER_ENV, crate::screen::LAUNCHER_ENV, crate::apps::LAUNCHER_ENV, crate::apps::LEASE_ENV, loka_shared::command_rules::ENV, loka_shared::approvals::ENV].contains(&name)
 }
 
 pub fn configure_child_environment(

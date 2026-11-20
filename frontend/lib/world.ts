@@ -252,6 +252,7 @@ export function draftDecision(drafts: Draft[], decisions: { approved: boolean; b
 }
 
 export interface MessageMeta {
+  quote?: { text: string; label?: string; source?: string };
   kind?: "ask" | "quest" | "voice" | "shell" | "reset" | "equip" | "ui";
   ui?: unknown;
   keys?: string[];
@@ -566,7 +567,7 @@ export interface WorldItem {
 export interface WorldRule {
   id: string;
   user_id: string | null;
-  scope: "all" | "talk" | "work";
+  scope: "all" | "talk" | "work" | "allow";
   body: string;
   enabled: boolean;
   position: number;
@@ -1133,11 +1134,11 @@ export const worldApi = {
     fetch(`/api/world/agents/${id}/messages?limit=200`, { cache: "no-store" }).then((r) => json<AgentMessage[]>(r)),
   messagesBefore: (id: string, before: string) =>
     fetch(`/api/world/agents/${id}/messages?limit=200&before=${encodeURIComponent(before)}`, { cache: "no-store" }).then((r) => json<AgentMessage[]>(r)),
-  send: (id: string, body: string, attachments: string[] = [], options?: TurnOptions, answers?: string, spoken?: boolean, taskId?: string, replyTo?: string) =>
+  send: (id: string, body: string, attachments: string[] = [], options?: TurnOptions, answers?: string, spoken?: boolean, taskId?: string, replyTo?: string, quote?: { text: string; label?: string; source?: string; context?: string } | null) =>
     fetch(`/api/world/agents/${id}/messages`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ body, attachments, options, answers, spoken, task_id: taskId, reply_to: replyTo }),
+      body: JSON.stringify({ body, attachments, options, answers, spoken, task_id: taskId, reply_to: replyTo, quote: quote ?? undefined }),
     }).then((r) => json<AgentMessage>(r)),
   quickStart: (agentId: string, body: { text: string; attachments?: string[]; spoken?: boolean; cli?: string; model?: string }) =>
     fetch(`/api/world/agents/${agentId}/quick`, {
@@ -1422,11 +1423,11 @@ export const worldApi = {
     ),
   channelMessagesBefore: (id: string, before: number) =>
     fetch(`/api/world/channels/${id}/messages?before=${before}`, { cache: "no-store" }).then((r) => json<ChannelMessage[]>(r)),
-  postChannel: (id: string, body: string, attachments: string[] = [], replyTo?: number, spoken?: boolean) =>
+  postChannel: (id: string, body: string, attachments: string[] = [], replyTo?: number, spoken?: boolean, quote?: { text: string; label?: string; source?: string; context?: string } | null) =>
     fetch(`/api/world/channels/${id}/messages`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ body, attachments, reply_to: replyTo, spoken }),
+      body: JSON.stringify({ body, attachments, reply_to: replyTo, spoken, quote: quote ?? undefined }),
     }).then((r) => json<ChannelMessage>(r)),
   channelReplies: (id: string, messageId: number) =>
     fetch(`/api/world/channels/${id}/messages/${messageId}/replies`, { cache: "no-store" }).then((r) => json<ChannelMessage[]>(r)),

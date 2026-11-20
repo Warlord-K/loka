@@ -73,9 +73,9 @@ export function DesktopStatusButton({ controlPlane, onOpen }: { controlPlane: "c
   const stateLabel =
     plane === "connecting" ? "Connecting to Loka" : plane === "off" ? "Loka is not reachable" : device === "ok" ? "All connected" : device === "connecting" ? "Device connecting" : device === "paused" ? "Device paused" : device === "disabled" ? "No device yet" : "Device not connected";
   return (
-    <button type="button" onClick={onOpen} title={`Devices: ${stateLabel}`} className={cn(HUD_CHIP, "hidden h-11 items-center gap-2.5 pl-3 pr-3.5 text-w-sm font-semibold text-w-text lg:flex")}>
+    <button type="button" onClick={onOpen} title={`${label}: ${stateLabel}`} aria-label={`${label}: ${stateLabel}`} className={cn(HUD_CHIP, "hidden h-11 items-center gap-2 px-3 text-w-sm font-semibold text-w-text lg:flex min-[1680px]:gap-2.5 min-[1680px]:pr-3.5")}>
       <Desktop size={18} weight="bold" className="shrink-0" />
-      <span className="max-w-[9rem] truncate">{label}</span>
+      <span className="hidden max-w-[9rem] truncate min-[1680px]:inline">{label}</span>
       <ConnectionMark state={state} size={16} label={stateLabel} />
     </button>
   );

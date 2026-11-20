@@ -73,11 +73,7 @@ pub fn account(session: &AgentSession, result: &CliResult) -> Accounted {
         if let Some(obj) = baseline.as_object_mut() {
             obj.insert("cost_usd".into(), json!(result.cost_usd));
         }
-        if result.cost_usd >= before {
-            result.cost_usd - before
-        } else {
-            result.cost_usd
-        }
+        loka_shared::pricing::session_cost_delta(result.cost_usd, before, &session.model, usage.input_tokens, usage.cached_input_tokens, usage.output_tokens)
     } else {
         loka_shared::pricing::cost(&session.model, usage.input_tokens, usage.cached_input_tokens, usage.output_tokens)
     };
@@ -236,7 +232,7 @@ fn base_branch(ctx: &Ctx, task: &AgentTask) -> String {
 }
 
 pub async fn execute(ctx: &Ctx, run: SessionRun) -> Result<()> {
-    let session = ctx
+    let mut session = ctx
         .store
         .get_session(run.session_id)
         .await?
@@ -267,12 +263,18 @@ pub async fn execute(ctx: &Ctx, run: SessionRun) -> Result<()> {
             let sid = parent
                 .cli_session_id
                 .ok_or_else(|| anyhow!("parent session has no CLI session yet"))?;
+            if let Some(baseline) = ctx.store.take_fork_baseline(session.id, parent_id).await? {
+                session.usage_baseline = baseline;
+            }
             (Some(sid), true, true)
         }
         None => match session.cli_session_id.clone() {
             Some(sid) => (Some(sid), true, false),
             None if run.kind == "quick" && ctx.store.quick_fork_source(&session).await?.is_some() => {
-                let (_, sid) = ctx.store.quick_fork_source(&session).await?.ok_or_else(|| anyhow!("main session has no CLI session yet"))?;
+                let (parent_id, sid) = ctx.store.quick_fork_source(&session).await?.ok_or_else(|| anyhow!("main session has no CLI session yet"))?;
+                if let Some(baseline) = ctx.store.take_fork_baseline(session.id, parent_id).await? {
+                    session.usage_baseline = baseline;
+                }
                 (Some(sid), true, true)
             }
             None if session.backend == "claude" => (Some(Uuid::new_v4().to_string()), false, false),
@@ -349,6 +351,14 @@ pub async fn execute(ctx: &Ctx, run: SessionRun) -> Result<()> {
         }
     }
     let mut environment = environment;
+    if matches!(run.kind.as_str(), "task" | "followup" | "review" | "direct") {
+        if let Ok(rules) = ctx.store.rules_for(agent.owner_user_id, agent.org_id).await {
+            let approved = loka_shared::approvals::from_rules(&rules);
+            if !approved.is_empty() {
+                environment.insert(loka_shared::approvals::ENV.to_string(), serde_json::to_string(&approved).unwrap_or_default());
+            }
+        }
+    }
     if matches!(run.kind.as_str(), "task" | "followup" | "review") && loka_shared::command_rules::enforced_for(&session.backend) {
         match ctx.store.command_policy_for_agent(agent.id).await {
             Ok(policy) if !policy.is_empty() => {
@@ -504,19 +514,6 @@ pub async fn execute(ctx: &Ctx, run: SessionRun) -> Result<()> {
             let acc = account(&session, &result);
             let output = redactor.redact(&result.output);
             let report = prompts::parse_report(&result.output).map(|report| redactor.redact_report(report));
-            ctx.store
-                .update_session_after_run(
-                    session.id,
-                    session_id_after_run(
-                        &session.backend,
-                        fork,
-                        result.session_id.as_deref(),
-                        cli_sid.as_deref(),
-                    ),
-                    acc.baseline,
-                    context_tokens(&result.usage),
-                )
-                .await?;
             let live = ctx.store
                 .finish_run(
                     run.id,
@@ -529,6 +526,19 @@ pub async fn execute(ctx: &Ctx, run: SessionRun) -> Result<()> {
                         cached_input_tokens: acc.usage.cached_input_tokens as i64,
                         output_tokens: acc.usage.output_tokens as i64,
                     },
+                )
+                .await?;
+            ctx.store
+                .update_session_after_run(
+                    session.id,
+                    session_id_after_run(
+                        &session.backend,
+                        fork,
+                        result.session_id.as_deref(),
+                        cli_sid.as_deref(),
+                    ),
+                    acc.baseline,
+                    context_tokens(&result.usage),
                 )
                 .await?;
             if !live {
