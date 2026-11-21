@@ -379,10 +379,8 @@ mod tests {
         std::env::set_var("LOKA_APP_SESSION_FILE", "/run/loka-session/app-session.key");
         let spec = Spec { working_dir: std::env::temp_dir(), read_only: false, readable: Vec::new(), state: Vec::new() };
         let paths = paths(&spec, &BTreeMap::new(), None);
-        for app in ["dev.ygpt.loka"] {
-            assert!(paths.hidden.iter().any(|p| p.ends_with(format!("{app}/local.json"))), "{app} local.json");
-            assert!(paths.hidden.iter().any(|p| p.ends_with(format!("{app}/app-session.key"))), "{app} app-session.key");
-        }
+        assert!(paths.hidden.iter().any(|p| p.ends_with("dev.ygpt.loka/local.json")));
+        assert!(paths.hidden.iter().any(|p| p.ends_with("dev.ygpt.loka/app-session.key")));
         assert!(paths.hidden.iter().any(|p| p.ends_with("loka-session/app-session.key")));
         let profile = seatbelt_profile(&paths);
         assert!(profile.contains("dev.ygpt.loka/local.json\"))"), "{profile}");
@@ -551,7 +549,7 @@ for line in sys.stdin:
     fn live_owner_seatbelt_signs_with_the_karna_key_and_pushes() {
         let home = PathBuf::from(std::env::var_os("HOME").unwrap());
         let key = std::env::var("SIGN_TEST_KEY").map(PathBuf::from).unwrap_or_else(|_| home.join(".ssh/karna_signing"));
-        let remote = std::env::var("PUSH_TEST_REMOTE").unwrap_or_else(|_| "https://github.com/Warlord-K/world.git".into());
+        let remote = std::env::var("PUSH_TEST_REMOTE").unwrap_or_else(|_| "https://github.com/Warlord-K/loka.git".into());
         let over_https = remote.starts_with("https://");
         let token = std::env::var("GH_TOKEN").ok().filter(|token| !token.is_empty()).or_else(|| {
             let out = std::process::Command::new("gh").args(["auth", "token"]).output().ok()?;

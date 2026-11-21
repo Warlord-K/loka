@@ -426,10 +426,8 @@ mod tests {
     fn claude_sandbox_hides_local_settings_and_the_app_session() {
         let s = settings(Mode::Strict, &BTreeMap::new(), None, &[], false).unwrap();
         let deny: Vec<&str> = s["sandbox"]["filesystem"]["denyRead"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
-        for app in ["dev.ygpt.loka"] {
-            assert!(deny.contains(&format!("~/Library/Application Support/{app}/local.json").as_str()), "{app}");
-            assert!(deny.contains(&format!("~/Library/Application Support/{app}/app-session.key").as_str()), "{app}");
-        }
+        assert!(deny.contains(&"~/Library/Application Support/dev.ygpt.loka/local.json"));
+        assert!(deny.contains(&"~/Library/Application Support/dev.ygpt.loka/app-session.key"));
         let env: Vec<&str> = s["sandbox"]["credentials"]["envVars"].as_array().unwrap().iter().filter_map(|v| v["name"].as_str()).collect();
         assert!(env.contains(&"LOKA_APP_SESSION_SECRET"));
     }
