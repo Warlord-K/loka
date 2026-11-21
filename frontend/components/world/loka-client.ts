@@ -15,6 +15,7 @@ import {
   type Region,
   type RegionDetail,
 } from "@/lib/loka";
+import { HATS } from "@/lib/looks";
 import type { WorldEvent } from "@/lib/world";
 import { PLAYER_LOOK } from "./engine";
 import type { Accessory, LokaLook } from "./types";
@@ -83,8 +84,6 @@ export const GEAR_ACCESSORY: Record<string, Accessory> = {
   "golden-quill": "quill",
   "comet-cloak": "cloak",
 };
-
-const HATS: Accessory[] = ["beanie", "cap", "mortarboard", "wizard", "hardhat"];
 
 export interface Cosmetics {
   gear: string[];

@@ -210,7 +210,12 @@ async fn reset_steps(ctx: &Ctx, agent: &WorldAgent, ids: &[i64]) -> Result<()> {
         Ok(Err(e)) => {
             let error = redact_secrets(&format!("{e:#}"), environment.values());
             finish_failed(ctx, run.id, &error).await;
-            Some(error)
+            if loka_shared::cli_errors::is_context_too_long(&error) {
+                system_note(ctx, agent, loka_shared::context::RESET_KEPT_NOTES).await?;
+                None
+            } else {
+                Some(error)
+            }
         }
         Err(_) => {
             finish_failed(ctx, run.id, "reset notes turn timed out").await;

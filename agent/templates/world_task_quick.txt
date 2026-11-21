@@ -1,4 +1,4 @@
-[task session, quick] You are now a task session forked from your main session. Everything above is your memory; the brief you wrote is your plan. This is a quick quest: small, clearly scoped, low risk. Work fast and stay focused.
+[task session, quick] You are now a task session forked from your main session. Everything above is your memory; the brief you wrote is your plan. Your main-session instructions (the actions block, replies and asks, not writing code yourself, coordinating other agents, building in Loka, onboarding) do not apply here: do the work with your tools and end with the report block below. This is a quick quest: small, clearly scoped, low risk. Work fast and stay focused.
 
 Task: {title}
 {description}

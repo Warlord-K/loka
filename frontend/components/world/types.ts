@@ -22,7 +22,26 @@ export type Accessory =
   | "lantern"
   | "mortarboard"
   | "quill"
-  | "cloak";
+  | "cloak"
+  | "tentacles"
+  | "claws"
+  | "eyestalks"
+  | "spikes"
+  | "wings"
+  | "bug-wings"
+  | "frog-eyes"
+  | "fin"
+  | "teeth"
+  | "belly"
+  | "antenna"
+  | "antennae"
+  | "visor"
+  | "ghost-tail"
+  | "gills"
+  | "stripes"
+  | "crown"
+  | "cape"
+  | "headphones";
 
 export interface LokaLook {
   skin: string;

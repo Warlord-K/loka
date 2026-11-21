@@ -7,10 +7,20 @@ export type ChangelogEntry = {
 export const CHANGELOG: ChangelogEntry[] = [
   {
     date: "2026-11-21",
-    title: "Only the Loka app can act as you",
+    title: "Lean quests, safer by default",
     items: [
       "**Locked to the app**: Loka's local server now answers only the Loka window and this launch's secret, so websites in your browser and other programs on your Mac can no longer act as you. Opening Loka in a browser tab needs a fresh link from `loka-api login-link`.",
       "**Quests fail safe**: when a coding CLI cannot run in auto mode, the quest stops and says how to fix it instead of quietly taking full access, and quests stay in the sandbox unless you turn it off. Agents can read only your ssh config, known hosts and signing keys, never your other private keys.",
+      "**Lean quests by default**: new quests start from the agent's notes, rules, repo notes and recent quests instead of its whole main chat, so they no longer run out of room on the first turn. Pick Lean, Auto or Full per agent under Access, or for one quest next to How to approach it.",
+      "**Import a .env file**: under You > Environment, press Import and paste a .env block to save many keys at once. You see which keys are new, which would replace a saved value and which names cannot be used before anything is saved.",
+      "**Keys from 1Password**: save a key as an op://vault/item/field reference instead of its value, by hand or in a pasted .env. Your Mac reads it from 1Password when a run starts and keeps it only for that run, and the key shows a Vault badge.",
+      "**More looks for agents**: agents can now be an octopus, bunny, crab, dino, dragon, frog, penguin, shark, robot, ghost, axolotl, bee and more, and wear a wizard hat, crown, beanie, glasses, headphones or a cape. Pick them with a live preview when you create an agent or edit its look.",
+      "Quests from an agent whose conversation is close to full now start fresh from its notes and recent quests instead of failing within seconds, and resetting such an agent's context works and keeps its saved notes.",
+      "Quests whose branch has no work of its own, or whose work is already on main after a squash merge, now finish cleanly instead of opening an empty pull request, and a branch with no shared history with main fails with a plain note to rebase it.",
+      "When a chat message can't be sent, Loka now says why, like a full disk, a restart or sending too fast, and keeps retrying for about 30 seconds when the problem is temporary.",
+      "Quests that finish after a long session are no longer marked failed when the agent writes its final report in a slightly different format.",
+      "Agents in a quest can open the dev server they started on localhost in their browser to check their work, and the browser, screen capture and app control no longer refuse to start inside quests.",
+      "Smaller UI fixes and polish, like the Workshop executor panel following dark mode.",
     ],
   },
   {

@@ -47,7 +47,27 @@ pub struct AgentDetail {
 
 pub(crate) fn internal(e: anyhow::Error) -> StatusCode {
     error!(error = %e, "world route failed");
+    if disk_full(&e) {
+        return StatusCode::INSUFFICIENT_STORAGE;
+    }
     StatusCode::INTERNAL_SERVER_ERROR
+}
+
+fn disk_full(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        if let Some(sqlx::Error::Database(db)) = cause.downcast_ref::<sqlx::Error>() {
+            if db.code().as_deref() == Some("53100") {
+                return true;
+            }
+        }
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            if io.raw_os_error() == Some(28) || io.kind() == std::io::ErrorKind::StorageFull {
+                return true;
+            }
+        }
+        let text = cause.to_string().to_ascii_lowercase();
+        text.contains("no space left on device") || text.contains("could not extend file")
+    })
 }
 
 async fn view(state: &AppState, agent: WorldAgent) -> Result<AgentView, StatusCode> {
@@ -320,6 +340,9 @@ pub(crate) async fn apply_agent_update(
         || !body.budget_valid()
     {
         return Err(reject(StatusCode::BAD_REQUEST, "invalid_update", None));
+    }
+    if body.quest_context.as_deref().is_some_and(|c| loka_shared::context::QuestContext::parse(c).is_err()) {
+        return Err(reject(StatusCode::BAD_REQUEST, "invalid_quest_context", Some(loka_shared::context::QUEST_CONTEXT_ERROR)));
     }
     if body.handle.as_deref().is_some_and(|h| loka_shared::world::normalize_handle(h).is_none()) {
         return Err(reject(StatusCode::BAD_REQUEST, "invalid_handle", Some("Handles use lowercase letters, digits and dashes")));
@@ -2983,5 +3006,25 @@ fn slugify(name: &str) -> String {
         "agent".to_string()
     } else {
         out
+    }
+}
+
+#[cfg(test)]
+mod disk_full_tests {
+    use super::*;
+
+    #[test]
+    fn a_full_disk_answers_insufficient_storage() {
+        let io = std::io::Error::from_raw_os_error(28);
+        assert_eq!(internal(anyhow::Error::new(io).context("saving message")), StatusCode::INSUFFICIENT_STORAGE);
+        let pg = anyhow::anyhow!("error returned from database: could not extend file \"base/16384/2619\": No space left on device");
+        assert_eq!(internal(pg), StatusCode::INSUFFICIENT_STORAGE);
+    }
+
+    #[test]
+    fn other_failures_stay_internal() {
+        assert_eq!(internal(anyhow::anyhow!("pool timed out while waiting for an open connection")), StatusCode::INTERNAL_SERVER_ERROR);
+        let io = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        assert_eq!(internal(anyhow::Error::new(io)), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

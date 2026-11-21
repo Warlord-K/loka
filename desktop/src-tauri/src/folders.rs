@@ -304,7 +304,7 @@ mod tests {
     fn paths_open_in_the_folder_that_holds_them() {
         let base = fs::canonicalize(std::env::temp_dir()).unwrap().join(format!("world-place-{}", Uuid::new_v4()));
         let home = base.join("home");
-        let runner = home.join("Library/Application Support/dev.ygpt.loka.pro/runner");
+        let runner = home.join("Library/Application Support/dev.ygpt.loka/runner");
         for dir in [home.join("code/app/.git"), home.join("code/app/src/deep"), home.join("loose/notes"), home.join(".ssh"), runner.clone(), base.join("outside")] {
             fs::create_dir_all(dir).unwrap();
         }

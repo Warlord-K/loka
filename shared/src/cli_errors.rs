@@ -13,6 +13,7 @@ pub enum FailureKind {
     CliMissing,
     CliOutdated,
     Permissions,
+    Vault,
 }
 
 impl FailureKind {
@@ -29,6 +30,7 @@ impl FailureKind {
             FailureKind::CliMissing => "cli_missing",
             FailureKind::CliOutdated => "cli_outdated",
             FailureKind::Permissions => "permissions",
+            FailureKind::Vault => "vault",
         }
     }
 
@@ -99,15 +101,23 @@ impl CliFailure {
             FailureKind::Permissions => {
                 "The CLI refused the permission mode Loka asked for, so it could not edit files or run commands. Loka never switches to full access on its own: pick a model with auto mode, set the agent's approval to Full, or set it to Read only. If the device's Claude settings turn full access off, allow it there.".to_string()
             }
+            FailureKind::Vault => {
+                "A key the agent uses is a 1Password reference (op://) that could not be read. Vault references are read only on your own Mac: install the 1Password CLI there (brew install 1password-cli), turn on 1Password > Settings > Developer > Integrate with 1Password CLI, unlock 1Password, check the reference in You > Environment, then retry.".to_string()
+            }
         }
     }
 }
+
+const VAULT_FAILURE: &str = "Vault reference for ";
 
 pub fn classify(error: &str) -> Option<CliFailure> {
     let raw = error.split(FRIENDLY_MARK).last().unwrap_or(error);
     let lower = raw.to_ascii_lowercase();
     let has = |needles: &[&str]| needles.iter().any(|n| lower.contains(n));
-    let kind = if has(&["is not installed on this device", "env: node: no such file or directory", "claude: command not found"]) {
+    let vault_failure = |line: &str| line.trim_start().starts_with(VAULT_FAILURE) || line.contains(&format!(": {VAULT_FAILURE}"));
+    let kind = if raw.lines().any(vault_failure) {
+        FailureKind::Vault
+    } else if has(&["is not installed on this device", "env: node: no such file or directory", "claude: command not found"]) {
         FailureKind::CliMissing
     } else if has(&["is too old for loka", "error: unknown option '--"]) {
         FailureKind::CliOutdated
@@ -160,6 +170,9 @@ pub fn classify(error: &str) -> Option<CliFailure> {
         "context length",
         "context window",
         "input is too long",
+        "exceed context limit",
+        "exceeds the context",
+        "conversation too long",
     ]) {
         FailureKind::ContextTooLong
     } else if has(&["overloaded", "api error: 5", "status: 5", "internal server error", "service unavailable", "bad gateway"]) {
@@ -193,6 +206,10 @@ fn has_status(lower: &str, code: &str) -> bool {
         let bounded = !head.ends_with(|c: char| c.is_ascii_digit()) && !tail.starts_with(|c: char| c.is_ascii_digit());
         bounded && (BEFORE.iter().any(|b| head.ends_with(b)) || AFTER.iter().any(|a| tail.starts_with(a)))
     })
+}
+
+pub fn is_context_too_long(error: &str) -> bool {
+    classify(error).is_some_and(|failure| failure.kind == FailureKind::ContextTooLong)
 }
 
 pub fn is_rejected_key(error: &str) -> bool {
@@ -295,6 +312,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_too_long_wording_is_a_context_failure() {
+        for raw in [
+            "prompt is too long: 215000 tokens > 200000 maximum",
+            "Claude Code returned error: Prompt is too long",
+            "Codex turn failed: input exceeds the context window of this model",
+            "Request would exceed context limit",
+            "Error: conversation too long, please start a new one",
+        ] {
+            assert!(is_context_too_long(raw), "{raw}");
+            assert!(is_context_too_long(&describe(raw)), "{raw}");
+        }
+        assert!(!is_context_too_long("Claude AI usage limit reached"));
+    }
+
+    #[test]
     fn claude_usage_limit_with_epoch() {
         let failure = classify("Claude Code returned error: Claude AI usage limit reached|1761930000").unwrap();
         assert_eq!(failure.kind, FailureKind::UsageLimit);
@@ -346,6 +378,10 @@ mod tests {
         assert_eq!(kind("Claude Code 1.0.3 is too old for Loka (it has no --tools)."), Some(FailureKind::CliOutdated));
         assert_eq!(kind("Claude Code would not start in auto mode (it fell back to default mode)."), Some(FailureKind::Permissions));
         assert_eq!(kind("Claude Code returned error: Auto mode is unavailable for your plan"), Some(FailureKind::Permissions));
+        assert_eq!(kind("Vault reference for GITHUB_TOKEN could not be read: 1Password CLI is not signed in."), Some(FailureKind::Vault));
+        assert_eq!(kind("run failed: Vault reference for GITHUB_TOKEN could not be read: 1Password is locked."), Some(FailureKind::Vault));
+        assert_ne!(kind("The agent wrote a vault reference for the docs page."), Some(FailureKind::Vault));
+        assert_ne!(kind("Error: no vault reference found"), Some(FailureKind::Vault));
         for error in ["Claude Code would not start in auto mode", "Claude Code is not installed on this device", "error: unknown option '--x'"] {
             assert!(!is_rejected_key(error), "{error}");
             assert!(!describe(error).contains('\u{2014}'));

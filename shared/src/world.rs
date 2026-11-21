@@ -10,6 +10,7 @@ use uuid::Uuid;
 pub const CHANNEL_EVENTS: &str = "world_events";
 
 pub const COMPACT_PROMPT: &str = "/compact";
+pub const SESSION_STARTED_LIKE: &str = "Session started: %";
 
 pub fn compact_limit(limit: i64, floor: Option<i64>) -> i64 {
     floor.map_or(limit, |floor| limit.max(floor + limit / 4))
@@ -87,8 +88,15 @@ pub struct WorldAgent {
     #[sqlx(default)]
     #[serde(default)]
     pub org_id: Option<Uuid>,
+    #[sqlx(default)]
+    #[serde(default = "default_quest_context")]
+    pub quest_context: String,
     pub is_main: bool,
     pub jobs: Value,
+}
+
+fn default_quest_context() -> String {
+    crate::context::QuestContext::default().as_str().to_string()
 }
 
 impl WorldAgent {
@@ -384,6 +392,19 @@ pub fn toolless_aside(asked_by: Option<&Value>) -> bool {
         .any(|flag| asked_by.and_then(|a| a.get(*flag)).and_then(Value::as_bool) == Some(true))
 }
 
+pub const FRESH_NOTES_CAP: usize = 6_000;
+
+pub fn with_notes(memory: String, notes: Option<&str>) -> String {
+    let Some(notes) = notes.map(str::trim).filter(|notes| !notes.is_empty()) else {
+        return memory;
+    };
+    let mut kept: String = notes.chars().take(FRESH_NOTES_CAP).collect();
+    if kept.len() < notes.len() {
+        kept.push_str("\n[notes shortened]");
+    }
+    format!("{memory}\n\nYour notes:\n{kept}")
+}
+
 pub fn default_task_timeout_secs() -> i32 {
     std::env::var("WORLD_TASK_TIMEOUT_SECS")
         .ok()
@@ -425,7 +446,7 @@ impl AsideChoice {
 pub const FOLLOWUP_ASK: &str =
     "Answer briefly. If you change anything in the workspace, describe it and end with an updated report block.";
 
-pub const REPORT_NUDGE: &str = "[report missing]\nYour last message ended without the report block, so the Loka cannot tell whether this quest is finished. Do not start over and do not redo finished steps. If the work is not finished, keep going from where you stopped. When it is finished, or you are blocked, end your final message with the full report block exactly as the task prompt describes, with status done or blocked.";
+pub const REPORT_NUDGE: &str = "[report missing]\nYour last message ended without the report block, so the Loka cannot tell whether this quest is finished. Do not start over and do not redo finished steps. If the work is not finished, keep going from where you stopped. When it is finished, or you are blocked, end your final message with the report block in exactly this form (an HTML comment holding one JSON object, not a markdown section or a YAML code fence), with status done or blocked and the other fields from the task prompt:\n<!-- report\n{\"status\": \"done\", \"summary\": \"What you did in 2-4 sentences\", \"pr_title\": \"...\", \"commit_message\": \"...\", \"checks\": [{\"check\": \"...\", \"how\": \"...\", \"result\": \"pass\"}], \"milestones_done\": [1, 2]}\nreport -->";
 
 pub const REPORT_NUDGES: i64 = 2;
 
@@ -1048,6 +1069,8 @@ pub struct AgentUpdate {
     pub daily_budget_usd: Option<Value>,
     #[serde(default, deserialize_with = "explicit_null")]
     pub daily_token_budget: Option<Value>,
+    #[serde(default)]
+    pub quest_context: Option<String>,
 }
 
 pub const MAX_DAILY_TOKEN_BUDGET: f64 = 10_000_000_000.0;
@@ -1174,7 +1197,7 @@ pub struct RunOutcome<'a> {
     pub output_tokens: i64,
 }
 
-const AGENT_COLUMNS: &str = "id, slug, name, avatar_emoji, cli, model, system_prompt_addendum, persona, role, look, gear, status, status_detail, owner_user_id, visibility, paused_reason, archived_at, archive_delete_at, tags, expertise, created_at, revoked_powers, approval_mode, reviewer, daily_budget_usd, daily_token_budget, agent_profiles.org_id,
+const AGENT_COLUMNS: &str = "id, slug, name, avatar_emoji, cli, model, system_prompt_addendum, persona, role, look, gear, status, status_detail, owner_user_id, visibility, paused_reason, archived_at, archive_delete_at, tags, expertise, created_at, revoked_powers, approval_mode, reviewer, daily_budget_usd, daily_token_budget, agent_profiles.org_id, agent_profiles.quest_context,
     (EXISTS (SELECT 1 FROM users u WHERE u.main_agent_id = agent_profiles.id) OR EXISTS (SELECT 1 FROM org_members om WHERE om.main_agent_id = agent_profiles.id)) AS is_main,
     agent_profiles.runner_id,
     (SELECT r.name FROM world_runners r WHERE r.id = agent_profiles.runner_id) AS runner_name,
@@ -1822,6 +1845,11 @@ impl WorldStore {
         Ok(lines.join("\n"))
     }
 
+    pub async fn fresh_start_memory(&self, agent: &WorldAgent, intro: &str) -> Result<String> {
+        let notes = self.own_notes_skill(agent.id, agent.owner_user_id).await.ok().flatten().map(|skill| skill.body);
+        Ok(with_notes(self.handoff_memory(agent.id, intro).await?, notes.as_deref()))
+    }
+
     pub async fn set_session_asked_by(&self, id: Uuid, asked_by: Value) -> Result<()> {
         sqlx::query("UPDATE agent_sessions SET asked_by = $2 WHERE id = $1")
             .bind(id)
@@ -2106,17 +2134,13 @@ impl WorldStore {
     pub async fn without_mcp_secrets(
         &self,
         agent_id: Uuid,
-        mut environment: std::collections::BTreeMap<String, String>,
+        environment: std::collections::BTreeMap<String, String>,
     ) -> Result<std::collections::BTreeMap<String, String>> {
         if environment.is_empty() {
             return Ok(environment);
         }
-        for entry in self.mcp_servers_for(agent_id).await? {
-            for name in crate::environment::secret_reference_names(&entry.definition).unwrap_or_default() {
-                environment.remove(&name);
-            }
-        }
-        Ok(environment)
+        let servers = self.mcp_servers_for(agent_id).await?;
+        Ok(crate::environment::without_secret_references(environment, servers.iter().map(|entry| &entry.definition)))
     }
 
     pub async fn mcp_servers_for(&self, agent_id: Uuid) -> Result<Vec<McpServerEntry>> {
@@ -2326,6 +2350,7 @@ impl WorldStore {
                daily_token_budget = CASE WHEN $16::jsonb IS NULL THEN daily_token_budget
                                          WHEN jsonb_typeof($16::jsonb) <> 'number' OR ($16::jsonb #>> '{{}}')::float8 < 1 THEN NULL
                                          ELSE round(($16::jsonb #>> '{{}}')::float8)::int8 END,
+               quest_context = COALESCE($17, quest_context),
                updated_at = NOW()
              WHERE id = $1 RETURNING {AGENT_COLUMNS}"
         );
@@ -2347,6 +2372,7 @@ impl WorldStore {
             .bind(&u.reviewer)
             .bind(&u.daily_budget_usd)
             .bind(&u.daily_token_budget)
+            .bind(u.quest_context.as_deref().and_then(|c| crate::context::QuestContext::parse(c).ok()).map(|c| c.as_str()))
             .fetch_optional(&self.pool)
             .await?)
     }
@@ -2826,17 +2852,20 @@ impl WorldStore {
         let (task_id, duration_secs, turns) = sqlx::query_as::<_, (Option<Uuid>, i64, i64)>(
             "SELECT task_id,
                     COALESCE(EXTRACT(EPOCH FROM COALESCE(finished_at, NOW()) - COALESCE(started_at, created_at)), 0)::bigint,
-                    (SELECT COUNT(*) FROM session_run_events e WHERE e.run_id = r.id AND e.kind IN ('text', 'tool'))
+                    (SELECT COUNT(*) FROM session_run_events e
+                      WHERE e.run_id = r.id AND e.kind IN ('text', 'tool') AND e.body NOT LIKE $2)
              FROM session_runs r WHERE id = $1",
         )
         .bind(run_id)
+        .bind(SESSION_STARTED_LIKE)
         .fetch_one(&self.pool)
         .await?;
         let mut last = sqlx::query_scalar::<_, String>(
-            "SELECT body FROM session_run_events WHERE run_id = $1 AND kind IN ('text', 'error', 'result')
+            "SELECT body FROM session_run_events WHERE run_id = $1 AND kind IN ('text', 'error', 'result') AND body NOT LIKE $2
              ORDER BY id DESC LIMIT 3",
         )
         .bind(run_id)
+        .bind(SESSION_STARTED_LIKE)
         .fetch_all(&self.pool)
         .await?;
         last.reverse();
@@ -2871,6 +2900,9 @@ impl WorldStore {
     }
 
     pub async fn auto_retry(&self, run_id: Uuid, diagnosis: &crate::run_causes::Diagnosis) -> Result<Option<Uuid>> {
+        if diagnosis.fork_too_long() {
+            return self.fresh_retry(run_id, diagnosis).await;
+        }
         if !diagnosis.transient() || diagnosis.auto_retried {
             return Ok(None);
         }
@@ -4323,6 +4355,25 @@ impl WorldStore {
     }
 
     pub async fn restart_main_session(&self, agent_id: Uuid, backend: &str, model: &str, notes: &str) -> Result<AgentSession> {
+        let fork_backends = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT q.backend FROM session_runs r
+             JOIN agent_sessions s ON s.id = r.fork_from
+             JOIN agent_sessions q ON q.id = r.session_id
+             WHERE s.agent_id = $1 AND s.role = 'main' AND s.status = 'active' AND r.status = 'queued'
+               AND r.kind IN ('task', 'followup', 'review')",
+        )
+        .bind(agent_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut memories = Vec::with_capacity(fork_backends.len());
+        if !fork_backends.is_empty() {
+            if let Some(agent) = self.get_agent(agent_id).await? {
+                for fork_backend in fork_backends {
+                    let intro = crate::context::fresh_intro(&agent.name, &fork_backend, None);
+                    memories.push((self.fresh_start_memory(&agent, &intro).await?, fork_backend));
+                }
+            }
+        }
         let mut tx = self.pool.begin().await?;
         sqlx::query_scalar::<_, Uuid>("SELECT id FROM agent_profiles WHERE id = $1 FOR SHARE")
             .bind(agent_id)
@@ -4341,6 +4392,24 @@ impl WorldStore {
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
+            for (memory, fork_backend) in &memories {
+                sqlx::query(
+                    "WITH moved AS (
+                       UPDATE session_runs r SET fork_from = NULL, prompt = $2 || E'\\n\\n' || r.prompt
+                       FROM agent_sessions q
+                       WHERE q.id = r.session_id AND q.backend = $3
+                         AND r.fork_from = $1 AND r.status = 'queued' AND r.kind IN ('task', 'followup', 'review')
+                       RETURNING r.session_id
+                     )
+                     UPDATE agent_sessions SET usage_baseline = '{}'::jsonb
+                     WHERE id IN (SELECT session_id FROM moved) AND cli_session_id IS NULL",
+                )
+                .bind(id)
+                .bind(memory)
+                .bind(fork_backend)
+                .execute(&mut *tx)
+                .await?;
+            }
         }
         let session = sqlx::query_as::<_, AgentSession>(
             "INSERT INTO agent_sessions (agent_id, role, backend, model, working_dir, summary, usage_baseline)
@@ -6411,6 +6480,558 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_main_sessions_start_quests_fresh_once() -> anyhow::Result<()> {
+        use crate::context::{ForkChoice, COMPACT_INBOX_KIND};
+        use crate::run_causes::{diagnose, RunEnd, FRESH_RETRY_CAUSE};
+        let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let _db = steer_db().read().await;
+        let pool = PgPoolOptions::new().max_connections(2).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email) VALUES ($1) RETURNING id")
+            .bind(format!("fork-{tag}@example.test"))
+            .fetch_one(&pool)
+            .await?;
+        let agent_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id) VALUES ($1, 'Fork', 'claude', 'sonnet', $2) RETURNING id",
+        )
+        .bind(format!("fork-{tag}"))
+        .bind(owner)
+        .fetch_one(&pool)
+        .await?;
+        let main_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_sessions (agent_id, role, backend, model, cli_session_id, context_tokens)
+             VALUES ($1, 'main', 'claude', 'sonnet', $2, 1000) RETURNING id",
+        )
+        .bind(agent_id)
+        .bind(format!("cli-{tag}"))
+        .fetch_one(&pool)
+        .await?;
+        store
+            .save_own_notes(agent_id, Some(owner), None, &format!("fork-{tag}-notes"), "notes", "Remember the blue widget.")
+            .await?;
+        let agent = store.get_agent(agent_id).await?.expect("agent");
+        let main = store.get_session(main_id).await?.expect("main");
+        assert!(matches!(store.fork_choice(&agent, &main, crate::context::QuestContext::Full).await?, ForkChoice::Fork));
+        use crate::context::QuestContext;
+        assert_eq!(agent.quest_context, "lean", "new and existing agents start lean");
+        let level = QuestContext::resolve(None, &agent.quest_context);
+        assert_eq!(store.fork_choice(&agent, &main, level).await?, ForkChoice::Lean { used: 1000, level: QuestContext::Lean });
+        assert_eq!(store.fork_choice(&agent, &main, QuestContext::Auto).await?, ForkChoice::Fork);
+        assert_eq!(
+            store.fork_choice(&agent, &main, QuestContext::resolve(Some("full"), &agent.quest_context)).await?,
+            ForkChoice::Fork,
+            "a quest override wins over the agent setting"
+        );
+        let updated = store
+            .update_agent(agent_id, &AgentUpdate { quest_context: Some("auto".into()), ..Default::default() })
+            .await?
+            .expect("agent");
+        assert_eq!(updated.quest_context, "auto");
+        let refused = sqlx::query("UPDATE agent_profiles SET quest_context = 'huge' WHERE id = $1").bind(agent_id).execute(&pool).await;
+        assert!(refused.is_err(), "the check constraint refuses unknown levels");
+
+        sqlx::query("UPDATE agent_sessions SET context_tokens = 120000 WHERE id = $1").bind(main_id).execute(&pool).await?;
+        let main = store.get_session(main_id).await?.expect("main");
+        assert_eq!(
+            store.fork_choice(&agent, &main, QuestContext::Auto).await?,
+            ForkChoice::Lean { used: 120_000, level: QuestContext::Auto },
+            "auto stops forking past half of the 200k window"
+        );
+
+        sqlx::query("UPDATE agent_sessions SET context_tokens = 150000 WHERE id = $1").bind(main_id).execute(&pool).await?;
+        let main = store.get_session(main_id).await?.expect("main");
+        match store.fork_choice(&agent, &main, crate::context::QuestContext::Full).await? {
+            ForkChoice::Fresh { used, limit, compacting } => {
+                assert_eq!((used, limit), (150_000, 140_000));
+                assert!(compacting);
+            }
+            other => panic!("an oversized main session must not fork: {other:?}"),
+        }
+        let compacts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_inbox WHERE agent_id = $1 AND kind = $2 AND status = 'pending'",
+        )
+        .bind(agent_id)
+        .bind(COMPACT_INBOX_KIND)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(compacts, 1);
+
+        let task_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_tasks (user_id, title, status) VALUES ($1, 'fork', 'in_progress') RETURNING id",
+        )
+        .bind(owner)
+        .fetch_one(&pool)
+        .await?;
+        let task_session: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_sessions (agent_id, role, backend, model, parent_session_id, task_id, cli_session_id)
+             VALUES ($1, 'task', 'claude', 'sonnet', $2, $3, $4) RETURNING id",
+        )
+        .bind(agent_id)
+        .bind(main_id)
+        .bind(task_id)
+        .bind(format!("fork-cli-{tag}"))
+        .fetch_one(&pool)
+        .await?;
+        let failed: Uuid = sqlx::query_scalar(
+            "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, fork_from, prompt, error)
+             VALUES ($1, $2, $3, 'task', 'failed', $4, 'Build the blue widget brief.', 'Prompt is too long') RETURNING id",
+        )
+        .bind(task_session)
+        .bind(agent_id)
+        .bind(task_id)
+        .bind(main_id)
+        .fetch_one(&pool)
+        .await?;
+        let end = RunEnd { kind: "task", error: Some("Prompt is too long"), output: "", turns: 0, timed_out: false };
+        let diagnosis = diagnose(&end);
+        let retry = store.fresh_retry(failed, &diagnosis).await?.expect("one fresh retry");
+        let (fork_from, prompt, cause, status): (Option<Uuid>, String, Option<String>, String) =
+            sqlx::query_as("SELECT fork_from, prompt, retry_cause, status FROM session_runs WHERE id = $1")
+                .bind(retry)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(fork_from, None);
+        assert_eq!(cause.as_deref(), Some(FRESH_RETRY_CAUSE));
+        assert_eq!(status, "queued");
+        assert!(prompt.contains("Build the blue widget brief."));
+        assert!(prompt.contains("Remember the blue widget."));
+        let cli: Option<String> = sqlx::query_scalar("SELECT cli_session_id FROM agent_sessions WHERE id = $1")
+            .bind(task_session)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(cli, None);
+
+        sqlx::query("UPDATE session_runs SET status = 'failed', error = 'Prompt is too long' WHERE id = $1")
+            .bind(retry)
+            .execute(&pool)
+            .await?;
+        assert_eq!(store.fresh_retry(retry, &diagnosis).await?, None);
+        assert_eq!(store.fresh_retry(failed, &diagnosis).await?, None);
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_runs WHERE task_id = $1")
+            .bind(task_id)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(runs, 2);
+
+        sqlx::query("UPDATE session_runs SET status = 'completed' WHERE id = $1").bind(retry).execute(&pool).await?;
+        sqlx::query("UPDATE agent_sessions SET cli_session_id = $2, context_tokens = 190000 WHERE id = $1")
+            .bind(task_session)
+            .bind(format!("fresh-cli-{tag}"))
+            .execute(&pool)
+            .await?;
+        let followup: Uuid = sqlx::query_scalar(
+            "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, prompt, error)
+             VALUES ($1, $2, $3, 'followup', 'failed', '[follow-up from owner]\nFix the red review comment.', 'Prompt is too long')
+             RETURNING id",
+        )
+        .bind(task_session)
+        .bind(agent_id)
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await?;
+        let end = RunEnd { kind: "followup", error: Some("Prompt is too long"), output: "", turns: 0, timed_out: false };
+        let diagnosis = diagnose(&end);
+        let resumed = store.auto_retry(followup, &diagnosis).await?.expect("one fresh resume");
+        let (kind, fork_from, prompt, cause): (String, Option<Uuid>, String, Option<String>) =
+            sqlx::query_as("SELECT kind, fork_from, prompt, retry_cause FROM session_runs WHERE id = $1")
+                .bind(resumed)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!((kind.as_str(), fork_from, cause.as_deref()), ("task", None, Some(FRESH_RETRY_CAUSE)));
+        assert!(prompt.contains("git log"));
+        assert!(prompt.contains("Remember the blue widget."));
+        assert!(prompt.contains("Build the blue widget brief."));
+        assert!(prompt.contains(crate::context::LATEST_FOLLOWUP));
+        assert!(prompt.contains("Fix the red review comment."));
+        let cli: Option<String> = sqlx::query_scalar("SELECT cli_session_id FROM agent_sessions WHERE id = $1")
+            .bind(task_session)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(cli, None);
+        sqlx::query("UPDATE session_runs SET status = 'failed', error = 'Prompt is too long' WHERE id = $1")
+            .bind(resumed)
+            .execute(&pool)
+            .await?;
+        assert_eq!(store.auto_retry(resumed, &diagnosis).await?, None);
+        assert_eq!(store.auto_retry(followup, &diagnosis).await?, None);
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_runs WHERE task_id = $1")
+            .bind(task_id)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(runs, 4);
+
+        sqlx::query("DELETE FROM agent_profiles WHERE id = $1").bind(agent_id).execute(&pool).await?;
+        sqlx::query("DELETE FROM agent_tasks WHERE id = $1").bind(task_id).execute(&pool).await?;
+        sqlx::query("DELETE FROM world_skills WHERE name = $1").bind(format!("fork-{tag}-notes")).execute(&pool).await?;
+        sqlx::query("DELETE FROM users WHERE id = $1").bind(owner).execute(&pool).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn auto_quests_that_fork_and_fail_turn_one_retry_fresh_once() -> anyhow::Result<()> {
+        use crate::context::{ForkChoice, QuestContext};
+        use crate::run_causes::{diagnose, RunEnd, FRESH_RETRY_CAUSE};
+        let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let _db = steer_db().read().await;
+        let pool = PgPoolOptions::new().max_connections(2).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email) VALUES ($1) RETURNING id")
+            .bind(format!("auto-{tag}@example.test"))
+            .fetch_one(&pool)
+            .await?;
+        let agent_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id, quest_context)
+             VALUES ($1, 'Auto', 'claude', 'sonnet', $2, 'auto') RETURNING id",
+        )
+        .bind(format!("auto-{tag}"))
+        .bind(owner)
+        .fetch_one(&pool)
+        .await?;
+        let main_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_sessions (agent_id, role, backend, model, cli_session_id, context_tokens)
+             VALUES ($1, 'main', 'claude', 'sonnet', $2, 60000) RETURNING id",
+        )
+        .bind(agent_id)
+        .bind(format!("cli-{tag}"))
+        .fetch_one(&pool)
+        .await?;
+        store
+            .save_own_notes(agent_id, Some(owner), None, &format!("auto-{tag}-notes"), "notes", "Remember the green gear.")
+            .await?;
+        let agent = store.get_agent(agent_id).await?.expect("agent");
+        let main = store.get_session(main_id).await?.expect("main");
+        let level = QuestContext::resolve(None, &agent.quest_context);
+        assert_eq!(level, QuestContext::Auto);
+        assert_eq!(store.fork_choice(&agent, &main, level).await?, ForkChoice::Fork, "auto forks under half the window");
+
+        let task_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_tasks (user_id, title, status) VALUES ($1, 'auto', 'in_progress') RETURNING id",
+        )
+        .bind(owner)
+        .fetch_one(&pool)
+        .await?;
+        let task_session: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_sessions (agent_id, role, backend, model, parent_session_id, task_id, cli_session_id)
+             VALUES ($1, 'task', 'claude', 'sonnet', $2, $3, $4) RETURNING id",
+        )
+        .bind(agent_id)
+        .bind(main_id)
+        .bind(task_id)
+        .bind(format!("auto-cli-{tag}"))
+        .fetch_one(&pool)
+        .await?;
+        let end = RunEnd { kind: "task", error: Some("Prompt is too long"), output: "", turns: 1, timed_out: false };
+        let diagnosis = diagnose(&end);
+        assert!(diagnosis.fork_too_long());
+        let failed: Uuid = sqlx::query_scalar(
+            "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, fork_from, prompt, error, cause, diagnosis)
+             VALUES ($1, $2, $3, 'task', 'failed', $4, 'Fit the green gear brief.', 'Prompt is too long', 'cli_error', $5)
+             RETURNING id",
+        )
+        .bind(task_session)
+        .bind(agent_id)
+        .bind(task_id)
+        .bind(main_id)
+        .bind(serde_json::to_value(&diagnosis)?)
+        .fetch_one(&pool)
+        .await?;
+
+        let retry = store.fresh_retry(failed, &diagnosis).await?.expect("one fresh retry");
+        let (fork_from, prompt, cause): (Option<Uuid>, String, Option<String>) =
+            sqlx::query_as("SELECT fork_from, prompt, retry_cause FROM session_runs WHERE id = $1")
+                .bind(retry)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(fork_from, None, "the retry never forks the main session again");
+        assert_eq!(cause.as_deref(), Some(FRESH_RETRY_CAUSE));
+        assert!(prompt.contains("Fit the green gear brief."));
+        assert!(prompt.contains("Remember the green gear."));
+        assert_eq!(store.fresh_retry(failed, &diagnosis).await?, None);
+        sqlx::query("UPDATE session_runs SET status = 'failed', error = 'Prompt is too long' WHERE id = $1")
+            .bind(retry)
+            .execute(&pool)
+            .await?;
+        assert_eq!(store.fresh_retry(retry, &diagnosis).await?, None, "a fresh retry is never retried again");
+
+        assert!(
+            !matches!(store.fork_choice(&agent, &main, level).await?, ForkChoice::Fork),
+            "after a failed fork, the next auto quest starts without the main conversation"
+        );
+        assert!(matches!(store.fork_choice(&agent, &main, QuestContext::Lean).await?, ForkChoice::Lean { .. }));
+
+        sqlx::query("DELETE FROM agent_profiles WHERE id = $1").bind(agent_id).execute(&pool).await?;
+        sqlx::query("DELETE FROM agent_tasks WHERE id = $1").bind(task_id).execute(&pool).await?;
+        sqlx::query("DELETE FROM world_skills WHERE name = $1").bind(format!("auto-{tag}-notes")).execute(&pool).await?;
+        sqlx::query("DELETE FROM users WHERE id = $1").bind(owner).execute(&pool).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forks_count_their_overhead_learn_from_failures_and_survive_resets() -> anyhow::Result<()> {
+        use crate::context::ForkChoice;
+        use crate::run_causes::FRESH_RETRY_CAUSE;
+        use crate::world::COMPACT_PROMPT;
+        use serde_json::json;
+        let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let _db = steer_db().read().await;
+        let pool = PgPoolOptions::new().max_connections(2).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email) VALUES ($1) RETURNING id")
+            .bind(format!("overhead-{tag}@example.test"))
+            .fetch_one(&pool)
+            .await?;
+        let agent_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id) VALUES ($1, 'Tara', 'claude', 'sonnet', $2) RETURNING id",
+        )
+        .bind(format!("overhead-{tag}"))
+        .bind(owner)
+        .fetch_one(&pool)
+        .await?;
+        let main_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_sessions (agent_id, role, backend, model, cli_session_id, context_tokens)
+             VALUES ($1, 'main', 'claude', 'sonnet', $2, 105000) RETURNING id",
+        )
+        .bind(agent_id)
+        .bind(format!("cli-{tag}"))
+        .fetch_one(&pool)
+        .await?;
+        store
+            .save_own_notes(agent_id, Some(owner), None, &format!("overhead-{tag}-notes"), "notes", "Keep the green ledger.")
+            .await?;
+        let agent = store.get_agent(agent_id).await?.expect("agent");
+        let clear_compacts = || async {
+            sqlx::query("DELETE FROM agent_inbox WHERE agent_id = $1").bind(agent_id).execute(&pool).await
+        };
+        let queued_compacts = || async {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_inbox WHERE agent_id = $1 AND kind = 'context.compact'")
+                .bind(agent_id)
+                .fetch_one(&pool)
+                .await
+        };
+
+        let main = store.get_session(main_id).await?.expect("main");
+        match store.fork_choice(&agent, &main, crate::context::QuestContext::Full).await? {
+            ForkChoice::Fresh { used, limit, compacting } => {
+                assert_eq!((used, limit), (105_000, 140_000));
+                assert!(!compacting, "only the fork overhead crosses the line, so the main session is not compacted");
+            }
+            other => panic!("a fork adds its own overhead, so 105k of main context must start fresh: {other:?}"),
+        }
+        assert_eq!(queued_compacts().await?, 0);
+
+        sqlx::query("UPDATE agent_sessions SET context_tokens = 150000 WHERE id = $1").bind(main_id).execute(&pool).await?;
+        let main = store.get_session(main_id).await?.expect("main");
+        assert!(matches!(store.fork_choice(&agent, &main, crate::context::QuestContext::Full).await?, ForkChoice::Fresh { compacting: true, .. }));
+        assert_eq!(queued_compacts().await?, 1);
+        clear_compacts().await?;
+        sqlx::query("UPDATE agent_sessions SET compact_floor = 150000 WHERE id = $1").bind(main_id).execute(&pool).await?;
+        let main = store.get_session(main_id).await?.expect("main");
+        assert!(matches!(store.fork_choice(&agent, &main, crate::context::QuestContext::Full).await?, ForkChoice::Fresh { compacting: false, .. }));
+        assert_eq!(queued_compacts().await?, 0);
+        sqlx::query("UPDATE agent_sessions SET compact_floor = NULL WHERE id = $1").bind(main_id).execute(&pool).await?;
+        clear_compacts().await?;
+        sqlx::query("UPDATE agent_sessions SET context_tokens = 60000 WHERE id = $1").bind(main_id).execute(&pool).await?;
+        let main = store.get_session(main_id).await?.expect("main");
+        assert!(matches!(store.fork_choice(&agent, &main, crate::context::QuestContext::Full).await?, ForkChoice::Fork));
+
+        let task_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_tasks (user_id, title, status) VALUES ($1, 'ledger', 'in_progress') RETURNING id",
+        )
+        .bind(owner)
+        .fetch_one(&pool)
+        .await?;
+        let task_session: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_sessions (agent_id, role, backend, model, parent_session_id, task_id, cli_session_id)
+             VALUES ($1, 'task', 'claude', 'sonnet', $2, $3, $4) RETURNING id",
+        )
+        .bind(agent_id)
+        .bind(main_id)
+        .bind(task_id)
+        .bind(format!("fork-cli-{tag}"))
+        .fetch_one(&pool)
+        .await?;
+        let failed: Uuid = sqlx::query_scalar(
+            "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, fork_from, prompt, error, started_at, finished_at)
+             VALUES ($1, $2, $3, 'task', 'failed', $4, 'Balance the green ledger.', 'Prompt is too long', NOW(), NOW()) RETURNING id",
+        )
+        .bind(task_session)
+        .bind(agent_id)
+        .bind(task_id)
+        .bind(main_id)
+        .fetch_one(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO session_run_events (run_id, kind, body) VALUES ($1, 'text', $2), ($1, 'text', 'Prompt is too long')",
+        )
+        .bind(failed)
+        .bind(format!("Session started: fork-cli-{tag}"))
+        .execute(&pool)
+        .await?;
+        let diagnosis = store.record_run_end(failed, "task", Some("Prompt is too long"), "", false).await?;
+        assert_eq!(diagnosis.turns, 1);
+        assert!(diagnosis.fork_too_long());
+        let retry = store.auto_retry(failed, &diagnosis).await?.expect("one fresh retry for a runner run");
+        let cause: Option<String> = sqlx::query_scalar("SELECT retry_cause FROM session_runs WHERE id = $1")
+            .bind(retry)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(cause.as_deref(), Some(FRESH_RETRY_CAUSE));
+        let retrying: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM world_events WHERE type = 'run.retrying' AND task_id = $1 AND payload->>'fresh' = 'true'",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(retrying, 1);
+        assert_eq!(store.auto_retry(failed, &diagnosis).await?, None);
+        sqlx::query("UPDATE session_runs SET status = 'failed', error = 'Prompt is too long' WHERE id = $1")
+            .bind(retry)
+            .execute(&pool)
+            .await?;
+        let again = store.record_run_end(retry, "task", Some("Prompt is too long"), "", false).await?;
+        assert_eq!(store.auto_retry(retry, &again).await?, None);
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_runs WHERE task_id = $1")
+            .bind(task_id)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(runs, 2);
+
+        let main = store.get_session(main_id).await?.expect("main");
+        assert!(store.fork_failed_since_compact(&main).await?);
+        assert!(matches!(store.fork_choice(&agent, &main, crate::context::QuestContext::Full).await?, ForkChoice::Fresh { used: 60_000, .. }));
+        clear_compacts().await?;
+        sqlx::query(
+            "INSERT INTO session_runs (session_id, agent_id, kind, status, prompt, error, created_at)
+             VALUES ($1, $2, 'turn', 'failed', $3, 'Prompt is too long', NOW() + INTERVAL '500 milliseconds')",
+        )
+        .bind(main_id)
+        .bind(agent_id)
+        .bind(COMPACT_PROMPT)
+        .execute(&pool)
+        .await?;
+        assert!(store.fork_failed_since_compact(&main).await?, "a failed /compact keeps the failed fork in mind");
+        clear_compacts().await?;
+        sqlx::query(
+            "INSERT INTO session_runs (session_id, agent_id, kind, status, prompt, created_at)
+             VALUES ($1, $2, 'turn', 'completed', $3, NOW() + INTERVAL '1 second')",
+        )
+        .bind(main_id)
+        .bind(agent_id)
+        .bind(COMPACT_PROMPT)
+        .execute(&pool)
+        .await?;
+        assert!(!store.fork_failed_since_compact(&main).await?);
+        assert!(matches!(store.fork_choice(&agent, &main, crate::context::QuestContext::Full).await?, ForkChoice::Fork));
+        sqlx::query(
+            "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, fork_from, prompt, cause, diagnosis, created_at)
+             VALUES ($1, $2, $3, 'task', 'failed', $4, 'Grow the green ledger.', 'cli_error',
+                     '{\"failure\": \"context_too_long\", \"turns\": 5}'::jsonb, NOW() + INTERVAL '2 seconds')",
+        )
+        .bind(task_session)
+        .bind(agent_id)
+        .bind(task_id)
+        .bind(main_id)
+        .execute(&pool)
+        .await?;
+        assert!(!store.fork_failed_since_compact(&main).await?, "a quest that outgrew the window later says nothing about the fork");
+        assert!(matches!(store.fork_choice(&agent, &main, crate::context::QuestContext::Full).await?, ForkChoice::Fork));
+
+        let queued_session: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_sessions (agent_id, role, backend, model, parent_session_id, task_id, usage_baseline)
+             VALUES ($1, 'task', 'claude', 'sonnet', $2, $3, '{\"cost_usd\": 4}'::jsonb) RETURNING id",
+        )
+        .bind(agent_id)
+        .bind(main_id)
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await?;
+        let queued: Uuid = sqlx::query_scalar(
+            "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, fork_from, prompt, not_before)
+             VALUES ($1, $2, $3, 'task', 'queued', $4, 'Audit the green ledger.', NOW() + INTERVAL '1 day') RETURNING id",
+        )
+        .bind(queued_session)
+        .bind(agent_id)
+        .bind(task_id)
+        .bind(main_id)
+        .fetch_one(&pool)
+        .await?;
+        let codex_session: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_sessions (agent_id, role, backend, model, parent_session_id, task_id)
+             VALUES ($1, 'task', 'codex', 'gpt-5.5', $2, $3) RETURNING id",
+        )
+        .bind(agent_id)
+        .bind(main_id)
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await?;
+        let codex_run: Uuid = sqlx::query_scalar(
+            "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, fork_from, prompt, not_before)
+             VALUES ($1, $2, $3, 'task', 'queued', $4, 'Port the green ledger.', NOW() + INTERVAL '1 day') RETURNING id",
+        )
+        .bind(codex_session)
+        .bind(agent_id)
+        .bind(task_id)
+        .bind(main_id)
+        .fetch_one(&pool)
+        .await?;
+        let aside_session: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_sessions (agent_id, role, backend, model, parent_session_id)
+             VALUES ($1, 'aside', 'claude', 'sonnet', $2) RETURNING id",
+        )
+        .bind(agent_id)
+        .bind(main_id)
+        .fetch_one(&pool)
+        .await?;
+        let aside_run: Uuid = sqlx::query_scalar(
+            "INSERT INTO session_runs (session_id, agent_id, kind, status, fork_from, prompt, not_before)
+             VALUES ($1, $2, 'aside', 'queued', $3, 'Which ledger is green?', NOW() + INTERVAL '1 day') RETURNING id",
+        )
+        .bind(aside_session)
+        .bind(agent_id)
+        .bind(main_id)
+        .fetch_one(&pool)
+        .await?;
+        let fresh = store.restart_main_session(agent_id, "claude", "sonnet", "Keep the green ledger.").await?;
+        assert_ne!(fresh.id, main_id);
+        let (fork_from, prompt): (Option<Uuid>, String) =
+            sqlx::query_as("SELECT fork_from, prompt FROM session_runs WHERE id = $1").bind(queued).fetch_one(&pool).await?;
+        assert_eq!(fork_from, None);
+        assert!(prompt.starts_with("[fresh session] You are Tara."));
+        assert!(prompt.contains("Keep the green ledger."));
+        assert!(prompt.ends_with("Audit the green ledger."));
+        assert!(prompt.contains("fresh claude session"));
+        let (fork_from, prompt): (Option<Uuid>, String) =
+            sqlx::query_as("SELECT fork_from, prompt FROM session_runs WHERE id = $1").bind(codex_run).fetch_one(&pool).await?;
+        assert_eq!(fork_from, None);
+        assert!(prompt.contains("fresh codex session"), "the intro names the quest's own CLI");
+        assert!(prompt.ends_with("Port the green ledger."));
+        let (fork_from, prompt): (Option<Uuid>, String) =
+            sqlx::query_as("SELECT fork_from, prompt FROM session_runs WHERE id = $1").bind(aside_run).fetch_one(&pool).await?;
+        assert_eq!(fork_from, Some(main_id), "asides keep forking the old main conversation");
+        assert_eq!(prompt, "Which ledger is green?");
+        let baseline: Value = sqlx::query_scalar("SELECT usage_baseline FROM agent_sessions WHERE id = $1")
+            .bind(queued_session)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(baseline, json!({}));
+
+        sqlx::query("DELETE FROM agent_profiles WHERE id = $1").bind(agent_id).execute(&pool).await?;
+        sqlx::query("DELETE FROM agent_tasks WHERE id = $1").bind(task_id).execute(&pool).await?;
+        sqlx::query("DELETE FROM world_skills WHERE name = $1").bind(format!("overhead-{tag}-notes")).execute(&pool).await?;
+        sqlx::query("DELETE FROM users WHERE id = $1").bind(owner).execute(&pool).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn message_pages_and_channel_scope_match_the_full_queries() -> anyhow::Result<()> {
         use super::WorldEvent;
         use serde_json::json;
@@ -7865,7 +8486,7 @@ mod heartbeat_tests {
                id UUID PRIMARY KEY DEFAULT gen_random_uuid(), agent_id UUID NOT NULL, session_id UUID,
                run_id UUID, author_kind TEXT NOT NULL, author_user_id UUID, author_agent_id UUID,
                body TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), edited_at TIMESTAMPTZ,
-               meta JSONB NOT NULL DEFAULT '{}'
+               meta JSONB NOT NULL DEFAULT '{}', reply_to UUID
              );
              CREATE TABLE session_runs (
                id UUID PRIMARY KEY DEFAULT gen_random_uuid(), session_id UUID NOT NULL, agent_id UUID NOT NULL,

@@ -236,6 +236,8 @@ pub struct RunnerPublish {
     pub pr_url: Option<String>,
     #[serde(default)]
     pub pr_number: Option<i64>,
+    #[serde(default)]
+    pub stack_onto_pr: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -347,6 +349,8 @@ pub struct RunnerJob {
     pub skills: Vec<RunnerSkill>,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub vault_refs: BTreeMap<String, String>,
     #[serde(default)]
     pub provider_keys: BTreeMap<String, String>,
     #[serde(default)]
@@ -425,6 +429,7 @@ pub struct LeaseSteers {
 }
 
 pub const USAGE_EVENT: &str = "usage";
+pub const PUBLISH_ELSEWHERE: &str = "elsewhere";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunnerEvent {

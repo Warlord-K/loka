@@ -54,6 +54,8 @@ pub struct QuestOptions {
     pub attempt_variants: Value,
     pub ci_feedback: bool,
     pub pace: String,
+    #[serde(default)]
+    pub context: Option<String>,
 }
 
 impl QuestOptions {
@@ -101,6 +103,8 @@ pub struct QuestChoice {
     pub ci_feedback: Option<bool>,
     #[serde(default)]
     pub pace: Option<String>,
+    #[serde(default)]
+    pub context: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -110,6 +114,7 @@ pub struct ValidChoice {
     pub variants: Option<Vec<ReviewerChoice>>,
     pub ci_feedback: Option<bool>,
     pub pace: Option<String>,
+    pub context: Option<String>,
 }
 
 impl ValidChoice {
@@ -119,6 +124,7 @@ impl ValidChoice {
             && self.variants.is_none()
             && self.ci_feedback.is_none()
             && self.pace.is_none()
+            && self.context.is_none()
     }
 }
 
@@ -158,7 +164,12 @@ impl QuestChoice {
             Some(Value::String(p)) => Some(p.clone()),
             Some(_) => return Err("pace must be normal, quick or urgent".into()),
         };
-        Ok(Self { plan_first, attempts, attempt_variants, ci_feedback, pace })
+        let context = match args.get("context") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(c)) => Some(c.clone()),
+            Some(_) => return Err(crate::context::QUEST_CONTEXT_ERROR.into()),
+        };
+        Ok(Self { plan_first, attempts, attempt_variants, ci_feedback, pace, context })
     }
 
     pub fn validate(&self) -> std::result::Result<ValidChoice, String> {
@@ -199,7 +210,12 @@ impl QuestChoice {
         if pace.as_deref() == Some("quick") && (self.plan_first == Some(true) || attempts.is_some_and(|n| n > 1)) {
             return Err(QUICK_ALONE.into());
         }
-        Ok(ValidChoice { plan_first: self.plan_first, attempts, variants, ci_feedback: self.ci_feedback, pace })
+        let context = self
+            .context
+            .as_deref()
+            .map(|c| crate::context::QuestContext::parse(c).map(|c| c.as_str().to_string()))
+            .transpose()?;
+        Ok(ValidChoice { plan_first: self.plan_first, attempts, variants, ci_feedback: self.ci_feedback, pace, context })
     }
 }
 
@@ -293,12 +309,12 @@ impl WorldStore {
 
     pub async fn quest_options(&self, task_id: Uuid) -> Result<QuestOptions> {
         Ok(sqlx::query_as::<_, QuestOptions>(
-            "SELECT plan_first, attempts, attempt_variants, ci_feedback, pace FROM agent_tasks WHERE id = $1",
+            "SELECT plan_first, attempts, attempt_variants, ci_feedback, pace, context FROM agent_tasks WHERE id = $1",
         )
         .bind(task_id)
         .fetch_optional(self.pool())
         .await?
-        .unwrap_or(QuestOptions { plan_first: false, attempts: 1, attempt_variants: json!([]), ci_feedback: false, pace: "normal".into() }))
+        .unwrap_or(QuestOptions { plan_first: false, attempts: 1, attempt_variants: json!([]), ci_feedback: false, pace: "normal".into(), context: None }))
     }
 
     pub async fn set_quest_options(&self, task_id: Uuid, choice: &ValidChoice) -> Result<()> {
@@ -323,7 +339,7 @@ impl WorldStore {
             "UPDATE agent_tasks
              SET plan_first = COALESCE($2, plan_first), attempts = COALESCE($3, attempts),
                  attempt_variants = COALESCE($4, attempt_variants), ci_feedback = COALESCE($5, ci_feedback),
-                 pace = COALESCE($6, pace), updated_at = NOW()
+                 pace = COALESCE($6, pace), context = COALESCE($7, context), updated_at = NOW()
              WHERE id = $1",
         )
         .bind(task_id)
@@ -332,6 +348,7 @@ impl WorldStore {
         .bind(variants)
         .bind(choice.ci_feedback)
         .bind(choice.pace.as_deref())
+        .bind(choice.context.as_deref())
         .execute(self.pool())
         .await?;
         if found.rows_affected() == 0 {
@@ -1081,11 +1098,15 @@ mod tests {
         assert!(QuestChoice { pace: Some("quick".into()), plan_first: Some(true), ..Default::default() }.validate().is_err());
         assert!(QuestChoice { pace: Some("quick".into()), attempts: Some(2), ..Default::default() }.validate().is_err());
         assert!(QuestChoice { pace: Some("urgent".into()), attempts: Some(2), ..Default::default() }.validate().is_ok());
+        assert_eq!(QuestChoice::from_args(&json!({ "context": " Full " })).unwrap().validate().unwrap().context.as_deref(), Some("full"));
+        assert!(QuestChoice::from_args(&json!({ "context": "huge" })).unwrap().validate().is_err());
+        let started: QuestChoice = serde_json::from_value(json!({ "context": "lean" })).unwrap();
+        assert_eq!(started.validate().unwrap().context.as_deref(), Some("lean"));
     }
 
     #[test]
     fn variants_are_per_attempt() {
-        let options = QuestOptions { plan_first: false, attempts: 3, attempt_variants: json!([{"model": "a"}, {"cli": "codex", "model": "b"}]), ci_feedback: false, pace: "normal".into() };
+        let options = QuestOptions { plan_first: false, attempts: 3, attempt_variants: json!([{"model": "a"}, {"cli": "codex", "model": "b"}]), ci_feedback: false, pace: "normal".into(), context: None };
         assert_eq!(options.variant(1).unwrap().model, "a");
         assert_eq!(options.variant(2).unwrap().cli.as_deref(), Some("codex"));
         assert!(options.variant(3).is_none());

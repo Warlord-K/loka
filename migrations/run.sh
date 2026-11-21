@@ -49,8 +49,13 @@ for f in /migrations/[0-9]*.sql; do
     echo "skip: $version (already applied)"
   else
     echo "applying: $version"
-    $psql -f "$f"
-    $psql -c "INSERT INTO schema_migrations (version) VALUES ('$version')"
+    record="INSERT INTO schema_migrations (version) VALUES ('$version')"
+    if head -n 1 "$f" | grep -q '^-- no-transaction'; then
+      $psql -f "$f"
+      $psql -c "$record"
+    else
+      $psql --single-transaction -f "$f" -c "$record"
+    fi
     echo "applied: $version"
   fi
 done

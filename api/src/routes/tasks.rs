@@ -272,7 +272,7 @@ pub async fn update(
         };
         state.world.set_task_time_limit(id, minutes).await.map_err(|_| StatusCode::BAD_REQUEST)?;
     }
-    let options = ["plan_first", "attempts", "attempt_variants", "ci_feedback", "pace"];
+    let options = ["plan_first", "attempts", "attempt_variants", "ci_feedback", "pace", "context"];
     if options.iter().any(|k| body.contains_key(*k)) {
         let args = Value::Object(options.iter().filter_map(|k| body.remove(*k).map(|v| (k.to_string(), v))).collect());
         let quest = loka_shared::quests::QuestChoice::from_args(&args)

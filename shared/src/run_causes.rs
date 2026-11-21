@@ -10,6 +10,8 @@ pub const RETRY_BACKOFF_SECS: i64 = 20;
 
 pub const RESUME_AFTER_ERROR: &str = "[resumed after an interruption]\nYour last run was cut off by a problem outside your work, and the Loka resumed this same session for you. Do not start over and do not redo finished steps. Check where you stopped, carry on, and end your final message with the full report block exactly as the task prompt describes.";
 
+pub const FRESH_RETRY_CAUSE: &str = "context_fresh";
+
 pub const UPDATE_PAUSE: &str = "Paused while Loka restarted for an update";
 
 pub const RESUME_AFTER_UPDATE: &str = "[resumed after a Loka update]\nLoka restarted for an update while you were working and resumed this same session for you. Do not start over and do not redo finished steps. Check where you stopped (the last command may not have finished), carry on, and end your final message with the full report block exactly as the task prompt describes.";
@@ -93,6 +95,12 @@ const WORKSPACE: &[&str] = &[
     "fatal: ",
 ];
 
+const UNRELATED_HISTORY: &str = "has commits but no history in common with";
+
+pub fn unrelated_history_error(base: &str) -> String {
+    format!("The quest branch {UNRELATED_HISTORY} {base}; nothing was published, rebase it onto the new base.")
+}
+
 pub fn diagnose(end: &RunEnd) -> Diagnosis {
     let started = end.turns > 0;
     let at_run = if started { "run" } else { "start" };
@@ -105,6 +113,8 @@ pub fn diagnose(end: &RunEnd) -> Diagnosis {
             if update_pause(raw) {
                 let cause = if started { Cause::CliError } else { Cause::NeverStarted };
                 (cause, Some("update".to_string()), at_run, "Loka restarted for an update, so it picks up where it left off.".to_string(), None)
+            } else if lower.contains(UNRELATED_HISTORY) {
+                (Cause::CliError, None, "publish", first, None)
             } else if lower.starts_with("stopped by") {
                 (Cause::Stopped, None, at_run, format!("{} stopped it.", raw.trim_start_matches("Stopped by ").split('.').next().unwrap_or("Someone")), None)
             } else if end.timed_out || lower.contains("timed out after") || lower.contains("time limit") || lower.contains("runner job timed out") {
@@ -173,6 +183,10 @@ impl Diagnosis {
             ),
             _ => false,
         }
+    }
+
+    pub fn fork_too_long(&self) -> bool {
+        self.cause == Cause::CliError && self.failure.as_deref() == Some("context_too_long") && self.turns <= 1
     }
 
     pub fn for_update(&self) -> bool {
@@ -265,6 +279,16 @@ mod tests {
         assert_eq!(d.retry_at(now), now);
         let d = diagnose(&end(Some(UPDATE_PAUSE), "", 0));
         assert_eq!(d.cause, Cause::NeverStarted);
+    }
+
+    #[test]
+    fn only_early_context_failures_retry_fresh() {
+        let d = diagnose(&end(Some("Prompt is too long"), "", 0));
+        assert_eq!((d.cause, d.failure.as_deref()), (Cause::CliError, Some("context_too_long")));
+        assert!(d.fork_too_long());
+        assert!(diagnose(&end(Some("Prompt is too long"), "", 1)).fork_too_long());
+        assert!(!diagnose(&end(Some("Prompt is too long"), "", 6)).fork_too_long());
+        assert!(!diagnose(&end(Some("API Error: 529 Overloaded"), "", 0)).fork_too_long());
     }
 
     #[test]

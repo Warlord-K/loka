@@ -148,7 +148,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         return Err("apps only work on a Mac".into());
     }
     let binary = real_binary().ok_or_else(|| format!("{COMMAND} is not installed on this Mac"))?;
-    let root = std::env::var_os("WORLD_RUNNER_ROOT").filter(|r| !r.is_empty()).map(PathBuf::from).ok_or("apps only run inside a Loka job")?;
+    let root = crate::browser::runner_root().ok_or("apps only run inside a Loka job")?;
     let lease: Uuid = std::env::var(LEASE_ENV).ok().and_then(|v| v.parse().ok()).ok_or("apps only run inside a quest")?;
     let vetted = vet(rest)?;
     let asking_help = vetted.iter().any(|a| matches!(a.as_str(), "--help" | "-h" | "help" | "--version" | "version" | "status" | "permissions" | "skills"));

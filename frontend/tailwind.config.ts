@@ -82,6 +82,7 @@ const config: Config = {
           onalert: "rgb(var(--w-onalert) / <alpha-value>)",
           scrim: "rgb(var(--w-scrim) / <alpha-value>)",
           onscrim: "rgb(var(--w-onscrim) / <alpha-value>)",
+          quiet: "rgb(var(--w-quiet) / <alpha-value>)",
           wood: "rgb(var(--w-wood) / <alpha-value>)",
         },
         gray: {

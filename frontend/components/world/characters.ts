@@ -65,7 +65,41 @@ const LEGS_SIDE = {
   a: ["...PPPPPP...", "..PP...PP...", ".BBB...BBB..", "............"],
 };
 
+const TENTACLES_FRONT = {
+  idle: ["..SSSSSSSS..", ".SS.SSSS.SS.", ".S..S..S..S.", "S...s..s...S"],
+  a: ["..SSSSSSSS..", ".SS.SSSS.SS.", "S...S..S..S.", "s..s....s..S"],
+  b: ["..SSSSSSSS..", ".SS.SSSS.SS.", ".S..S..S...S", "S..s....s..s"],
+};
+
+const TENTACLES_SIDE = {
+  idle: ["...SSSSSS...", "..S.SSSS.S..", ".S..S..S..S.", "S...s...s..s"],
+  a: ["...SSSSSS...", "..S.SSSS.S..", "S...S..S...S", "s..s...s...."],
+  b: ["...SSSSSS...", "..S.SSSS.S..", "S...S..S...S", "s..s...s...."],
+};
+
+const GHOST_FRONT = {
+  idle: [".SSSSSSSSSS.", ".SSSSSSSSSS.", ".S.SS.SS.SS.", "............"],
+  a: [".SSSSSSSSSS.", ".SSSSSSSSSS.", ".SS.SS.SS.S.", "............"],
+  b: [".SSSSSSSSSS.", ".SSSSSSSSSS.", ".S.SS.SS.SS.", "............"],
+};
+
+const GHOST_SIDE = {
+  idle: ["...SSSSSSS..", "...SSSSSSSS.", "...S.SS.SS.S", "............"],
+  a: ["...SSSSSSS..", "...SSSSSSSS.", "....SS.SS.SS", "............"],
+  b: ["...SSSSSSS..", "...SSSSSSSS.", "....SS.SS.SS", "............"],
+};
+
+type Step = "idle" | "a" | "b";
+
 type Grid = string[][];
+
+function walkPhase(g: Grid, dir: "down" | "up" | "side"): Step {
+  if (dir === "side") return g[13 + PAD].join("") === LEGS_SIDE.a[1] ? "a" : "idle";
+  const row = g[14 + PAD].join("");
+  if (row === LEGS_FRONT.a[2]) return "a";
+  if (row === LEGS_FRONT.b[2]) return "b";
+  return "idle";
+}
 
 function build(head: string[], body: string[], legs: string[]): Grid {
   const rows = [...Array(PAD).fill(".".repeat(W)), ...head, ...body, ...legs];
@@ -242,6 +276,132 @@ function accessorize(g: Grid, look: LokaLook, dir: "down" | "up" | "side"): void
     for (let r = 8; r <= 10; r++) set(g, x, r + PAD, "y");
     set(g, x, 11 + PAD, "V");
   }
+  const step = walkPhase(g, dir);
+  const rows = (lines: string[], from: number) => {
+    lines.forEach((line, i) => {
+      for (let x = 0; x < W; x++) set(g, x, from + i + PAD, line[x]);
+    });
+  };
+  if (acc.includes("ghost-tail")) {
+    for (let r = 8; r <= 11; r++) {
+      replaceRow(g, r, ["C"], "S");
+      replaceRow(g, r, ["c"], "s");
+    }
+    const tails = dir === "side" ? GHOST_SIDE : GHOST_FRONT;
+    rows(tails[step], 12);
+  }
+  if (acc.includes("tentacles")) {
+    const tails = dir === "side" ? TENTACLES_SIDE : TENTACLES_FRONT;
+    rows(tails[step], 12);
+  }
+  if (acc.includes("stripes")) for (const r of [9, 11]) replaceRow(g, r, ["C", "c"], "M");
+  if (acc.includes("belly") && dir === "down") for (let r = 8; r <= 11; r++) replaceRow(g, r, ["C", "c"], "W", 4, 8);
+  if (acc.includes("claws")) {
+    if (dir === "side") ear([[1, 10], [2, 10], [1, 12], [2, 12], [2, 11]], "S");
+    else ear([[0, 10], [0, 12], [1, 12], [11, 10], [11, 12], [10, 12]], "S");
+  }
+  if (acc.includes("wings") || acc.includes("bug-wings")) {
+    const c = acc.includes("wings") ? "h" : "X";
+    if (dir === "side") ear([[9, 8], [10, 7], [11, 6], [10, 8], [11, 7], [10, 9]], c);
+    else ear([[0, 7], [1, 7], [0, 8], [1, 8], [0, 9], [11, 7], [10, 7], [11, 8], [10, 8], [11, 9]], c);
+  }
+  if (acc.includes("spikes")) {
+    if (dir === "side") {
+      ear([[6, -1], [8, 0], [10, 1], [11, 3]], "h");
+      ear([[10, 11], [10, 12], [11, 12]], "S");
+    } else ear([[4, -1], [5, -2], [5, -1], [6, -1], [6, -2], [7, -1]], "h");
+  }
+  if (acc.includes("fin")) {
+    if (dir === "side") ear([[5, -1], [6, -1], [7, -1], [6, -2], [7, -2], [7, -3]], "h");
+    else ear([[5, -1], [6, -1], [5, -2], [6, -2], [6, -3]], "h");
+  }
+  if (acc.includes("teeth") && dir !== "up") {
+    if (dir === "side") {
+      ear([[1, 6], [2, 6]], "W");
+      set(g, 3, 6 + PAD, "E");
+    } else for (let x = 3; x <= 8; x++) set(g, x, 6 + PAD, x === 4 || x === 7 ? "E" : "W");
+  }
+  if (acc.includes("frog-eyes")) {
+    if (dir === "side") {
+      ear([[3, -1], [4, -1], [3, -2], [4, -2]], "W");
+      set(g, 3, PAD - 1, "E");
+      ear([[1, 6], [2, 6]], "s");
+    } else {
+      const c = dir === "up" ? "S" : "W";
+      ear([[2, -1], [3, -1], [2, 0], [3, 0], [8, -1], [9, -1], [8, 0], [9, 0]], c);
+      if (dir === "down") {
+        set(g, 3, PAD, "E");
+        set(g, 8, PAD, "E");
+        replaceRow(g, 6, ["S", "r"], "s", 3, 9);
+      }
+    }
+  }
+  if (acc.includes("eyestalks")) {
+    if (dir === "side") {
+      ear([[3, 0], [3, -1]], "S");
+      set(g, 2, PAD - 2, "E");
+      set(g, 3, PAD - 2, "W");
+    } else {
+      ear([[3, 0], [3, -1], [8, 0], [8, -1]], "S");
+      ear([[2, -2], [9, -2]], "W");
+      ear([[3, -2], [8, -2]], dir === "up" ? "W" : "E");
+    }
+  }
+  if (acc.includes("gills")) {
+    if (dir === "side") ear([[11, 2], [11, 4], [10, 6]], "R");
+    else ear([[0, 2], [0, 4], [1, 6], [11, 2], [11, 4], [10, 6]], "R");
+  }
+  if (acc.includes("visor") && dir !== "up") {
+    if (dir === "side") {
+      replaceRow(g, 5, ["S", "E"], "M", 1, 7);
+      set(g, 2, 5 + PAD, "Z");
+    } else {
+      replaceRow(g, 5, ["S", "E"], "M", 2, 10);
+      set(g, 3, 5 + PAD, "Z");
+      set(g, 8, 5 + PAD, "Z");
+    }
+  }
+  if (acc.includes("antenna")) {
+    const x = dir === "side" ? 6 : 5;
+    ear([[x, -1], [x, -2]], "V");
+    set(g, x, PAD - 3, "y");
+  }
+  if (acc.includes("antennae")) {
+    if (dir === "side") ear([[5, -1], [4, -2], [3, -3], [7, -1], [8, -2], [9, -3]], "M");
+    else ear([[4, -1], [3, -2], [2, -3], [7, -1], [8, -2], [9, -3]], "M");
+  }
+  if (acc.includes("cape")) {
+    if (dir === "down") {
+      for (let r = 9; r <= 12; r++) {
+        replaceRow(g, r, ["C", "c", "P", "."], "a", 1, 2);
+        replaceRow(g, r, ["C", "c", "P", "."], "a", 10, 11);
+      }
+      for (const r of [11, 12]) {
+        replaceRow(g, r, ["."], "a", 0, 1);
+        replaceRow(g, r, ["."], "a", 11, 12);
+      }
+    } else if (dir === "up") {
+      for (let r = 8; r <= 13; r++) {
+        replaceRow(g, r, ["C", "c", "P", "S", "."], "A", 1, 11);
+        replaceRow(g, r, ["A"], "a", 3, 4);
+        replaceRow(g, r, ["A"], "a", 8, 9);
+      }
+    } else for (let r = 8; r <= 13; r++) replaceRow(g, r, ["C", "c", "P", "."], r % 2 ? "a" : "A", 8, 11);
+  }
+  if (acc.includes("headphones")) {
+    if (dir === "side") {
+      ear([[7, 3], [7, 2], [7, 1], [7, 0], [6, -1], [5, -1]], "M");
+      ear([[7, 4], [8, 4], [7, 5], [8, 5]], "A");
+    } else {
+      ear([[1, 3], [1, 2], [2, 1], [3, 0], [4, -1], [5, -1], [6, -1], [7, -1], [8, 0], [9, 1], [10, 2], [10, 3]], "M");
+      ear([[0, 4], [0, 5], [1, 4], [1, 5], [10, 4], [10, 5], [11, 4], [11, 5]], "A");
+    }
+  }
+  if (acc.includes("crown")) {
+    replaceRow(g, 0, ["H", "h", "."], "U", 3, 9);
+    ear([[3, -1], [5, -1], [6, -1], [8, -1]], "U");
+    if (dir !== "up") ear([[5, 0], [6, 0]], "R");
+  }
   if (acc.includes("feather")) {
     const pts: [number, number, string][] = [
       [9, 4, "k"], [9, 3, "k"], [9, 2, "g"], [10, 2, "g"], [10, 3, "g"],
@@ -281,6 +441,8 @@ function palette(look: LokaLook): Record<string, string> {
     u: "#c99a1a",
     X: "#e6edf3",
     Q: "#1b2a5e",
+    Z: "#5ee0e6",
+    R: "#e8508a",
   };
 }
 

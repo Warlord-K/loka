@@ -22,6 +22,8 @@ import {
   type BackendModels,
   type TaskBrief,
   type QuestOptions,
+  type QuestContext,
+  QUEST_CONTEXTS,
   type WorldAgent,
   type WorldItem,
   type WorldEvent,
@@ -70,7 +72,7 @@ import { engineChoice, VoiceMode } from "./voice-mode";
 import { primeLiveAudio } from "./live-voice";
 import { EquipCard, OmpModelsSection } from "./omp-models";
 import { ContextButton, ContextMeter, useAgentContext } from "./context-control";
-import { ApprovalRow, ReviewerRow, KitSection, MainAgentRow, PowersSection, ResetContextRow, TidyHistoryRow, UsageSection, RemoveAgentButton, ArchiveAgentRow, SchedulesSection, SubscriptionsSection, FeedsSection, TagChips } from "./agent-manage";
+import { ApprovalRow, QuestContextRow, ReviewerRow, KitSection, MainAgentRow, PowersSection, ResetContextRow, TidyHistoryRow, UsageSection, RemoveAgentButton, ArchiveAgentRow, SchedulesSection, SubscriptionsSection, FeedsSection, TagChips } from "./agent-manage";
 import { AgentRunnerSelector, DesktopStatusButton } from "./desktop-devices";
 import { OfflineBanner } from "./offline-banner";
 import { DesktopCommandPalette, takeAgentTab, useAgentTabRequests } from "./desktop-command-palette";
@@ -118,13 +120,16 @@ import { ChangelogPanel, CreateAgentDialog, FolderWorkshop, preloadPanels, Quest
 import { HIGHLIGHT, LinkButton, openMessage, requestJump, resolveMessage, useMessageJump, type LinkedMessage } from "./message-links";
 import { draftsFrom, MilestoneDraftEditor, MilestoneList, milestoneProgress } from "./milestones-ui";
 import { AssigneeBadge, assigneeName, paceLabel, SelectionBar, StatusIcon, statusLabel, useQuestControls, type QuestViewer } from "./quest-ui";
-import type { Trade } from "./types";
+import type { Accessory, Trade } from "./types";
+import { LookFields } from "./look-fields";
+import { declaredAccessories, unknownAccessories } from "@/lib/looks";
 import { atLeast, BellButton, Hotbar, HOTBAR_ICONS, PlayerCard, Toasts, type Me, type Toast } from "./hud";
 import { CLOSE_BTN, CloseButton, EmptyState, GHOST_ICON_BTN, InfoNote, SettingsGroup, WindowHeader } from "./settings-shell";
 import { AgentAvatar, AgentFace, PersonAvatar, startsGroup } from "./channel-ui";
 import { FindBar } from "./find-bar";
 import { PaneResizer, usePaneWidth } from "./pane-resizer";
 import { cliName, modelName, runtimeName } from "@/lib/model-names";
+import { SEND_RETRY_DELAYS, notSent, sendFailure } from "@/lib/send-failure";
 
 const Workbench = dynamic(() => import("./workbench/workbench").then((m) => m.Workbench), {
   ssr: false,
@@ -144,15 +149,8 @@ const TIMES: { id: TimeOfDay; label: string; Icon: typeof Sun }[] = [
 
 const NOOP = () => {};
 const SIDE_KEY = "world.sidechat";
-const SEND_RETRY_DELAYS = [1000, 3000];
 
 const WELCOMED_KEY = "world.welcomed";
-
-function retryableSend(err: unknown): boolean {
-  if (err instanceof TypeError) return true;
-  const status = err instanceof Error ? Number.parseInt(err.message, 10) : NaN;
-  return status === 408 || status === 429 || status >= 500;
-}
 
 const QUEST_APPROACHES = [
   { value: "", label: "Just do it" },
@@ -161,6 +159,11 @@ const QUEST_APPROACHES = [
   { value: "plan", label: "Plan first", hint: "you approve the plan" },
   { value: "2", label: "Best of 2", hint: "2x the cost" },
   { value: "3", label: "Best of 3", hint: "3x the cost" },
+];
+
+const QUEST_CONTEXT_CHOICES = [
+  { value: "", label: "Agent's context", hint: "use the agent's setting" },
+  ...QUEST_CONTEXTS.map((c) => ({ value: c.value, label: `${c.label} context`, hint: c.hint.toLowerCase() })),
 ];
 
 function approachOptions(approach: string): QuestOptions {
@@ -441,11 +444,12 @@ function AgentDialog({
   const [waitForMerge, setWaitForMerge] = useState(true);
   const [timeLimit, setTimeLimit] = useState("");
   const [approach, setApproach] = useState("");
+  const [questContext, setQuestContext] = useState("");
   const [fixCi, setFixCi] = useState(false);
   const [editing, setEditing] = useState<string | null>(null);
   const [thread, setThread] = useState<string | null>(null);
   const [asking, setAsking] = useState(false);
-  const [outgoing, setOutgoing] = useState<{ text: string; files: number } | null>(null);
+  const [outgoing, setOutgoing] = useState<{ text: string; files: number; status?: string } | null>(null);
   const [waiting, setWaiting] = useState<{ after: string | undefined } | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement | HTMLInputElement | null>(null);
@@ -612,8 +616,8 @@ function AgentDialog({
       await worldApi.send(agent.id, choice, [], turn.effective, askId);
       refresh();
       return true;
-    } catch {
-      setError("That did not go through. Try again.");
+    } catch (err) {
+      setError(`That did not go through. ${sendFailure(err).reason} Try again.`);
       return false;
     }
   };
@@ -640,7 +644,9 @@ function AgentDialog({
           await deliver(text, talking, quoted);
           break;
         } catch (err) {
-          if (!talking || attempt >= SEND_RETRY_DELAYS.length || !retryableSend(err)) throw err;
+          const failure = sendFailure(err);
+          if (!talking || attempt >= SEND_RETRY_DELAYS.length || !failure.retry) throw err;
+          setOutgoing((cur) => cur && { ...cur, status: failure.retrying });
           await new Promise((resolve) => window.setTimeout(resolve, SEND_RETRY_DELAYS[attempt]));
           const fresh = access.use ? await worldApi.messages(agent.id).catch(() => null) : null;
           if (fresh?.some((m) => m.author_kind === "user" && !known.has(m.id) && m.body.trim() === text)) break;
@@ -651,7 +657,7 @@ function AgentDialog({
       if (talking) files.clear();
       if (access.use) await worldApi.messages(agent.id).then(setMessages).catch(() => {});
       refresh();
-    } catch {
+    } catch (err) {
       if (talking) {
         setInput((cur) => (cur.trim() ? `${text}\n${cur}` : text));
         setWaiting(null);
@@ -660,7 +666,7 @@ function AgentDialog({
       setError(
         tab === "aside"
           ? `${agent.name} could not be pulled aside. If you have never talked to them, say hi in Talk first.`
-          : "Not sent. Your message is back in the box, press Send to try again.",
+          : notSent(sendFailure(err)),
       );
     } finally {
       setOutgoing(null);
@@ -678,9 +684,9 @@ function AgentDialog({
     try {
       await worldApi.send(agent.id, text, [], turn.effective);
       refresh();
-    } catch {
+    } catch (err) {
       setWaiting(null);
-      setError("That did not go through. Try again.");
+      setError(`That did not go through. ${sendFailure(err).reason} Try again.`);
     } finally {
       setOutgoing(null);
       setBusy(false);
@@ -693,9 +699,10 @@ function AgentDialog({
     setBusy(true);
     setError(null);
     try {
-      await worldApi.assign(agent.id, title.trim(), description.trim(), repo.trim() || null, draftsFrom(steps), waitForMerge && !!repo.trim(), timeLimit ? Number(timeLimit) : null, { ...approachOptions(approach), ...(fixCi && waitForMerge && repo.trim() ? { ci_feedback: true } : {}) });
+      await worldApi.assign(agent.id, title.trim(), description.trim(), repo.trim() || null, draftsFrom(steps), waitForMerge && !!repo.trim(), timeLimit ? Number(timeLimit) : null, { ...approachOptions(approach), ...(questContext ? { context: questContext as QuestContext } : {}), ...(fixCi && waitForMerge && repo.trim() ? { ci_feedback: true } : {}) });
       setTitle("");
       setApproach("");
+      setQuestContext("");
       setFixCi(false);
       setDescription("");
       setRepo("");
@@ -954,6 +961,7 @@ function AgentDialog({
             <SettingsGroup title="Access" description="What it may do without asking and who reviews its work.">
               <div className="space-y-4">
                 <ApprovalRow agent={agent} canChange={access.manage} onUpdated={onAgentUpdated} />
+                <QuestContextRow agent={agent} canChange={access.manage} onUpdated={onAgentUpdated} />
                 <ReviewerRow agent={agent} canChange={access.manage} onUpdated={onAgentUpdated} />
                 <PowersSection agent={agent} onUpdated={onAgentUpdated} />
               </div>
@@ -1010,6 +1018,7 @@ function AgentDialog({
                   options={QUEST_TIME_LIMITS}
                 />
                 <WSelect ariaLabel="How to approach it" className="w-auto shrink-0 whitespace-nowrap" value={approach} onChange={setApproach} options={QUEST_APPROACHES} />
+                <WSelect ariaLabel="Context for this quest" className="w-auto shrink-0 whitespace-nowrap" value={questContext} onChange={setQuestContext} options={QUEST_CONTEXT_CHOICES} />
                 <button type="submit" disabled={busy || !title.trim() || !description.trim()} className={cn(BTN_PRIMARY, "ml-auto")}>
                   <Sword size={14} weight="bold" />
                   Hand it over
@@ -1259,7 +1268,7 @@ function AgentDialog({
             {tab === "talk" && outgoing && (
               <div className="mt-3 flex animate-[fade-in-up_180ms_ease-out_both] flex-col items-end text-w-base leading-relaxed opacity-60 motion-reduce:animate-none">
                 <p className="mb-1 flex items-baseline gap-2 text-w-sm">
-                  <Shimmer className="text-w-2xs">Sending</Shimmer>
+                  <Shimmer className="text-w-2xs">{outgoing.status ?? "Sending"}</Shimmer>
                   <span className="font-semibold text-w-strong">You</span>
                 </p>
                 <div className="min-w-0 max-w-[min(85%,56rem)] rounded-2xl rounded-tr-md border-2 border-w-line2 bg-w-teal/15 px-3.5 py-2">
@@ -1269,7 +1278,7 @@ function AgentDialog({
             )}
             {tab === "talk" && <LiveLine agent={agent} progress={progress} />}
             {tab === "talk" && waiting && agent.status !== "thinking" && (
-              <LiveLine agent={{ ...agent, status: "thinking", status_detail: null }} progress={outgoing ? "Sending" : `${agent.name} got your message`} />
+              <LiveLine agent={{ ...agent, status: "thinking", status_detail: null }} progress={outgoing ? outgoing.status ?? "Sending" : `${agent.name} got your message`} />
             )}
             {asidePending && <LiveLine agent={{ ...agent, status: "thinking", status_detail: null }} progress={`${agent.name} is thinking it over on the side`} />}
             <NewMessagesPill show={follow.unseen} away={follow.away} onClick={follow.jump} />
@@ -1398,6 +1407,7 @@ function AgentSettings({ agent, onUpdated }: { agent: WorldAgent; onUpdated: (ag
   const [species, setSpecies] = useState(
     typeof agent.look.species === "string" && agent.look.species !== "person" ? agent.look.species : "",
   );
+  const [accessories, setAccessories] = useState<Accessory[]>(() => declaredAccessories(agent.look.accessories));
   const [gear, setGear] = useState(typeof agent.gear.quest === "string" ? agent.gear.quest : "");
   const [voice, setVoice] = useState(voiceFor(agent));
   const [trade, setTrade] = useState<Trade | "">(
@@ -1437,6 +1447,9 @@ function AgentSettings({ agent, onUpdated }: { agent: WorldAgent; onUpdated: (ag
     try {
       const look = { ...agent.look };
       look.species = species.trim() || "person";
+      const keptAccessories = [...accessories, ...unknownAccessories(agent.look.accessories)];
+      if (keptAccessories.length) look.accessories = keptAccessories;
+      else delete look.accessories;
       look.voice = voice;
       if (trade) look.trade = trade;
       else delete look.trade;
@@ -1549,16 +1562,24 @@ function AgentSettings({ agent, onUpdated }: { agent: WorldAgent; onUpdated: (ag
         {switching ? " Changing the CLI moves them to a new mind; their old one writes a handoff so they keep their memory." : ""}
         {agent.pending_switch ? ` Switching from ${cliName(agent.cli)} to ${runtimeName(agent.pending_switch.cli, agent.pending_switch.model)} once their current work finishes.` : ""}
       </p>
-      <div className="flex gap-2">
-        <label className="block flex-1">
-          <span className="mb-1.5 block text-w-sm font-medium text-w-text2">Species (blank for a person)</span>
-          <input className={cn(INPUT, "w-full")} placeholder="raccoon, robot, owl..." value={species} onChange={(e) => setSpecies(e.target.value)} />
-        </label>
-        <label className="block flex-1">
-          <span className="mb-1.5 block text-w-sm font-medium text-w-text2">Quest gear</span>
-          <VoiceField placeholder="viking helmet and sword" ariaLabel="Quest gear" value={gear} onChange={setGear} />
-        </label>
-      </div>
+      <LookFields
+        slug={agent.slug}
+        look={agent.look}
+        species={species}
+        onSpecies={(value) => {
+          setSpecies(value);
+          setState("idle");
+        }}
+        accessories={accessories}
+        onAccessories={(value) => {
+          setAccessories(value);
+          setState("idle");
+        }}
+      />
+      <label className="block">
+        <span className="mb-1.5 block text-w-sm font-medium text-w-text2">Quest gear</span>
+        <VoiceField placeholder="viking helmet and sword" ariaLabel="Quest gear" value={gear} onChange={setGear} />
+      </label>
       <label className="block">
         <span className="mb-1.5 block text-w-sm font-medium text-w-text2">Trade (how they look while working)</span>
         <WSelect

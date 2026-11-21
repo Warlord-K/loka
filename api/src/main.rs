@@ -303,6 +303,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/world/environment/choices", axum::routing::put(routes::environment::choose))
         .route(
+            "/world/environment/import",
+            axum::routing::post(routes::environment::import)
+                .layer(axum::extract::DefaultBodyLimit::max(routes::environment::MAX_IMPORT_BYTES)),
+        )
+        .route(
             "/world/command-rules",
             get(routes::environment::list_command_rules).post(routes::environment::add_command_rule),
         )

@@ -144,7 +144,7 @@ fn run(args: &[String]) -> Result<PathBuf, String> {
     if !installed() {
         return Err("screen capture only works on a Mac".into());
     }
-    let root = std::env::var_os("WORLD_RUNNER_ROOT").filter(|r| !r.is_empty()).map(PathBuf::from).ok_or("screen capture only runs inside a Loka job")?;
+    let root = crate::browser::runner_root().ok_or("screen capture only runs inside a Loka job")?;
     if !switch_file(&root).is_file() {
         return Err("your owner has not allowed screen capture on this Mac (Devices > Let agents see this screen)".into());
     }

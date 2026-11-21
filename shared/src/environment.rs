@@ -32,6 +32,7 @@ pub struct EnvironmentEntry {
     pub name: String,
     pub updated_at: DateTime<Utc>,
     pub agent_ids: Vec<Uuid>,
+    pub vault: bool,
 }
 
 #[derive(Clone, FromRow, Serialize)]
@@ -50,6 +51,15 @@ struct EncryptedEntry {
     name: String,
     ciphertext: Vec<u8>,
     nonce: Vec<u8>,
+}
+
+#[derive(FromRow)]
+struct GrantedEntry {
+    owner_user_id: Uuid,
+    name: String,
+    ciphertext: Vec<u8>,
+    nonce: Vec<u8>,
+    vault: bool,
 }
 
 #[derive(Debug)]
@@ -192,7 +202,54 @@ pub fn valid_name(name: &str) -> bool {
 }
 
 pub fn valid_value(value: &str) -> bool {
-    !value.is_empty() && value.len() <= MAX_VALUE_LEN && !value.contains('\0')
+    !value.is_empty()
+        && value.len() <= MAX_VALUE_LEN
+        && !value.contains('\0')
+        && (!is_vault_reference(value) || valid_vault_reference(value))
+}
+
+pub const VAULT_PREFIX: &str = "op://";
+
+const MAX_VAULT_REFERENCE_LEN: usize = 512;
+
+const VAULT_QUERIES: &[&str] = &["attribute", "ssh-format"];
+
+pub fn is_vault_reference(value: &str) -> bool {
+    value.trim().starts_with(VAULT_PREFIX)
+}
+
+pub fn valid_vault_reference(value: &str) -> bool {
+    if value.len() > MAX_VAULT_REFERENCE_LEN || value != value.trim() {
+        return false;
+    }
+    let Some(rest) = value.strip_prefix(VAULT_PREFIX) else {
+        return false;
+    };
+    let (path, query) = match rest.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (rest, None),
+    };
+    let part_ok = |part: &str| {
+        !part.trim().is_empty()
+            && part != "."
+            && part != ".."
+            && !part.starts_with('-')
+            && part.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.'))
+    };
+    let parts: Vec<&str> = path.split('/').collect();
+    if !(3..=4).contains(&parts.len()) || !parts.iter().all(|part| part_ok(part)) {
+        return false;
+    }
+    query.is_none_or(|query| {
+        query.split_once('=').is_some_and(|(key, value)| {
+            VAULT_QUERIES.contains(&key) && !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+    })
+}
+
+pub struct AgentKeys {
+    pub values: BTreeMap<String, String>,
+    pub vault_refs: BTreeMap<String, String>,
 }
 
 pub fn validate_mcp_definition(definition: &Value) -> Result<()> {
@@ -266,6 +323,18 @@ pub fn runnable_definition(mut definition: Value) -> Value {
     definition
 }
 
+pub fn without_secret_references<'a>(
+    mut environment: BTreeMap<String, String>,
+    definitions: impl IntoIterator<Item = &'a Value>,
+) -> BTreeMap<String, String> {
+    for definition in definitions {
+        for name in secret_reference_names(definition).unwrap_or_default() {
+            environment.remove(&name);
+        }
+    }
+    environment
+}
+
 pub fn missing_secrets(definition: &Value, environment: &BTreeMap<String, String>) -> Result<Vec<String>> {
     Ok(secret_reference_names(definition)?.into_iter().filter(|name| !environment.contains_key(name)).collect())
 }
@@ -303,12 +372,13 @@ impl WorldStore {
         Ok(sqlx::query_as::<_, EnvironmentEntry>(
             "SELECT e.name, e.updated_at,
                     COALESCE(array_agg(g.agent_id ORDER BY g.agent_id)
-                      FILTER (WHERE g.agent_id IS NOT NULL), ARRAY[]::uuid[]) AS agent_ids
+                      FILTER (WHERE g.agent_id IS NOT NULL), ARRAY[]::uuid[]) AS agent_ids,
+                    e.vault
              FROM world_environment e
              LEFT JOIN world_environment_agents g
                ON g.owner_user_id = e.owner_user_id AND g.name = e.name
              WHERE e.owner_user_id = $1
-             GROUP BY e.owner_user_id, e.name, e.updated_at
+             GROUP BY e.owner_user_id, e.name, e.updated_at, e.vault
              ORDER BY e.name",
         )
         .bind(owner)
@@ -321,19 +391,48 @@ impl WorldStore {
             return Err(anyhow!("invalid environment entry"));
         }
         let key = master_key()?;
+        let value = if is_vault_reference(value) { value.trim() } else { value };
         let (ciphertext, nonce) = encrypt(key, owner, name, value.as_bytes())?;
         sqlx::query(
-            "INSERT INTO world_environment (owner_user_id, name, ciphertext, nonce)
-             VALUES ($1, $2, $3, $4)
+            "INSERT INTO world_environment (owner_user_id, name, ciphertext, nonce, vault)
+             VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT (owner_user_id, name) DO UPDATE
-             SET ciphertext = EXCLUDED.ciphertext, nonce = EXCLUDED.nonce, updated_at = NOW()",
+             SET ciphertext = EXCLUDED.ciphertext, nonce = EXCLUDED.nonce, vault = EXCLUDED.vault, updated_at = NOW()",
         )
         .bind(owner)
         .bind(name)
         .bind(ciphertext)
         .bind(nonce)
+        .bind(is_vault_reference(value))
         .execute(self.pool())
         .await?;
+        Ok(())
+    }
+
+    pub async fn save_environment_many(&self, owner: Uuid, entries: &[(String, String)]) -> Result<()> {
+        if entries.iter().any(|(name, value)| !valid_name(name) || !valid_value(value)) {
+            return Err(anyhow!("invalid environment entry"));
+        }
+        let key = master_key()?;
+        let mut tx = self.pool().begin().await?;
+        for (name, value) in entries {
+            let value = if is_vault_reference(value) { value.trim() } else { value.as_str() };
+            let (ciphertext, nonce) = encrypt(key, owner, name, value.as_bytes())?;
+            sqlx::query(
+                "INSERT INTO world_environment (owner_user_id, name, ciphertext, nonce, vault)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (owner_user_id, name) DO UPDATE
+                 SET ciphertext = EXCLUDED.ciphertext, nonce = EXCLUDED.nonce, vault = EXCLUDED.vault, updated_at = NOW()",
+            )
+            .bind(owner)
+            .bind(name)
+            .bind(ciphertext)
+            .bind(nonce)
+            .bind(is_vault_reference(value))
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -412,7 +511,7 @@ impl WorldStore {
 
     pub async fn environment_value(&self, owner: Uuid, name: &str) -> Result<Option<String>> {
         let row = sqlx::query_as::<_, EncryptedEntry>(
-            "SELECT owner_user_id, name, ciphertext, nonce FROM world_environment WHERE owner_user_id = $1 AND name = $2",
+            "SELECT owner_user_id, name, ciphertext, nonce FROM world_environment WHERE owner_user_id = $1 AND name = $2 AND NOT vault",
         )
         .bind(owner)
         .bind(name)
@@ -425,10 +524,15 @@ impl WorldStore {
     }
 
     pub async fn environment_for_agent(&self, agent_id: Uuid) -> Result<BTreeMap<String, String>> {
-        let rows = sqlx::query_as::<_, EncryptedEntry>(&format!(
+        Ok(self.keys_for_agent(agent_id).await?.values)
+    }
+
+    pub async fn keys_for_agent(&self, agent_id: Uuid) -> Result<AgentKeys> {
+        let rows = sqlx::query_as::<_, GrantedEntry>(&format!(
             "SELECT e.owner_user_id,
                     CASE WHEN v.environment IS NULL THEN e.name ELSE e.name || '@' || v.environment END AS name,
-                    COALESCE(v.ciphertext, e.ciphertext) AS ciphertext, COALESCE(v.nonce, e.nonce) AS nonce
+                    COALESCE(v.ciphertext, e.ciphertext) AS ciphertext, COALESCE(v.nonce, e.nonce) AS nonce,
+                    COALESCE(v.vault, e.vault) AS vault
              FROM agent_profiles a
              JOIN world_environment_agents g ON g.agent_id = a.id
              JOIN world_environment e
@@ -439,7 +543,7 @@ impl WorldStore {
                ON v.owner_user_id = c.owner_user_id AND v.name = c.name AND v.environment = c.environment
              WHERE a.id = $1 AND a.owner_user_id = e.owner_user_id
              UNION ALL
-             SELECT CASE WHEN s.org_id = $3 THEN $2::uuid ELSE s.org_id END, s.name, s.ciphertext, s.nonce
+             SELECT CASE WHEN s.org_id = $3 THEN $2::uuid ELSE s.org_id END, s.name, s.ciphertext, s.nonce, FALSE
              FROM world_shared_environment_agents g
              JOIN world_shared_environment s ON s.org_id = g.org_id AND s.name = g.name
              JOIN agent_profiles a ON a.id = g.agent_id AND a.org_id = g.org_id
@@ -451,19 +555,20 @@ impl WorldStore {
         .bind(crate::orgs::DEFAULT_ORG)
         .fetch_all(self.pool())
         .await?;
+        let mut values = BTreeMap::new();
+        let mut vault_refs = BTreeMap::new();
         if rows.is_empty() {
-            return Ok(BTreeMap::new());
+            return Ok(AgentKeys { values, vault_refs });
         }
         master_key()?;
         let agent_org: Option<Uuid> = sqlx::query_scalar("SELECT org_id FROM agent_profiles WHERE id = $1")
             .bind(agent_id)
             .fetch_optional(self.pool())
             .await?;
-        let mut values = BTreeMap::new();
         for row in rows {
             let shared = row.owner_user_id == SHARED_OWNER || Some(row.owner_user_id) == agent_org;
             let key = crate::key_environments::key_of(&row.name).to_string();
-            if shared && values.contains_key(&key) {
+            if shared && (values.contains_key(&key) || vault_refs.contains_key(&key)) {
                 continue;
             }
             let plaintext = open(
@@ -476,11 +581,15 @@ impl WorldStore {
                 .map_err(|_| anyhow!("environment decryption failed"))?;
             if shared {
                 values.entry(key).or_insert(value);
+            } else if row.vault {
+                values.remove(&key);
+                vault_refs.insert(key, value.trim().to_string());
             } else {
+                vault_refs.remove(&key);
                 values.insert(key, value);
             }
         }
-        Ok(values)
+        Ok(AgentKeys { values, vault_refs })
     }
 
     pub async fn rotate_environment_key(&self) -> Result<Rotation> {
@@ -622,7 +731,7 @@ impl WorldStore {
     }
 
     pub async fn save_shared_key(&self, org: Uuid, by: Uuid, name: &str, value: Option<&str>, note: Option<&str>) -> Result<bool> {
-        if !valid_name(name) || value.is_some_and(|v| !valid_value(v)) || note.is_some_and(|n| n.chars().count() > 500) {
+        if !valid_name(name) || value.is_some_and(|v| !valid_value(v) || is_vault_reference(v)) || note.is_some_and(|n| n.chars().count() > 500) {
             return Err(anyhow!("invalid environment entry"));
         }
         let Some(value) = value else {
@@ -942,6 +1051,19 @@ mod tests {
     }
 
     #[test]
+    fn vault_refs_an_mcp_server_needs_stay_out_of_the_cli_environment() {
+        let definitions = [serde_json::json!({"command": "x", "env": {"TOKEN": "${secret:LINEAR_KEY}"}})];
+        let vault_refs = BTreeMap::from([
+            ("LINEAR_KEY".to_string(), "op://Private/Linear/key".to_string()),
+            ("GITHUB_TOKEN".to_string(), "op://Private/GitHub/token".to_string()),
+        ]);
+        assert_eq!(
+            without_secret_references(vault_refs, &definitions),
+            BTreeMap::from([("GITHUB_TOKEN".to_string(), "op://Private/GitHub/token".to_string())])
+        );
+    }
+
+    #[test]
     fn missing_secrets_names_only_ungranted_keys() {
         let definition = serde_json::json!({"command": "x", "env": {"A": "${secret:A}", "B": "${secret:B}"}});
         let granted = BTreeMap::from([("A".to_string(), "1".to_string())]);
@@ -1050,6 +1172,108 @@ mod tests {
         assert!(valid_value("secret"));
         assert!(!valid_value(""));
         assert!(!valid_value("bad\0value"));
+    }
+
+    #[test]
+    fn vault_references_are_checked_before_they_are_kept() {
+        for good in [
+            "op://Private/GitHub/token",
+            "op://Work Vault/Stripe API/credentials/secret key",
+            "op://dev/ssh.key/private key?ssh-format=openssh",
+            "op://dev/db/password?attribute=otp",
+        ] {
+            assert!(is_vault_reference(good), "{good}");
+            assert!(valid_vault_reference(good), "{good}");
+            assert!(valid_value(good), "{good}");
+        }
+        for bad in [
+            "op://",
+            "op://vault",
+            "op://vault/item",
+            "op://vault/item/section/field/extra",
+            "op://vault//field",
+            "op://vault/../field",
+            "op://vault/item/field?format=json",
+            "op://vault/item/field?attribute=",
+            "op://vault/item/$(whoami)",
+            "op://vault/item/field;rm",
+            "op://vault/item/fi\nld",
+            "op://-vault/item/field",
+            "op://vault/item/--account=evil",
+        ] {
+            assert!(is_vault_reference(bad), "{bad}");
+            assert!(!valid_vault_reference(bad), "{bad}");
+            assert!(!valid_value(bad), "{bad}");
+        }
+        assert!(!is_vault_reference("-op://vault/item/field"));
+        assert!(!valid_vault_reference("-op://vault/item/field"));
+        assert!(!valid_vault_reference("--account=x op://vault/item/field"));
+        assert!(!is_vault_reference("sk-live-123"));
+        assert!(valid_value("sk-live-123"));
+        assert!(!valid_vault_reference(&format!("op://v/i/{}", "a".repeat(600))));
+    }
+
+    #[tokio::test]
+    async fn bulk_save_marks_vault_references_on_insert_and_update() -> Result<()> {
+        let Ok(url) = std::env::var("KEYS_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        initialize_for_tests();
+        let pool = sqlx::postgres::PgPoolOptions::new().max_connections(2).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email, world_role) VALUES ($1, 'write') RETURNING id")
+            .bind(format!("bulk-{}@test.dev", Uuid::new_v4().simple()))
+            .fetch_one(&pool)
+            .await?;
+        let vault_flags = |entries: Vec<EnvironmentEntry>| {
+            entries.into_iter().map(|e| (e.name, e.vault)).collect::<BTreeMap<_, _>>()
+        };
+        let first = [
+            ("PLAIN_KEY".to_string(), "sk-live-123".to_string()),
+            ("VAULT_KEY".to_string(), "op://Private/GitHub/token".to_string()),
+        ];
+        store.save_environment_many(owner, &first).await?;
+        assert_eq!(
+            vault_flags(store.list_environment(owner).await?),
+            BTreeMap::from([("PLAIN_KEY".to_string(), false), ("VAULT_KEY".to_string(), true)])
+        );
+        assert_eq!(store.environment_value(owner, "VAULT_KEY").await?, None);
+        let swapped = [
+            ("PLAIN_KEY".to_string(), "op://Private/Linear/key".to_string()),
+            ("VAULT_KEY".to_string(), "ghp_plain".to_string()),
+        ];
+        store.save_environment_many(owner, &swapped).await?;
+        assert_eq!(
+            vault_flags(store.list_environment(owner).await?),
+            BTreeMap::from([("PLAIN_KEY".to_string(), true), ("VAULT_KEY".to_string(), false)])
+        );
+        assert_eq!(store.environment_value(owner, "VAULT_KEY").await?.as_deref(), Some("ghp_plain"));
+        sqlx::query("DELETE FROM world_environment WHERE owner_user_id = $1").bind(owner).execute(&pool).await?;
+        sqlx::query("DELETE FROM users WHERE id = $1").bind(owner).execute(&pool).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn vault_provider_keys_are_not_counted_as_the_owners_own() -> Result<()> {
+        let Ok(url) = std::env::var("KEYS_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        initialize_for_tests();
+        let pool = sqlx::postgres::PgPoolOptions::new().max_connections(2).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email, world_role) VALUES ($1, 'write') RETURNING id")
+            .bind(format!("providers-{}@test.dev", Uuid::new_v4().simple()))
+            .fetch_one(&pool)
+            .await?;
+        let keys = [
+            ("OPENAI_API_KEY".to_string(), "sk-proj-plain-value-123456".to_string()),
+            ("ANTHROPIC_API_KEY".to_string(), "op://Private/Anthropic/key".to_string()),
+        ];
+        store.save_environment_many(owner, &keys).await?;
+        assert_eq!(store.own_provider_names(owner).await?, vec!["OPENAI_API_KEY".to_string()]);
+        sqlx::query("DELETE FROM world_environment WHERE owner_user_id = $1").bind(owner).execute(&pool).await?;
+        sqlx::query("DELETE FROM users WHERE id = $1").bind(owner).execute(&pool).await?;
+        Ok(())
     }
 
     #[test]

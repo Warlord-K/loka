@@ -793,7 +793,7 @@ export function Workbench({
                     return (
                       <span
                         key={pane}
-                        className={cn("flex shrink-0 items-center rounded-t text-w-xs", layout.pane === pane ? "bg-[#fbf3e0] text-[#261822]" : "text-[#9c8a9a] hover:text-white")}
+                        className={cn("flex shrink-0 items-center rounded-t text-w-xs", layout.pane === pane ? "bg-w-paper text-w-strong" : "text-[#9c8a9a] hover:text-white")}
                       >
                         <button type="button" aria-pressed={layout.pane === pane} onClick={() => patch({ pane })} className={cn("py-1", extra ? "pl-3 pr-1" : "px-3")}>
                           {extra?.running ? <Shimmer>{label}</Shimmer> : label}
@@ -867,7 +867,7 @@ export function Workbench({
                 </span>
                 {changes.length > 0 && <span className="rounded-md bg-[#e8b64a] px-1.5 py-px text-w-2xs font-semibold text-[#261822]">Review</span>}
               </button>
-              <div className="min-h-0 flex-1 overflow-hidden bg-[#fbf3e0] text-[#3b2a1a]">
+              <div className="min-h-0 flex-1 overflow-hidden bg-w-paper text-w-text">
                 {layout.pane === "executor" ? (
                   <SessionDetail
                     key={session.id}
@@ -887,11 +887,11 @@ export function Workbench({
                     workshop={false}
                   />
                 ) : layout.pane !== "agent" ? (
-                  <p className="p-4 text-w-sm text-[#8a705a]">This session is closed.</p>
+                  <p className="p-4 text-w-sm text-w-muted">This session is closed.</p>
                 ) : agent ? (
                   <div className="h-full overflow-hidden">{renderAgent(agent)}</div>
                 ) : (
-                  <p className="p-4 text-w-sm text-[#8a705a]">This agent is not visible to you.</p>
+                  <p className="p-4 text-w-sm text-w-muted">This agent is not visible to you.</p>
                 )}
               </div>
             </div>

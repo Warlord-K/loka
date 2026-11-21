@@ -4,7 +4,8 @@ import { SOLO } from "@/lib/edition";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { qk } from "@/lib/query-keys";
-import { Trash, Key } from "@phosphor-icons/react";
+import { Trash, Key, FileArrowUp } from "@phosphor-icons/react";
+import { AnimatePresence } from "framer-motion";
 import { cn } from "@/lib/utils";
 import {
   worldApi,
@@ -17,10 +18,11 @@ import {
   type WorldAgent,
 } from "@/lib/world";
 import { WSelect } from "./controls";
-import { BTN_PRIMARY_SM, BTN_SECONDARY_SM, CHUNKY, INPUT } from "./styles";
+import { BTN_PRIMARY_SM, BTN_SECONDARY_SM, CHUNKY, INPUT, PILL_INFO } from "./styles";
 import { refreshReadiness } from "./setup-hint";
 import { Shimmer } from "./work-ui";
 import { EmptyState, InfoNote } from "./settings-shell";
+import { EnvImportDialog } from "./env-import";
 
 const STATUS_LABEL: Record<ProviderKey["status"], string> = {
   own: "Your key",
@@ -45,6 +47,7 @@ export function EnvironmentPanel({ ownerId, embedded = false }: { ownerId: strin
   const [value, setValue] = useState("");
   const [replacing, setReplacing] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
+  const [importing, setImporting] = useState(false);
   const [granting, setGranting] = useState<string | null>(null);
   const [deleteArmed, setDeleteArmed] = useState<string | null>(null);
   const [actionError, setError] = useState<string | null>(null);
@@ -95,7 +98,7 @@ export function EnvironmentPanel({ ownerId, embedded = false }: { ownerId: strin
     setError(null);
     try {
       const provider = providerFor(entryName);
-      if (provider && warning === null) {
+      if (provider && warning === null && !value.trim().startsWith("op://")) {
         const check = await worldApi.checkProviderKey(provider.id, { value }).catch(() => null);
         if (check?.problem) {
           setWarning(check.problem);
@@ -116,6 +119,25 @@ export function EnvironmentPanel({ ownerId, embedded = false }: { ownerId: strin
     } finally {
       setPending(false);
     }
+  };
+
+  const importKeys = async (items: { name: string; value: string }[]) => {
+    if (!environment?.configured) return;
+    let result: { saved: string[]; rejected: string[] };
+    try {
+      result = await worldApi.importEnvironment(items);
+    } catch {
+      throw new Error("Could not save those keys. Nothing was changed.");
+    }
+    for (const entryName of result.saved) {
+      const wanting = (environment.wanted ?? []).filter((w) => w.keys.includes(entryName)).map((w) => w.agent_id);
+      if (!wanting.length) continue;
+      const existing = environment.entries.find((entry) => entry.name === entryName)?.agent_ids ?? [];
+      await worldApi.setEnvironmentAgents(entryName, Array.from(new Set([...existing, ...wanting]))).catch(() => undefined);
+    }
+    await refresh();
+    refreshReadiness();
+    setError(result.rejected.length ? `Saved ${result.saved.length}. Could not save ${result.rejected.join(", ")}.` : null);
   };
 
   const setGrant = async (entryName: string, agentId: string, enabled: boolean) => {
@@ -281,7 +303,19 @@ export function EnvironmentPanel({ ownerId, embedded = false }: { ownerId: strin
         </div>
       )}
       <form onSubmit={save} className="mb-4 flex flex-col gap-2 rounded-lg border-2 border-w-line2 bg-w-card p-3">
-        <p className="text-w-sm font-semibold text-w-strong">{replacing ? `Replace ${replacing}` : "Add a value"}</p>
+        <div className="flex items-center justify-between gap-2">
+          <p className="text-w-sm font-semibold text-w-strong">{replacing ? `Replace ${replacing}` : "Add a value"}</p>
+          <button
+            type="button"
+            className={cn(BTN_SECONDARY_SM, "gap-1.5")}
+            disabled={!environment?.configured}
+            title="Paste a .env file to save many keys at once"
+            onClick={() => setImporting(true)}
+          >
+            <FileArrowUp size={14} weight="bold" />
+            Import
+          </button>
+        </div>
         <input
           className={cn(INPUT, "font-mono text-w-sm")}
           aria-label="Environment name"
@@ -308,6 +342,9 @@ export function EnvironmentPanel({ ownerId, embedded = false }: { ownerId: strin
             setWarning(null);
           }}
         />
+        <p className="text-w-xs text-w-muted">
+          Or paste a 1Password reference such as <span className="font-mono">op://Work/GitHub/token</span>. Your Mac reads it with op when a run starts, and Loka never stores the value.
+        </p>
         {providerFor(name.trim()) && !warning && (
           <p className="text-w-xs text-w-muted">{providerFor(name.trim())?.label} keys usually {providerFor(name.trim())?.hint.replace(/^starts/, "start").replace(/^looks/, "look")}.</p>
         )}
@@ -331,7 +368,10 @@ export function EnvironmentPanel({ ownerId, embedded = false }: { ownerId: strin
           <li key={entry.name} className="rounded-lg border-2 border-w-line bg-w-field/70 p-3">
             <div className="flex flex-wrap items-center gap-2">
               <span className="min-w-0 flex-1">
-                <b className="block truncate font-mono text-w-sm">{entry.name}</b>
+                <span className="flex min-w-0 items-center gap-2">
+                  <b className="truncate font-mono text-w-sm">{entry.name}</b>
+                  {entry.vault && <span className={PILL_INFO} title="Read from 1Password on your Mac when a run starts">Vault</span>}
+                </span>
                 <span className="text-w-2xs text-w-muted">Updated {new Date(entry.updated_at).toLocaleString()}</span>
               </span>
               <button
@@ -396,6 +436,16 @@ export function EnvironmentPanel({ ownerId, embedded = false }: { ownerId: strin
         ))}
       </ul>
       {error && <p role="alert" className="mt-3 text-w-xs text-w-danger">{error}</p>}
+      <AnimatePresence>
+        {importing && (
+          <EnvImportDialog
+            key="env-import"
+            existing={(environment?.entries ?? []).map((entry) => entry.name)}
+            onSave={importKeys}
+            onClose={() => setImporting(false)}
+          />
+        )}
+      </AnimatePresence>
     </section>
   );
 }
@@ -498,13 +548,14 @@ function KeyEnvironments({
             disabled={busy}
             onClick={() => void remove(variant.environment)}
             onBlur={() => setArmed(null)}
-            title={armed === variant.environment ? "Click again to delete" : `Delete the ${variant.environment} value`}
+            title={armed === variant.environment ? "Click again to delete" : `Delete the ${variant.environment} ${variant.vault ? "1Password reference" : "value"}`}
             className={cn(
               "flex items-center gap-1 rounded-md px-1.5 py-0.5 text-w-2xs",
               armed === variant.environment ? "bg-w-alert text-w-onalert" : "bg-w-aqua text-w-link hover:bg-w-field",
             )}
           >
             {variant.environment}
+            {variant.vault && <span className="rounded bg-w-field px-1 font-semibold text-w-strong">Vault</span>}
             <Trash size={11} weight="bold" />
           </button>
         ))}

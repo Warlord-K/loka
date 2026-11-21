@@ -1079,7 +1079,7 @@ fn inherits(name: &str, provider_names: &[&str], share_server_keys: bool) -> boo
 }
 
 fn runtime_name(name: &str) -> bool {
-    [crate::browser::LAUNCHER_ENV, crate::screen::LAUNCHER_ENV, crate::apps::LAUNCHER_ENV, crate::apps::LEASE_ENV, loka_shared::command_rules::ENV, loka_shared::approvals::ENV].contains(&name)
+    [crate::browser::LAUNCHER_ENV, crate::browser::ROOT_ENV, crate::screen::LAUNCHER_ENV, crate::apps::LAUNCHER_ENV, crate::apps::LEASE_ENV, loka_shared::command_rules::ENV, loka_shared::approvals::ENV].contains(&name)
 }
 
 pub fn configure_child_environment(
@@ -1301,6 +1301,19 @@ mod environment_tests {
         }
         assert_eq!(env.get("DATABASE_URL"), Some(&Some("app-db".to_string())));
         assert_eq!(env.get("GIT_CONFIG_COUNT"), Some(&Some("1".to_string())));
+    }
+
+    #[test]
+    fn child_environment_keeps_the_gate_root_of_the_job() {
+        let mut command = tokio::process::Command::new("true");
+        let environment = BTreeMap::from([
+            (crate::browser::LAUNCHER_ENV.to_string(), "/x/loka-agent browser a quest".to_string()),
+            (crate::browser::ROOT_ENV.to_string(), "/runner".to_string()),
+        ]);
+        configure_child_environment(&mut command, &environment).unwrap();
+        let env = child_env(&command);
+        assert_eq!(env.get(crate::browser::ROOT_ENV), Some(&Some("/runner".to_string())));
+        assert_eq!(env.get(crate::browser::LAUNCHER_ENV), Some(&Some("/x/loka-agent browser a quest".to_string())));
     }
 
     #[test]

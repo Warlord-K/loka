@@ -4,7 +4,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::world::{InboxItem, NewEvent, WorldAgent, WorldStore, RESET_INBOX_KIND};
+use crate::world::{compact_limit, AgentSession, InboxItem, NewEvent, WorldAgent, WorldStore, COMPACT_PROMPT, RESET_INBOX_KIND};
 
 pub const EVENT: &str = "agent.context";
 pub const COMPACT_INBOX_KIND: &str = "context.compact";
@@ -17,7 +17,16 @@ pub const AUTO_TOKENS_INVALID: &str =
 pub const AUTO_TOKENS_OVER_MAX: &str = "auto_context_tokens must be below max_tokens, the model's context window.";
 pub const AUTO_ACTION_INVALID: &str = "auto_context_action must be \"compact\" or \"reset\".";
 pub const AUTO_NOTHING_SENT: &str = "Send auto_context_tokens, auto_context_action or both.";
+pub const RESET_KEPT_NOTES: &str =
+    "The main conversation was too long to write new notes, so the context was reset with the notes already saved.";
 pub const AUTO_FELL_BACK: &str = "This CLI cannot compact a session, so the context was reset instead.";
+pub const FORK_SHARE_PERCENT: i64 = 70;
+pub const FORK_LIMIT_FALLBACK: i64 = 140_000;
+pub const BYTES_PER_TOKEN: i64 = 4;
+pub const FORK_OVERHEAD_TOKENS: i64 = 40_000;
+pub const AUTO_FORK_SHARE_PERCENT: i64 = 50;
+pub const AUTO_FORK_FALLBACK: i64 = 100_000;
+pub const QUEST_CONTEXT_ERROR: &str = "context must be \"lean\", \"auto\" or \"full\".";
 
 pub fn window(cli: &str, model: &str) -> Option<i64> {
     let raw = model.trim().to_ascii_lowercase();
@@ -47,6 +56,73 @@ pub fn window(cli: &str, model: &str) -> Option<i64> {
         Some(262_144)
     } else {
         None
+    }
+}
+
+pub fn default_auto_tokens(cli: &str, model: &str) -> Option<i64> {
+    window(cli, model).map(|tokens| tokens * FORK_SHARE_PERCENT / 100)
+}
+
+pub fn fork_limit(cli: &str, model: &str) -> i64 {
+    default_auto_tokens(cli, model).unwrap_or(FORK_LIMIT_FALLBACK)
+}
+
+pub fn estimated_tokens(context_tokens: i64, transcript_bytes: i64) -> i64 {
+    if context_tokens > 0 {
+        context_tokens
+    } else {
+        transcript_bytes.max(0) / BYTES_PER_TOKEN
+    }
+}
+
+pub fn fork_too_large(used: i64, cli: &str, model: &str) -> bool {
+    used > 0 && used >= fork_limit(cli, model)
+}
+
+pub fn carried_into_fork(used: i64) -> i64 {
+    if used > 0 { used + FORK_OVERHEAD_TOKENS } else { 0 }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuestContext {
+    #[default]
+    Lean,
+    Auto,
+    Full,
+}
+
+impl QuestContext {
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "lean" => Ok(Self::Lean),
+            "auto" => Ok(Self::Auto),
+            "full" => Ok(Self::Full),
+            _ => Err(QUEST_CONTEXT_ERROR.to_string()),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lean => "lean",
+            Self::Auto => "auto",
+            Self::Full => "full",
+        }
+    }
+
+    pub fn resolve(quest: Option<&str>, agent: &str) -> Self {
+        quest.and_then(|raw| Self::parse(raw).ok()).or_else(|| Self::parse(agent).ok()).unwrap_or_default()
+    }
+}
+
+pub fn auto_fork_limit(cli: &str, model: &str) -> i64 {
+    window(cli, model).map_or(AUTO_FORK_FALLBACK, |tokens| tokens * AUTO_FORK_SHARE_PERCENT / 100)
+}
+
+pub fn level_allows_fork(level: QuestContext, used: i64, cli: &str, model: &str) -> bool {
+    match level {
+        QuestContext::Lean => false,
+        QuestContext::Auto => used < auto_fork_limit(cli, model),
+        QuestContext::Full => true,
     }
 }
 
@@ -173,6 +249,55 @@ pub struct ContextView {
     pub auto_context_action: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkChoice {
+    Fork,
+    Fresh { used: i64, limit: i64, compacting: bool },
+    Lean { used: i64, level: QuestContext },
+}
+
+pub const FORKED_LINE: &str = "You are now a task session forked from your main session. Everything above is your memory; the brief you wrote is your plan. Your main-session instructions (the actions block, replies and asks, not writing code yourself, coordinating other agents, building in Loka, onboarding) do not apply here: do the work with your tools and end with the report block below.";
+pub const UNFORKED_LINE: &str = "You are now a task session for this quest. The notes above are your memory; the brief below is your plan.";
+
+pub fn unforked(prompt: &str) -> String {
+    prompt.replacen(FORKED_LINE, UNFORKED_LINE, 1)
+}
+
+pub fn lean_intro(name: &str, backend: &str, persona: Option<&str>, addendum: Option<&str>) -> String {
+    let persona = persona.map(str::trim).filter(|p| !p.is_empty()).map(|p| format!(" {p}")).unwrap_or_default();
+    let addendum = addendum.map(str::trim).filter(|a| !a.is_empty()).map(|a| format!("\nExtra instructions:\n{a}")).unwrap_or_default();
+    format!(
+        "[lean session] You are {name}, a resident of the Loka.{persona}{addendum}\nThis quest runs in a fresh {backend} session without your main conversation, to keep its context small. Your notes, recent quests and the quest below are what you have. If something you need is missing, say so in your report."
+    )
+}
+
+pub fn fresh_intro(name: &str, backend: &str, used: Option<i64>) -> String {
+    match used {
+        Some(used) => {
+            let size = if used >= 1000 { format!(" (about {} thousand tokens)", used / 1000) } else { String::new() };
+            format!(
+                "[fresh session] You are {name}. Your main conversation is too long to carry into this quest{size}, so this is a fresh {backend} session with only these notes. Your notes and recent quests below are what you remember of it."
+            )
+        }
+        None => format!(
+            "[fresh session] You are {name}. This is a fresh {backend} session for this quest, so you do not have your main conversation, only these notes."
+        ),
+    }
+}
+
+pub const LATEST_FOLLOWUP: &str = "Latest follow-up for this quest:";
+
+pub fn resume_intro(name: &str, backend: &str, used: i64) -> String {
+    let size = if used >= 1000 { format!(" (about {} thousand tokens)", used / 1000) } else { String::new() };
+    format!(
+        "[fresh session] You are {name}. This quest's session grew past the model's context window{size}, so this is a fresh {backend} session. The work so far is in this worktree: check git status and git log before you change anything, and carry on from there. Your notes and recent quests below are what you remember."
+    )
+}
+
+pub fn quest_brief(prompt: &str) -> &str {
+    prompt.find("[task session").map_or(prompt, |at| &prompt[at..])
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompactRequest {
     Queued,
@@ -276,10 +401,12 @@ impl WorldStore {
             return Ok(None);
         }
         let auto = self.auto_context(agent.id).await?;
-        let Some(limit) = auto.tokens else {
+        let view = self.context_view(&agent).await?;
+        let default_limit = auto.tokens.is_none();
+        let Some(limit) = auto.tokens.or_else(|| default_auto_tokens(&view.cli, &view.model)) else {
             return Ok(None);
         };
-        let view = self.context_view(&agent).await?;
+        let auto = AutoContext { tokens: Some(limit), ..auto };
         let Some(session) = view.session_id else {
             return Ok(None);
         };
@@ -293,6 +420,7 @@ impl WorldStore {
         let detail = json!({
             "origin": "auto",
             "auto_context_tokens": limit,
+            "default_limit": default_limit,
             "used_tokens": view.used_tokens,
             "max_tokens": view.max_tokens,
             "requested_action": auto.action.as_str(),
@@ -345,6 +473,245 @@ impl WorldStore {
         Ok(())
     }
 
+    pub async fn inherited_context_tokens(&self, main: &AgentSession) -> Result<i64> {
+        if main.context_tokens > 0 {
+            return Ok(main.context_tokens);
+        }
+        let bytes: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(octet_length(COALESCE(r.prompt, '')) + octet_length(COALESCE(r.output, ''))), 0)::bigint
+             FROM session_runs r
+             WHERE r.session_id = $1
+               AND r.created_at > COALESCE(
+                 (SELECT MAX(c.created_at) FROM session_runs c WHERE c.session_id = $1 AND c.prompt = $2),
+                 '-infinity'::timestamptz)",
+        )
+        .bind(main.id)
+        .bind(COMPACT_PROMPT)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(estimated_tokens(0, bytes))
+    }
+
+    pub async fn fork_failed_since_compact(&self, main: &AgentSession) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(
+               SELECT 1 FROM session_runs r
+               WHERE r.agent_id = $1 AND r.fork_from = $2
+                 AND r.created_at > GREATEST($3, COALESCE(
+                   (SELECT MAX(c.created_at) FROM session_runs c
+                    WHERE c.session_id = $2 AND c.prompt = $4 AND c.status = 'completed'),
+                   '-infinity'::timestamptz))
+                 AND r.cause = 'cli_error' AND r.diagnosis->>'failure' = 'context_too_long'
+                 AND COALESCE((r.diagnosis->>'turns')::int, 0) <= 1
+             )",
+        )
+        .bind(main.agent_id)
+        .bind(main.id)
+        .bind(main.created_at)
+        .bind(COMPACT_PROMPT)
+        .fetch_one(self.pool())
+        .await?)
+    }
+
+    async fn fork_compaction_allowed(&self, main: &AgentSession, used: i64, limit: i64) -> Result<bool> {
+        let (after_compaction, floor): (bool, Option<i32>) = sqlx::query_as(
+            "SELECT COALESCE((SELECT prompt = $2 FROM session_runs
+                 WHERE session_id = $1 AND status = 'completed' AND kind = 'turn'
+                 ORDER BY created_at DESC, id DESC LIMIT 1), false),
+               (SELECT compact_floor FROM agent_sessions WHERE id = $1)",
+        )
+        .bind(main.id)
+        .bind(COMPACT_PROMPT)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(!after_compaction && floor.is_none_or(|floor| used > compact_limit(limit, Some(i64::from(floor)))))
+    }
+
+    pub async fn fork_choice(&self, agent: &WorldAgent, main: &AgentSession, level: QuestContext) -> Result<ForkChoice> {
+        let used = self.inherited_context_tokens(main).await?;
+        if !level_allows_fork(level, used, &main.backend, &main.model) {
+            tracing::info!(agent = %agent.slug, used, level = level.as_str(), "Starting the quest lean, without the main conversation");
+            return Ok(ForkChoice::Lean { used, level });
+        }
+        let too_large = fork_too_large(carried_into_fork(used), &main.backend, &main.model);
+        let failed_before = !too_large && self.fork_failed_since_compact(main).await?;
+        if !too_large && !failed_before {
+            return Ok(ForkChoice::Fork);
+        }
+        let limit = fork_limit(&main.backend, &main.model);
+        let compact_due = fork_too_large(used, &main.backend, &main.model) || failed_before;
+        let compacting = compact_due
+            && compact_unsupported(&main.backend).is_none()
+            && self.fork_compaction_allowed(main, used, limit).await?
+            && matches!(
+                self.request_compact(
+                    agent,
+                    json!({ "origin": "fork", "used_tokens": used, "fork_limit": limit, "failed_before": failed_before })
+                )
+                .await?,
+                CompactRequest::Queued | CompactRequest::AlreadyPending
+            );
+        if compacting {
+            let _ = self.announce_context(agent.id).await;
+        }
+        tracing::info!(agent = %agent.slug, used, limit, compacting, failed_before, "Main session too large to fork, starting the quest fresh");
+        Ok(ForkChoice::Fresh { used, limit, compacting })
+    }
+
+    pub async fn fresh_retry(&self, run_id: Uuid, diagnosis: &crate::run_causes::Diagnosis) -> Result<Option<Uuid>> {
+        if !diagnosis.fork_too_long() {
+            return Ok(None);
+        }
+        let run = sqlx::query_as::<_, (Uuid, Uuid, Option<Uuid>, String, String, Option<Uuid>, i32, Option<String>)>(
+            "SELECT session_id, agent_id, task_id, kind, prompt, fork_from, timeout_secs, retry_cause
+             FROM session_runs WHERE id = $1",
+        )
+        .bind(run_id)
+        .fetch_optional(self.pool())
+        .await?;
+        let Some((session_id, agent_id, Some(task_id), kind, prompt, fork_from, timeout_secs, retry_cause)) = run else {
+            return Ok(None);
+        };
+        if retry_cause.as_deref() == Some(crate::run_causes::FRESH_RETRY_CAUSE) {
+            return Ok(None);
+        }
+        let Some(agent) = self.get_agent(agent_id).await? else {
+            return Ok(None);
+        };
+        let (memory, prompt, backend) = match (kind.as_str(), fork_from) {
+            ("task", Some(fork_from)) => {
+                let main = sqlx::query_as::<_, (String, i64)>("SELECT backend, context_tokens FROM agent_sessions WHERE id = $1")
+                    .bind(fork_from)
+                    .fetch_optional(self.pool())
+                    .await?;
+                let (backend, used) = main.unwrap_or_else(|| (agent.cli.clone(), 0));
+                let memory = self.fresh_start_memory(&agent, &fresh_intro(&agent.name, &backend, Some(used))).await?;
+                (memory, unforked(&prompt), backend)
+            }
+            ("followup", None) => {
+                let Some((backend, used, brief)) = self.quest_session_brief(session_id, task_id).await? else {
+                    return Ok(None);
+                };
+                let memory = self.fresh_start_memory(&agent, &resume_intro(&agent.name, &backend, used)).await?;
+                (memory, format!("{brief}\n\n{LATEST_FOLLOWUP}\n{prompt}"), backend)
+            }
+            _ => return Ok(None),
+        };
+        let mut tx = self.pool().begin().await?;
+        let status = sqlx::query_scalar::<_, String>("SELECT status FROM agent_tasks WHERE id = $1 FOR UPDATE")
+            .bind(task_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let closed = if kind == "task" { &["cancelled", "done"][..] } else { &["cancelled"][..] };
+        if status.is_none_or(|status| closed.contains(&status.as_str())) {
+            return Ok(None);
+        }
+        let retried = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+               SELECT 1 FROM session_runs
+               WHERE task_id = $1 AND retry_cause = $2
+                 AND created_at >= (SELECT created_at FROM session_runs WHERE id = $3)
+             )",
+        )
+        .bind(task_id)
+        .bind(crate::run_causes::FRESH_RETRY_CAUSE)
+        .bind(run_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if retried {
+            return Ok(None);
+        }
+        let open = sqlx::query_scalar::<_, String>("SELECT status FROM agent_sessions WHERE id = $1 FOR UPDATE")
+            .bind(session_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some_and(|status| status != "archived");
+        if !open {
+            return Ok(None);
+        }
+        sqlx::query(
+            "UPDATE agent_sessions SET cli_session_id = NULL, usage_baseline = '{}'::jsonb, status = 'active', updated_at = NOW()
+             WHERE id = $1",
+        )
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+        let id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO session_runs
+               (session_id, agent_id, task_id, kind, status, fork_from, prompt, timeout_secs, activity, retry_cause)
+             VALUES ($1, $2, $3, 'task', 'queued', NULL, $4, $5, 'Starting fresh from notes', $6)
+             RETURNING id",
+        )
+        .bind(session_id)
+        .bind(agent_id)
+        .bind(task_id)
+        .bind(format!("{memory}\n\n{prompt}"))
+        .bind(timeout_secs)
+        .bind(crate::run_causes::FRESH_RETRY_CAUSE)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let compacting = kind == "task"
+            && compact_unsupported(&backend).is_none()
+            && matches!(
+                self.request_compact(&agent, json!({ "origin": "fork_failed", "failed_run_id": run_id })).await?,
+                CompactRequest::Queued | CompactRequest::AlreadyPending
+            );
+        if compacting {
+            let _ = self.announce_context(agent.id).await;
+        }
+        let mut payload = json!({
+            "task_id": task_id,
+            "session_id": session_id,
+            "failed_run_id": run_id,
+            "retry_run_id": id,
+            "fresh": true,
+            "compacting": compacting,
+            "quiet": true,
+        });
+        diagnosis.merge_into(&mut payload);
+        self.emit(
+            NewEvent::new("run.retrying").agent(agent_id).session(session_id).run(id).task(Some(task_id)).payload(payload),
+            None,
+        )
+        .await?;
+        tracing::info!(agent = %agent.slug, %run_id, retry = %id, compacting, "Quest fork was too long, retrying fresh from notes");
+        Ok(Some(id))
+    }
+
+    async fn quest_session_brief(&self, session_id: Uuid, task_id: Uuid) -> Result<Option<(String, i64, String)>> {
+        let session = sqlx::query_as::<_, (String, String, i64)>("SELECT role, backend, context_tokens FROM agent_sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_optional(self.pool())
+            .await?;
+        let Some((_, backend, used)) = session.filter(|(role, ..)| role == "task") else {
+            return Ok(None);
+        };
+        let first = sqlx::query_scalar::<_, String>(
+            "SELECT prompt FROM session_runs
+             WHERE session_id = $1 AND kind = 'task' AND retry_cause IS DISTINCT FROM $2
+             ORDER BY created_at LIMIT 1",
+        )
+        .bind(session_id)
+        .bind(crate::run_causes::FRESH_RETRY_CAUSE)
+        .fetch_optional(self.pool())
+        .await?;
+        let brief = match first {
+            Some(prompt) => quest_brief(&prompt).to_string(),
+            None => {
+                let task = sqlx::query_as::<_, (String, Option<String>)>("SELECT title, description FROM agent_tasks WHERE id = $1")
+                    .bind(task_id)
+                    .fetch_optional(self.pool())
+                    .await?;
+                let Some((title, description)) = task else {
+                    return Ok(None);
+                };
+                format!("Task: {title}\n{}", description.unwrap_or_default())
+            }
+        };
+        Ok(Some((backend, used, brief)))
+    }
+
     pub async fn request_compact(&self, agent: &WorldAgent, payload: Value) -> Result<CompactRequest> {
         if agent.paused_reason.is_some() {
             return Ok(CompactRequest::Refused(PAUSED));
@@ -387,6 +754,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn quest_context_levels_parse_and_resolve() {
+        assert_eq!(QuestContext::default(), QuestContext::Lean);
+        assert_eq!(QuestContext::parse(" Auto "), Ok(QuestContext::Auto));
+        assert_eq!(QuestContext::parse("full").map(QuestContext::as_str), Ok("full"));
+        assert_eq!(QuestContext::parse("huge"), Err(QUEST_CONTEXT_ERROR.to_string()));
+        assert_eq!(QuestContext::resolve(None, "full"), QuestContext::Full);
+        assert_eq!(QuestContext::resolve(Some("lean"), "full"), QuestContext::Lean);
+        assert_eq!(QuestContext::resolve(Some("bogus"), "auto"), QuestContext::Auto);
+        assert_eq!(QuestContext::resolve(None, ""), QuestContext::Lean);
+    }
+
+    #[test]
+    fn auto_forks_only_under_half_the_window() {
+        assert_eq!(auto_fork_limit("claude", "sonnet"), 100_000);
+        assert_eq!(auto_fork_limit("claude", "made-up-model"), AUTO_FORK_FALLBACK);
+        assert!(!level_allows_fork(QuestContext::Lean, 0, "claude", "sonnet"));
+        assert!(level_allows_fork(QuestContext::Auto, 99_999, "claude", "sonnet"));
+        assert!(!level_allows_fork(QuestContext::Auto, 100_000, "claude", "sonnet"));
+        assert!(level_allows_fork(QuestContext::Full, 10_000_000, "claude", "sonnet"));
+    }
+
+    #[test]
+    fn lean_intro_carries_the_persona_and_no_chat() {
+        let intro = lean_intro("Ada", "claude", Some("Careful with migrations."), Some("Prefer small PRs."));
+        assert!(intro.starts_with("[lean session] You are Ada"));
+        assert!(intro.contains("Careful with migrations."));
+        assert!(intro.contains("Prefer small PRs."));
+        assert!(intro.contains("without your main conversation"));
+        assert!(!lean_intro("Ada", "claude", None, None).contains("Extra instructions"));
+    }
+
+    #[test]
     fn windows_per_cli_and_model() {
         let cases = [
             ("claude", "opus", Some(200_000)),
@@ -411,6 +810,26 @@ mod tests {
         for (cli, model, expected) in cases {
             assert_eq!(window(cli, model), expected, "{cli} {model}");
         }
+    }
+
+    #[test]
+    fn forks_stay_under_most_of_the_window() {
+        assert_eq!(default_auto_tokens("claude", "sonnet"), Some(140_000));
+        assert_eq!(default_auto_tokens("codex", "gpt-5.3-codex"), Some(190_400));
+        assert_eq!(default_auto_tokens("cursor", "composer-2.5"), None);
+        assert_eq!(fork_limit("cursor", "composer-2.5"), FORK_LIMIT_FALLBACK);
+        assert!(!fork_too_large(0, "claude", "sonnet"));
+        assert!(!fork_too_large(139_999, "claude", "sonnet"));
+        assert!(fork_too_large(140_000, "claude", "sonnet"));
+        assert!(!fork_too_large(150_000, "claude", "sonnet[1m]"));
+        assert!(fork_too_large(150_000, "opencode", "local/llama-4"));
+    }
+
+    #[test]
+    fn inherited_size_falls_back_to_bytes() {
+        assert_eq!(estimated_tokens(120_000, 4_000_000), 120_000);
+        assert_eq!(estimated_tokens(0, 800_000), 200_000);
+        assert_eq!(estimated_tokens(0, -5), 0);
     }
 
     #[test]

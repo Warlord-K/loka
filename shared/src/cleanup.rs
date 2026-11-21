@@ -4,7 +4,7 @@ use serde::Serialize;
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::world::WorldStore;
+use crate::world::{WorldStore, COMPACT_PROMPT};
 
 pub const MIN_DAYS: i32 = 7;
 pub const MAX_DAYS: i32 = 3650;
@@ -232,10 +232,20 @@ async fn run_logs(tx: &mut Transaction<'_, Postgres>, r: &CleanupRequest, apply:
         tx,
         "CREATE TEMP TABLE cleanup_runs (id UUID PRIMARY KEY) ON COMMIT DROP",
         &format!(
-            "INSERT INTO cleanup_runs SELECT x.id FROM session_runs x LEFT JOIN agent_tasks t ON t.id = x.task_id
+            "INSERT INTO cleanup_runs
+             WITH live AS MATERIALIZED (
+               SELECT s.id, COALESCE(MAX(c.created_at), '-infinity'::timestamptz) AS since
+                 FROM agent_sessions s
+                 LEFT JOIN session_runs c ON c.session_id = s.id AND c.prompt = '{COMPACT_PROMPT}'
+                WHERE s.agent_id IN ({MINE}) AND s.role = 'main' AND s.status = 'active'
+                GROUP BY s.id)
+             SELECT x.id FROM session_runs x
+               LEFT JOIN agent_tasks t ON t.id = x.task_id
+               LEFT JOIN live l ON l.id = x.session_id AND x.created_at >= l.since
               WHERE x.agent_id IN ({MINE}) AND x.status NOT IN ('queued', 'running')
                 AND COALESCE(x.finished_at, x.created_at) < NOW() - make_interval(days => $4)
-                AND (t.id IS NULL OR t.status IN ('done', 'failed', 'cancelled'))"
+                AND (t.id IS NULL OR t.status IN ('done', 'failed', 'cancelled'))
+                AND l.id IS NULL"
         ),
         r,
     )
@@ -448,6 +458,15 @@ mod tests {
                 .await?;
             runs.push(run);
         }
+        sqlx::query(
+            "INSERT INTO session_runs (session_id, agent_id, kind, status, prompt, output, created_at, finished_at)
+             VALUES ($1, $2, 'turn', 'completed', $3, 'compacted', NOW() - INTERVAL '50 days', NOW() - INTERVAL '50 days')",
+        )
+        .bind(main)
+        .bind(mine)
+        .bind(COMPACT_PROMPT)
+        .execute(&pool)
+        .await?;
         let total = || async {
             sqlx::query_scalar::<_, f64>("SELECT cost_usd::float8 FROM agent_usage_totals WHERE agent_id = $1").bind(mine).fetch_one(&pool).await
         };
@@ -503,6 +522,94 @@ mod tests {
 
         sqlx::query("DELETE FROM agent_profiles WHERE id = ANY($1)").bind(vec![mine, theirs]).execute(&pool).await?;
         sqlx::query("DELETE FROM users WHERE id = ANY($1)").bind(vec![owner, other]).execute(&pool).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_logs_keep_what_the_fork_size_estimate_reads() -> Result<()> {
+        let Ok(url) = std::env::var("CLEANUP_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new().max_connections(2).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email, world_role) VALUES ($1, 'write') RETURNING id")
+            .bind(format!("fork-size-{tag}@test.dev"))
+            .fetch_one(&pool)
+            .await?;
+        let agent: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id) VALUES ($1, 'Sizer', 'claude', 'sonnet', $2) RETURNING id",
+        )
+        .bind(format!("sizer-{tag}"))
+        .bind(owner)
+        .fetch_one(&pool)
+        .await?;
+        let org: Option<Uuid> = sqlx::query_scalar("SELECT org_id FROM agent_profiles WHERE id = $1").bind(agent).fetch_one(&pool).await?;
+        let session = |status: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Uuid>(
+                    "INSERT INTO agent_sessions (agent_id, role, backend, model, status) VALUES ($1, 'main', 'claude', 'sonnet', $2) RETURNING id",
+                )
+                .bind(agent)
+                .bind(status)
+                .fetch_one(&pool)
+                .await
+            }
+        };
+        let old_main = session("archived").await?;
+        let main = session("active").await?;
+        let big = "x".repeat(150_000);
+        let run = |session: Uuid, prompt: String, days: i32| {
+            let pool = pool.clone();
+            let output = big.clone();
+            async move {
+                sqlx::query_scalar::<_, Uuid>(
+                    "INSERT INTO session_runs (session_id, agent_id, kind, status, prompt, output, created_at, finished_at)
+                     VALUES ($1, $2, 'turn', 'completed', $3, $4, NOW() - make_interval(days => $5), NOW() - make_interval(days => $5))
+                     RETURNING id",
+                )
+                .bind(session)
+                .bind(agent)
+                .bind(prompt)
+                .bind(output)
+                .bind(days)
+                .fetch_one(&pool)
+                .await
+            }
+        };
+        let archived = run(old_main, big.clone(), 120).await?;
+        let before_compaction = run(main, big.clone(), 100).await?;
+        let compaction = run(main, COMPACT_PROMPT.to_string(), 90).await?;
+        let mut kept = vec![compaction];
+        for days in [80, 70, 60] {
+            kept.push(run(main, big.clone(), days).await?);
+        }
+
+        let loaded = store.get_session(main).await?.expect("main session");
+        let estimate = store.inherited_context_tokens(&loaded).await?;
+        assert!(crate::context::fork_too_large(estimate, "claude", "sonnet"), "{estimate}");
+
+        let request = CleanupRequest { owner, org, agent: Some(agent), kind: CleanupKind::RunLogs, older_than_days: 30, by_agent: None };
+        assert!(store.clean_up(request, true).await?.applied);
+
+        let blanked: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM session_runs WHERE agent_id = $1 AND prompt = '' AND output IS NULL ORDER BY created_at")
+            .bind(agent)
+            .fetch_all(&pool)
+            .await?;
+        assert_eq!(blanked, vec![archived, before_compaction], "only runs the live context no longer holds are blanked");
+        let intact: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_runs WHERE id = ANY($1) AND prompt <> '' AND output IS NOT NULL")
+            .bind(&kept)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(intact, kept.len() as i64);
+
+        let after = store.inherited_context_tokens(&loaded).await?;
+        assert_eq!(after, estimate, "the cleanup leaves the estimate alone");
+        assert!(crate::context::fork_too_large(after, "claude", "sonnet"), "{after}");
+
+        sqlx::query("DELETE FROM agent_profiles WHERE id = $1").bind(agent).execute(&pool).await?;
+        sqlx::query("DELETE FROM users WHERE id = $1").bind(owner).execute(&pool).await?;
         Ok(())
     }
 }

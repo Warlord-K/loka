@@ -9,7 +9,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::StreamExt;
 use loka_shared::runners::{
     LeaseBeat, LeaseSteers, RunnerCompletion, RunnerEvent, RunnerHeartbeat, RunnerJob, RunnerPoll, RunnerPolled,
-    RunnerUsage, RunnerWorkspace, RUNNER_LEASE_SECONDS,
+    RunnerPublish, RunnerUsage, RunnerWorkspace, RUNNER_LEASE_SECONDS,
 };
 use loka_shared::git_names::{validate_git_ref, validate_repo};
 use loka_shared::shell::{ShellFinish, ShellJob, OUTPUT_CAP};
@@ -29,6 +29,7 @@ mod health;
 mod media;
 mod outbox;
 mod storage;
+mod vault_refs;
 
 use outbox::{Batch, Deliver, EventSink, Outbox, Sent};
 use storage::RunnerStorage;
@@ -1459,6 +1460,16 @@ async fn execute_job_inner(
     if job.cli == "cursor" && cli::job_user().is_some() && !cli::cursor_homes_set() {
         bail!("runners with a separate job user run Cursor jobs only when CURSOR_CONFIG_DIR and CURSOR_DATA_DIR point at folders the job group shares");
     }
+    let mut granted = job.environment.clone();
+    let mut vault_values = Vec::new();
+    if let Some(name) = job.vault_refs.keys().next() {
+        if storage.is_some() || !cfg!(target_os = "macos") {
+            return Err(vault_refs::failure(name, "vault references are read only on their owner's own Mac."));
+        }
+        let resolved = vault_refs::Resolver::new(vault_refs::find_op()).resolve(&job.vault_refs).await?;
+        vault_values.extend(redactable(resolved.values()));
+        granted.extend(resolved);
+    }
     let mut skills = materialize_skills(&work_root, job).await?;
     let browser = storage.is_none() && crate::browser::wanted(&job.kind) && crate::browser::available();
     if browser {
@@ -1500,7 +1511,7 @@ async fn execute_job_inner(
             let host: Vec<String> = std::env::vars().map(|(name, _)| name).collect();
             crate::key_proxy::prompt_note(
                 &job.cli,
-                job.provider_keys.keys().chain(job.environment.keys()).map(String::as_str).chain(host.iter().map(String::as_str)),
+                job.provider_keys.keys().chain(granted.keys()).map(String::as_str).chain(host.iter().map(String::as_str)),
             )
         })
         .flatten()
@@ -1508,7 +1519,7 @@ async fn execute_job_inner(
         Some(note) => format!("{prompt}\n\n{note}"),
         None => prompt,
     };
-    let prompt = match (!job.lean).then(|| crate::cmd_hub::prompt_note(&job.cli, &job.environment)).flatten() {
+    let prompt = match (!job.lean).then(|| crate::cmd_hub::prompt_note(&job.cli, &granted)).flatten() {
         Some(note) => format!("{prompt}\n\n{note}"),
         None => prompt,
     };
@@ -1516,7 +1527,7 @@ async fn execute_job_inner(
         Some(note) => format!("{prompt}\n\n{note}"),
         None => prompt,
     };
-    let mut environment = filtered_environment(&job.environment, storage.is_some())?;
+    let mut environment = filtered_environment(&granted, storage.is_some())?;
     if let Some(policy) = job
         .command_rules
         .as_ref()
@@ -1531,9 +1542,12 @@ async fn execute_job_inner(
     for (name, value) in &provided {
         environment.entry(name.clone()).or_insert_with(|| value.clone());
     }
+    if browser || screen_launcher.is_some() || apps_launcher.is_some() {
+        environment.insert(crate::browser::ROOT_ENV.to_string(), root.display().to_string());
+    }
     if browser {
-        for (name, value) in crate::browser::environment(job.agent_id) {
-            environment.entry(name).or_insert(value);
+        for (name, value) in crate::browser::environment(root, job.agent_id, &job.kind) {
+            environment.insert(name, value);
         }
     }
     if let Some(launcher) = screen_launcher {
@@ -1598,7 +1612,8 @@ async fn execute_job_inner(
     let upload = events.clone();
     let mut secrets = redaction_values(job);
     secrets.extend(hub_values);
-    secrets.extend(provided.values().filter(|value| value.len() >= 4).cloned());
+    secrets.extend(redactable(provided.values()));
+    secrets.extend(vault_values);
     secrets.sort_by_key(|value| std::cmp::Reverse(value.len()));
     secrets.dedup();
     let event_secrets = secrets.clone();
@@ -1724,10 +1739,15 @@ async fn publish_job(root: &Path, job: &RunnerJob) -> Result<ExecutionOutcome> {
         bail!("publish repository does not match the workspace");
     }
     let workspace = prepare_workspace(root, &job.workspace).await?;
-    crate::git::workspace::commit_all(&workspace, &publish.commit_message).await?;
-    if publish.pr_number.is_none()
-        && !crate::git::workspace::has_commits_ahead(&workspace, &publish.base_branch).await?
-    {
+    let quest_branch = job
+        .workspace
+        .branch
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(&publish.branch);
+    crate::git::workspace::commit_signed(&workspace, &publish.commit_message).await?;
+    let ahead = crate::git::workspace::ahead_of_fresh_base(&workspace, &publish.base_branch).await?;
+    if publish.pr_number.is_none() && !ahead {
         return Ok(ExecutionOutcome {
             result: crate::cli::CliResult {
                 output: "Nothing to publish".to_string(),
@@ -1764,42 +1784,65 @@ async fn publish_job(root: &Path, job: &RunnerJob) -> Result<ExecutionOutcome> {
             }
         }
     }
+    if let Some((url, number)) = kept_pr(publish, ahead) {
+        return Ok(ExecutionOutcome {
+            result: crate::cli::CliResult {
+                output: format!("Nothing new to publish, keeping pull request #{number}"),
+                session_id: job.cli_session_id.clone(),
+                cost_usd: 0.0,
+                exit_code: 0,
+                usage: crate::cli::Usage::default(),
+                checkpoint: None,
+            },
+            pr_url: Some(url),
+            pr_number: Some(number),
+            publish_pr_state: None,
+            work_summary: None,
+        });
+    }
+    let mut publish_pr_state = None;
     let pr = match crate::git::github::open_pr_containing_head(
         &workspace,
         repo,
         &publish.base_branch,
+        quest_branch,
     )
     .await?
     {
-        Some((pr, head)) => {
-            crate::git::workspace::push(&workspace, &head).await?;
+        crate::git::github::HeadPr::Own(pr, head) if ahead => {
+            crate::git::workspace::ensure_signed_commits(&workspace, &publish.base_branch).await?;
+            crate::git::workspace::push_quest_branch(&workspace, &head, quest_branch).await?;
             Some(pr)
         }
-        None if crate::git::workspace::has_commits_ahead(&workspace, &publish.base_branch)
-            .await? =>
-        {
-            let branch = crate::git::workspace::publish_branch(
-                &workspace,
-                job.workspace.branch.as_deref(),
-            )
-            .await?;
+        crate::git::github::HeadPr::Elsewhere(pr) => {
+            info!(pr = %pr.url, "Work already sits in another branch's pull request, not attaching it");
+            publish_pr_state = Some(loka_shared::runners::PUBLISH_ELSEWHERE.to_string());
+            None
+        }
+        crate::git::github::HeadPr::Missing if ahead => 'missing: {
+            if !crate::git::workspace::ahead_of_fresh_base(&workspace, &publish.base_branch).await? {
+                info!("The base branch caught up with this work while publishing, not opening a pull request");
+                break 'missing None;
+            }
+            let branch =
+                crate::git::workspace::publish_branch(&workspace, Some(quest_branch)).await?;
             if branch == publish.base_branch {
                 bail!("publish workspace is on the base branch");
             }
-            crate::git::workspace::push(&workspace, &branch).await?;
-            Some(
-                crate::git::github::create_pr(
-                    &workspace,
-                    repo,
-                    &branch,
-                    &publish.base_branch,
-                    &publish.pr_title,
-                    &publish.pr_body,
-                )
-                .await?,
+            crate::git::workspace::ensure_signed_commits(&workspace, &publish.base_branch).await?;
+            crate::git::workspace::push_quest_branch(&workspace, &branch, quest_branch).await?;
+            let into = crate::git::github::stack_base(&workspace, repo, &publish.base_branch, quest_branch, publish.stack_onto_pr).await;
+            crate::git::github::create_pr(
+                &workspace,
+                repo,
+                &branch,
+                &into,
+                &publish.pr_title,
+                &publish.pr_body,
             )
+            .await?
         }
-        None => None,
+        _ => None,
     };
     if let Err(error) = run_git(
         &workspace,
@@ -1829,9 +1872,17 @@ async fn publish_job(root: &Path, job: &RunnerJob) -> Result<ExecutionOutcome> {
         },
         pr_url: pr.as_ref().map(|pr| pr.url.clone()),
         pr_number: pr.map(|pr| i64::from(pr.number)),
-        publish_pr_state: None,
+        publish_pr_state,
         work_summary: None,
     })
+}
+
+fn kept_pr(publish: &RunnerPublish, ahead: bool) -> Option<(String, i64)> {
+    if ahead {
+        return None;
+    }
+    let url = publish.pr_url.as_deref().map(str::trim).filter(|url| !url.is_empty())?;
+    Some((url.to_string(), publish.pr_number?))
 }
 
 const LIVE_USAGE_EVERY: Duration = Duration::from_secs(5);
@@ -1903,16 +1954,15 @@ fn map_event(event: StreamEvent, secrets: &[String]) -> Option<RunnerEvent> {
     })
 }
 
+fn redactable<'a>(values: impl IntoIterator<Item = &'a String> + 'a) -> impl Iterator<Item = String> + 'a {
+    values.into_iter().filter(|value| value.len() >= 4).cloned()
+}
+
 fn redaction_values(job: &RunnerJob) -> Vec<String> {
-    let mut values = job
-        .environment
-        .values()
-        .filter(|value| value.len() >= 4)
-        .cloned()
-        .collect::<Vec<_>>();
-    values.extend(job.provider_keys.values().filter(|value| value.len() >= 4).cloned());
+    let mut values = redactable(job.environment.values()).collect::<Vec<_>>();
+    values.extend(redactable(job.provider_keys.values()));
     values.push(job.mcp_token.clone());
-    values.extend(job.omp_secrets.iter().filter(|value| value.len() >= 4).cloned());
+    values.extend(redactable(&job.omp_secrets));
     collect_json_strings(&job.mcp_servers, &mut values);
     values.extend(cli::host_secrets().iter().cloned());
     values.sort_by_key(|value| std::cmp::Reverse(value.len()));
@@ -2234,7 +2284,7 @@ async fn prepare_workspace(root: &Path, workspace: &RunnerWorkspace) -> Result<P
         validate_git_ref(branch)?;
         let staging = target.with_file_name(format!("worktree-{}", Uuid::new_v4().simple()));
         let target_arg = staging.to_string_lossy().to_string();
-        let stems: Vec<&str> = std::iter::once(branch).chain(legacy_branch(branch)).collect();
+        let stems: Vec<&str> = std::iter::once(branch).chain(crate::git::workspace::legacy_branch(branch)).collect();
         let patterns: Vec<String> = stems
             .iter()
             .flat_map(|stem| [format!("refs/heads/{stem}"), format!("refs/heads/{stem}-[0-9]*")])
@@ -2248,7 +2298,7 @@ async fn prepare_workspace(root: &Path, workspace: &RunnerWorkspace) -> Result<P
             .filter_map(|line| line.strip_prefix("branch refs/heads/"))
             .collect();
         let existing = refs.lines().map(str::trim).find(|name| {
-            !in_use.contains(name) && stems.iter().any(|stem| is_branch_of(name, stem))
+            !in_use.contains(name) && stems.iter().any(|stem| crate::git::workspace::is_branch_of(name, stem))
         });
         if let (false, Some(existing)) = (workspace.create, existing) {
             run_git(&repo_path, &["worktree", "add", "--no-checkout", &target_arg, existing]).await?;
@@ -2275,19 +2325,6 @@ async fn prepare_workspace(root: &Path, workspace: &RunnerWorkspace) -> Result<P
         .await?;
     }
     canonical_contained(&workspaces, &target).await
-}
-
-fn legacy_branch(branch: &str) -> Option<&str> {
-    let (stem, suffix) = branch.rsplit_once('-')?;
-    (!branch.contains('/') && suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_hexdigit()))
-        .then_some(stem)
-}
-
-fn is_branch_of(name: &str, stem: &str) -> bool {
-    name == stem
-        || name.strip_prefix(stem).and_then(|rest| rest.strip_prefix('-')).is_some_and(|n| {
-            (1..=3).contains(&n.len()) && n.chars().all(|c| c.is_ascii_digit())
-        })
 }
 
 async fn remove_closed_workspaces(api: &RunnerApi, root: &Path) -> Result<()> {
@@ -2441,7 +2478,7 @@ async fn materialize_browser(root: &Path, job: &RunnerJob) -> Result<PathBuf> {
     secure_create_dir(&profiles, Path::new(&job.agent_id.to_string()), false).await?;
     let dir = secure_create_dir(&root.join("skills"), Path::new(&job.session_id.to_string()), false).await?;
     let path = dir.join("browser.md");
-    let launcher = crate::browser::launcher(job.agent_id).ok_or_else(|| anyhow::anyhow!("the browser launcher path is not usable"))?;
+    let launcher = crate::browser::launcher(job.agent_id, &job.kind).ok_or_else(|| anyhow::anyhow!("the browser launcher path is not usable"))?;
     tokio::fs::write(&path, crate::browser::skill(&launcher)).await?;
     Ok(path)
 }
@@ -2664,6 +2701,7 @@ fn capabilities() -> Value {
         "versions": { "claude": crate::claude::detect::version(), "runner": env!("WORLD_BUILD") },
         "terminal": true,
         "setup_scan": cfg!(target_os = "macos"),
+        "vault_refs": cfg!(target_os = "macos"),
         "quick": true,
         "github_feed": github_feed::capability(),
         "provider_keys": loka_shared::providers::server_key_names(),
@@ -2791,6 +2829,27 @@ async fn reconnect_delay() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_recorded_pr_is_kept_when_nothing_is_ahead() {
+        let publish = |url: Option<&str>, number: Option<i64>| RunnerPublish {
+            repo: "o/r".into(),
+            branch: "fix-x-dcec4a9d".into(),
+            base_branch: "main".into(),
+            commit_message: "m".into(),
+            pr_title: "t".into(),
+            pr_body: "b".into(),
+            pr_url: url.map(str::to_string),
+            pr_number: number,
+            stack_onto_pr: None,
+        };
+        let recorded = publish(Some("https://github.com/o/r/pull/94"), Some(94));
+        assert_eq!(kept_pr(&recorded, false), Some(("https://github.com/o/r/pull/94".to_string(), 94)));
+        assert_eq!(kept_pr(&recorded, true), None);
+        assert_eq!(kept_pr(&publish(None, None), false), None);
+        assert_eq!(kept_pr(&publish(None, Some(94)), false), None);
+        assert_eq!(kept_pr(&publish(Some(" "), Some(94)), false), None);
+    }
 
     #[test]
     fn slack_capture_status_comes_from_the_mac_app() {
@@ -2942,6 +3001,17 @@ mod tests {
             &secrets,
         );
         assert_eq!(text, "[REDACTED] [REDACTED] [REDACTED]");
+    }
+
+    #[test]
+    fn short_vault_values_are_not_redacted_everywhere() {
+        let resolved = BTreeMap::from([
+            ("PIN".to_string(), "42".to_string()),
+            ("API_KEY".to_string(), "vault-secret".to_string()),
+        ]);
+        let values = redactable(resolved.values()).collect::<Vec<_>>();
+        assert_eq!(values, vec!["vault-secret".to_string()]);
+        assert_eq!(redact("build 42 vault-secret", &values), "build 42 [REDACTED]");
     }
 
     #[test]

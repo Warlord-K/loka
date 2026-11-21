@@ -280,6 +280,12 @@ impl RunnerCoordinator {
             let _ = self.store.announce_context(agent.id).await;
             return Ok(());
         }
+        self.reset_with_saved_notes(agent, main, run_id).await?;
+        self.prepare_claimed_turn(runner_id, agent.id).await?;
+        Ok(())
+    }
+
+    async fn reset_with_saved_notes(&self, agent: &WorldAgent, main: &AgentSession, run_id: Uuid) -> Result<()> {
         let notes = self
             .store
             .own_notes_skill(agent.id, agent.owner_user_id)
@@ -291,9 +297,8 @@ impl RunnerCoordinator {
         self.store.mark_context_reset(agent.id, fresh.id, main.id).await?;
         self.runners.finish_run_inbox(run_id, "done", None).await?;
         self.store.set_agent_status(agent.id, "idle", agent.status_detail.as_deref()).await?;
-        tracing::info!(agent = %agent.slug, old = %main.id, new = %fresh.id, "Main session reset after saving notes");
+        tracing::info!(agent = %agent.slug, old = %main.id, new = %fresh.id, "Main session reset with saved notes");
         let _ = self.store.announce_context(agent.id).await;
-        self.prepare_claimed_turn(runner_id, agent.id).await?;
         Ok(())
     }
 
@@ -500,8 +505,8 @@ impl RunnerCoordinator {
         }
         let on_mac = runner.platform == "macos"
             || runner.capabilities.get("platform").and_then(Value::as_str) == Some("macos");
-        let (all_environment, omp, provider_keys, publish) = tokio::try_join!(
-            self.store.environment_for_agent(agent.id),
+        let (agent_keys, omp, provider_keys, publish) = tokio::try_join!(
+            self.store.keys_for_agent(agent.id),
             async {
                 if claimed.kind == "publish" {
                     Ok(None)
@@ -525,15 +530,31 @@ impl RunnerCoordinator {
                 }
             },
         )?;
-        let environment = if matches!(claimed.kind.as_str(), "task" | "followup" | "direct" | "quick") {
+        let all_environment = agent_keys.values;
+        let gets_environment = matches!(claimed.kind.as_str(), "task" | "followup" | "direct" | "quick");
+        let environment = if gets_environment {
             self.store.without_mcp_secrets(agent.id, all_environment.clone()).await?
         } else {
             BTreeMap::new()
         };
+        let all_vault_refs = agent_keys.vault_refs;
+        let vault_refs = if gets_environment {
+            self.store.without_mcp_secrets(agent.id, all_vault_refs.clone()).await?
+        } else {
+            BTreeMap::new()
+        };
+        if let Some(name) = vault_refs.keys().next() {
+            if !on_mac {
+                bail!("Vault reference for {name} could not be read: vault references are read only on your own Mac, and this agent runs on a device that is not one. Move the agent to your Mac or store the value itself.");
+            }
+            if runner.capabilities.get("vault_refs").and_then(Value::as_bool) != Some(true) {
+                bail!("Vault reference for {name} could not be read: this Mac runs an older Loka app that cannot read vault references. Update the Loka app on it.");
+            }
+        }
         let mcp_servers = if claimed.kind == "aside" {
             json!({})
         } else {
-            self.mcp_servers(agent.id, claimed.kind == "review", &all_environment)
+            self.mcp_servers(agent.id, claimed.kind == "review", &all_environment, &all_vault_refs)
                 .await?
         };
         let system_prompt = match claimed.kind.as_str() {
@@ -609,6 +630,7 @@ impl RunnerCoordinator {
             mcp_servers,
             skills,
             environment,
+            vault_refs,
             provider_keys,
             images,
             publish,
@@ -1590,7 +1612,7 @@ impl RunnerCoordinator {
                 bail!("publish completion reported a pull request outside this quest's repository")
             }
         }
-        if pr.is_none() {
+        if pr.is_none() && may_attach_reported_pr(completion) {
             pr = prompts::stored_report(session.summary.as_deref())
                 .zip(repo)
                 .and_then(|(report, repo)| report.reported_pr(&repo))
@@ -2123,6 +2145,10 @@ impl RunnerCoordinator {
             return Ok(());
         }
         if self.is_reset(run_id, kind).await? {
+            if loka_shared::cli_errors::is_context_too_long(error) {
+                self.system_note(agent, loka_shared::context::RESET_KEPT_NOTES).await?;
+                return self.reset_with_saved_notes(agent, session, run_id).await;
+            }
             self.system_note(
                 agent,
                 &format!("Context reset aborted: {}. Nothing was forgotten; ask again when ready.", loka_shared::cli_errors::error_text(error)),
@@ -2580,6 +2606,7 @@ impl RunnerCoordinator {
         agent_id: Uuid,
         keyless: bool,
         environment: &BTreeMap<String, String>,
+        vault_refs: &BTreeMap<String, String>,
     ) -> Result<Value> {
         let mut servers = Map::new();
         for entry in self.store.mcp_servers_for(agent_id).await? {
@@ -2592,6 +2619,11 @@ impl RunnerCoordinator {
                     continue;
                 }
             };
+            let vault_keys: Vec<&str> = missing.iter().map(String::as_str).filter(|name| vault_refs.contains_key(*name)).collect();
+            if !vault_keys.is_empty() {
+                tracing::warn!(%agent_id, server = %entry.name, keys = %vault_keys.join(", "), "Skipping an MCP server whose keys are vault references: MCP servers cannot read vault references, so store the value itself for these keys");
+                continue;
+            }
             if !missing.is_empty() {
                 tracing::warn!(%agent_id, server = %entry.name, keys = %missing.join(", "), "Skipping an MCP server whose keys are not granted");
                 continue;
@@ -2633,6 +2665,7 @@ impl RunnerCoordinator {
             pr_body,
             pr_url: task.pr_url.clone(),
             pr_number: task.pr_number.map(i64::from),
+            stack_onto_pr: parent_quest_pr(&self.db, task).await,
         })
     }
 
@@ -2962,9 +2995,133 @@ fn review_value(output: &str, final_attempt: bool) -> Value {
     }
 }
 
+fn may_attach_reported_pr(completion: &RunnerCompletion) -> bool {
+    completion.publish_pr_state.as_deref() != Some(loka_shared::runners::PUBLISH_ELSEWHERE)
+}
+
+pub async fn parent_quest_pr(db: &Database, task: &AgentTask) -> Option<i64> {
+    let parent = db.get_task(task.parent_task_id?).await.ok()??;
+    if parent.repo.is_none() || parent.repo != task.repo || parent.pr_url.is_none() {
+        return None;
+    }
+    parent.pr_number.map(i64::from)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{followup_step, incomplete_report, review_value, FollowupStep};
+    use super::{followup_step, incomplete_report, may_attach_reported_pr, review_value, FollowupStep};
+
+    #[tokio::test]
+    async fn a_reset_whose_notes_turn_is_too_long_still_resets_and_keeps_the_notes() -> anyhow::Result<()> {
+        use super::RunnerCoordinator;
+        use loka_shared::{db::Database, world::WorldStore};
+        use uuid::Uuid;
+        let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let db = Database::connect(&url).await?;
+        let pool = db.pool().clone();
+        let store = WorldStore::new(pool.clone());
+        let coordinator = RunnerCoordinator::new(db, store.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email) VALUES ($1) RETURNING id")
+            .bind(format!("reset-{tag}@example.test"))
+            .fetch_one(&pool)
+            .await?;
+        let agent_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id) VALUES ($1, 'Tenzing', 'claude', 'sonnet', $2) RETURNING id",
+        )
+        .bind(format!("reset-{tag}"))
+        .bind(owner)
+        .fetch_one(&pool)
+        .await?;
+        let main_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_sessions (agent_id, role, backend, model, cli_session_id, context_tokens)
+             VALUES ($1, 'main', 'claude', 'sonnet', $2, 190000) RETURNING id",
+        )
+        .bind(agent_id)
+        .bind(format!("cli-{tag}"))
+        .fetch_one(&pool)
+        .await?;
+        let notes = "Tenzing keeps the summit log.";
+        store
+            .save_own_notes(agent_id, Some(owner), None, &format!("reset-{tag}-notes"), "notes", notes)
+            .await?;
+        assert!(store.request_context_reset(agent_id, serde_json::json!({"by": "owner"})).await?);
+        let inbox: i64 = sqlx::query_scalar("UPDATE agent_inbox SET status = 'processing' WHERE agent_id = $1 RETURNING id")
+            .bind(agent_id)
+            .fetch_one(&pool)
+            .await?;
+        let run_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO session_runs (session_id, agent_id, kind, status, prompt, started_at)
+             VALUES ($1, $2, 'turn', 'running', $3, NOW()) RETURNING id",
+        )
+        .bind(main_id)
+        .bind(agent_id)
+        .bind(crate::prompts::RESET_PROMPT)
+        .fetch_one(&pool)
+        .await?;
+        sqlx::query("INSERT INTO runner_run_inbox (run_id, inbox_id) VALUES ($1, $2)")
+            .bind(run_id)
+            .bind(inbox)
+            .execute(&pool)
+            .await?;
+        let main = store.get_session(main_id).await?.expect("main");
+        let agent = store.get_agent(agent_id).await?.expect("agent");
+
+        coordinator
+            .fail_run(run_id, "turn", &main, &agent, "prompt is too long: 215000 tokens > 200000 maximum", false)
+            .await?;
+
+        let old_status: String = sqlx::query_scalar("SELECT status FROM agent_sessions WHERE id = $1")
+            .bind(main_id)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(old_status, "archived");
+        let fresh = store.main_session(agent_id).await?.expect("a fresh main session");
+        assert_ne!(fresh.id, main_id);
+        assert!(fresh.summary.as_deref().unwrap_or_default().contains(notes));
+        let kept = store.own_notes_skill(agent_id, Some(owner)).await?.expect("notes skill");
+        assert_eq!(kept.body, notes);
+        let status: String = sqlx::query_scalar("SELECT status FROM agent_inbox WHERE id = $1")
+            .bind(inbox)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(status, "done");
+        let noted: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM agent_messages WHERE agent_id = $1 AND author_kind = 'system' AND body = $2)",
+        )
+        .bind(agent_id)
+        .bind(loka_shared::context::RESET_KEPT_NOTES)
+        .fetch_one(&pool)
+        .await?;
+        assert!(noted);
+
+        sqlx::query("DELETE FROM agent_profiles WHERE id = $1").bind(agent_id).execute(&pool).await?;
+        sqlx::query("DELETE FROM world_skills WHERE name = $1").bind(format!("reset-{tag}-notes")).execute(&pool).await?;
+        sqlx::query("DELETE FROM users WHERE id = $1").bind(owner).execute(&pool).await?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_publish_that_found_another_branchs_pr_never_falls_back_to_the_report() {
+        let completion = |state: Option<&str>| -> loka_shared::runners::RunnerCompletion {
+            serde_json::from_value(serde_json::json!({
+                "output": "Nothing to publish",
+                "session_id": null,
+                "exit_code": 0,
+                "error": null,
+                "workspace_key": "tasks/x",
+                "pr_url": null,
+                "pr_number": null,
+                "publish_pr_state": state,
+            }))
+            .unwrap()
+        };
+        assert!(!may_attach_reported_pr(&completion(Some(loka_shared::runners::PUBLISH_ELSEWHERE))));
+        assert!(may_attach_reported_pr(&completion(None)));
+        assert!(may_attach_reported_pr(&completion(Some("merged"))));
+    }
     use crate::prompts::Report;
 
     fn empty_report() -> Report {

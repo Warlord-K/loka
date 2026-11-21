@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::{anyhow, Result};
+use loka_shared::context::{ForkChoice, QuestContext};
 use loka_shared::milestones::{self, MilestoneStore};
 use loka_shared::models::AgentTask;
 use loka_shared::quests::{QuestChoice, QuestOptions, PLAN_FIRST};
@@ -120,12 +121,23 @@ pub async fn open_sessions(store: &WorldStore, start: QuestStart<'_>, dirs: &[St
         _ => String::new(),
     };
     let mut opened = Vec::new();
+    let mut choice = None;
     for (i, dir) in dirs.iter().enumerate() {
         let attempt = i as i16 + 1;
         let variant = racing.then(|| options.variant(attempt)).flatten();
         let backend = variant.as_ref().and_then(|v| v.cli.clone()).unwrap_or_else(|| main.backend.clone());
         let model = variant.as_ref().map(|v| v.model.clone()).unwrap_or_else(|| main.model.clone());
-        let fork = backend == main.backend;
+        let too_large = match (backend == main.backend, choice) {
+            (false, _) => None,
+            (true, Some(known)) => Some(known),
+            (true, None) => {
+                let level = QuestContext::resolve(options.context.as_deref(), &agent.quest_context);
+                let known = store.fork_choice(agent, main, level).await?;
+                choice = Some(known);
+                Some(known)
+            }
+        };
+        let fork = matches!(too_large, Some(ForkChoice::Fork));
         let session = store
             .create_session(NewSession {
                 agent_id: agent.id,
@@ -163,11 +175,7 @@ pub async fn open_sessions(store: &WorldStore, start: QuestStart<'_>, dirs: &[St
             prompt.push_str(&format!("\n\n{PLAN_FIRST}"));
         }
         if !fork {
-            let intro = format!(
-                "[fresh session] You are {}. This is a fresh {backend} session for this quest, so you do not have your main conversation, only these notes.",
-                agent.name
-            );
-            prompt = format!("{}\n\n{prompt}", store.handoff_memory(agent.id, &intro).await?);
+            prompt = format!("{}\n\n{}", store.fresh_start_memory(agent, &fresh_intro(agent, &backend, too_large)).await?, prompts::unforked(&prompt));
         }
         let run = store
             .create_run(NewRun {
@@ -184,6 +192,17 @@ pub async fn open_sessions(store: &WorldStore, start: QuestStart<'_>, dirs: &[St
         opened.push((session, run));
     }
     Ok(opened)
+}
+
+pub fn fresh_intro(agent: &WorldAgent, backend: &str, choice: Option<ForkChoice>) -> String {
+    let used = match choice {
+        Some(ForkChoice::Fresh { used, .. }) => Some(used),
+        Some(ForkChoice::Lean { .. }) => {
+            return loka_shared::context::lean_intro(&agent.name, backend, agent.persona.as_deref(), agent.system_prompt_addendum.as_deref());
+        }
+        _ => None,
+    };
+    loka_shared::context::fresh_intro(&agent.name, backend, used)
 }
 
 pub async fn label_attempts(store: &WorldStore, task: &AgentTask, opened: &[(AgentSession, SessionRun)]) -> Result<()> {

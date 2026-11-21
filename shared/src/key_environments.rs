@@ -6,7 +6,7 @@ use serde::Serialize;
 use sqlx::FromRow;
 use uuid::Uuid;
 
-use crate::environment::{encrypt, master_key, open, valid_name, valid_value};
+use crate::environment::{encrypt, is_vault_reference, master_key, open, valid_name, valid_value};
 use crate::world::WorldStore;
 
 pub const DEFAULT: &str = "default";
@@ -34,6 +34,7 @@ pub struct Variant {
     pub name: String,
     pub environment: String,
     pub updated_at: DateTime<Utc>,
+    pub vault: bool,
 }
 
 #[derive(Clone, Debug, FromRow, Serialize)]
@@ -73,6 +74,8 @@ impl WorldStore {
             return Err(anyhow!("invalid environment entry"));
         }
         let key = master_key()?;
+        let vault = is_vault_reference(value);
+        let value = if vault { value.trim() } else { value };
         let (ciphertext, nonce) = encrypt(key, owner, &variant_aad_name(name, environment), value.as_bytes())?;
         let mut tx = self.pool().begin().await?;
         let base: Option<i32> = sqlx::query_scalar("SELECT 1 FROM world_environment WHERE owner_user_id = $1 AND name = $2 FOR UPDATE")
@@ -95,16 +98,17 @@ impl WorldStore {
             return Err(anyhow!("a key can have at most {MAX_ENVIRONMENTS_PER_KEY} environments"));
         }
         sqlx::query(
-            "INSERT INTO world_environment_variants (owner_user_id, name, environment, ciphertext, nonce)
-             VALUES ($1, $2, $3, $4, $5)
+            "INSERT INTO world_environment_variants (owner_user_id, name, environment, ciphertext, nonce, vault)
+             VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (owner_user_id, name, environment) DO UPDATE
-             SET ciphertext = EXCLUDED.ciphertext, nonce = EXCLUDED.nonce, updated_at = NOW()",
+             SET ciphertext = EXCLUDED.ciphertext, nonce = EXCLUDED.nonce, vault = EXCLUDED.vault, updated_at = NOW()",
         )
         .bind(owner)
         .bind(name)
         .bind(environment)
         .bind(ciphertext)
         .bind(nonce)
+        .bind(vault)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -127,7 +131,7 @@ impl WorldStore {
 
     pub async fn list_environment_variants(&self, owner: Uuid) -> Result<Vec<Variant>> {
         Ok(sqlx::query_as::<_, Variant>(
-            "SELECT name, environment, updated_at FROM world_environment_variants WHERE owner_user_id = $1 ORDER BY name, environment",
+            "SELECT name, environment, updated_at, vault FROM world_environment_variants WHERE owner_user_id = $1 ORDER BY name, environment",
         )
         .bind(owner)
         .fetch_all(self.pool())
@@ -228,7 +232,7 @@ impl WorldStore {
                ON c.agent_id = $2 AND c.owner_user_id = e.owner_user_id AND c.name = e.name AND {ACTIVE_CHOICE}
              LEFT JOIN world_environment_variants v
                ON v.owner_user_id = c.owner_user_id AND v.name = c.name AND v.environment = c.environment
-             WHERE e.owner_user_id = $1 AND e.name = $3"
+             WHERE e.owner_user_id = $1 AND e.name = $3 AND NOT COALESCE(v.vault, e.vault)"
         ))
         .bind(owner)
         .bind(agent_id)

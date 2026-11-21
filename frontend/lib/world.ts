@@ -1,5 +1,5 @@
 import type { Accessory, Trade, LokaLook, Resident, LokaShopStyle } from "@/components/world/types";
-import { hash, lookFor, pick, text } from "./looks";
+import { gearAccessories, hash, lookFor, pick, text } from "./looks";
 
 export { lookFor };
 
@@ -13,6 +13,14 @@ export const APPROVAL_MODES: { value: ApprovalMode; label: string; hint: string 
   { value: "auto", label: "Auto approve", hint: "A safety check approves each action" },
   { value: "full", label: "Full access", hint: "Skips every permission check" },
   { value: "read_only", label: "Read only", hint: "Can look, cannot change anything" },
+];
+
+export type QuestContext = "lean" | "auto" | "full";
+
+export const QUEST_CONTEXTS: { value: QuestContext; label: string; hint: string }[] = [
+  { value: "lean", label: "Lean", hint: "Fresh session with notes, rules and the quest. Smallest and safest" },
+  { value: "auto", label: "Auto", hint: "Carries the main chat while it fills under half the window" },
+  { value: "full", label: "Full", hint: "Always carries the whole main chat. Can overflow" },
 ];
 
 export type ReviewerChoice = { cli?: string; model: string };
@@ -64,6 +72,7 @@ export interface WorldAgent {
   expertise: string | null;
   revoked_powers: string[];
   approval_mode?: ApprovalMode;
+  quest_context?: QuestContext;
   reviewer?: ReviewerChoice | null;
   paused_reason?: string | null;
   archived_at?: string | null;
@@ -577,6 +586,7 @@ export interface EnvironmentEntry {
   name: string;
   updated_at: string;
   agent_ids: string[];
+  vault?: boolean;
 }
 
 export interface WantedKeys {
@@ -608,6 +618,7 @@ export interface EnvironmentVariant {
   name: string;
   environment: string;
   updated_at: string;
+  vault?: boolean;
 }
 
 export interface EnvironmentChoice {
@@ -775,6 +786,7 @@ export interface QuestOptions {
   attempts?: number;
   ci_feedback?: boolean;
   pace?: QuestPace;
+  context?: QuestContext;
 }
 
 export interface QuestPart {
@@ -979,6 +991,21 @@ async function json<T>(res: Response): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+async function sendJson<T>(res: Response): Promise<T> {
+  if (!res.ok) {
+    const raw = (await res.text().catch(() => "")).trim();
+    let reason = "";
+    try {
+      const body = JSON.parse(raw) as { error?: unknown };
+      if (typeof body?.error === "string") reason = body.error;
+    } catch {
+      if (raw && raw.length <= 300 && !raw.startsWith("<")) reason = `${res.status} ${raw}`;
+    }
+    throw new WorldApiError(res.status, reason || `${res.status} ${res.statusText}`.trim());
+  }
+  return res.json() as Promise<T>;
+}
+
 async function quickJson<T>(res: Response): Promise<T> {
   if (!res.ok) {
     const body = (await res.json().catch(() => null)) as { error?: string } | null;
@@ -1139,7 +1166,7 @@ export const worldApi = {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ body, attachments, options, answers, spoken, task_id: taskId, reply_to: replyTo, quote: quote ?? undefined }),
-    }).then((r) => json<AgentMessage>(r)),
+    }).then((r) => sendJson<AgentMessage>(r)),
   quickStart: (agentId: string, body: { text: string; attachments?: string[]; spoken?: boolean; cli?: string; model?: string }) =>
     fetch(`/api/world/agents/${agentId}/quick`, {
       method: "POST",
@@ -1232,7 +1259,7 @@ export const worldApi = {
     fetch("/api/world/assistant", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }).then((r) =>
       json<WorldAgent>(r),
     ),
-  update: (id: string, patch: Partial<Pick<WorldAgent, "name" | "persona" | "cli" | "model" | "avatar_emoji" | "look" | "gear" | "tags" | "expertise" | "revoked_powers" | "visibility" | "approval_mode" | "reviewer" | "daily_budget_usd" | "daily_token_budget">> & { handle?: string; paused?: boolean; archived?: boolean; delete_after_days?: number | null }) =>
+  update: (id: string, patch: Partial<Pick<WorldAgent, "name" | "persona" | "cli" | "model" | "avatar_emoji" | "look" | "gear" | "tags" | "expertise" | "revoked_powers" | "visibility" | "approval_mode" | "quest_context" | "reviewer" | "daily_budget_usd" | "daily_token_budget">> & { handle?: string; paused?: boolean; archived?: boolean; delete_after_days?: number | null }) =>
     fetch(`/api/world/agents/${id}`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
@@ -1493,6 +1520,12 @@ export const worldApi = {
     }).then((r) => json<WorldRule>(r)),
   deleteRule: (id: string) => fetch(`/api/world/rules/${id}`, { method: "DELETE" }),
   environment: () => fetch("/api/world/environment", { cache: "no-store" }).then((r) => json<EnvironmentResponse>(r)),
+  importEnvironment: (items: { name: string; value: string }[]) =>
+    fetch("/api/world/environment/import", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ items }),
+    }).then((r) => json<{ saved: string[]; rejected: string[] }>(r)),
   saveEnvironment: (name: string, value: string) =>
     fetch(`/api/world/environment/${encodeURIComponent(name)}`, {
       method: "PUT",
@@ -1659,19 +1692,9 @@ const AWNINGS: [string, string][] = [
   ["#2f80ed", "#fbf3e0"],
 ];
 
-const GEAR: [RegExp, Accessory[]][] = [
-  [/viking|horn/, ["horns"]],
-  [/helmet/, ["horns"]],
-  [/wizard|staff|hat/, ["wizard"]],
-  [/hard ?hat|construction/, ["hardhat"]],
-  [/sword|blade|axe/, ["sword"]],
-  [/lantern|lamp|torch/, ["lantern"]],
-];
-
 export function questFor(agent: Pick<WorldAgent, "gear" | "slug">): Accessory[] {
-  const words = text(agent.gear).toLowerCase();
-  const found = GEAR.filter(([re]) => re.test(words)).flatMap(([, acc]) => acc);
-  if (found.length) return Array.from(new Set(found));
+  const found = gearAccessories(text(agent.gear));
+  if (found.length) return found;
   const presets: Accessory[][] = [["horns", "sword"], ["wizard", "lantern"], ["hardhat", "lantern"], ["horns", "lantern"]];
   return pick(presets, hash(agent.slug), 2);
 }

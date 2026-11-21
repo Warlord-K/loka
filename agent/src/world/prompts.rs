@@ -1,4 +1,5 @@
 use loka_shared::models::AgentTask;
+pub use loka_shared::context::unforked;
 use loka_shared::outside::{defused, one_line};
 use loka_shared::powers;
 use loka_shared::quests::QuestChoice;
@@ -1233,7 +1234,150 @@ fn tail_chars(text: &str, max: usize) -> String {
 }
 
 pub fn parse_report(output: &str) -> Option<Report> {
-    extract_block(output, "report").and_then(|(_, body)| report_from_json(&body))
+    extract_block(output, "report")
+        .and_then(|(_, body)| report_from_json(&body))
+        .or_else(|| fenced_report(output))
+        .or_else(|| comment_pair_report(output))
+}
+
+fn fenced_report(output: &str) -> Option<Report> {
+    let lines: Vec<&str> = output.lines().collect();
+    let mut found = None;
+    let mut at = 0;
+    while at < lines.len() {
+        let Some((fence, info)) = fence_opening(lines[at]) else {
+            at += 1;
+            continue;
+        };
+        let close = (at + 1..lines.len()).find(|&line| fence_closes(lines[line], &fence))?;
+        let label = lines[..at].iter().rev().find(|line| !line.trim().is_empty()).copied().unwrap_or("");
+        if report_fence(&info, label) {
+            found = Some(lines[at + 1..close].join("\n"));
+        }
+        at = close + 1;
+    }
+    let body = found?;
+    let value: Value = serde_json::from_str(&body).or_else(|_| serde_yaml::from_str(&body)).ok()?;
+    report_from_fields(value)
+}
+
+fn comment_pair_report(output: &str) -> Option<Report> {
+    let lines: Vec<&str> = output.lines().collect();
+    let is = |line: &str, mark: &str| {
+        let line = line.trim();
+        line.strip_prefix("<!--")
+            .and_then(|rest| rest.strip_suffix("-->"))
+            .is_some_and(|inner| inner.trim().eq_ignore_ascii_case(mark))
+    };
+    let open = lines.iter().rposition(|line| is(line, "report"))?;
+    let close = (open + 1..lines.len()).find(|&line| is(lines[line], "/report"))?;
+    let body = lines[open + 1..close].join("\n");
+    let value = serde_json::from_str::<Value>(&body)
+        .ok()
+        .or_else(|| serde_yaml::from_str::<Value>(&body).ok())
+        .filter(Value::is_object)
+        .or_else(|| report_lines(&lines[open + 1..close]))?;
+    report_from_fields(value)
+}
+
+const REPORT_KEYS: &[&str] = &[
+    "status",
+    "summary",
+    "decisions",
+    "followups",
+    "pr_title",
+    "pr_body",
+    "pr_url",
+    "commit_message",
+    "milestones_done",
+    "checks",
+    "review_comments",
+    "findings",
+    "repo_notes",
+];
+
+fn report_lines(lines: &[&str]) -> Option<Value> {
+    let mut fields: Vec<(String, String)> = Vec::new();
+    for line in lines {
+        let started = line.split_once(':').and_then(|(key, rest)| {
+            let key = key.trim();
+            REPORT_KEYS.contains(&key).then(|| (key.to_string(), rest.trim().to_string()))
+        });
+        match (started, fields.last_mut()) {
+            (Some(field), _) => fields.push(field),
+            (None, Some((_, text))) => {
+                text.push('\n');
+                text.push_str(line);
+            }
+            (None, None) if line.trim().is_empty() => {}
+            (None, None) => return None,
+        }
+    }
+    let object: serde_json::Map<String, Value> = fields
+        .into_iter()
+        .map(|(key, text)| {
+            let text = text.trim().to_string();
+            let structured = if text.starts_with('[') || text.starts_with('{') {
+                serde_json::from_str(&text).ok().or_else(|| serde_yaml::from_str(&text).ok())
+            } else {
+                None
+            };
+            (key, structured.unwrap_or(Value::String(text)))
+        })
+        .collect();
+    Some(Value::Object(object))
+}
+
+fn report_from_fields(mut value: Value) -> Option<Report> {
+    let fields = value.as_object_mut()?;
+    fields.get("status")?.as_str()?;
+    if let Some(findings) = fields.get_mut("findings").filter(|findings| findings.is_array() || findings.is_object()) {
+        *findings = Value::String(serde_yaml::to_string(findings).ok()?.trim().to_string());
+    }
+    report_from_value(value)
+}
+
+const REPORT_LISTS: &[&str] = &["decisions", "followups", "checks", "review_comments", "repo_notes"];
+
+fn lists_from_scalars(value: &mut Value) {
+    let Value::Object(fields) = value else { return };
+    for key in REPORT_LISTS {
+        let Some(field) = fields.get_mut(*key) else { continue };
+        *field = match field.take() {
+            Value::Array(items) => Value::Array(items),
+            Value::Null => Value::Array(Vec::new()),
+            Value::String(text) if text.trim().is_empty() => Value::Array(Vec::new()),
+            other => Value::Array(vec![other]),
+        };
+    }
+}
+
+fn fence_opening(line: &str) -> Option<(String, String)> {
+    let line = line.trim();
+    let mark = line.chars().next().filter(|mark| *mark == '`' || *mark == '~')?;
+    let fence: String = line.chars().take_while(|c| *c == mark).collect();
+    if fence.len() < 3 {
+        return None;
+    }
+    let info = line[fence.len()..].trim();
+    if mark == '`' && info.contains('`') {
+        return None;
+    }
+    Some((fence, info.split_whitespace().next().unwrap_or("").to_ascii_lowercase()))
+}
+
+fn fence_closes(line: &str, fence: &str) -> bool {
+    let line = line.trim();
+    let mark = fence.chars().next().unwrap_or('`');
+    line.len() >= fence.len() && line.chars().all(|c| c == mark)
+}
+
+fn report_fence(info: &str, label: &str) -> bool {
+    if info == "report" {
+        return true;
+    }
+    let label = label.trim().trim_matches(|c: char| matches!(c, '*' | '_' | '#' | ':' | '`') || c.is_whitespace());
+    matches!(info, "" | "json" | "yaml" | "yml") && label.eq_ignore_ascii_case("report")
 }
 
 pub fn stored_report(summary: Option<&str>) -> Option<Report> {
@@ -1241,7 +1385,11 @@ pub fn stored_report(summary: Option<&str>) -> Option<Report> {
 }
 
 fn report_from_json(text: &str) -> Option<Report> {
-    let value: Value = serde_json::from_str(text).ok()?;
+    report_from_value(serde_json::from_str(text).ok()?)
+}
+
+fn report_from_value(mut value: Value) -> Option<Report> {
+    lists_from_scalars(&mut value);
     if let Ok(report) = serde_json::from_value::<Report>(value.clone()) {
         return Some(report);
     }
@@ -1837,6 +1985,7 @@ mod tests {
             daily_budget_usd: None,
             daily_token_budget: None,
             org_id: None,
+            quest_context: "lean".into(),
             is_main,
             jobs: Value::Array(vec![]),
         }
@@ -1946,6 +2095,24 @@ mod tests {
         let (_, actions) = split_actions(out);
         let Action::StartTask { quest, .. } = &actions[0] else { panic!("no start_task") };
         assert_eq!(quest.validate().unwrap().pace.as_deref(), Some("quick"));
+        let out = "ok\n<!-- actions\n[{\"type\":\"start_task\",\"task_id\":\"abc\",\"context\":\"full\"}]\nactions -->";
+        let (_, actions) = split_actions(out);
+        let Action::StartTask { quest, .. } = &actions[0] else { panic!("no start_task") };
+        assert_eq!(quest.validate().unwrap().context.as_deref(), Some("full"));
+    }
+
+    #[test]
+    fn unforked_quests_do_not_claim_a_fork() {
+        use loka_shared::context::{FORKED_LINE, UNFORKED_LINE};
+        for prompt in [TASK, QUICK_TASK] {
+            assert!(prompt.contains(FORKED_LINE));
+            assert!(prompt.contains("main-session instructions") && prompt.contains("do not apply here"));
+            let lean = unforked(prompt);
+            assert!(!lean.contains("forked from your main session"));
+            assert!(!lean.contains("actions block"), "lean starts never mention main-session instructions");
+            assert!(lean.contains(UNFORKED_LINE));
+            assert!(lean.starts_with("[task session"));
+        }
     }
 
     #[test]
@@ -1985,6 +2152,111 @@ mod tests {
         assert_eq!(parse_report(json).unwrap().summary.as_deref(), Some("fenced"));
         let bare = "Done.\n<!-- report\n```\n{\"status\": \"done\", \"summary\": \"plain fence\"}\n```\n-->";
         assert_eq!(parse_report(bare).unwrap().summary.as_deref(), Some("plain fence"));
+    }
+
+    #[test]
+    fn a_report_fence_of_yaml_after_compaction_parses() {
+        let report = parse_report(include_str!("fixtures/report_fenced_yaml.md")).unwrap();
+        assert_eq!(report.status.as_deref(), Some("done"));
+        assert_eq!(report.pr_url.as_deref(), Some("https://github.com/acme/site/pull/3"));
+        assert!(report.summary.as_deref().unwrap().len() > 40);
+        assert!(report.commit_message.as_deref().unwrap().starts_with("feat: hiring section"));
+        assert_eq!(report.checks.len(), 4);
+        assert!(matches!(&report.milestones_done[..], [MilestoneRef::Title(first), .., MilestoneRef::Title(last)] if first == "Read lumen.example and update Lumen" && last == "Open the PR"));
+    }
+
+    #[test]
+    fn a_labelled_bare_fence_of_yaml_parses() {
+        let report = parse_report(include_str!("fixtures/report_labeled_fence.md")).unwrap();
+        assert_eq!(report.status.as_deref(), Some("done"));
+        assert!(report.pr_body.as_deref().unwrap().contains('\n'));
+        assert!(!report.repo_notes.is_empty());
+        assert_eq!(report.milestones_done.len(), 5);
+        let titled = "Done.\n\n## Report:\n```yaml\nstatus: blocked\nsummary: needs a key\n```\n";
+        assert_eq!(parse_report(titled).unwrap().status.as_deref(), Some("blocked"));
+    }
+
+    #[test]
+    fn a_report_fence_of_json_parses_and_findings_lists_become_text() {
+        let json = "Done.\n```report\n{\"status\": \"done\", \"summary\": \"json fence\", \"milestones_done\": [1, 2]}\n```";
+        let report = parse_report(json).unwrap();
+        assert_eq!(report.summary.as_deref(), Some("json fence"));
+        assert_eq!(report.milestones_done.len(), 2);
+        let listed = "```report\nstatus: done\nfindings:\n  - summary: slow query\n    outcome: fixed\n```";
+        assert!(parse_report(listed).unwrap().findings.unwrap().contains("slow query"));
+    }
+
+    #[test]
+    fn partial_or_unlabelled_fences_are_not_reports() {
+        assert!(parse_report("Done.\n```report\nstatus: done\nsummary: cut off").is_none());
+        assert!(parse_report("**report**\n```yaml\nstatus: done\n").is_none());
+        assert!(parse_report("Here is the config:\n```yaml\nstatus: done\nsummary: not a report\n```").is_none());
+        assert!(parse_report("```report\n- just\n- a list\n```").is_none());
+        assert!(parse_report("```report\nsummary: no status\n```").is_none());
+        assert!(parse_report("```report\nstatus:\n  phase: Running\n```").is_none());
+        let later_unclosed = "```report\nstatus: done\n```\nthen\n```report\nstatus: blocked";
+        assert!(parse_report(later_unclosed).is_none());
+    }
+
+    #[test]
+    fn a_comment_pair_with_plain_string_lists_parses() {
+        let report = parse_report(include_str!("fixtures/report_comment_pair_strings.md")).unwrap();
+        assert_eq!(report.status.as_deref(), Some("done"));
+        assert!(report.summary.as_deref().unwrap().starts_with("Provided the requested compact"));
+        assert_eq!(report.decisions.len(), 1);
+        assert_eq!(report.followups.len(), 1);
+        assert_eq!(report.checks.len(), 1);
+        assert_eq!(report.repo_notes.len(), 1);
+        assert!(report.followups[0].contains("113_agent_usage_totals.sql"));
+    }
+
+    #[test]
+    fn a_comment_pair_that_is_not_yaml_parses_by_known_keys() {
+        let report = parse_report(include_str!("fixtures/report_comment_pair_first.md")).unwrap();
+        assert_eq!(report.status.as_deref(), Some("done"));
+        assert!(report.summary.as_deref().unwrap().starts_with("Audited all 43 real routes"));
+        assert_eq!(report.decisions.len(), 1);
+        assert_eq!(report.followups.len(), 1);
+        assert_eq!(report.checks.len(), 1);
+        assert_eq!(report.repo_notes.len(), 1);
+        assert!(report.repo_notes[0].contains("data-theme"));
+    }
+
+    #[test]
+    fn plain_strings_become_one_item_lists_in_json_blocks() {
+        let output = "<!-- report {\"status\": \"done\", \"decisions\": \"one\", \"followups\": \"\", \"checks\": \"cargo test\", \"repo_notes\": null, \"milestones_done\": 2} report -->";
+        let report = parse_report(output).unwrap();
+        assert_eq!(report.decisions, vec!["one".to_string()]);
+        assert!(report.followups.is_empty());
+        assert_eq!(report.checks, vec![Value::String("cargo test".into())]);
+        assert!(report.repo_notes.is_empty());
+        assert_eq!(report.milestones_done, vec![MilestoneRef::Position(2)]);
+    }
+
+    #[test]
+    fn partial_or_statusless_comment_pairs_are_not_reports() {
+        assert!(parse_report("<!-- report -->\nstatus: done\nsummary: cut off").is_none());
+        assert!(parse_report("<!-- report -->\nsummary: no status\n<!-- /report -->").is_none());
+        assert!(parse_report("<!-- report -->\nsome prose first\nstatus: done\n<!-- /report -->").is_none());
+        let multi = "<!-- report -->\nstatus: blocked\nsummary: first line\nsecond line\nmilestones_done: [1, 3]\n<!-- /report -->";
+        let report = parse_report(multi).unwrap();
+        assert_eq!(report.summary.as_deref(), Some("first line\nsecond line"));
+        assert_eq!(report.milestones_done.len(), 2);
+    }
+
+    #[test]
+    fn the_report_reminder_shows_a_block_the_parser_reads() {
+        let example = parse_report(loka_shared::world::REPORT_NUDGE).unwrap();
+        assert_eq!(example.status.as_deref(), Some("done"));
+        assert!(loka_shared::world::REPORT_NUDGE.starts_with("[report missing]"));
+    }
+
+    #[test]
+    fn the_comment_block_wins_over_a_report_fence() {
+        let both = "```report\nstatus: blocked\nsummary: draft\n```\n<!-- report {\"status\": \"done\", \"summary\": \"real\"} report -->";
+        assert_eq!(parse_report(both).unwrap().summary.as_deref(), Some("real"));
+        let last = "```report\nstatus: blocked\nsummary: first\n```\n```report\nstatus: done\nsummary: second\n```";
+        assert_eq!(parse_report(last).unwrap().summary.as_deref(), Some("second"));
     }
 
     #[test]
@@ -2079,8 +2351,10 @@ mod tests {
         .expect("bad fields are dropped, not the report");
         assert_eq!(report.status.as_deref(), Some("done"));
         assert_eq!(bad.summary.as_deref(), Some("kept"));
-        assert!(bad.decisions.is_empty());
-        assert!(bad.checks.is_empty());
+        assert_eq!(bad.decisions, vec!["one string".to_string()]);
+        assert_eq!(bad.checks, vec![serde_json::json!(7)]);
+        let wrong = parse_report("<!-- report {\"status\":\"done\",\"decisions\":{\"x\":1}} report -->").unwrap();
+        assert!(wrong.decisions.is_empty());
         assert_eq!(bad.repo_notes, vec!["note".to_string()]);
         let round = serde_json::to_value(&report).unwrap();
         assert_eq!(round["milestones_done"], serde_json::json!([1, 2, 3, "Tests pass", 4]));

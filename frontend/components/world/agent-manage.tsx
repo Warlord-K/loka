@@ -5,9 +5,9 @@ import { parseTokens, tokenText } from "@/lib/budgets";
 import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { qk } from "@/lib/query-keys";
-import { Archive, ArrowCounterClockwise, Broom, Star, Globe, HandArrowUp, LockSimple, MagnifyingGlass, Plus, ShieldCheck, Trash, X, Rss, CalendarBlank, Plugs, BookOpen, ChartBar, GithubLogo } from "@phosphor-icons/react";
+import { Archive, ArrowCounterClockwise, Broom, Stack, Star, Globe, HandArrowUp, LockSimple, MagnifyingGlass, Plus, ShieldCheck, Trash, X, Rss, CalendarBlank, Plugs, BookOpen, ChartBar, GithubLogo } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
-import { APPROVAL_MODES, cliOptions, compactNumber, formatUsage, reviewerLabel, type AgentUsageRow, type BackendModels, POWERS, SUBSCRIPTION_EVENTS, worldApi, type AgentFeed, type FeedSecret, type AgentSchedule, type AgentWatch, type AgentUsage, type ApprovalMode, type McpServer, type Person, type Skill, type WorldAgent } from "@/lib/world";
+import { APPROVAL_MODES, QUEST_CONTEXTS, cliOptions, compactNumber, formatUsage, reviewerLabel, type AgentUsageRow, type BackendModels, POWERS, SUBSCRIPTION_EVENTS, worldApi, type AgentFeed, type FeedSecret, type AgentSchedule, type AgentWatch, type AgentUsage, type ApprovalMode, type QuestContext, type McpServer, type Person, type Skill, type WorldAgent } from "@/lib/world";
 import { BTN, BTN_MD, BTN_PRIMARY, BTN_SECONDARY, BTN_SECONDARY_SM, CHUNKY, INPUT } from "./styles";
 import { ConfirmDelete, WCombobox, WSelect } from "./controls";
 import { VoiceField } from "./voice-ui";
@@ -177,6 +177,42 @@ export function ApprovalRow({ agent, canChange, onUpdated }: { agent: WorldAgent
         disabled={busy}
         onChange={(v) => void pick(v as ApprovalMode)}
         options={APPROVAL_MODES.map((m) => ({ value: m.value, label: m.label, hint: m.hint }))}
+      />
+    </section>
+  );
+}
+
+export function QuestContextRow({ agent, canChange, onUpdated }: { agent: WorldAgent; canChange: boolean; onUpdated: (agent: WorldAgent) => void }) {
+  const [busy, setBusy] = useState(false);
+  const [failed, setFailed] = useState(false);
+  if (!canChange) return null;
+  const level = agent.quest_context ?? "lean";
+  const pick = async (next: QuestContext) => {
+    if (next === level) return;
+    setBusy(true);
+    setFailed(false);
+    try {
+      onUpdated(await worldApi.update(agent.id, { quest_context: next }));
+    } catch {
+      setFailed(true);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <section className={cn(SECTION, "flex flex-wrap items-center gap-3 space-y-0")}>
+      <Stack size={20} weight="bold" className="text-w-teal" />
+      <span className="min-w-0 flex-1 text-w-sm text-w-text2">
+        {failed ? "Could not change quest context." : `How much of ${agent.name}'s main chat a new quest starts with.`}
+        <span className="block text-w-xs text-w-muted">{QUEST_CONTEXTS.find((c) => c.value === level)?.hint}.</span>
+      </span>
+      <WSelect
+        ariaLabel="Quest context"
+        className="w-44"
+        value={level}
+        disabled={busy}
+        onChange={(v) => void pick(v as QuestContext)}
+        options={QUEST_CONTEXTS.map((c) => ({ value: c.value, label: c.label, hint: c.hint }))}
       />
     </section>
   );

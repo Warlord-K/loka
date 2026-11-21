@@ -17,6 +17,7 @@ import { SpokenMark, VoiceField } from "./voice-ui";
 import { Shimmer } from "./work-ui";
 import { MemoryOffer } from "./quick-chat";
 import { takeEscape } from "@/lib/escape";
+import { notSent, sendFailure } from "@/lib/send-failure";
 
 export interface ThreadItem {
   key: string;
@@ -215,9 +216,9 @@ export function ThreadPanel({
       setDictated(false);
       refresh();
       follow.stick();
-    } catch {
+    } catch (err) {
       setDraft(text);
-      setError("Not sent. Your reply is back in the box, try again.");
+      setError(notSent(sendFailure(err), "reply"));
     } finally {
       setSending(false);
     }

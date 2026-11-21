@@ -17,6 +17,7 @@ import {
   type Sprite,
   type TreeKind,
 } from "./art";
+import { withGear } from "@/lib/looks";
 import { buildSheet, type CharacterSheet, type Dir } from "./characters";
 import { CIVIC, parseOpens, type CivicId } from "./places";
 import { makeCivic } from "./places-art";
@@ -735,7 +736,7 @@ export function buildWorld(guide: Resident | null, residents: Resident[], items:
     reserve(tx, ty, tx + 1, ty + 1);
     const x = tx * T + 8;
     const y = ty * T + 13;
-    const quest = { ...resident.look, accessories: [...(resident.look.accessories ?? []), ...resident.quest] };
+    const quest = { ...resident.look, accessories: withGear(resident.look.accessories ?? [], resident.quest) };
     npcs.push({
       resident,
       tx,

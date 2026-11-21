@@ -94,19 +94,69 @@ pub async fn viewer_for(state: &AppState, user: uuid::Uuid) -> Result<Viewer, St
     Ok(v)
 }
 
+pub fn posts_a_message(method: &Method, path: &str) -> bool {
+    if method != Method::POST {
+        return false;
+    }
+    let path = path.strip_prefix("/api").unwrap_or(path).trim_end_matches('/');
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    matches!(segs.as_slice(), ["world", "agents" | "channels" | "sessions" | "quick", _, "messages"] | ["world", "agents", _, "quick"])
+}
+
+pub fn refusal_reason(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST => "empty or invalid message",
+        StatusCode::UNAUTHORIZED => "not signed in",
+        StatusCode::FORBIDDEN => "not allowed",
+        StatusCode::NOT_FOUND => "agent, channel, thread or quest not found",
+        StatusCode::CONFLICT => "conflict",
+        StatusCode::PAYLOAD_TOO_LARGE => "too large",
+        StatusCode::UNSUPPORTED_MEDIA_TYPE | StatusCode::UNPROCESSABLE_ENTITY => "unreadable request body",
+        StatusCode::TOO_MANY_REQUESTS => "message rate limit",
+        StatusCode::INSUFFICIENT_STORAGE => "disk full",
+        s if s.is_server_error() => "server error",
+        _ => "refused",
+    }
+}
+
+fn log_refused_message(status: StatusCode, reason: &str, path: &str, user: Option<&UserId>) {
+    if status.is_client_error() {
+        tracing::warn!(status = status.as_u16(), reason, path, user = ?user.map(|u| u.0), "message not sent");
+    }
+}
+
+async fn admit(state: &AppState, user: Option<UserId>, method: &Method, path: &str) -> Result<(UserId, Viewer), (StatusCode, &'static str)> {
+    let user = user.ok_or((StatusCode::UNAUTHORIZED, "not signed in"))?;
+    let viewer = viewer_for(state, user.0).await.map_err(|status| (status, refusal_reason(status)))?;
+    if viewer.org.is_none() && !works_without_org(method, path) {
+        return Err((StatusCode::FORBIDDEN, "no organization"));
+    }
+    if viewer.role < min_role(method, path) {
+        return Err((StatusCode::FORBIDDEN, "role too low"));
+    }
+    Ok((user, viewer))
+}
+
 pub async fn role_middleware(State(state): State<AppState>, mut req: Request, next: Next) -> Result<Response, StatusCode> {
-    let user = req.extensions().get::<UserId>().cloned().ok_or(StatusCode::UNAUTHORIZED)?;
     let (method, path) = (req.method().clone(), req.uri().path().to_string());
-    let viewer = viewer_for(&state, user.0).await?;
-    if viewer.org.is_none() && !works_without_org(&method, &path) {
-        return Err(StatusCode::FORBIDDEN);
-    }
-    if viewer.role < min_role(&method, &path) {
-        return Err(StatusCode::FORBIDDEN);
-    }
+    let message = posts_a_message(&method, &path);
+    let user = req.extensions().get::<UserId>().cloned();
+    let (user, viewer) = match admit(&state, user.clone(), &method, &path).await {
+        Ok(admitted) => admitted,
+        Err((status, reason)) => {
+            if message {
+                log_refused_message(status, reason, &path, user.as_ref());
+            }
+            return Err(status);
+        }
+    };
     req.extensions_mut().insert(viewer.role);
     req.extensions_mut().insert(viewer);
-    Ok(next.run(req).await)
+    let response = next.run(req).await;
+    if message {
+        log_refused_message(response.status(), refusal_reason(response.status()), &path, Some(&user));
+    }
+    Ok(response)
 }
 
 #[derive(PartialEq)]
@@ -193,6 +243,7 @@ mod tests {
         assert_eq!(min_role(&Method::POST, "/world/runs/abc/retry"), Role::Write);
         assert_eq!(min_role(&Method::GET, "/world/environment"), Role::Write);
         assert_eq!(min_role(&Method::PUT, "/world/environment/choices"), Role::Write);
+        assert_eq!(min_role(&Method::POST, "/world/environment/import"), Role::Write);
         assert_eq!(min_role(&Method::GET, "/world/command-rules"), Role::Write);
         assert_eq!(min_role(&Method::DELETE, "/world/command-rules/x"), Role::Write);
         assert_eq!(min_role(&Method::PUT, "/world/environment/TOKEN"), Role::Write);
@@ -219,5 +270,11 @@ mod tests {
         assert!(works_without_org(&Method::GET, "/api/world/me"));
         assert!(!works_without_org(&Method::GET, "/api/world/agents"));
         assert!(!works_without_org(&Method::GET, "/api/world/stream"));
+        assert!(posts_a_message(&Method::POST, "/api/world/agents/abc/messages"));
+        assert!(posts_a_message(&Method::POST, "/api/world/channels/abc/messages"));
+        assert!(!posts_a_message(&Method::GET, "/api/world/channels/abc/messages"));
+        assert!(!posts_a_message(&Method::POST, "/api/world/agents/abc/messages/def/rewind"));
+        assert_eq!(refusal_reason(StatusCode::INSUFFICIENT_STORAGE), "disk full");
+        assert_eq!(refusal_reason(StatusCode::UNPROCESSABLE_ENTITY), "unreadable request body");
     }
 }

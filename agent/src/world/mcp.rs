@@ -110,6 +110,24 @@ async fn read_docs(page: &str) -> Result<String> {
     Ok(text)
 }
 
+pub(crate) const LOOK_SPECIES: &[&str] = &[
+    "person", "octopus", "bunny", "crab", "dino", "dragon", "frog", "penguin", "duck", "shark", "robot", "ghost",
+    "axolotl", "bee", "fox", "cat", "dog", "panda", "bear", "raccoon", "sloth", "owl", "peacock", "parrot", "mouse",
+];
+
+pub(crate) const LOOK_ACCESSORIES: &[&str] = &[
+    "glasses", "headphones", "crown", "wizard", "beanie", "cap", "hardhat", "mortarboard", "headband", "bun",
+    "beard", "scarf", "cape", "cloak", "apron",
+];
+
+pub(crate) fn look_guide(lead: &str) -> String {
+    format!(
+        "{lead} species is one of {} (aliases like squid, rabbit, dinosaur, android or kitten work too); any other species draws a person. accessories is a list from {} (one hat at a time: wizard, beanie, cap, hardhat, mortarboard, crown). archetype, outfit and palette are free text.",
+        LOOK_SPECIES.join(", "),
+        LOOK_ACCESSORIES.join(", "),
+    )
+}
+
 #[cfg(test)]
 mod docs_tests {
     use super::docs_path;
@@ -318,6 +336,7 @@ fn with_quest_options(mut properties: Value) -> Value {
         map.insert("plan_first".into(), json!({ "type": "boolean", "description": "Off unless the person you work for asks or a rule says so. The quest first sends a read-only plan to them to approve or redirect" }));
         map.insert("attempts".into(), json!({ "type": "integer", "description": "Off (1) unless the person you work for asks. 2 or 3 sessions try the quest in parallel and an independent judge ships the best one; costs that many times more; not with plan_first" }));
         map.insert("ci_feedback".into(), json!({ "type": "boolean", "description": "With a repo and wait for merge: failing checks on the pull request go back to the quest and get fixed without the person, at most 3 rounds. Set it when the repo has checks, unless the person or a rule says not to" }));
+        map.insert("context".into(), json!({ "type": "string", "enum": ["lean", "auto", "full"], "description": "How much of your main conversation the quest starts with. Leave it out to use your setting (lean by default). lean: a fresh session with your notes, persona, rules, repo notes, recent quests and this brief, nothing from the chat. auto: carries the chat while it is under half the model window. full: carries the whole chat; only when the work truly depends on it, since big chats make quests fail on their first turn" }));
         map.insert("pace".into(), json!({ "type": "string", "enum": ["normal", "quick", "urgent"], "description": "normal (default, the full flow), quick (small, clearly scoped, low-risk changes and questions about code: short checks, no review, plan or attempts, no report-back turn when it finishes cleanly) or urgent (the owner said urgent, asap or now: same care as normal, runs first and in fast mode). Owner words and rules win; never quick for auth, payments, migrations, deletes, infra or large work" }));
         map.insert("attempt_variants".into(), json!({ "type": "array", "items": { "type": "object", "properties": { "cli": { "type": "string" }, "model": { "type": "string" } }, "required": ["model"] }, "description": "Optional per-attempt {cli, model}, in attempt order; missing ones use your own" }));
     }
@@ -475,7 +494,7 @@ impl Server {
                 "note": s("Building note"),
                 "opens": { "type": "object", "description": "What walking into the building opens, same shape as place_building; null clears it" },
                 "persona": s("Character persona"), "greeting": s("Character greeting"),
-                "look": { "type": "object", "description": "Character sprite hints" },
+                "look": { "type": "object", "description": look_guide("Character sprite hints.") },
                 "dialogue": { "type": "array", "items": { "type": "object" }, "description": "Character script, same shape as add_npc" },
                 "agent": { "type": ["string", "null"], "description": "Agent handle, name or id who staffs the character; none or null unstaffs it" },
                 "label": s("Portal sign text"), "to": s("Portal destination region, or hearth"),
@@ -556,7 +575,7 @@ impl Server {
                 "cli": s("claude, codex or cursor, default claude"),
                 "model": s("Model, default sonnet for claude"),
                 "avatar_emoji": s("One emoji"),
-                "look": { "type": "object", "description": "Appearance: species, archetype, outfit, palette, accessories" },
+                "look": { "type": "object", "description": look_guide("Appearance.") },
                 "gear": { "type": "object", "description": "Quest gear they put on when they go do a task" },
                 "visibility": s("private (only your owner can use them; needed to hold environment keys) or public (anyone with write access can use it), default private")
             }), &["name", "persona"]));
@@ -572,11 +591,12 @@ impl Server {
                 "handle": s("New @handle: lowercase letters, digits and dashes. Fails when another agent, another agent's old handle or a person already uses it (dashes are ignored when matching mentions); the old one keeps working as an alias, and an agent can switch back to one of its own old handles"),
                 "persona": s("New persona"),
                 "avatar_emoji": s("One emoji"),
-                "look": { "type": "object", "description": "Keys to change, merged over the current look (null removes a key). voice is the in-app speech voice (Kokoro: female af_heart, af_bella, af_nicole, af_sarah, af_nova, af_sky, bf_emma, bf_isabella, bf_alice, bf_lily; male am_michael, am_fenrir, am_puck, am_adam, am_eric, am_liam, am_onyx, bm_george, bm_fable, bm_daniel, bm_lewis). Calls follow its gender. live_voice is the live call voice (female: eve, ara, luna, aurora, celeste, iris, liora, carina; male: leo, rex, orion, atlas, helix, kepler, rigel, castor; also zagan, altair, zenith, perseus, helios, lux, cosmo, ursa, sirius, lumen, naksh, sal). Without live_voice, calls pick one matching voice." },
+                "look": { "type": "object", "description": format!("{} voice is the in-app speech voice (Kokoro: female af_heart, af_bella, af_nicole, af_sarah, af_nova, af_sky, bf_emma, bf_isabella, bf_alice, bf_lily; male am_michael, am_fenrir, am_puck, am_adam, am_eric, am_liam, am_onyx, bm_george, bm_fable, bm_daniel, bm_lewis). Calls follow its gender. live_voice is the live call voice (female: eve, ara, luna, aurora, celeste, iris, liora, carina; male: leo, rex, orion, atlas, helix, kepler, rigel, castor; also zagan, altair, zenith, perseus, helios, lux, cosmo, ursa, sirius, lumen, naksh, sal). Without live_voice, calls pick one matching voice.", look_guide("Keys to change, merged over the current look (null removes a key).")) },
                 "gear": { "type": "object" },
                 "visibility": s("private or public. Public agents can be used by everyone; only grant them keys the owner is fine with others using through them"),
                 "tags": { "type": "array", "items": { "type": "string" }, "description": "Their expertise tags, replacing the old ones: at most 8 broad, lasting domains" },
-                "expertise": s("One or two sentences on what they are good at")
+                "expertise": s("One or two sentences on what they are good at"),
+                "quest_context": { "type": "string", "enum": ["lean", "auto", "full"], "description": "How much of their main conversation their quests start with: lean (default, fresh session with notes, persona, rules, repo notes and recent quests), auto (carries the chat while it is under half the model window) or full (always carries the whole chat). Change it only when the owner asks" }
             }), &["agent"]));
         }
         if self.can(powers::MANAGE_AGENTS) {
@@ -2792,6 +2812,10 @@ impl Server {
                     delete_after_days: None,
                     daily_budget_usd: None,
                     daily_token_budget: None,
+                    quest_context: match arg("quest_context") {
+                        Some(raw) => Some(loka_shared::context::QuestContext::parse(raw).map_err(|e| anyhow!(e))?.as_str().to_string()),
+                        None => None,
+                    },
                 };
                 let updated = self.store.update_agent(a.id, &update).await?.ok_or_else(|| anyhow!("agent vanished"))?;
                 let new_tags: Option<Vec<String>> = args
@@ -2944,6 +2968,21 @@ pub fn config_json_for(agent_id: Uuid, quick: Option<Uuid>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn look_guide_lists_every_species_and_the_person_fallback() {
+        let guide = look_guide("Appearance.");
+        for name in ["octopus", "bunny", "crown", "wizard", "headphones", "cape"] {
+            assert!(guide.contains(name), "{name}");
+        }
+        assert!(guide.contains("any other species draws a person"));
+        let looks = include_str!("../../../frontend/lib/looks.ts");
+        for name in LOOK_SPECIES.iter().chain(LOOK_ACCESSORIES) {
+            assert!(looks.contains(&format!("\"{name}\"")), "{name} is missing from frontend/lib/looks.ts");
+        }
+        let options = looks.split("SPECIES_OPTIONS").nth(1).and_then(|rest| rest.split("];").next()).unwrap_or_default();
+        assert_eq!(options.matches('"').count() / 2, LOOK_SPECIES.len());
+    }
 
     #[test]
     fn cron_gaps_bound_follow_up_checks() {

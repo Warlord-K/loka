@@ -229,7 +229,7 @@ impl WorldStore {
     pub async fn own_provider_names(&self, owner: Uuid) -> Result<Vec<String>> {
         let names: Vec<&str> = PROVIDERS.iter().map(|provider| provider.env).collect();
         Ok(sqlx::query_scalar(
-            "SELECT name FROM world_environment WHERE owner_user_id = $1 AND name = ANY($2) ORDER BY name",
+            "SELECT name FROM world_environment WHERE owner_user_id = $1 AND name = ANY($2) AND NOT vault ORDER BY name",
         )
         .bind(owner)
         .bind(&names)

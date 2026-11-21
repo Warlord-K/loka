@@ -74,7 +74,7 @@ pub fn build_tools(tool: fn(&str, &str, Value, &[&str]) -> Value) -> Vec<Value> 
                 "agent": s("Handle, name or id of one of your person's agents who staffs this character, optional"),
                 "persona": s("Who they are and how they speak, a few sentences"),
                 "greeting": s("First thing they say"),
-                "look": { "type": "object", "description": "Sprite hints like the agents' look: species, palette, accessories, optional" },
+                "look": { "type": "object", "description": super::mcp::look_guide("Sprite hints like the agents' look, optional.") },
                 "dialogue": { "type": "array", "description": "Optional script: lines with id, text and up to 4 options {label, next} where next is another line id", "items": { "type": "object" } }
             }),
             &["name"],

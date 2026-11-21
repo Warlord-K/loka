@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use loka_shared::environment::{self, EnvironmentEntry, InvalidEnvironmentGrant, SharedKey, WantedKeys};
 use loka_shared::providers::{self, Provider, PROVIDERS};
 use serde::{Deserialize, Serialize};
-use tracing::error;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::{auth::UserId, AppState};
@@ -49,6 +49,26 @@ pub struct CheckResult {
 pub struct SaveEnvironment {
     value: String,
 }
+
+#[derive(Deserialize)]
+pub struct ImportItem {
+    name: String,
+    value: String,
+}
+
+#[derive(Deserialize)]
+pub struct ImportEnvironment {
+    items: Vec<ImportItem>,
+}
+
+#[derive(Serialize)]
+pub struct ImportedEnvironment {
+    saved: Vec<String>,
+    rejected: Vec<String>,
+}
+
+pub const MAX_IMPORT_ITEMS: usize = 500;
+pub const MAX_IMPORT_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Deserialize)]
 pub struct SetEnvironmentAgents {
@@ -164,6 +184,48 @@ pub async fn save(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub async fn import(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserId>,
+    Json(body): Json<ImportEnvironment>,
+) -> Result<Json<ImportedEnvironment>, StatusCode> {
+    if body.items.is_empty() || body.items.len() > MAX_IMPORT_ITEMS {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if !environment::configured() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let (entries, rejected) = import_entries(body.items);
+    if entries.is_empty() {
+        return Ok(Json(ImportedEnvironment { saved: Vec::new(), rejected }));
+    }
+    state.world.save_environment_many(user.0, &entries).await.map_err(internal)?;
+    for (name, _) in &entries {
+        if let Err(error) = state.world.release_key_pauses(user.0, None, Some(name)).await {
+            warn!(%error, key = %name, "imported key saved, but releasing key pauses failed");
+        }
+    }
+    let saved = entries.into_iter().map(|(name, _)| name).collect();
+    Ok(Json(ImportedEnvironment { saved, rejected }))
+}
+
+fn import_entries(items: Vec<ImportItem>) -> (Vec<(String, String)>, Vec<String>) {
+    let mut entries: Vec<(String, String)> = Vec::new();
+    let mut rejected: Vec<String> = Vec::new();
+    for item in items {
+        if !environment::valid_name(&item.name) || !environment::valid_value(&item.value) {
+            let shown: String = item.name.chars().take(128).collect();
+            if !rejected.contains(&shown) {
+                rejected.push(shown);
+            }
+            continue;
+        }
+        entries.retain(|(name, _)| name != &item.name);
+        entries.push((item.name, item.value));
+    }
+    (entries, rejected)
+}
+
 pub async fn set_agents(
     State(state): State<AppState>,
     Extension(user): Extension<UserId>,
@@ -250,7 +312,7 @@ pub async fn save_shared(
 ) -> Result<StatusCode, StatusCode> {
     let value = body.value.filter(|v| !v.is_empty());
     let note = body.note.map(|n| n.trim().to_string());
-    if !environment::valid_name(&name) || value.as_deref().is_some_and(|v| !environment::valid_value(v)) || note.as_deref().is_some_and(|n| n.chars().count() > 500) {
+    if !environment::valid_name(&name) || value.as_deref().is_some_and(|v| !environment::valid_value(v) || environment::is_vault_reference(v)) || note.as_deref().is_some_and(|n| n.chars().count() > 500) {
         return Err(StatusCode::BAD_REQUEST);
     }
     if !environment::configured() {
@@ -396,5 +458,28 @@ pub async fn delete_command_rule(
     match state.world.remove_command_rule(user.0, id).await.map_err(internal)? {
         true => Ok(StatusCode::NO_CONTENT),
         false => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+
+    fn item(name: &str, value: &str) -> ImportItem {
+        ImportItem { name: name.into(), value: value.into() }
+    }
+
+    #[test]
+    fn import_keeps_the_last_value_and_names_only_rejects() {
+        let (entries, rejected) = import_entries(vec![
+            item("A_KEY", "one"),
+            item("lower", "secret-1"),
+            item("B_KEY", "two"),
+            item("A_KEY", "three"),
+            item("LOKA_TOKEN", "secret-2"),
+            item("EMPTY", ""),
+        ]);
+        assert_eq!(entries, vec![("B_KEY".to_string(), "two".to_string()), ("A_KEY".to_string(), "three".to_string())]);
+        assert_eq!(rejected, vec!["lower".to_string(), "LOKA_TOKEN".to_string(), "EMPTY".to_string()]);
     }
 }

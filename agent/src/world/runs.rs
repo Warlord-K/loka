@@ -285,8 +285,14 @@ pub async fn execute(ctx: &Ctx, run: SessionRun) -> Result<()> {
     let aside = run.kind == "aside";
     let quick = run.kind == "quick";
     let has_environment = session.role == "task" && matches!(run.kind.as_str(), "task" | "followup") || quick;
-    let granted_environment = match ctx.store.environment_for_agent(agent.id).await {
-        Ok(environment) => environment,
+    let granted_environment = match ctx.store.keys_for_agent(agent.id).await {
+        Ok(keys) => match keys.vault_refs.keys().next().filter(|_| has_environment) {
+            Some(name) => {
+                let error = format!("Vault reference for {name} could not be read: vault references are read only on their owner's own Mac, and this agent runs in the cloud. Move the agent to your Mac or store the value itself.");
+                return fail(ctx, &run, &session, "failed", "run.failed", &error).await;
+            }
+            None => keys.values,
+        },
         Err(error) => {
             return fail(ctx, &run, &session, "failed", "run.failed", &error.to_string()).await
         }
@@ -1278,6 +1284,13 @@ fn completion_error(
     }
 }
 
+fn reported_pr_to_keep(found: Option<&github::HeadPr>, report: &prompts::Report, repo: &str) -> Option<(String, i32)> {
+    match found {
+        None => report.reported_pr(repo),
+        Some(_) => None,
+    }
+}
+
 async fn open_pr(
     ctx: &Ctx,
     task: &AgentTask,
@@ -1296,45 +1309,60 @@ async fn open_pr(
             }
         }
         let message = report.commit_message.clone().unwrap_or_else(|| format!("fix: address review for {}", task.title));
-        workspace::commit_all(wd, &message).await?;
-        if !workspace::has_commits_ahead(wd, &base).await? {
+        workspace::commit_signed(wd, &message).await?;
+        if !workspace::ahead_of_fresh_base(wd, &base).await? {
             return Ok(Some(url));
         }
         workspace::ensure_signed_commits(wd, &base).await?;
-        let head = match github::open_pr_containing_head(wd, repo, &base).await? {
-            Some((_, head)) => head,
-            None => workspace::publish_branch(wd, Some(&task_branch)).await?,
+        let head = match github::open_pr_containing_head(wd, repo, &base, &task_branch).await? {
+            github::HeadPr::Own(_, head) => head,
+            github::HeadPr::Elsewhere(_) => return Ok(Some(url)),
+            github::HeadPr::Missing => workspace::publish_branch(wd, Some(&task_branch)).await?,
         };
-        workspace::push(wd, &head).await?;
+        workspace::push_quest_branch(wd, &head, &task_branch).await?;
         return Ok(Some(url));
     }
     let message = report
         .commit_message
         .clone()
         .unwrap_or_else(|| format!("feat: {}", task.title));
-    workspace::commit_all(wd, &message).await?;
-    if !workspace::has_commits_ahead(wd, &base).await? {
-        let Some((url, number)) = report.reported_pr(repo) else {
-            return Ok(None);
-        };
-        ctx.db.set_pr(task.id, &url, number).await?;
-        return Ok(Some(url));
-    }
-    if let Some((pr, head)) = github::open_pr_containing_head(wd, repo, &base).await? {
-        workspace::ensure_signed_commits(wd, &base).await?;
-        workspace::push(wd, &head).await.context("push failed")?;
-        ctx.db.set_pr(task.id, &pr.url, pr.number).await?;
-        return Ok(Some(pr.url));
+    workspace::commit_signed(wd, &message).await?;
+    let found = if workspace::ahead_of_fresh_base(wd, &base).await? {
+        Some(github::open_pr_containing_head(wd, repo, &base, &task_branch).await?)
+    } else {
+        None
+    };
+    match found {
+        None | Some(github::HeadPr::Elsewhere(_)) => {
+            let Some((url, number)) = reported_pr_to_keep(found.as_ref(), report, repo) else {
+                return Ok(None);
+            };
+            ctx.db.set_pr(task.id, &url, number).await?;
+            return Ok(Some(url));
+        }
+        Some(github::HeadPr::Own(pr, head)) => {
+            workspace::ensure_signed_commits(wd, &base).await?;
+            workspace::push_quest_branch(wd, &head, &task_branch).await.context("push failed")?;
+            ctx.db.set_pr(task.id, &pr.url, pr.number).await?;
+            return Ok(Some(pr.url));
+        }
+        Some(github::HeadPr::Missing) => {}
     }
     workspace::ensure_signed_commits(wd, &base).await?;
+    if !workspace::ahead_of_fresh_base(wd, &base).await? {
+        return Ok(None);
+    }
     let branch = workspace::publish_branch(wd, Some(&task_branch)).await?;
     if branch == base {
         return Err(anyhow!("workspace is on the base branch {base}"));
     }
-    workspace::push(wd, &branch).await.context("push failed")?;
+    workspace::push_quest_branch(wd, &branch, &task_branch).await.context("push failed")?;
     let title = report.pr_title.clone().unwrap_or_else(|| task.title.clone());
     let body = report.pr_body.clone().or_else(|| report.summary.clone()).unwrap_or_default();
-    let pr = github::create_pr(wd, repo, &branch, &base, &title, &body).await?;
+    let into = github::stack_base(wd, repo, &base, &task_branch, loka_agent::runner_server::parent_quest_pr(&ctx.db, task).await).await;
+    let Some(pr) = github::create_pr(wd, repo, &branch, &into, &title, &body).await? else {
+        return Ok(None);
+    };
     ctx.db.set_pr(task.id, &pr.url, pr.number).await?;
     Ok(Some(pr.url))
 }
@@ -1526,7 +1554,18 @@ fn task_timeout() -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{completion_error, session_id_after_run, SecretRedactor};
+    use super::{completion_error, reported_pr_to_keep, session_id_after_run, SecretRedactor};
+    use crate::git::github::{HeadPr, PrInfo};
+
+    #[test]
+    fn another_branchs_pr_is_never_attached_from_the_report() {
+        let report = Report { pr_url: Some("https://github.com/o/r/pull/86".into()), ..Report::default() };
+        let elsewhere = HeadPr::Elsewhere(PrInfo { url: "https://github.com/o/r/pull/86".into(), number: 86 });
+        assert_eq!(reported_pr_to_keep(Some(&elsewhere), &report, "o/r"), None);
+        assert_eq!(reported_pr_to_keep(Some(&HeadPr::Missing), &report, "o/r"), None);
+        assert_eq!(reported_pr_to_keep(None, &report, "o/r"), Some(("https://github.com/o/r/pull/86".to_string(), 86)));
+        assert_eq!(reported_pr_to_keep(None, &Report::default(), "o/r"), None);
+    }
     use crate::world::prompts::Report;
     use loka_shared::progress::phrase as activity_phrase;
     use serde_json::json;

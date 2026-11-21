@@ -10,6 +10,8 @@ import { VoiceField } from "./voice-ui";
 import { TagChips } from "./agent-manage";
 import { CloseButton, WindowHeader } from "./settings-shell";
 import { escapeTaken } from "@/lib/escape";
+import { LookFields } from "./look-fields";
+import type { Accessory } from "./types";
 
 export function CreateAgentDialog({ onCreated, onClose }: { onCreated: (agent: WorldAgent) => void; onClose: () => void }) {
   const [backends, setBackends] = useState<Record<string, BackendModels>>({});
@@ -18,6 +20,7 @@ export function CreateAgentDialog({ onCreated, onClose }: { onCreated: (agent: W
   const [cli, setCli] = useState("claude");
   const [model, setModel] = useState("");
   const [species, setSpecies] = useState("");
+  const [accessories, setAccessories] = useState<Accessory[]>([]);
   const [gear, setGear] = useState("");
   const [tags, setTags] = useState<string[]>([]);
   const [expertise, setExpertise] = useState("");
@@ -80,7 +83,7 @@ export function CreateAgentDialog({ onCreated, onClose }: { onCreated: (agent: W
         cli,
         model: model.trim(),
         role: "worker",
-        look: { species: species.trim() || "person" },
+        look: accessories.length ? { species: species.trim() || "person", accessories } : { species: species.trim() || "person" },
         gear: { quest: gear.trim() },
         visibility: "private",
         tags,
@@ -133,16 +136,11 @@ export function CreateAgentDialog({ onCreated, onClose }: { onCreated: (agent: W
           </label>
         </div>
         {Object.keys(backends).length > 0 && !("opencode" in backends) && <p className="-mt-2 text-w-xs text-w-muted">{OPENCODE_OFF_NOTE}</p>}
-        <div className="flex gap-2">
-          <label className="block flex-1">
-            <span className="mb-1.5 block text-w-sm font-medium text-w-text2">Species</span>
-            <input className={cn(INPUT, "w-full")} value={species} onChange={(e) => setSpecies(e.target.value)} placeholder="person, fox, owl..." />
-          </label>
-          <label className="block flex-1">
-            <span className="mb-1.5 block text-w-sm font-medium text-w-text2">Quest gear</span>
-            <VoiceField ariaLabel="Quest gear" value={gear} onChange={setGear} placeholder="wizard hat and lantern" />
-          </label>
-        </div>
+        <LookFields slug={name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-")} species={species} onSpecies={setSpecies} accessories={accessories} onAccessories={setAccessories} />
+        <label className="block">
+          <span className="mb-1.5 block text-w-sm font-medium text-w-text2">Quest gear</span>
+          <VoiceField ariaLabel="Quest gear" value={gear} onChange={setGear} placeholder="sword and lantern" />
+        </label>
         {error && <p role="alert" className="rounded-lg border-2 border-w-danger bg-w-rose p-2 text-w-danger">{error}</p>}
         <button type="submit" disabled={busy || !name.trim() || !persona.trim() || !model.trim()} className={BTN_PRIMARY}>
           {busy ? "Creating..." : "Create bot"}
