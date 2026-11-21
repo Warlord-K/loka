@@ -268,7 +268,7 @@ fn base_command(opts: &CliOptions<'_>, config: Option<&Path>, agent: Option<&Run
     if agent.is_some() {
         cmd.env("OPENCODE_DISABLE_PROJECT_CONFIG", "1");
     }
-    if !opts.lean && opts.approval != crate::cli::Approval::ReadOnly && crate::claude::sandbox::mode_for(false) == crate::claude::sandbox::Mode::Off {
+    if !opts.lean && opts.approval != crate::cli::Approval::ReadOnly && crate::claude::sandbox::mode() == crate::claude::sandbox::Mode::Off {
         crate::cmd_hub::shield(&mut cmd, &opts.environment, crate::cmd_hub::Hook::Shell);
     }
     if opts.lean {

@@ -66,11 +66,11 @@ pub(crate) async fn acp_setup(opts: &CliOptions<'_>) -> Result<crate::acp::Setup
     if !host.is_empty() || !crate::cli::runner_private_paths().is_empty() {
         keep.push(Box::new(permit_mcp_tools(opts.working_dir, &[], &host).await?));
     }
-    let sandbox_mode = crate::claude::sandbox::mode_for(false);
+    let sandbox_mode = crate::claude::sandbox::mode();
     if sandbox_mode != crate::claude::sandbox::Mode::Off {
         let temp = sandbox::run_temp().context("Failed to create the Cursor run temp dir")?;
         command.env("TMPDIR", &temp.0);
-        if let Some(policy) = sandbox::policy(crate::claude::sandbox::mode_for(false), opts.working_dir, &opts.readable_files, Some(&temp.0)) {
+        if let Some(policy) = sandbox::policy(crate::claude::sandbox::mode(), opts.working_dir, &opts.readable_files, Some(&temp.0)) {
             keep.push(Box::new(install_sandbox_policy(opts.working_dir, &policy).await?));
         }
         keep.push(Box::new(temp));
@@ -482,7 +482,7 @@ fn cursor_tool_summary(tool: &str, input: &serde_json::Value) -> String {
 }
 
 fn shield_commands(cmd: &mut tokio::process::Command, opts: &CliOptions<'_>) {
-    if !opts.lean && crate::claude::sandbox::mode_for(false) == crate::claude::sandbox::Mode::Off {
+    if !opts.lean && crate::claude::sandbox::mode() == crate::claude::sandbox::Mode::Off {
         crate::cmd_hub::shield(cmd, &opts.environment, crate::cmd_hub::Hook::Shell);
     }
 }
@@ -499,7 +499,7 @@ async fn run_inner(opts: &CliOptions<'_>, plugin_dir: Option<&Path>) -> Result<C
 
     let mut readable = opts.readable_files.clone();
     readable.extend(opts.image_paths.iter().cloned());
-    let sandbox_mode = crate::claude::sandbox::mode_for(false);
+    let sandbox_mode = crate::claude::sandbox::mode();
     let sandboxed = sandbox_mode != crate::claude::sandbox::Mode::Off;
     let run_temp = if sandboxed { Some(sandbox::run_temp().context("Failed to create the Cursor run temp dir")?) } else { None };
     if let Some(temp) = &run_temp {

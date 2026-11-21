@@ -70,13 +70,8 @@ pub(crate) fn refusal(reader: &TurnReader, opts: &CliOptions<'_>) -> Option<anyh
     Some(match reader.expect_mode {
         Some("auto") => {
             detect::note_auto_refused(opts);
-            let next = if sandbox::mode_for(false) == sandbox::Mode::Off {
-                "full access with no sandbox"
-            } else {
-                "full access inside the sandbox"
-            };
             anyhow::anyhow!(
-                "Claude Code would not start in auto mode (it fell back to {actual} mode, where it cannot edit files or run commands). Auto mode is not available for this Claude account, model or device settings, so the next try uses {next}."
+                "Claude Code would not start in auto mode (it fell back to {actual} mode, where it cannot edit files or run commands). {AUTO_UNAVAILABLE_FIX}"
             )
         }
         _ => anyhow::anyhow!(
@@ -294,16 +289,20 @@ fn auto_mode_supported(model: &str) -> bool {
 enum Permission {
     LeanReads,
     Auto,
+    AutoUnavailable,
     ReadOnly,
     Bypass,
 }
+
+pub(crate) const AUTO_UNAVAILABLE_FIX: &str = "Auto mode is not available for this Claude account, model or device settings, and Loka never switches to full access on its own. Pick a model with auto mode (Sonnet or Opus), set the agent's approval to Full to allow full access, or set it to Read only.";
 
 fn permission(opts: &CliOptions<'_>, launch: &Launch) -> Permission {
     match (opts.lean, opts.approval) {
         (true, _) if !opts.readable_files.is_empty() => Permission::LeanReads,
         (false, crate::cli::Approval::Auto) if detect::wants_auto(opts) && !launch.auto_refused && launch.caps.mode("auto") => Permission::Auto,
+        (false, crate::cli::Approval::Auto) => Permission::AutoUnavailable,
         (false, crate::cli::Approval::ReadOnly) => Permission::ReadOnly,
-        _ => Permission::Bypass,
+        (false, crate::cli::Approval::Full) | (true, _) => Permission::Bypass,
     }
 }
 
@@ -314,7 +313,7 @@ pub(crate) fn expected_mode(opts: &CliOptions<'_>, launch: &Launch) -> Option<&'
     match permission(opts, launch) {
         Permission::Auto => Some("auto"),
         Permission::Bypass => Some("bypassPermissions"),
-        Permission::LeanReads | Permission::ReadOnly => None,
+        Permission::LeanReads | Permission::ReadOnly | Permission::AutoUnavailable => None,
     }
 }
 
@@ -354,6 +353,9 @@ pub(crate) fn command(opts: &CliOptions<'_>, mcp_config_path: Option<&Path>, lau
         Permission::Bypass => {
             cmd.arg("--dangerously-skip-permissions");
         }
+        Permission::AutoUnavailable => {
+            anyhow::bail!("Claude Code cannot start in auto mode for model {}. {AUTO_UNAVAILABLE_FIX}", opts.model);
+        }
     }
     cmd.arg("--verbose");
     cmd.arg("--output-format").arg("stream-json");
@@ -362,7 +364,7 @@ pub(crate) fn command(opts: &CliOptions<'_>, mcp_config_path: Option<&Path>, lau
     if let Some(level) = launch.caps.effort(effort) {
         cmd.arg("--effort").arg(level);
     }
-    let sandbox_mode = if opts.lean { sandbox::Mode::Off } else { sandbox::mode_for(false) };
+    let sandbox_mode = if opts.lean { sandbox::Mode::Off } else { sandbox::mode() };
     let writable = if sandbox_mode == sandbox::Mode::Off { Vec::new() } else { sandbox::git_write_roots(opts.working_dir) };
     let settings = (!lean_reads).then(|| sandbox::settings(sandbox_mode, &opts.environment, mcp_config_path, &writable, opts.fast)).flatten();
     let settings = if opts.lean { settings } else { Some(without_attribution(settings)) };
@@ -372,9 +374,6 @@ pub(crate) fn command(opts: &CliOptions<'_>, mcp_config_path: Option<&Path>, lau
         sandbox::open_for_owner(&mut settings);
         if mode == Permission::Auto {
             settings["autoMode"] = serde_json::json!({ "allow": owner_allow(&opts.environment) });
-        }
-        if mode == Permission::Bypass && opts.approval == crate::cli::Approval::Auto && settings.get("sandbox").is_some() {
-            settings["sandbox"]["failIfUnavailable"] = serde_json::json!(true);
         }
         cmd.arg("--settings").arg(settings.to_string());
         if let Some(token) = (sandbox_mode != sandbox::Mode::Off).then(|| sandbox::github_token(&opts.environment)).flatten() {
@@ -1094,21 +1093,33 @@ mod tests {
     }
 
     #[test]
-    fn refused_auto_mode_falls_back_to_full_access_in_the_sandbox() {
+    fn refused_auto_mode_fails_closed_instead_of_taking_full_access() {
         let work = options(false, Vec::new(), false, Approval::Auto, "sonnet");
         let normal = Launch::assume("claude");
         assert_eq!(after(&args(&work, &normal), "--permission-mode"), Some("auto"));
         assert_eq!(expected_mode(&work, &normal), Some("auto"));
 
         let refused = Launch { auto_refused: true, ..Launch::assume("claude") };
-        let fallback = args(&work, &refused);
-        assert!(fallback.iter().any(|arg| arg == "--dangerously-skip-permissions"));
-        assert!(!fallback.iter().any(|arg| arg == "--permission-mode"));
-        assert_eq!(expected_mode(&work, &refused), Some("bypassPermissions"));
+        let error = command(&work, None, &refused).expect_err("a refused auto mode must not build a command").to_string();
+        assert!(error.contains("never switches to full access"), "{error}");
+        assert!(!error.contains('\u{2014}'));
+        assert_eq!(loka_shared::cli_errors::classify(&error).map(|f| f.kind), Some(loka_shared::cli_errors::FailureKind::Permissions));
+        assert_eq!(expected_mode(&work, &refused), None);
+
+        let help = "  -p, --print x\n  --tools <t> x\n  --permission-mode <mode> x (choices: \"acceptEdits\", \"bypassPermissions\", \"default\")";
+        let no_auto = Launch { caps: Arc::new(Caps::parse(Some("2.1.0".into()), help)), ..Launch::assume("claude") };
+        assert!(command(&work, None, &no_auto).is_err());
 
         let haiku = options(false, Vec::new(), false, Approval::Auto, "haiku");
-        assert_eq!(expected_mode(&haiku, &normal), Some("bypassPermissions"));
+        assert!(command(&haiku, None, &normal).is_err());
+        assert_eq!(expected_mode(&haiku, &normal), None);
+
+        let full = options(false, Vec::new(), false, Approval::Full, "haiku");
+        assert!(args(&full, &refused).iter().any(|arg| arg == "--dangerously-skip-permissions"));
+        assert_eq!(expected_mode(&full, &normal), Some("bypassPermissions"));
+
         let read_only = options(false, Vec::new(), false, Approval::ReadOnly, "sonnet");
+        assert!(!args(&read_only, &refused).iter().any(|arg| arg == "--dangerously-skip-permissions"));
         assert_eq!(expected_mode(&read_only, &normal), None);
         assert_eq!(expected_mode(&options(true, Vec::new(), false, Approval::Auto, "sonnet"), &normal), None);
     }
@@ -1119,9 +1130,12 @@ mod tests {
         let old = Launch { caps: Arc::new(Caps::parse(Some("2.0.1".into()), help)), ..Launch::assume("claude") };
         let work = options(false, Vec::new(), false, Approval::Auto, "sonnet");
         assert!(old.caps.outdated().is_none());
-        let built = args(&work, &old);
+        let refused = command(&work, None, &old).expect_err("an old CLI without auto mode never falls back to full access").to_string();
+        assert!(refused.contains("never switches to full access"), "{refused}");
+        let built = args(&options(false, Vec::new(), false, Approval::Full, "sonnet"), &old);
         assert!(!built.iter().any(|arg| arg == "--effort"));
         assert!(!built.iter().any(|arg| arg == "auto"));
+        assert!(built.iter().any(|arg| arg == "--dangerously-skip-permissions"));
         let reads = args(&options(true, vec![PathBuf::from("/tmp/s.md")], false, Approval::Auto, "sonnet"), &old);
         assert_eq!(after(&reads, "--permission-mode"), Some("default"));
         let current = args(&work, &Launch::assume("claude"));
@@ -1136,6 +1150,7 @@ mod tests {
         reader.feed(&init, None);
         let error = refusal(&reader, &opts).unwrap().to_string();
         assert!(error.contains("would not start in auto mode") && error.contains("default mode"));
+        assert!(error.contains("never switches to full access") && !error.contains("next try"));
         assert!(!error.contains('\u{2014}'));
         assert_eq!(loka_shared::cli_errors::classify(&error).map(|f| f.kind), Some(loka_shared::cli_errors::FailureKind::Permissions));
 

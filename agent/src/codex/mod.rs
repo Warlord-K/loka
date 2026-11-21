@@ -226,9 +226,16 @@ pub(crate) async fn writable_roots(dir: &Path) -> Vec<PathBuf> {
     let env_dir = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from);
     let mut roots: Vec<PathBuf> = crate::cli::git_common_dir(dir).await.into_iter().collect();
     roots.extend(env_dir("WORLD_RUNNER_CODEX_STATE_DIR"));
+    if crate::cli::JobUid::current().is_none() {
+        roots.extend(owner_cache_roots(env_dir("HOME").as_deref()));
+    }
     let homes: Vec<PathBuf> = env_dir("CODEX_HOME").into_iter().collect();
     roots.retain(|root| homes.iter().all(|home| !home.starts_with(root) && !root.starts_with(home)));
     roots
+}
+
+fn owner_cache_roots(home: Option<&Path>) -> Vec<PathBuf> {
+    home.map(crate::claude::sandbox::writable_in).unwrap_or_default().into_iter().filter(|root| root.is_dir()).collect()
 }
 
 pub(crate) fn shell_environment_overrides(granted: &BTreeMap<String, String>) -> Result<Vec<String>> {
@@ -838,7 +845,22 @@ fn extract_codex_item_output(item: &serde_json::Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{chatgpt_login, exec_uses_chatgpt_login, mcp_overrides, uses_chatgpt_login, work_effort, McpLaunch};
+    use super::{chatgpt_login, exec_uses_chatgpt_login, mcp_overrides, owner_cache_roots, uses_chatgpt_login, work_effort, McpLaunch};
+
+    #[test]
+    fn owner_codex_runs_can_write_existing_package_caches() {
+        let home = std::env::temp_dir().join(format!("loka-codex-caches-{}", uuid::Uuid::new_v4().simple()));
+        for dir in [".cargo/registry", ".npm", ".ssh"] {
+            std::fs::create_dir_all(home.join(dir)).unwrap();
+        }
+        let roots = owner_cache_roots(Some(&home));
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(roots.contains(&home.join(".cargo/registry")));
+        assert!(roots.contains(&home.join(".npm")));
+        assert!(!roots.contains(&home.join(".cargo/git")));
+        assert!(roots.iter().all(|root| !root.starts_with(home.join(".ssh"))));
+        assert!(owner_cache_roots(None).is_empty());
+    }
 
     #[test]
     fn reads_the_login_mode_from_auth_json() {

@@ -72,7 +72,7 @@ Everything has a working default.
 | Variable | Default | Effect |
 |---|---|---|
 | `WORLD_TASK_TIMEOUT_SECS` | 3600 | Default time limit for task, follow-up and review runs |
-| `WORLD_TASK_SANDBOX` | `auto` | `auto`, `strict` (fail if the sandbox cannot start) or `off` |
+| `WORLD_TASK_SANDBOX` | `auto` | `auto` (owner quests stay sandboxed), `strict` (fail if the sandbox cannot start) or `off` |
 | `WORLD_CLAUDE_EFFORT` | `medium` for chat, `high` for work | Claude Code effort when a message does not pick one |
 | `WORLD_REVIEWS` | on | `off` disables independent reviews |
 | `WORLD_MAX_REVIEW_ROUNDS` | 2 | Fix rounds after a review asks for changes |
@@ -95,4 +95,4 @@ Everything has a working default.
 
 ## Running the pieces by hand
 
-For development only; see [CONTRIBUTING.md](../CONTRIBUTING.md). The API needs `DATABASE_URL`, `AUTH_DISABLED=true` and `API_BIND_HOST=127.0.0.1`. The runner needs `WORLD_RUNNER_URL`, `WORLD_RUNNER_ID`, `WORLD_RUNNER_TOKEN` and `WORLD_RUNNER_ROOT`. `AUTH_DISABLED=true` makes every request the one local user, which is safe only while the API listens on `127.0.0.1`.
+For development only; see [CONTRIBUTING.md](../CONTRIBUTING.md). The API needs `DATABASE_URL`, `AUTH_DISABLED=true`, `API_BIND_HOST=127.0.0.1` and `LOKA_APP_SESSION_FILE` (where it reads or writes the app session; `loka-api login-link` prints a one-time link that hands a browser the cookie). `AUTH_DISABLED_ORIGINS` adds exact extra origins to the allowlist. The runner needs `WORLD_RUNNER_URL`, `WORLD_RUNNER_ID`, `WORLD_RUNNER_TOKEN` and `WORLD_RUNNER_ROOT`. `AUTH_DISABLED=true` makes every request the one local user, which is safe only while the API listens on `127.0.0.1`.

@@ -6,6 +6,14 @@ export type ChangelogEntry = {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    date: "2026-11-21",
+    title: "Only the Loka app can act as you",
+    items: [
+      "**Locked to the app**: Loka's local server now answers only the Loka window and this launch's secret, so websites in your browser and other programs on your Mac can no longer act as you. Opening Loka in a browser tab needs a fresh link from `loka-api login-link`.",
+      "**Quests fail safe**: when a coding CLI cannot run in auto mode, the quest stops and says how to fix it instead of quietly taking full access, and quests stay in the sandbox unless you turn it off. Agents can read only your ssh config, known hosts and signing keys, never your other private keys.",
+    ],
+  },
+  {
     date: "2026-11-20",
     title: "Quote anything into your reply",
     items: [

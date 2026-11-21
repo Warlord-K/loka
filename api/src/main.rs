@@ -5,7 +5,7 @@ use axum::{
     routing::{delete, get, patch, post, put},
     Router,
 };
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::info;
 
 mod access;
@@ -36,6 +36,9 @@ pub struct AppState {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
+    if std::env::args().nth(1).as_deref() == Some("login-link") {
+        return print_login_link(std::env::args().nth(2));
+    }
     loka_shared::environment::initialize();
 
     {
@@ -117,9 +120,20 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(run_runner_schedules(state.clone(), schedule_notify));
 
     let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_origin(AllowOrigin::predicate(|origin, _| origin.to_str().is_ok_and(|origin| auth::LocalPolicy::current().origin_ok(origin))))
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::PUT,
+            axum::http::Method::PATCH,
+            axum::http::Method::DELETE,
+            axum::http::Method::OPTIONS,
+        ])
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderName::from_static(auth::APP_SESSION_HEADER),
+        ]);
 
     let api = Router::new()
         .route(
@@ -424,6 +438,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .merge(mcp_api)
         .route("/api/terminal/socket", get(routes::terminal::browser_socket))
+        .route("/api/app-session", get(auth::app_session_handoff))
         .nest("/api/runner", runner_api)
         .nest("/api", api.layer(tower_http::compression::CompressionLayer::new()))
         .route_layer(middleware::from_fn(metrics::track))
@@ -436,8 +451,9 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     keepalive::spawn()?;
-    if std::env::var("AUTH_DISABLED").as_deref() == Ok("true") {
-        tracing::warn!(%addr, "AUTH_DISABLED=true: every request acts as the one local user unless a local x-world-user header says otherwise. Never expose this API to other machines");
+    if auth::auth_disabled() {
+        auth::app_session_secret();
+        tracing::warn!(%addr, "AUTH_DISABLED=true: local pages that hold the app session act as the one local user (the desktop app hands its window the session; in development run loka-api login-link). Requests without it get 401. Never expose this API to other machines");
     }
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
 
@@ -749,4 +765,17 @@ async fn relay_runner_events(
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
+}
+
+fn print_login_link(base: Option<String>) -> anyhow::Result<()> {
+    let Some(secret) = auth::saved_app_session() else {
+        anyhow::bail!("No app session found. Start the API with AUTH_DISABLED=true and LOKA_APP_SESSION_FILE set first.");
+    };
+    let base = base
+        .or_else(|| std::env::var("WORLD_APP_URL").ok())
+        .map(|base| base.trim().to_string())
+        .filter(|base| !base.is_empty())
+        .unwrap_or_else(|| format!("http://localhost:{}", std::env::var("FRONTEND_PORT").ok().filter(|port| port.parse::<u16>().is_ok()).unwrap_or_else(|| "3000".into())));
+    println!("{}", auth::login_link(&base, &secret));
+    Ok(())
 }

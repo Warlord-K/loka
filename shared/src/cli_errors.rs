@@ -97,7 +97,7 @@ impl CliFailure {
                 "The CLI on the execution device is too old for Loka. Update it there (claude update), then retry.".to_string()
             }
             FailureKind::Permissions => {
-                "The CLI refused the permission mode Loka asked for, so it could not edit files or run commands. Loka retries with full access inside the sandbox; if the device's Claude settings turn that off too, allow it there or set the agent to Read only.".to_string()
+                "The CLI refused the permission mode Loka asked for, so it could not edit files or run commands. Loka never switches to full access on its own: pick a model with auto mode, set the agent's approval to Full, or set it to Read only. If the device's Claude settings turn full access off, allow it there.".to_string()
             }
         }
     }
@@ -111,7 +111,7 @@ pub fn classify(error: &str) -> Option<CliFailure> {
         FailureKind::CliMissing
     } else if has(&["is too old for loka", "error: unknown option '--"]) {
         FailureKind::CliOutdated
-    } else if has(&["would not start in auto mode", "would not start with full access", "auto mode is unavailable"]) {
+    } else if has(&["would not start in auto mode", "cannot start in auto mode", "would not start with full access", "auto mode is unavailable"]) {
         FailureKind::Permissions
     } else if has(&["missing scopes:", "missing scope:", "insufficient permissions for this operation"])
         && has(&["api.responses", "api.model.", "/responses", "openai", "chatgpt"])

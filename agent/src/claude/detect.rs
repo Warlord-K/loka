@@ -253,7 +253,7 @@ fn account(opts: &crate::cli::CliOptions<'_>) -> u64 {
 }
 
 pub(crate) fn note_auto_refused(opts: &crate::cli::CliOptions<'_>) {
-    warn!(model = opts.model, fast = opts.fast, "Claude Code refused auto mode; later runs of this account use full access inside the sandbox");
+    warn!(model = opts.model, fast = opts.fast, "Claude Code refused auto mode; later auto runs of this account fail until the owner picks another model or approval");
     auto_cache().lock().unwrap().insert((account(opts), opts.model.to_string(), opts.fast), Instant::now());
 }
 

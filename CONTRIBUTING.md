@@ -18,18 +18,21 @@ createdb loka
 Run the pieces you are changing:
 
 ```bash
-DATABASE_URL=postgres://localhost/loka AUTH_DISABLED=true API_BIND_HOST=127.0.0.1 cargo run -p loka-api
+DATABASE_URL=postgres://localhost/loka AUTH_DISABLED=true API_BIND_HOST=127.0.0.1 LOKA_APP_SESSION_FILE=$HOME/.loka-dev/app-session.key cargo run -p loka-api
 cd frontend && npm install && npm run dev
+LOKA_APP_SESSION_FILE=$HOME/.loka-dev/app-session.key cargo run -p loka-api -- login-link
 ```
+
+Open the printed link within 120 seconds; it sets the app session cookie and lands on `/world`. Calls from the terminal send the secret as a header: `-H "x-loka-app-session: $(cat ~/.loka-dev/app-session.key)"`.
 
 The API applies `migrations/` on startup. For agent work you also need a runner. Register one and start it with the returned id and token (one runner per person; revoke the old one first):
 
 ```bash
-curl -s -X POST http://127.0.0.1:8081/api/world/runners -H 'content-type: application/json' -d '{"name":"dev","platform":"macos"}'
+curl -s -X POST http://127.0.0.1:8081/api/world/runners -H 'content-type: application/json' -H "x-loka-app-session: $(cat ~/.loka-dev/app-session.key)" -d '{"name":"dev","platform":"macos"}'
 WORLD_RUNNER_URL=http://127.0.0.1:8081 WORLD_RUNNER_ID=... WORLD_RUNNER_TOKEN=... WORLD_RUNNER_ROOT=$HOME/.loka-dev/runner cargo run -p loka-agent -- runner
 ```
 
-With `AUTH_DISABLED=true` every request is one local user. Keep the API on `127.0.0.1`.
+With `AUTH_DISABLED=true` every request that holds the app session is one local user. Keep the API on `127.0.0.1`.
 
 The desktop app builds everything it bundles in its prepare step (`desktop/src-tauri/scripts/prepare-sidecar.sh`, also run by `npm run build`). For a dev window: `cd desktop && npm ci && npm run dev`.
 
