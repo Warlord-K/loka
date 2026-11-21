@@ -97,6 +97,7 @@ struct RunnerView {
 }
 
 static WEB_ORIGIN: OnceLock<String> = OnceLock::new();
+const APP_SESSION_HEADER: &str = "x-loka-app-session";
 
 fn keep_awake() {
     if !cfg!(target_os = "macos") {
@@ -332,7 +333,7 @@ async fn boot(app: &AppHandle) {
     match result {
         Ok(()) => {
             stack.ready();
-            if let (Some(window), Ok(target)) = (app.get_webview_window("main"), Url::parse(&format!("{}/world", stack.web_origin()))) {
+            if let (Some(window), Ok(target)) = (app.get_webview_window("main"), Url::parse(&stack.login_url("/world"))) {
                 let _ = window.navigate(target);
             }
         }
@@ -521,7 +522,7 @@ async fn pair_device(window: WebviewWindow, name: String) -> Result<DesktopStatu
     let runner_id = state.config.lock().map_err(lock_error)?.runner_id.clone();
     match runner_id {
         Some(runner_id) => {
-            let response = local_client()?
+            let response = owner_client(app)?
                 .patch(format!("{}/api/world/runners/{runner_id}", api_origin(app)))
                 .json(&serde_json::json!({ "name": name }))
                 .send()
@@ -625,18 +626,28 @@ fn api_origin(app: &AppHandle) -> String {
     app.state::<Arc<Stack>>().api_origin()
 }
 
+fn owner_client(app: &AppHandle) -> Result<reqwest::Client, String> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    let mut session = reqwest::header::HeaderValue::from_str(app.state::<Arc<Stack>>().app_session()).map_err(display_error)?;
+    session.set_sensitive(true);
+    headers.insert(APP_SESSION_HEADER, session);
+    local_builder().default_headers(headers).build().map_err(display_error)
+}
+
 fn local_client() -> Result<reqwest::Client, String> {
+    local_builder().build().map_err(display_error)
+}
+
+fn local_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(20))
-        .build()
-        .map_err(display_error)
 }
 
 async fn ensure_runner(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<NativeState>();
     let stack = app.state::<Arc<Stack>>();
-    let client = local_client()?;
+    let client = owner_client(app)?;
     let origin = stack.api_origin();
     let response = client
         .get(format!("{origin}/api/world/runners"))
@@ -736,7 +747,7 @@ async fn set_paused(app: &AppHandle, paused: bool) -> Result<(), String> {
         .runner_id
         .clone()
         .ok_or_else(|| "This Mac is still connecting.".to_string())?;
-    let response = local_client()?
+    let response = owner_client(app)?
         .patch(format!("{}/api/world/runners/{runner_id}", api_origin(app)))
         .json(&serde_json::json!({ "paused": paused }))
         .send()

@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const LOG_ROTATE_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
@@ -296,6 +297,7 @@ pub struct Stack {
     bundled_web: PathBuf,
     phase: Mutex<Phase>,
     busy: AtomicBool,
+    app_session: String,
 }
 
 impl Stack {
@@ -310,6 +312,9 @@ impl Stack {
         secrets.ports = choose_ports(secrets.ports);
         save_secrets(&secrets_path, &secrets).map_err(|error| error.to_string())?;
         let ports = secrets.ports;
+        let app_session = hex(&random_bytes(32)?);
+        let app_session_path = root.join(APP_SESSION_FILE);
+        write_private(&app_session_path, app_session.as_bytes()).map_err(|error| error.to_string())?;
         let data = root.join("postgres");
         let database = {
             let bin = runtime.join("postgres").join("bin");
@@ -340,6 +345,7 @@ impl Stack {
             let binary = api_binary.clone();
             let secrets = secrets.clone();
             let config = root.join("config.yaml");
+            let app_session_path = app_session_path.clone();
             Supervised::new("api", logs.join("api.log"), &pid_dir, libc::SIGTERM, true, Duration::from_secs(5), move || {
                 let binary = binary.lock().map_err(|_| "The Loka API path is unavailable.".to_string())?.clone();
                 if !binary.is_file() {
@@ -351,6 +357,7 @@ impl Stack {
                     .env("PORT", ports.api.to_string())
                     .env("API_BIND_HOST", "127.0.0.1")
                     .env("AUTH_DISABLED", "true")
+                    .env("LOKA_APP_SESSION_FILE", &app_session_path)
                     .env("AUTH_SECRET", &secrets.auth_secret)
                     .env("WORLD_SECRETS_KEY", &secrets.secrets_key)
                     .env("WORLD_PUBLIC_API_URL", format!("http://127.0.0.1:{}", ports.api))
@@ -408,7 +415,17 @@ impl Stack {
             bundled_web,
             phase: Mutex::new(Phase::Starting("Starting Loka")),
             busy: AtomicBool::new(false),
+            app_session,
         })
+    }
+
+    pub fn app_session(&self) -> &str {
+        &self.app_session
+    }
+
+    pub fn login_url(&self, next: &str) -> String {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|elapsed| elapsed.as_secs()).unwrap_or_default();
+        format!("{}/api/app-session?code={}&next={next}", self.web_origin(), login_code(&self.app_session, now))
     }
 
     pub fn api_origin(&self) -> String {
@@ -740,6 +757,26 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+pub const APP_SESSION_FILE: &str = "app-session.key";
+const LOGIN_CODE_SECS: u64 = 120;
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut block = [0u8; 64];
+    if key.len() > block.len() {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let padded = |byte: u8| block.iter().map(|b| b ^ byte).collect::<Vec<u8>>();
+    let inner = Sha256::new().chain_update(padded(0x36)).chain_update(message).finalize();
+    Sha256::new().chain_update(padded(0x5c)).chain_update(inner).finalize().into()
+}
+
+fn login_code(secret: &str, now: u64) -> String {
+    let expires = now + LOGIN_CODE_SECS;
+    format!("{expires}.{}", hex(&hmac_sha256(secret.as_bytes(), format!("loka-login:{expires}").as_bytes())))
+}
+
 fn load_secrets(path: &Path) -> Result<Secrets, String> {
     let mut secrets = std::fs::read(path)
         .ok()
@@ -872,6 +909,16 @@ mod tests {
             assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn login_codes_match_the_api_hmac() {
+        assert_eq!(hex(&hmac_sha256(b"Jefe", b"what do ya want for nothing?")), "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+        let long = [0xaau8; 131];
+        assert_eq!(hex(&hmac_sha256(&long, b"Test Using Larger Than Block-Size Key - Hash Key First")), "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+        let code = login_code("s", 1000);
+        assert!(code.starts_with("1120."), "{code}");
+        assert_eq!(code.len(), 5 + 64);
     }
 
     #[test]

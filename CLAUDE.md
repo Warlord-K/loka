@@ -26,7 +26,7 @@ desktop/   Tauri app: bundles Postgres, the API, the web app and the runner; wor
 migrations/ numbered SQL
 ```
 
-The app runs everything on `127.0.0.1` with `AUTH_DISABLED=true`, so every request is the one local user. `auth::came_from_a_local_page` refuses requests whose `Host` or `Origin` is not local (or listed in `AUTH_DISABLED_HOSTS`), so a website open in the browser can't act as that user. Its data lives in `~/Library/Application Support/dev.ygpt.loka` ([desktop/src-tauri/src/local.rs](desktop/src-tauri/src/local.rs)).
+The app runs everything on `127.0.0.1` with `AUTH_DISABLED=true`, so every request is the one local user. `auth::LocalPolicy` refuses requests whose `Host` is not local or whose `Origin` is not an exact app origin (CORS uses the same list, extend with `AUTH_DISABLED_ORIGINS`), and every owner request also needs the per-launch app session: the desktop writes `app-session.key` (0600), passes `LOKA_APP_SESSION_FILE` to the API, sends `x-loka-app-session` on its own calls and opens the window through a one-time `/api/app-session?code=` link that sets the HttpOnly SameSite=Strict `loka-app-session` cookie (`loka-api login-link` in development). Sandboxes deny `local.json` and `app-session.key`. Its data lives in `~/Library/Application Support/dev.ygpt.loka` ([desktop/src-tauri/src/local.rs](desktop/src-tauri/src/local.rs)).
 
 ## Runtime invariants
 
@@ -53,7 +53,7 @@ Each CLI's fork, resume, rewind, steering, warm process and MCP setup are compar
 
 ## Safety
 
-- **Owner work runs as each CLI ships it**: `sandbox::mode_for(false)` turns the default `auto` into off, so `approval_mode` is the limit (Claude auto mode also gets `OWN_BRANCH_FORCE_PUSH`, so quests can force push their own branch, plus the owner's approved actions); `WORLD_TASK_SANDBOX=strict` restores the sandbox below. Lean turns stay tool-less.
+- **Owner work fails closed**: `sandbox::mode()` keeps the default `auto` sandbox on for owner quests (`WORLD_TASK_SANDBOX=off` is the only way out), and an Auto approval that the CLI cannot honour refuses to start (`AUTO_UNAVAILABLE_FIX`) instead of falling back to bypass; only Full approval bypasses. Claude auto mode also gets `OWN_BRANCH_FORCE_PUSH` plus the owner's approved actions. `~/.ssh` is hidden except `config`, `known_hosts`, the agent socket, the karna/loka signing keys and the `.pub` of the configured signing key. Lean turns stay tool-less.
 - **Sandbox** ([agent/src/claude/sandbox.rs](agent/src/claude/sandbox.rs), [agent/src/sandbox_wrap.rs](agent/src/sandbox_wrap.rs)): credential paths hidden, writes limited to the worktree, its git dir, temp and caches. CLI env is an allowlist (`cli::configure_child_environment`) plus the agent's granted keys; host secrets are redacted from output.
 - **Powers** ([shared/src/powers.rs](shared/src/powers.rs)) are stored as revocations, so new powers default on. Owner-setup tools need `owner_asked_now`.
 - **Keys** ([shared/src/environment.rs](shared/src/environment.rs)): encrypted, granted per agent, masked `***` everywhere, resolved only through `${secret:KEY}`. The MCP hub ([agent/src/mcp_hub/](agent/src/mcp_hub/)) keeps resolved values out of files and arguments. A kit server with an unreadable definition or ungranted keys is skipped with a warning, never failing the run (`environment::runnable_definition`, `missing_secrets`); `mcp-remote` sign-ins live in `mcp-auth/<owner>` (`mcp_hub::pin_sign_in_dirs`), never in a worktree.
