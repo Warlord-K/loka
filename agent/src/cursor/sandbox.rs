@@ -71,7 +71,8 @@ pub(crate) fn policy(mode: Mode, working_dir: &Path, readable: &[PathBuf], temp:
     }
     write.extend(crate::claude::sandbox::git_write_roots(working_dir).into_iter().map(PathBuf::from));
     if let Some(home) = home.as_ref() {
-        read.push(home.join(crate::claude::sandbox::OWNER_SSH));
+        read.extend(crate::claude::sandbox::owner_ssh_readable(Some(home)));
+        read.extend(std::env::var_os("SSH_AUTH_SOCK").filter(|v| !v.is_empty()).map(PathBuf::from));
         write.extend(crate::claude::sandbox::OWNER_WRITABLE_HOME.iter().map(|rel| home.join(rel)));
     }
     let network = if mode == Mode::Strict {
@@ -103,6 +104,7 @@ mod tests {
         for secret in [".aws", ".codex", ".config/gh", ".kube", ".npmrc", ".cursor/agent-cli-state"] {
             assert!(!listed.iter().any(|path| path.contains(secret)), "{secret} must stay hidden: {listed:?}");
         }
+        assert!(!listed.iter().any(|path| path.ends_with("/.ssh") || path.ends_with(".ssh/id_ed25519") || path.ends_with(".ssh/id_rsa")), "owners read only signing keys, config and known_hosts in ssh: {listed:?}");
         assert!(policy(Mode::Off, &dir, &[], None).is_none());
     }
 }

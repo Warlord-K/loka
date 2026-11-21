@@ -24,6 +24,7 @@ pub(crate) const HIDDEN_PATHS: &[&str] = &[
     "~/Library/Application Support/dev.ygpt.loka/slack-connection.key",
     "~/Library/Application Support/dev.ygpt.loka/desktop.json",
     "~/Library/Application Support/dev.ygpt.loka/local.json",
+    "~/Library/Application Support/dev.ygpt.loka/app-session.key",
     "~/Library/Application Support/dev.ygpt.loka/postgres",
     "~/Library/Application Support/dev.ygpt.loka/pids",
     "~/Library/Application Support/dev.ygpt.loka/runner/leases",
@@ -94,7 +95,13 @@ const HIDDEN_ENV: &[&str] = &[
     "WORLD_SLACK_KEY_FILE",
     "WORLD_SLACK_CONNECTION_KEY",
     "WORLD_RUNNER_LEASE_FILE",
+    "LOKA_APP_SESSION_SECRET",
+    "KARNA_APP_SESSION_SECRET",
 ];
+
+pub(crate) fn app_session_file() -> Option<PathBuf> {
+    loka_shared::loka_env::var("APP_SESSION_FILE").filter(|v| !v.trim().is_empty()).map(PathBuf::from)
+}
 
 const PROCESS_INFO: &[&str] = &["Read(//proc)", "Read(//proc/**)"];
 
@@ -107,17 +114,6 @@ pub enum Mode {
 
 pub fn mode() -> Mode {
     parse_mode(std::env::var("WORLD_TASK_SANDBOX").ok().as_deref())
-}
-
-pub fn mode_for(guest: bool) -> Mode {
-    for_job(mode(), guest)
-}
-
-fn for_job(mode: Mode, guest: bool) -> Mode {
-    match mode {
-        Mode::Auto if !guest => Mode::Off,
-        mode => mode,
-    }
 }
 
 fn parse_mode(value: Option<&str>) -> Mode {
@@ -202,10 +198,10 @@ fn ssh_readable(signing_key: Option<&str>, home: Option<&str>) -> Vec<String> {
         _ => path.to_string(),
     };
     let mut paths = vec![expand("~/.ssh/known_hosts"), expand("~/.ssh/config")];
-    if let Some(key) = signing_key.map(expand).filter(|k| Path::new(k).is_file()) {
-        let private = key.trim_end_matches(".pub").to_string();
-        paths.push(format!("{private}.pub"));
-        paths.push(private);
+    if let Some(public) = signing_key.map(expand).map(|key| format!("{}.pub", key.trim_end_matches(".pub"))) {
+        if Path::new(&public).is_file() {
+            paths.push(public);
+        }
     }
     paths
 }
@@ -247,6 +243,9 @@ pub fn settings(
     }
     if let Some(key) = std::env::var_os("WORLD_SLACK_KEY_FILE").filter(|v| !v.is_empty()) {
         deny_read.push(Path::new(&key).display().to_string());
+    }
+    if let Some(file) = app_session_file() {
+        deny_read.push(file.display().to_string());
     }
     if let Some(path) = mcp_config_path {
         deny_read.push(path.display().to_string());
@@ -294,7 +293,6 @@ pub fn settings(
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .filter(|p| *p != "~/.ssh")
         .flat_map(|p| {
             let p = p.trim_end_matches('/');
             let p = if p.starts_with('/') { format!("/{p}") } else { p.to_string() };
@@ -313,14 +311,53 @@ pub(crate) const OWNER_SSH: &str = ".ssh";
 
 pub(crate) const OWNER_WRITABLE_HOME: &[&str] = &[".tsh", ".ssh/known_hosts"];
 
+pub(crate) const OWNER_SIGNING_KEYS: &[&str] = &[
+    ".ssh/karna_signing",
+    ".ssh/karna_signing.pub",
+    ".ssh/loka_signing",
+    ".ssh/loka_signing.pub",
+];
+
+pub(crate) const PACKAGE_HOSTS: &[&str] = &[
+    "crates.io",
+    "index.crates.io",
+    "static.crates.io",
+    "static.rust-lang.org",
+    "registry.npmjs.org",
+    "registry.yarnpkg.com",
+    "repo.yarnpkg.com",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "proxy.golang.org",
+    "sum.golang.org",
+];
+
+pub(crate) fn owner_ssh_readable(home: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> =
+        ssh_exceptions(home.and_then(Path::to_str)).into_iter().map(PathBuf::from).collect();
+    if let Some(home) = home {
+        paths.extend(OWNER_SIGNING_KEYS.iter().map(|rel| home.join(rel)));
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 pub fn open_for_owner(settings: &mut Value) {
     let Some(sandbox) = settings.get_mut("sandbox").filter(|s| s.is_object()) else {
         return;
     };
     sandbox["network"]["allowLocalBinding"] = json!(true);
-    let ssh = format!("~/{OWNER_SSH}");
-    if let Some(deny) = sandbox["filesystem"]["denyRead"].as_array_mut() {
-        deny.retain(|path| path.as_str() != Some(ssh.as_str()));
+    if let Some(domains) = sandbox["network"]["allowedDomains"].as_array_mut() {
+        domains.extend(PACKAGE_HOSTS.iter().map(|host| Value::String(host.to_string())));
+    }
+    if let Some(read) = sandbox["filesystem"]["allowRead"].as_array_mut() {
+        for rel in OWNER_SIGNING_KEYS {
+            let path = Value::String(format!("~/{rel}"));
+            if !read.contains(&path) {
+                read.push(path);
+            }
+        }
     }
     if let Some(write) = sandbox["filesystem"]["allowWrite"].as_array_mut() {
         write.extend(OWNER_WRITABLE_HOME.iter().map(|rel| Value::String(format!("~/{rel}"))));
@@ -332,13 +369,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn owner_jobs_bind_local_ports_and_reach_ssh_and_teleport() {
+    fn owner_jobs_bind_local_ports_and_teleport_but_read_only_signing_keys_in_ssh() {
         let mut owner = settings(Mode::Auto, &BTreeMap::new(), None, &[], false).unwrap();
         open_for_owner(&mut owner);
         assert_eq!(owner["sandbox"]["network"]["allowLocalBinding"], json!(true));
-        assert_eq!(owner["sandbox"]["network"]["allowedDomains"], json!(GITHUB_HOSTS));
-        assert!(!denies(&owner, "~/.ssh/id_ed25519"));
+        let domains = owner["sandbox"]["network"]["allowedDomains"].as_array().unwrap();
+        assert!(GITHUB_HOSTS.iter().all(|h| domains.iter().any(|d| d == h)));
+        assert!(domains.iter().any(|d| d == "index.crates.io"));
+        assert!(domains.iter().any(|d| d == "registry.npmjs.org"));
+        assert!(denies(&owner, "~/.ssh/id_ed25519"));
         assert!(denies(&owner, "~/.aws/credentials"));
+        let read = owner["sandbox"]["filesystem"]["allowRead"].as_array().unwrap();
+        assert!(read.iter().any(|p| p == "~/.ssh/karna_signing"));
+        assert!(read.iter().any(|p| p == "~/.ssh/karna_signing.pub"));
+        assert!(!read.iter().any(|p| p == "~/.ssh/id_ed25519" || p == "~/.ssh"));
         let write = owner["sandbox"]["filesystem"]["allowWrite"].as_array().unwrap();
         assert!(write.iter().any(|p| p == "~/.tsh"));
         assert!(write.iter().any(|p| p == "~/.ssh/known_hosts"));
@@ -351,18 +395,43 @@ mod tests {
     fn parses_modes_with_auto_as_default() {
         assert_eq!(parse_mode(None), Mode::Auto);
         assert_eq!(parse_mode(Some("OFF")), Mode::Off);
-        assert_eq!(for_job(Mode::Auto, false), Mode::Off, "owner work runs as the CLI ships it");
-        assert_eq!(for_job(Mode::Auto, true), Mode::Auto, "guests stay sandboxed");
-        assert_eq!(for_job(Mode::Strict, false), Mode::Strict, "strict sandboxes owners too");
-        assert_eq!(for_job(Mode::Off, true), Mode::Off);
         assert_eq!(parse_mode(Some("strict")), Mode::Strict);
         assert_eq!(parse_mode(Some("whatever")), Mode::Auto);
+    }
+
+    #[test]
+    fn owner_jobs_stay_sandboxed_unless_the_sandbox_is_turned_off() {
+        assert_eq!(parse_mode(None), Mode::Auto);
+        assert_eq!(parse_mode(Some("auto")), Mode::Auto);
+    }
+
+    #[test]
+    fn owner_ssh_readable_lists_only_config_known_hosts_and_signing_keys() {
+        let home = Path::new("/Users/someone");
+        let paths = owner_ssh_readable(Some(home));
+        assert!(paths.contains(&home.join(".ssh/karna_signing")));
+        assert!(paths.contains(&home.join(".ssh/known_hosts")));
+        assert!(paths.contains(&home.join(".ssh/config")));
+        assert!(!paths.contains(&home.join(".ssh/id_ed25519")));
+        assert!(!paths.contains(&home.join(".ssh")));
     }
 
     #[test]
     fn off_keeps_only_fast_mode() {
         assert!(settings(Mode::Off, &BTreeMap::new(), None, &[], false).is_none());
         assert_eq!(settings(Mode::Off, &BTreeMap::new(), None, &[], true).unwrap(), json!({ "fastMode": true }));
+    }
+
+    #[test]
+    fn claude_sandbox_hides_local_settings_and_the_app_session() {
+        let s = settings(Mode::Strict, &BTreeMap::new(), None, &[], false).unwrap();
+        let deny: Vec<&str> = s["sandbox"]["filesystem"]["denyRead"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        for app in ["dev.ygpt.loka"] {
+            assert!(deny.contains(&format!("~/Library/Application Support/{app}/local.json").as_str()), "{app}");
+            assert!(deny.contains(&format!("~/Library/Application Support/{app}/app-session.key").as_str()), "{app}");
+        }
+        let env: Vec<&str> = s["sandbox"]["credentials"]["envVars"].as_array().unwrap().iter().filter_map(|v| v["name"].as_str()).collect();
+        assert!(env.contains(&"LOKA_APP_SESSION_SECRET"));
     }
 
     #[test]
@@ -446,8 +515,14 @@ mod tests {
         let readable = ssh_readable(Some("~/.ssh/signing.pub"), Some(&home));
         assert_eq!(
             readable,
-            [".ssh/known_hosts", ".ssh/config", ".ssh/signing.pub", ".ssh/signing"].map(|p| format!("{home}/{p}"))
+            [".ssh/known_hosts", ".ssh/config", ".ssh/signing.pub"].map(|p| format!("{home}/{p}"))
         );
+        std::fs::write(dir.join(".ssh/id_ed25519"), "k").unwrap();
+        std::fs::write(dir.join(".ssh/id_ed25519.pub"), "k").unwrap();
+        let main_key = ssh_readable(Some("~/.ssh/id_ed25519"), Some(&home));
+        assert!(main_key.contains(&format!("{home}/.ssh/id_ed25519.pub")));
+        assert!(!main_key.contains(&format!("{home}/.ssh/id_ed25519")), "a configured signing key must never expose its private half");
+        assert!(!ssh_readable(Some("~/.ssh/id_ed25519.pub"), Some(&home)).contains(&format!("{home}/.ssh/id_ed25519")));
         assert_eq!(ssh_readable(Some("~/.ssh/missing"), Some(&home)).len(), 2);
         let link = dir.join("link");
         std::fs::create_dir_all(dir.join("real")).unwrap();

@@ -188,24 +188,35 @@ async fn live_owner_task_signs_a_merge_commit() {
 
 #[tokio::test]
 #[ignore]
-async fn live_owner_task_runs_like_the_cli_ships() {
+async fn live_owner_task_runs_in_the_owner_sandbox() {
     let (backend, model) = backend_and_model();
-    let dir = scratch("unsandboxed");
+    let dir = scratch("owner-sandbox");
     let outside = home_scratch("outside");
     let escaped = outside.0.join("escaped.txt");
+    let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+    let caches: Vec<PathBuf> = [".cargo/registry", ".npm"].iter().map(|cache| home.join(cache)).filter(|cache| cache.is_dir()).collect();
+    let probe = format!(".loka-parity-{}", uuid::Uuid::new_v4().simple());
+    let cache_lines: String = caches
+        .iter()
+        .map(|cache| format!("touch {dir}/{probe} && echo cache-ok-{name} >> results.txt; rm -f {dir}/{probe}\n", dir = cache.display(), name = cache.file_name().unwrap().to_string_lossy()))
+        .collect();
     std::fs::write(
         dir.join("check.sh"),
         format!(
-            "gcloud config get-value core/account >/dev/null 2>&1 && echo gcloud-ok >> results.txt\necho out > {} && echo write-ok >> results.txt\ncurl -s -o /dev/null -w '%{{http_code}}' https://pypi.org/simple/ | grep -q 200 && echo net-ok >> results.txt\ncat results.txt\n",
+            "echo in > inside.txt && echo write-in-ok >> results.txt\necho out > {} 2>/dev/null && echo write-out-ok >> results.txt\n{cache_lines}curl -s -o /dev/null -w '%{{http_code}}' https://pypi.org/simple/ | grep -q 200 && echo net-ok >> results.txt\ncat results.txt\n",
             escaped.display()
         ),
     )
     .unwrap();
     let prompt = "Use the shell. Run exactly `sh check.sh` once, never ask for extra permissions, and quote its output.";
-    let result = ask(&backend, CliOptions { lean: false, system_prompt: None, ..options(&dir, prompt, &model) }).await;
+    let result = ask(&backend, CliOptions { lean: false, system_prompt: None, approval: crate::cli::Approval::Auto, ..options(&dir, prompt, &model) }).await;
     let results = std::fs::read_to_string(dir.join("results.txt")).unwrap_or_default();
-    for (line, what) in [("gcloud-ok", "gcloud could not use its config"), ("write-ok", "could not write outside its worktree"), ("net-ok", "could not reach a non-GitHub host")] {
-        assert!(results.contains(line), "{what}: {results:?} {}", result.output);
+    eprintln!("OWNER SANDBOX {backend}: {results:?}");
+    assert!(!escaped.exists() && !results.contains("write-out-ok"), "wrote outside its worktree: {results:?}");
+    let mut wanted = vec![("write-in-ok".to_string(), "could not write its worktree"), ("net-ok".to_string(), "could not reach a package host")];
+    wanted.extend(caches.iter().map(|cache| (format!("cache-ok-{}", cache.file_name().unwrap().to_string_lossy()), "could not write a package cache")));
+    for (line, what) in wanted {
+        assert!(results.contains(&line), "{what}: {results:?} {}", result.output);
     }
 }
 

@@ -169,7 +169,7 @@ impl Diagnosis {
             Cause::NeverStarted => true,
             Cause::CliError => matches!(
                 self.failure.as_deref(),
-                Some("network" | "overloaded" | "rate_limited" | "usage_limit" | "runner" | "permissions" | "update")
+                Some("network" | "overloaded" | "rate_limited" | "usage_limit" | "runner" | "update")
             ),
             _ => false,
         }
@@ -286,6 +286,9 @@ mod tests {
         let lost = diagnose(&end(Some("runner lease expired before it could be renewed"), "", 9));
         assert_eq!((lost.cause, lost.failure.as_deref()), (Cause::CliError, Some("runner")));
         assert!(lost.transient());
+        let refused = diagnose(&end(Some("Claude Code cannot start in auto mode for model haiku. Loka never switches to full access on its own."), "", 0));
+        assert_eq!((refused.cause, refused.failure.as_deref()), (Cause::CliError, Some("permissions")));
+        assert!(!refused.transient(), "a refused permission mode must not be retried with more access");
         let other = diagnose(&end(Some("Claude Code exited with code 1"), "", 3));
         assert_eq!(other.cause, Cause::CliError);
         assert!(!other.transient());

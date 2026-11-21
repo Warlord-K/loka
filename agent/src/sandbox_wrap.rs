@@ -69,6 +69,7 @@ fn dedup(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
 pub(crate) fn paths(spec: &Spec, granted: &BTreeMap<String, String>, run_temp: Option<&Path>) -> Paths {
     let home = home();
     let mut hidden: Vec<PathBuf> = sandbox::HIDDEN_PATHS.iter().filter_map(|p| expand(p, home.as_deref())).collect();
+    hidden.extend(home.as_ref().map(|home| home.join(sandbox::OWNER_SSH)));
     hidden.extend(crate::cli::runner_private_paths());
     for name in crate::cli::CREDENTIAL_FILE_ENV {
         for value in [granted.get(*name).map(OsString::from), std::env::var_os(name)].into_iter().flatten() {
@@ -78,12 +79,12 @@ pub(crate) fn paths(spec: &Spec, granted: &BTreeMap<String, String>, run_temp: O
         }
     }
     hidden.extend(std::env::var_os("WORLD_SLACK_KEY_FILE").filter(|v| !v.is_empty()).map(PathBuf::from));
+    hidden.extend(sandbox::app_session_file());
     let temp = std::env::temp_dir();
     if !home.as_deref().is_some_and(|home| resolve(home).starts_with(resolve(&temp))) {
         hidden.push(temp);
     }
-    let mut readable: Vec<PathBuf> =
-        sandbox::ssh_exceptions(home.as_deref().and_then(Path::to_str)).iter().map(PathBuf::from).collect();
+    let mut readable: Vec<PathBuf> = sandbox::owner_ssh_readable(home.as_deref());
     readable.extend(spec.readable.iter().cloned());
     readable.push(spec.working_dir.clone());
     let git_roots: Vec<PathBuf> = sandbox::git_write_roots(&spec.working_dir).into_iter().map(PathBuf::from).collect();
@@ -123,9 +124,11 @@ fn subpaths(path: &Path) -> String {
     spellings.join(" ")
 }
 
+const DEV_WRITES: &str = "^/dev/(null|zero|random|urandom|stdin|stdout|stderr|ptmx|dtracehelper|autofs_nowait|tty[^/]*|fd/[0-9]+)$";
+
 pub(crate) fn seatbelt_profile(paths: &Paths) -> String {
     let mut rules = vec!["(version 1)".to_string(), "(allow default)".to_string(), "(deny file-write* (subpath \"/\"))".to_string()];
-    rules.push("(allow file-write* (subpath \"/dev\"))".into());
+    rules.push(format!("(allow file-write* (regex #\"{DEV_WRITES}\"))"));
     for path in &paths.writable {
         rules.push(format!("(allow file-write* {})", subpaths(path)));
     }
@@ -267,7 +270,7 @@ pub(crate) fn wrap(
     spec: &Spec,
     granted: &BTreeMap<String, String>,
 ) -> Result<(tokio::process::Command, Option<RunTemp>)> {
-    let mode = sandbox::mode_for(false);
+    let mode = sandbox::mode();
     if mode == Mode::Off && !spec.read_only {
         return Ok((cmd, None));
     }
@@ -311,6 +314,19 @@ mod tests {
         assert!(pos("(deny file-read* file-write* (subpath \"/home/a/.ssh\"))") < pos("(allow file-read* (subpath \"/home/a/.ssh/known_hosts\"))"));
         assert!(!profile.contains("(allow file-read* (subpath \"/tmp\"))"));
         assert!(profile.contains("(allow file-read* (literal \"/tmp\"))"), "{profile}");
+        assert!(!profile.contains("(allow file-write* (subpath \"/dev\"))"), "only device nodes tools need stay writable");
+        assert!(profile.contains("(regex #\"^/dev/(null|"));
+    }
+
+    #[test]
+    fn device_writes_cover_terminals_and_null_but_not_disks() {
+        let dev = regex_lite::Regex::new(DEV_WRITES).unwrap();
+        for ok in ["/dev/null", "/dev/ttys003", "/dev/tty", "/dev/fd/3", "/dev/ptmx", "/dev/urandom", "/dev/dtracehelper"] {
+            assert!(dev.is_match(ok), "{ok}");
+        }
+        for no in ["/dev/disk0", "/dev/rdisk1s1", "/dev/fd/3/x", "/dev/auditpipe", "/dev/bpf0"] {
+            assert!(!dev.is_match(no), "{no}");
+        }
     }
 
     #[test]
@@ -359,10 +375,29 @@ mod tests {
     }
 
     #[test]
-    fn owner_runs_keep_ssh_and_teleport() {
+    fn task_sandbox_hides_local_settings_and_the_app_session() {
+        std::env::set_var("LOKA_APP_SESSION_FILE", "/run/loka-session/app-session.key");
+        let spec = Spec { working_dir: std::env::temp_dir(), read_only: false, readable: Vec::new(), state: Vec::new() };
+        let paths = paths(&spec, &BTreeMap::new(), None);
+        for app in ["dev.ygpt.loka"] {
+            assert!(paths.hidden.iter().any(|p| p.ends_with(format!("{app}/local.json"))), "{app} local.json");
+            assert!(paths.hidden.iter().any(|p| p.ends_with(format!("{app}/app-session.key"))), "{app} app-session.key");
+        }
+        assert!(paths.hidden.iter().any(|p| p.ends_with("loka-session/app-session.key")));
+        let profile = seatbelt_profile(&paths);
+        assert!(profile.contains("dev.ygpt.loka/local.json\"))"), "{profile}");
+        assert!(profile.contains("loka-session/app-session.key\"))"), "{profile}");
+    }
+
+    #[test]
+    fn owner_runs_read_only_signing_keys_in_ssh_and_keep_teleport() {
         let spec = Spec { working_dir: std::env::temp_dir(), read_only: false, readable: Vec::new(), state: Vec::new() };
         let owner = paths(&spec, &BTreeMap::new(), None);
-        assert!(!owner.hidden.iter().any(|p| p.ends_with(".ssh")));
+        assert!(owner.hidden.iter().any(|p| p.ends_with(".ssh")));
+        assert!(owner.readable.iter().any(|p| p.ends_with(".ssh/karna_signing")));
+        assert!(owner.readable.iter().any(|p| p.ends_with(".ssh/known_hosts")));
+        assert!(!owner.readable.iter().any(|p| p.ends_with(".ssh/id_ed25519") || p.ends_with(".ssh")));
+        assert!(owner.writable.iter().any(|p| p.ends_with(".ssh/known_hosts")));
         assert!(owner.writable.iter().any(|p| p.ends_with(".tsh")));
         assert!(owner.hidden.iter().any(|p| p.ends_with(".aws")));
     }
@@ -509,6 +544,71 @@ for line in sys.stdin:
         .await;
         drop(prepared);
         assert!(std::fs::read_to_string(&marker).unwrap_or_default().contains("called"), "the sandboxed CLI reached the MCP server through the hub");
+    }
+
+    #[test]
+    #[ignore]
+    fn live_owner_seatbelt_signs_with_the_karna_key_and_pushes() {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let key = std::env::var("SIGN_TEST_KEY").map(PathBuf::from).unwrap_or_else(|_| home.join(".ssh/karna_signing"));
+        let remote = std::env::var("PUSH_TEST_REMOTE").unwrap_or_else(|_| "https://github.com/Warlord-K/world.git".into());
+        let over_https = remote.starts_with("https://");
+        let token = std::env::var("GH_TOKEN").ok().filter(|token| !token.is_empty()).or_else(|| {
+            let out = std::process::Command::new("gh").args(["auth", "token"]).output().ok()?;
+            Some(String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|token| !token.is_empty())
+        });
+        assert!(!over_https || token.is_some(), "set GH_TOKEN or sign in with gh to push over https");
+        let branch = format!("loka-sandbox-proof-{}", uuid::Uuid::new_v4().simple());
+        let work = scratch("push-proof");
+        let run_temp = scratch("push-proof-tmp");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git").arg("-C").arg(&work.0).args(args).status().unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["-c", "user.email=a@b", "-c", "user.name=a", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "init"]);
+        let tree = work.0.join("tree");
+        git(&["worktree", "add", "-q", tree.to_str().unwrap(), "-b", "task"]);
+        let spec = Spec { working_dir: tree.clone(), read_only: false, readable: Vec::new(), state: Vec::new() };
+        let profile = seatbelt_profile(&paths(&spec, &BTreeMap::new(), Some(&run_temp.0)));
+        let checks: String = ["id_rsa", "id_ed25519", "id_ecdsa"]
+            .iter()
+            .filter(|name| home.join(".ssh").join(name).exists())
+            .map(|name| format!("head -c 0 ~/.ssh/{name} 2>/dev/null && echo '{name} readable' || echo '{name} denied'\n"))
+            .collect();
+        let push = if over_https {
+            format!("git -c credential.helper= -c 'credential.helper=!f() {{ echo username=x-access-token; echo \"password=$GH_TOKEN\"; }}; f' push -q {remote} HEAD:refs/heads/{branch}")
+        } else {
+            format!("GIT_SSH_COMMAND=\"ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$TMPDIR/known_hosts\" git push -q {remote} HEAD:refs/heads/{branch}")
+        };
+        let script = format!(
+            "git -c user.email=a@b -c user.name=a -c gpg.format=ssh -c user.signingkey={key}.pub commit -q --allow-empty -S -m signed && echo \"signed: $(git cat-file -p HEAD | grep -c '^gpgsig')\"\n\
+             {checks}\
+             {push} 2>&1 && echo \"pushed: $(git rev-parse --short HEAD) -> {branch}\"\n",
+            key = key.display(),
+        );
+        let mut command = std::process::Command::new(SANDBOX_EXEC);
+        command.current_dir(&tree).env("TMPDIR", &run_temp.0).env("GIT_TERMINAL_PROMPT", "0");
+        if let Some(token) = &token {
+            command.env("GH_TOKEN", token);
+        }
+        let out = command.args(["-p", &profile, "sh", "-c", &script]).output().unwrap();
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        let landed = std::process::Command::new("git").arg("-C").arg(&tree).args(["ls-remote", &remote, &format!("refs/heads/{branch}")]).env("GH_TOKEN", token.clone().unwrap_or_default()).output().unwrap();
+        let head = std::process::Command::new("git").arg("-C").arg(&tree).args(["rev-parse", "HEAD"]).output().unwrap();
+        let landed = String::from_utf8_lossy(&landed.stdout).starts_with(String::from_utf8_lossy(&head.stdout).trim());
+        if text.contains("pushed:") {
+            let mut delete = std::process::Command::new("git");
+            delete.arg("-C").arg(&tree).env("GH_TOKEN", token.clone().unwrap_or_default()).env("GIT_TERMINAL_PROMPT", "0");
+            if over_https {
+                delete.args(["-c", "credential.helper=", "-c", "credential.helper=!f() { echo username=x-access-token; echo \"password=$GH_TOKEN\"; }; f"]);
+            }
+            let _ = delete.args(["push", "-q", "--delete", &remote, &branch]).status();
+        }
+        println!("{text}landed on remote: {landed}");
+        assert!(text.contains("signed: 1"), "the karna key could not sign inside the sandbox: {text}");
+        assert!(!text.contains("readable"), "a private key in ~/.ssh was readable: {text}");
+        assert!(text.contains("pushed:") && landed, "the sandboxed push did not land: {text}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

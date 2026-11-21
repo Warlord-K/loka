@@ -820,7 +820,7 @@ fn sandbox(opts: &CliOptions<'_>) -> &'static str {
 }
 
 pub(crate) fn sandbox_of(opts: &CliOptions<'_>) -> &'static str {
-    sandbox_for(opts.lean, opts.approval, crate::claude::sandbox::mode_for(false))
+    sandbox_for(opts.lean, opts.approval, crate::claude::sandbox::mode())
 }
 
 pub(crate) fn sandbox_for(lean: bool, approval: Approval, mode: crate::claude::sandbox::Mode) -> &'static str {
