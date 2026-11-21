@@ -35,6 +35,41 @@ pub fn away_grace_secs(platform: &str) -> i64 {
 fn runner_away() -> String {
     RUNNER_AWAY.replace("__GRACE__", AWAY_GRACE)
 }
+pub const WORKSPACE_SETTLE_SECONDS: f64 = 3600.0;
+pub const WORKSPACE_DONE_GRACE_SECONDS: f64 = 3.0 * 86400.0;
+pub const WORKSPACE_FAILED_GRACE_SECONDS: f64 = 7.0 * 86400.0;
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ClosedTask {
+    pub id: Uuid,
+    pub status: String,
+    pub idle_since: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiskNotice {
+    pub free_bytes: u64,
+    pub freed_bytes: u64,
+    pub removed: usize,
+    pub still_low: bool,
+}
+
+impl DiskNotice {
+    pub fn message(&self, device: &str) -> String {
+        let gb = |bytes: u64| format!("{:.1} GB", bytes as f64 / 1e9);
+        let freed = if self.removed > 0 {
+            format!(" Loka removed {} closed quest workspace{} ({}).", self.removed, if self.removed == 1 { "" } else { "s" }, gb(self.freed_bytes))
+        } else {
+            String::new()
+        };
+        if self.still_low {
+            format!("{device} has only {} of disk space left.{freed} Free up space on that device, or quests will start failing with a full disk.", gb(self.free_bytes))
+        } else {
+            format!("{device} was running low on disk space ({} free now).{freed}", gb(self.free_bytes))
+        }
+    }
+}
+
 pub const RUNNER_MOVED_ERROR: &str = "run stopped: the agent was moved to another device while it ran";
 pub const WORLD_WORKER_APP: &str = "loka-world";
 const LEGACY_WORLD_WORKER_APP: &str = "karna-world";
@@ -199,6 +234,8 @@ pub struct RunnerPolled {
     pub screen: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apps: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clean_workspaces: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1181,25 +1218,85 @@ impl RunnerStore {
         .await?)
     }
 
-    pub async fn closed_tasks(&self, runner_id: Uuid, task_ids: &[Uuid]) -> Result<Vec<Uuid>> {
-        Ok(sqlx::query_scalar::<_, Uuid>(
-            "SELECT t.id FROM agent_tasks t JOIN agent_profiles a ON a.id = t.assigned_agent_id
-             JOIN world_runners w ON w.id = $2
-             WHERE t.id = ANY($1) AND (a.owner_user_id = w.owner_user_id OR a.runner_id = w.id)
-               AND (t.status = 'cancelled' OR t.status IN ('done', 'failed')
-                 AND t.updated_at < NOW() - INTERVAL '7 days'
-                 AND NOT EXISTS (
-                   SELECT 1 FROM session_runs r WHERE r.task_id = t.id
-                     AND COALESCE(r.finished_at, r.created_at) > NOW() - INTERVAL '7 days'
-                 ))
-               AND NOT EXISTS (
-                 SELECT 1 FROM session_runs r WHERE r.task_id = t.id AND r.status IN ('queued', 'running')
-               )",
+    pub async fn closed_tasks(&self, runner_id: Uuid, task_ids: &[Uuid], pressure: bool) -> Result<Vec<ClosedTask>> {
+        Ok(sqlx::query_as::<_, ClosedTask>(
+            "WITH me AS (SELECT id, owner_user_id FROM world_runners WHERE id = $2),
+             state AS (
+               SELECT i.id, COALESCE(t.status, 'deleted') AS status,
+                      GREATEST(t.updated_at, (SELECT MAX(COALESCE(r.finished_at, r.created_at)) FROM session_runs r WHERE r.task_id = i.id)) AS idle_since
+                 FROM unnest($1::uuid[]) AS i(id)
+                 LEFT JOIN agent_tasks t ON t.id = i.id
+                 LEFT JOIN agent_profiles a ON a.id = t.assigned_agent_id
+                 JOIN me ON t.id IS NULL
+                         OR a.owner_user_id = me.owner_user_id OR a.runner_id = me.id
+                         OR (t.assigned_agent_id IS NULL AND t.user_id = me.owner_user_id)
+                WHERE NOT EXISTS (SELECT 1 FROM session_runs r WHERE r.task_id = i.id AND r.status IN ('queued', 'running'))
+             )
+             SELECT id, status, idle_since FROM state
+              WHERE status IN ('deleted', 'cancelled', 'done', 'failed')
+                AND COALESCE(idle_since, '-infinity'::timestamptz) < NOW() - make_interval(secs => CASE
+                      WHEN status IN ('deleted', 'cancelled') OR $3::boolean THEN $4::double precision
+                      WHEN status = 'done' THEN $5::double precision
+                      ELSE $6::double precision END)
+              ORDER BY idle_since ASC NULLS FIRST",
         )
         .bind(task_ids)
         .bind(runner_id)
+        .bind(pressure)
+        .bind(WORKSPACE_SETTLE_SECONDS)
+        .bind(WORKSPACE_DONE_GRACE_SECONDS)
+        .bind(WORKSPACE_FAILED_GRACE_SECONDS)
         .fetch_all(&self.pool)
         .await?)
+    }
+
+    pub async fn take_workspace_cleanup(&self, runner_id: Uuid) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "UPDATE world_runners SET clean_workspaces_at = NULL WHERE id = $1 AND clean_workspaces_at IS NOT NULL RETURNING true",
+        )
+        .bind(runner_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(false))
+    }
+
+    pub async fn warn_disk_low(&self, runner_id: Uuid, notice: &DiskNotice) -> Result<bool> {
+        let Some((owner, name)) = sqlx::query_as::<_, (Uuid, String)>("SELECT owner_user_id, name FROM world_runners WHERE id = $1")
+            .bind(runner_id)
+            .fetch_optional(&self.pool)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let recent: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM world_events WHERE type = 'runner.disk_low' AND payload->>'runner_id' = $1
+                              AND created_at > NOW() - INTERVAL '1 hour')",
+        )
+        .bind(runner_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        if recent {
+            return Ok(false);
+        }
+        let message = notice.message(&name);
+        let mut tx = self.pool.begin().await?;
+        emit_in(
+            &mut tx,
+            &NewEvent::new("runner.disk_low").payload(serde_json::json!({
+                "runner_id": runner_id,
+                "runner_name": name,
+                "owner_user_id": owner,
+                "free_bytes": notice.free_bytes,
+                "freed_bytes": notice.freed_bytes,
+                "removed": notice.removed,
+                "still_low": notice.still_low,
+                "message": message,
+            })),
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     pub async fn claim(&self, runner_id: Uuid, mcp_token: &str) -> Result<Option<ClaimedRun>> {
@@ -3363,6 +3460,124 @@ mod tests {
         assert!(store.adopt_stranded(runner, None).await.unwrap().is_empty(), "nothing moves while the cloud worker is online");
         drop(worker);
         sqlx::query("DELETE FROM agent_profiles WHERE id = ANY($1)").bind(vec![fresh, wrong_cli, busy, idle]).execute(&pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_tasks_follow_grace_rules_and_disk_pressure() {
+        let _global = global_state().lock().await;
+        let Some(pool) = pool().await else { return };
+        let owner = user(&pool).await;
+        let other = user(&pool).await;
+        let mine = agent(&pool, owner).await;
+        let theirs = agent(&pool, other).await;
+        let store = RunnerStore::new(pool.clone());
+        let runner = registration(&store, owner, "Workspace Mac").await.runner.id;
+        let task = |agent: Uuid, status: &'static str, secs: i64| {
+            let pool = pool.clone();
+            async move {
+                let id = Uuid::new_v4();
+                sqlx::query(
+                    "INSERT INTO agent_tasks (id, user_id, title, assigned_agent_id, status, updated_at)
+                     VALUES ($1, $2, 'Quest', $3, $4, NOW() - make_interval(secs => $5::double precision))",
+                )
+                .bind(id)
+                .bind(owner)
+                .bind(agent)
+                .bind(status)
+                .bind(secs as f64)
+                .execute(&pool)
+                .await
+                .unwrap();
+                id
+            }
+        };
+        let day = 86_400;
+        let open = task(mine, "in_progress", 30 * day).await;
+        let in_review = task(mine, "review", 30 * day).await;
+        let done_fresh = task(mine, "done", day).await;
+        let done_old = task(mine, "done", 4 * day).await;
+        let failed_mid = task(mine, "failed", 5 * day).await;
+        let failed_old = task(mine, "failed", 8 * day).await;
+        let cancelled = task(mine, "cancelled", day).await;
+        let cancelled_fresh = task(mine, "cancelled", 300).await;
+        let busy = task(mine, "done", 30 * day).await;
+        let foreign = task(theirs, "done", 30 * day).await;
+        let deleted = Uuid::new_v4();
+        let session: Uuid = sqlx::query_scalar("INSERT INTO agent_sessions (agent_id, role, backend, model, task_id) VALUES ($1, 'task', 'codex', 'test-model', $2) RETURNING id")
+            .bind(mine)
+            .bind(busy)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, prompt) VALUES ($1, $2, $3, 'followup', 'running', 'go')")
+            .bind(session)
+            .bind(mine)
+            .bind(busy)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let all = [open, in_review, done_fresh, done_old, failed_mid, failed_old, cancelled, cancelled_fresh, busy, foreign, deleted];
+
+        let got_ids = |tasks: &[ClosedTask]| tasks.iter().map(|task| task.id).collect::<Vec<Uuid>>();
+        let routine: Vec<Uuid> = store.closed_tasks(runner, &all, false).await.unwrap().into_iter().map(|t| t.id).collect();
+        let mut expected = vec![done_old, failed_old, cancelled, deleted];
+        expected.sort();
+        let mut got = routine.clone();
+        got.sort();
+        assert_eq!(got, expected, "done after 3 days, failed after 7, cancelled and deleted after an hour; never open, running, someone else's or closed minutes ago");
+
+        let pressure = store.closed_tasks(runner, &all, true).await.unwrap();
+        let mut got = got_ids(&pressure);
+        got.sort();
+        let mut expected = vec![done_fresh, done_old, failed_mid, failed_old, cancelled, deleted];
+        expected.sort();
+        assert_eq!(got, expected, "disk pressure drops the grace but not the open, running and foreign quests");
+        let order: Vec<Uuid> = pressure.iter().take(4).map(|t| t.id).collect();
+        assert_eq!(order, vec![deleted, failed_old, failed_mid, done_old], "unknown quests first, then the longest idle");
+
+        assert!(!got_ids(&pressure).contains(&cancelled_fresh), "a quest that closed minutes ago is left alone even under disk pressure");
+
+        assert!(!store.take_workspace_cleanup(runner).await.unwrap());
+        sqlx::query("UPDATE world_runners SET clean_workspaces_at = NOW() WHERE id = $1").bind(runner).execute(&pool).await.unwrap();
+        assert!(store.take_workspace_cleanup(runner).await.unwrap());
+        assert!(!store.take_workspace_cleanup(runner).await.unwrap(), "a request is delivered once");
+
+        let notice = DiskNotice { free_bytes: 3_000_000_000, freed_bytes: 40_000_000_000, removed: 12, still_low: false };
+        assert!(store.warn_disk_low(runner, &notice).await.unwrap());
+        assert!(!store.warn_disk_low(runner, &notice).await.unwrap(), "one notice per hour");
+        let bell: (String, String) = sqlx::query_as(
+            "SELECT n.kind, e.payload->>'message' FROM world_notifications n JOIN world_events e ON e.seq = n.event_seq
+              WHERE n.user_id = $1 AND e.type = 'runner.disk_low'",
+        )
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(bell.0, "alert");
+        assert!(bell.1.contains("removed 12 closed quest workspaces (40.0 GB)"), "{}", bell.1);
+
+        let report = crate::world::WorldStore::new(pool.clone());
+        sqlx::query("UPDATE world_runners SET capabilities = jsonb_build_object('workspaces', jsonb_build_object('bytes', 9000000000, 'tasks', 3, 'free_gb', 2, 'total_gb', 460, 'low', true, 'largest', jsonb_build_array(jsonb_build_object('id', $2::text, 'bytes', 5000000000), jsonb_build_object('id', $3::text, 'bytes', 3000000000)))) WHERE id = $1")
+            .bind(runner)
+            .bind(done_old.to_string())
+            .bind(open.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let usage = report.workspace_use(owner).await.unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!((usage[0].bytes, usage[0].tasks, usage[0].reclaimable_bytes, usage[0].reclaimable_tasks, usage[0].low), (9_000_000_000, 3, 5_000_000_000, 1, true));
+        let request = crate::cleanup::CleanupRequest { owner, org: None, agent: None, kind: crate::cleanup::CleanupKind::Workspaces, older_than_days: 0, by_agent: None };
+        let preview = report.clean_up(request, false).await.unwrap();
+        assert_eq!((preview.rows, preview.bytes, preview.applied), (1, 5_000_000_000, false));
+        assert!(!store.take_workspace_cleanup(runner).await.unwrap(), "a preview asks nothing of the device");
+        assert!(report.clean_up(request, true).await.unwrap().applied);
+        assert!(store.take_workspace_cleanup(runner).await.unwrap());
+        assert!(report.clean_up(crate::cleanup::CleanupRequest { agent: Some(mine), ..request }, false).await.is_err());
+
+        sqlx::query("DELETE FROM world_cleanups WHERE user_id = $1").bind(owner).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM agent_profiles WHERE id = ANY($1)").bind(vec![mine, theirs]).execute(&pool).await.unwrap();
+        sqlx::query("DELETE FROM agent_tasks WHERE user_id = $1").bind(owner).execute(&pool).await.unwrap();
     }
 
     #[tokio::test]

@@ -845,7 +845,7 @@ impl RunnerCoordinator {
         let quest = if read_only { self.store.get_session(lease.session_id).await?.and_then(|s| s.task_id) } else { None };
         let session = quest.is_some().then_some(lease.session_id);
         let quick = (lease.kind == "quick").then_some(lease.session_id);
-        let server = crate::mcp::Server::new(self.store.clone(), self.db.clone(), caller).in_quest(quest, session).in_quick(quick);
+        let server = crate::mcp::Server::new(self.store.clone(), self.db.clone(), caller).in_quest(quest, session).in_quick(quick).in_aside(lease.kind == "aside");
         let server = if read_only { server.read_only() } else { server };
         let server = if self.store.runner_owner(lease.runner_id).await? == Some(lease.owner_user_id) {
             server

@@ -397,10 +397,10 @@ pub async fn execute(ctx: &Ctx, run: SessionRun) -> Result<()> {
     let mcp_has_secrets = kit.as_ref().is_some_and(|kit| kit.has_secret_refs);
     let owner_aside = aside && !loka_shared::world::toolless_aside(session.asked_by.as_ref());
     let servers = if owner_aside {
-        super::kit::world_server(agent.id)
+        super::kit::world_server_for(agent.id, None, true)
     } else if quick {
         let mut servers = kit.map(|kit| kit.servers).unwrap_or_default();
-        servers.extend(super::kit::world_server_for(agent.id, Some(session.id)));
+        servers.extend(super::kit::world_server_for(agent.id, Some(session.id), false));
         servers
     } else {
         kit.map(|kit| kit.servers).unwrap_or_default()

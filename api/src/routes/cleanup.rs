@@ -23,6 +23,7 @@ pub async fn report(State(state): State<AppState>, Extension(viewer): Extension<
 #[derive(Deserialize)]
 pub struct CleanupBody {
     kind: String,
+    #[serde(default)]
     older_than_days: i32,
     agent_id: Option<Uuid>,
     #[serde(default)]
@@ -45,7 +46,7 @@ pub async fn cleanup(
     };
     state.world.clean_up(request, body.apply).await.map(Json).map_err(|error| {
         let text = error.to_string();
-        if text.contains("older_than_days") || text.contains("not yours") {
+        if text.contains("older_than_days") || text.contains("not yours") || text.contains("at once") {
             refuse(StatusCode::BAD_REQUEST, &text)
         } else {
             tracing::error!(%error, "cleanup failed");

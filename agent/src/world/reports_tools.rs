@@ -2,9 +2,11 @@ use anyhow::{anyhow, bail, Result};
 use loka_shared::reports::{NewReport, Report, ReportActor, ReportBrief, ReportFilter, ReportPatch};
 use loka_shared::world::{WorldAgent, WorldStore};
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 pub const REPORT_TOOLS: &[&str] = &["write_report", "update_report", "get_report", "list_reports", "delete_report"];
 pub const READ_TOOLS: &[&str] = &["get_report", "list_reports"];
+pub const QUEST_WRITE_TOOLS: &[&str] = &["write_report", "update_report"];
 const READ_CHARS: usize = 60_000;
 
 pub fn tools(tool: fn(&str, &str, Value, &[&str]) -> Value) -> Vec<Value> {
@@ -82,6 +84,9 @@ fn line(r: &ReportBrief) -> String {
     if r.pinned {
         extra.push("pinned".into());
     }
+    if r.kind == "canvas" {
+        extra.push(if r.open_marks > 0 { format!("canvas, {} open marks", r.open_marks) } else { "canvas".into() });
+    }
     if r.visibility == "public" {
         extra.push("public".into());
     }
@@ -106,7 +111,7 @@ fn tags_arg(args: &Value) -> Option<Vec<String>> {
     args.get("tags").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
 }
 
-pub async fn call(store: &WorldStore, caller: &WorldAgent, name: &str, args: &Value) -> Result<String> {
+pub async fn call(store: &WorldStore, caller: &WorldAgent, quest: Option<Uuid>, name: &str, args: &Value) -> Result<String> {
     let owner = caller.owner_user_id.ok_or_else(|| anyhow!("you have no person to keep reports for"))?;
     let org = caller.org_id.ok_or_else(|| anyhow!("you are not in an organization"))?;
     let arg = |k: &str| args.get(k).and_then(Value::as_str);
@@ -131,7 +136,7 @@ pub async fn call(store: &WorldStore, caller: &WorldAgent, name: &str, args: &Va
                     tags: tags_arg(args).unwrap_or_default(),
                     visibility: args.get("public").and_then(Value::as_bool).filter(|p| *p).map(|_| "public".to_string()),
                     pinned: args.get("pinned").and_then(Value::as_bool).unwrap_or(false),
-                    task_id: None,
+                    task_id: quest,
                 })
                 .await?;
             Ok(format!(
@@ -156,6 +161,9 @@ pub async fn call(store: &WorldStore, caller: &WorldAgent, name: &str, args: &Va
                     .ok_or_else(|| anyhow!("revision {n} is not kept; get_report with history lists the kept ones"))?;
                 return Ok(format!("Restored report:{} \"{}\" to revision {n}, now revision {}.", restored.id, restored.title, restored.revision));
             }
+            if report.kind == "canvas" && (arg("body").is_some() || arg("append").is_some()) {
+                bail!("\"{}\" is a canvas; change it with canvas_add_items, canvas_update_items, canvas_connect and canvas_layout", report.title);
+            }
             for text in [arg("body"), arg("append")].into_iter().flatten() {
                 loka_shared::ui_cards::check_markdown(text)?;
             }
@@ -167,6 +175,7 @@ pub async fn call(store: &WorldStore, caller: &WorldAgent, name: &str, args: &Va
                 tags: tags_arg(args),
                 pinned: args.get("pinned").and_then(Value::as_bool),
                 visibility: arg("visibility").map(String::from),
+                canvas: None,
             };
             let updated = store.update_report(report.id, by, &patch).await?.ok_or_else(|| anyhow!("that report is gone"))?;
             Ok(format!("Updated report:{} \"{}\", now revision {}.", updated.id, updated.title, updated.revision))
@@ -186,6 +195,9 @@ pub async fn call(store: &WorldStore, caller: &WorldAgent, name: &str, args: &Va
                     out.push(format!("- revision {} {} by {who}: \"{}\" ({} bytes)", r.revision, r.created_at.format("%Y-%m-%d %H:%M UTC"), r.title, r.size));
                 }
                 return Ok(out.join("\n"));
+            }
+            if report.kind == "canvas" && args.get("revision").is_none() {
+                return super::canvas_tools::view(store, owner, org, &report).await;
             }
             let (title, body, revision) = match args.get("revision").and_then(Value::as_i64) {
                 Some(n) => {

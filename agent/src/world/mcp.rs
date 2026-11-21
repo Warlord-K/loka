@@ -32,6 +32,7 @@ pub(crate) struct Server {
     quest: Option<Uuid>,
     session: Option<Uuid>,
     quick: Option<Uuid>,
+    aside: bool,
 }
 
 pub(crate) const OWNER_DEVICE_POWERS: &[&str] = &["install", "manage_powers", "manage_agents", "govern", "people"];
@@ -57,11 +58,45 @@ pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
     "progress_of",
 ];
 
-const QUICK_HIDDEN: &[&str] = &["update_my_notes", "reset_context"];
+const QUEST_CHANNEL_TOOLS: &[(&str, &str)] = &[
+    ("read_channel", "Read the latest messages in your team channel or a channel you are in."),
+    ("post_to_channel", "Post a short update in your team channel or a channel you are in. Put long detail in a thread (thread: msg:chN)."),
+];
+
+const QUEST_CHANNEL_REFUSAL: &str = "task sessions can only use your team channels and channels you are in";
+
+const QUICK_HIDDEN: &[&str] = &["update_my_notes", "reset_context", "start_task"];
+
+const ASIDE_HIDDEN: &[&str] = &["start_task"];
+
+fn hidden_in_session(quick: bool, aside: bool, name: &str) -> bool {
+    quick && QUICK_HIDDEN.contains(&name) || aside && ASIDE_HIDDEN.contains(&name)
+}
+
+fn start_task_guide(args: &Value) -> String {
+    let mut action = serde_json::Map::new();
+    action.insert("type".into(), json!("start_task"));
+    if let Some(fields) = args.as_object() {
+        for (key, value) in fields {
+            if key != "type" && !value.is_null() {
+                action.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    action.entry("task_id").or_insert(json!("<task id>"));
+    format!(
+        "start_task is an action, not a tool, so nothing has started yet. Add this to the actions block at the end of this reply (in the same list as your other actions) and the quest starts when the turn ends:\n<!-- actions\n[{}]\nactions -->",
+        Value::Object(action)
+    )
+}
 const SETUP_TOOLS: &[&str] = &["set_rule", "grant_environment_key", "install_mcp_server", "install_skill", "equip", "set_omp_models", "set_powers", "update_agent", "add_feed", "update_feed"];
 
+fn follows_open_thread(read_only: bool) -> bool {
+    !read_only
+}
+
 fn tool_allowed(read_only: bool, name: &str) -> bool {
-    !read_only || matches!(name, "show_media" | "ask_to_use_apps") || quest::QUEST_TOOLS.contains(&name) || READ_ONLY_TOOLS.contains(&name) || super::reports_tools::READ_TOOLS.contains(&name) || super::teams_tools::READ_TOOLS.contains(&name)
+    !read_only || matches!(name, "show_media" | "ask_to_use_apps") || QUEST_CHANNEL_TOOLS.iter().any(|(tool, _)| *tool == name) || quest::QUEST_TOOLS.contains(&name) || READ_ONLY_TOOLS.contains(&name) || super::reports_tools::READ_TOOLS.contains(&name) || super::reports_tools::QUEST_WRITE_TOOLS.contains(&name) || super::canvas_tools::CANVAS_TOOLS.contains(&name) || super::teams_tools::READ_TOOLS.contains(&name)
 }
 
 fn docs_path(page: &str) -> Result<String> {
@@ -167,11 +202,15 @@ fn actions_schema() -> Value {
 
 impl Server {
     pub(crate) fn new(store: WorldStore, db: Database, caller: WorldAgent) -> Self {
-        Self { store, db, caller, read_only: false, on_shared_device: false, quest: None, session: None, quick: None }
+        Self { store, db, caller, read_only: false, on_shared_device: false, quest: None, session: None, quick: None, aside: false }
     }
 
     pub(crate) fn in_quick(self, quick: Option<Uuid>) -> Self {
         Self { quick, ..self }
+    }
+
+    pub(crate) fn in_aside(self, aside: bool) -> Self {
+        Self { aside, ..self }
     }
 
     pub(super) fn quick_session(&self) -> Option<Uuid> {
@@ -197,13 +236,28 @@ impl Server {
         !self.on_shared_device
     }
 
+    async fn check_channel_reach(&self, channel: Uuid) -> Result<()> {
+        if self.store.agent_reaches_channel(channel, self.caller.id, !self.read_only).await? {
+            return Ok(());
+        }
+        bail!(if self.read_only { QUEST_CHANNEL_REFUSAL } else { "that is a private conversation" })
+    }
+
     fn allows(&self, name: &str) -> bool {
-        tool_allowed(self.read_only, name) && !(self.quick.is_some() && QUICK_HIDDEN.contains(&name)) && (name != "offer_memory" || self.quick.is_some())
+        tool_allowed(self.read_only, name) && !hidden_in_session(self.quick.is_some(), self.aside, name) && (name != "offer_memory" || self.quick.is_some())
     }
 
     fn listed_tools(&self) -> Vec<Value> {
         let mut tools = self.tools();
         tools.retain(|tool| tool.get("name").and_then(Value::as_str).is_some_and(|name| self.allows(name)));
+        if self.read_only {
+            for tool in &mut tools {
+                let short = tool.get("name").and_then(Value::as_str).and_then(|name| QUEST_CHANNEL_TOOLS.iter().find(|(t, _)| *t == name)).map(|(_, d)| *d);
+                if let Some(short) = short {
+                    tool["description"] = json!(short);
+                }
+            }
+        }
         tools
     }
 
@@ -229,6 +283,8 @@ impl Server {
                     self.call(name, &args).await
                 } else if self.quick.is_some() {
                     Err(anyhow!("{name} is not available in a quick chat. Nothing here changes your memory unless your person agrees; use offer_memory for one line worth keeping."))
+                } else if self.aside {
+                    Err(anyhow!("{name} is not available in an aside. Asides only answer a question; say what should happen in your answer instead."))
                 } else {
                     Err(anyhow!("{name} is not available in task sessions, which only get read-only Loka tools. Put this step in your report so your main session can do it."))
                 };
@@ -255,7 +311,8 @@ pub async fn serve() -> Result<()> {
         .await?
         .ok_or_else(|| anyhow!("agent {caller_id} not found"))?;
     let quick = std::env::var("WORLD_QUICK_SESSION").ok().and_then(|id| id.parse::<Uuid>().ok());
-    let server = Server::new(store, db, caller).in_quick(quick);
+    let aside = std::env::var("WORLD_ASIDE_SESSION").is_ok_and(|v| v == "1");
+    let server = Server::new(store, db, caller).in_quick(quick).in_aside(aside);
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
@@ -375,7 +432,7 @@ impl Server {
         let clis = loka_shared::backends::cli_list_here();
         let mut tools = vec![
             tool("world_agents", "List everyone in the world: name, role, cli and model, the device they run on, what they are doing right now, open task count.", json!({}), &[]),
-            tool("share_link", "Get a full web link to something in Loka for use outside the app: Slack, email, a GitHub PR or issue, docs. Inside Loka chat keep using msg:, quest:, report: and todo: refs, which show as cards. kind is message, quest, report, todo or agent.", json!({ "kind": s("message, quest, report, todo or agent"), "ref": s("The id or first characters (msg:3f2a91c0, msg:ch42, a quest id, report:<id> or its title, a to-do id or text, an agent name or slug)") }), &["kind", "ref"]),
+            tool("share_link", "Get a full web link to something in Loka for use outside the app: Slack, email, a GitHub PR or issue, docs. Inside Loka chat keep using msg:, quest:, report: and todo: refs, which show as cards. kind is message, quest, report, todo or agent.", json!({ "kind": s("message, quest, report, todo or agent"), "ref": s("The id or first characters (msg:3f2a91c0, msg:ch42, a quest id, report:<id> or its title, report:<id>#<item> for one item on a canvas, a to-do id or text, an agent name or slug)") }), &["kind", "ref"]),
             tool("read_docs", "Read Loka's own docs as Markdown. Use it when someone pastes a Loka docs link (any URL with /docs in it) or asks how Loka works: agents, quests, devices, keys, teams, setup. Leave page empty for the list of pages, or pass all for every page at once.", json!({ "page": s("A docs link, a page slug like quests or devices, all, or empty for the list") }), &[]),
             tool("show_ui", loka_shared::ui_cards::GUIDE, json!({ "summary": s("Plain text version of the card: what it shows or asks, one or two sentences"), "spec": { "type": "object", "description": "The json-render spec: root, elements, optional state" } }), &["summary", "spec"]),
             tool("show_media", SHOW_MEDIA_GUIDE, json!({
@@ -563,6 +620,7 @@ impl Server {
             tool("kit", "List installed MCP servers and skills, and which of your owner's agents have each one equipped (global ones reach everyone).", json!({}), &[]),
             tool("rules", "List the rules agents follow: global ones and your owner's own, with ids, scope (talk, work or all) and whether each is on.", json!({}), &[]),
         ];
+        tools.push(tool("start_task", "Start a quest. start_task is an action in your reply's actions block, not a tool: calling this starts nothing and returns the exact action to add.", json!({ "task_id": s("The task id"), "brief": s("Approach, constraints, what done looks like") }), &["task_id"]));
         if self.can(powers::ASSIGN_OTHERS) {
             tools.push(tool("create_task", "Create a task on the board and assign it to an agent, or to yourself by leaving agent empty. Another assignee starts it on its own; your own you start in this same reply with a start_task action on the returned task id.", with_quest_options(json!({ "title": s("Short title"), "description": s("What done looks like"), "agent": s("Agent name or slug to assign, optional, defaults to you"), "repo": s("owner/repo, optional"), "team": s("Team name from list_teams, optional: gives the quest to that team. Without agent its lead (or best fit member) picks it up; a lead splitting team work sets team and the teammate as agent"), "part_of": s("The quest id (or its first 8 characters) this is one part of: a quest of yours you are splitting into parts instead of starting it, or with team the team quest (defaults to the lead's only open team quest). The parent shows its parts and closes by itself once every part is finished"), "milestones": { "type": "array", "items": { "type": "string" }, "description": "Optional ordered checklist of steps; each is ticked off when the quest reports it done" }, "wait_for_merge": { "type": "boolean", "description": "With a repo: keep the quest open until the PR merges, checking it every 30 minutes and sending review comments back to the quest. Default true when a repo is set" }, "time_limit_minutes": { "type": "integer", "description": "Most minutes each run of this quest may take before it is stopped, 5 to 1440, optional, defaults to the standard limit. Use your estimate plus about a third for long work" } })), &["title", "description"]));
         } else {
@@ -654,6 +712,7 @@ impl Server {
         if self.caller.owner_user_id.is_some() {
             tools.extend(super::music_tools::tools(tool));
             tools.extend(super::reports_tools::tools(tool));
+            tools.extend(super::canvas_tools::tools(tool));
             tools.extend(super::teams_tools::tools(tool, self.can(powers::TEAMS)));
             tools.extend(super::loka_tools::look_tools(tool));
             if self.can(powers::WORLDBUILD) {
@@ -748,9 +807,22 @@ impl Server {
             "quest" | "task" => app_links::quest_url(self.reachable_quest(&strip("quest:"), "link").await?.id),
             "report" => {
                 let owner = owner.ok_or_else(|| anyhow!("you have no person whose reports you can link"))?;
-                let key = strip("report:");
+                let full = strip("report:");
+                let (key, item) = match full.split_once('#') {
+                    Some((key, item)) => (key.trim().to_string(), Some(item.trim().to_string())),
+                    None => (full.clone(), None),
+                };
                 let report = self.store.find_report(owner, self.caller.org_id.unwrap_or_default(), &key).await?.ok_or_else(|| anyhow!("no report matches {key}; see list_reports"))?;
-                app_links::report_url(report.id)
+                match item {
+                    Some(item) => {
+                        let canvas = loka_shared::canvas::Canvas::parse(report.canvas.as_ref())?;
+                        if !canvas.items.iter().any(|i| i.id == item) {
+                            bail!("\"{}\" has no item {item}; read_canvas lists them", report.title);
+                        }
+                        app_links::canvas_item_url(report.id, &item)
+                    }
+                    None => app_links::report_url(report.id),
+                }
             }
             "todo" | "to-do" => {
                 let owner = owner.ok_or_else(|| anyhow!("you have no person whose list you can link"))?;
@@ -1123,6 +1195,7 @@ impl Server {
             "read_docs" => read_docs(arg("page").unwrap_or("")).await,
             "features" => self.feature_guide(arg("feature")),
             "my_quest" => self.my_quest(args).await,
+            "start_task" => Err(anyhow!(start_task_guide(args))),
             "offer_memory" => match self.quick {
                 Some(session) => {
                     self.store.offer_memory(&self.caller, session, need("line")?).await?;
@@ -1519,9 +1592,7 @@ impl Server {
             }
             "read_channel" => {
                 let channel = self.store.find_channel(self.caller.org_id, need("channel")?).await?.ok_or_else(|| anyhow!("no such channel"))?;
-                if channel.kind != "channel" && !self.store.is_member(channel.id, "agent", self.caller.id).await? {
-                    bail!("that is a private conversation");
-                }
+                self.check_channel_reach(channel.id).await?;
                 let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(20).clamp(1, 100);
                 let msgs = self.store.channel_messages(channel.id, None, limit).await?;
                 Ok(msgs
@@ -1542,9 +1613,7 @@ impl Server {
                 let found = self.store.resolve_message(&reference, Some(self.caller.id)).await?.ok_or_else(|| anyhow!("no message msg:{reference}"))?;
                 if let Some(channel_id) = found.channel_id {
                     let channel = self.store.get_channel(channel_id).await?.filter(|c| c.org_id == self.caller.org_id).ok_or_else(|| anyhow!("no message msg:{reference}"))?;
-                    if channel.kind != "channel" && !self.store.is_member(channel.id, "agent", self.caller.id).await? {
-                        bail!("that is a private conversation");
-                    }
+                    self.check_channel_reach(channel.id).await?;
                     let id = loka_shared::replies::channel_reply_ref(&found.reference).ok_or_else(|| anyhow!("no message msg:{reference}"))?;
                     let root = self.store.channel_thread_root(channel.id, id).await?.ok_or_else(|| anyhow!("no message msg:{reference}"))?;
                     let msgs = self.store.channel_thread(channel.id, root, 200).await?;
@@ -1619,14 +1688,13 @@ impl Server {
             }
             "post_to_channel" => {
                 let channel = self.store.find_channel(self.caller.org_id, need("channel")?).await?.ok_or_else(|| anyhow!("no such channel"))?;
-                if channel.kind != "channel" && !self.store.is_member(channel.id, "agent", self.caller.id).await? {
-                    bail!("that is a private conversation");
-                }
+                self.check_channel_reach(channel.id).await?;
                 let text = self.store.expand_message_links(&super::prompts::plain_dashes(need("text")?), self.caller.id).await;
                 let root = match arg("thread").map(str::trim).filter(|t| !t.is_empty()) {
                     Some("main") => None,
                     Some(t) => Some(loka_shared::replies::channel_reply_ref(t).ok_or_else(|| anyhow!("thread should be msg:chN or main"))?),
-                    None => self.store.open_channel_thread(self.caller.id, channel.id).await?,
+                    None if follows_open_thread(self.read_only) => self.store.open_channel_thread(self.caller.id, channel.id).await?,
+                    None => None,
                 };
                 let posted = self
                     .store
@@ -1663,7 +1731,8 @@ impl Server {
                 super::items_tools::call(&self.store, &self.caller, name, args).await
             }
             n if super::music_tools::MUSIC_TOOLS.contains(&n) => super::music_tools::call(&self.store, &self.caller, name, args).await,
-            n if super::reports_tools::REPORT_TOOLS.contains(&n) => super::reports_tools::call(&self.store, &self.caller, name, args).await,
+            n if super::reports_tools::REPORT_TOOLS.contains(&n) => super::reports_tools::call(&self.store, &self.caller, self.quest, name, args).await,
+            n if super::canvas_tools::CANVAS_TOOLS.contains(&n) => super::canvas_tools::call(&self.store, &self.caller, self.quest, name, args).await,
             n if super::teams_tools::TEAM_TOOLS.contains(&n) => {
                 if !super::teams_tools::READ_TOOLS.contains(&n) {
                     self.require(powers::TEAMS)?;
@@ -2947,12 +3016,15 @@ fn time_limit_arg(args: &Value) -> Result<Option<i64>> {
     }
 }
 
-pub fn config_json_for(agent_id: Uuid, quick: Option<Uuid>) -> Option<String> {
+pub fn config_json_for(agent_id: Uuid, quick: Option<Uuid>, aside: bool) -> Option<String> {
     let exe = std::env::current_exe().ok()?;
     let mut env = serde_json::Map::new();
     env.insert("WORLD_AGENT_ID".into(), json!(agent_id.to_string()));
     if let Some(quick) = quick {
         env.insert("WORLD_QUICK_SESSION".into(), json!(quick.to_string()));
+    }
+    if aside {
+        env.insert("WORLD_ASIDE_SESSION".into(), json!("1"));
     }
     for key in ["DATABASE_URL", "REDIS_URL", "WORLD_PUBLIC_API_URL", "AGENT_WEBHOOK_URL", "WORLD_FEEDS_ALLOW_PRIVATE", "SLACK_BOT_TOKEN"] {
         if let Ok(v) = std::env::var(key) {
@@ -3004,13 +3076,122 @@ mod tests {
 
     #[test]
     fn read_only_sessions_get_only_lookup_tools() {
-        for name in ["list_tasks", "agent_activity", "world_agents", "list_items"] {
+        for name in ["list_tasks", "agent_activity", "world_agents", "list_items", "read_channel", "post_to_channel"] {
             assert!(tool_allowed(true, name), "{name}");
         }
-        for name in ["read_channel", "read_thread", "find_messages", "recent_events", "list_todos", "kit", "message_agent", "post_to_channel", "create_task", "environment_keys", "grant_environment_key", "add_todo", "slack_post", "update_my_notes", "list_feeds", "cancel_task"] {
+        for name in ["write_report", "update_report", "get_report", "list_reports"] {
+            assert!(tool_allowed(true, name), "{name}");
+        }
+        for name in ["delete_report", "read_thread", "find_messages", "recent_events", "list_todos", "kit", "message_agent", "create_task", "environment_keys", "grant_environment_key", "add_todo", "slack_post", "update_my_notes", "list_feeds", "cancel_task"] {
             assert!(!tool_allowed(true, name), "{name}");
             assert!(tool_allowed(false, name), "{name}");
         }
+    }
+
+    #[test]
+    fn start_task_tool_hands_back_the_action() {
+        assert!(tool_allowed(false, "start_task"));
+        assert!(!tool_allowed(true, "start_task"));
+        assert!(hidden_in_session(true, false, "start_task"));
+        let guide = start_task_guide(&json!({ "task_id": "abc", "brief": "do x", "review": true, "type": "other" }));
+        let (_, actions) = super::super::prompts::split_actions(&guide);
+        assert_eq!(actions.len(), 1, "{guide}");
+        let super::super::prompts::Action::StartTask { task_id, brief, review, .. } = &actions[0] else { panic!("{guide}") };
+        assert_eq!((task_id.as_str(), brief.as_deref(), *review), ("abc", Some("do x"), Some(true)));
+        assert!(guide.starts_with("start_task is an action, not a tool"));
+        assert!(start_task_guide(&json!({})).contains("\"task_id\":\"<task id>\""));
+    }
+
+    #[test]
+    fn start_task_without_a_brief_leaves_brief_out() {
+        let guide = start_task_guide(&json!({ "task_id": "abc" }));
+        assert!(!guide.contains("brief"), "{guide}");
+        assert!(!guide.contains("<approach"), "{guide}");
+        let (_, actions) = super::super::prompts::split_actions(&guide);
+        assert_eq!(actions.len(), 1, "{guide}");
+        let super::super::prompts::Action::StartTask { task_id, brief, .. } = &actions[0] else { panic!("{guide}") };
+        assert_eq!((task_id.as_str(), brief.as_deref()), ("abc", None));
+    }
+
+    #[tokio::test]
+    async fn an_aside_server_lists_no_start_task() -> Result<()> {
+        let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let db = Database::connect(&url).await?;
+        let store = WorldStore::new(db.pool().clone());
+        let caller: WorldAgent = serde_json::from_value(json!({
+            "id": Uuid::new_v4(), "slug": "ana", "name": "Ana", "avatar_emoji": "a", "cli": "claude", "model": "sonnet",
+            "role": "worker", "look": null, "gear": null, "status": "idle", "visibility": "private", "tags": [],
+            "created_at": chrono::Utc::now(), "revoked_powers": [], "is_main": true, "jobs": []
+        }))?;
+        let names = |server: &Server| server.listed_tools().iter().filter_map(|t| t["name"].as_str().map(str::to_string)).collect::<Vec<_>>();
+        let main = Server::new(store.clone(), db.clone(), caller.clone());
+        let aside = Server::new(store, db, caller).in_aside(true);
+        assert!(names(&main).iter().any(|n| n == "start_task"));
+        assert!(!names(&aside).iter().any(|n| n == "start_task"));
+        assert!(names(&aside).iter().any(|n| n == "create_task"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn share_link_points_at_one_canvas_item() -> Result<()> {
+        let Ok(url) = std::env::var("REPORTS_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let db = Database::connect(&url).await?;
+        let store = WorldStore::new(db.pool().clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email, name) VALUES ($1, 'Linker') RETURNING id")
+            .bind(format!("{tag}@links.test"))
+            .fetch_one(db.pool())
+            .await?;
+        let agent: Uuid = sqlx::query_scalar("INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id) VALUES ($1, 'Lin', 'claude', 'opus', $2) RETURNING id")
+            .bind(format!("lin-{}", &tag[..8]))
+            .bind(owner)
+            .fetch_one(db.pool())
+            .await?;
+        let caller = store.get_agent(agent).await?.expect("agent");
+        let canvas = loka_shared::canvas::Canvas::from_raw(&json!({ "items": [{ "id": "n", "kind": "note", "text": "Gate" }] }), "agent")?;
+        let new = loka_shared::reports::NewReport {
+            owner_user_id: owner,
+            by: loka_shared::reports::ReportActor::Agent(agent),
+            title: "Gate plan".into(),
+            body: String::new(),
+            folder: None,
+            tags: vec![],
+            visibility: None,
+            pinned: false,
+            task_id: None,
+        };
+        let report = store.create_canvas(new, canvas).await?;
+        let server = Server::new(store.clone(), db.clone(), caller);
+        let url = server.share_link("report", &format!("report:{}#n", report.id)).await?;
+        assert!(url.contains(&format!("/world?report={}&item=n", report.id)), "{url}");
+        let whole = server.share_link("report", &format!("report:{}", report.id)).await?;
+        assert!(whole.contains(&format!("/world?report={}", report.id)) && !whole.contains("item="), "{whole}");
+        let missing = server.share_link("report", &format!("report:{}#zz", report.id)).await.unwrap_err();
+        assert!(missing.to_string().contains("has no item zz"), "{missing}");
+
+        sqlx::query("DELETE FROM world_events WHERE agent_id = $1 OR payload->>'owner_user_id' = $2").bind(agent).bind(owner.to_string()).execute(db.pool()).await?;
+        sqlx::query("DELETE FROM world_reports WHERE owner_user_id = $1").bind(owner).execute(db.pool()).await?;
+        sqlx::query("DELETE FROM agent_profiles WHERE id = $1").bind(agent).execute(db.pool()).await?;
+        sqlx::query("DELETE FROM users WHERE id = $1").bind(owner).execute(db.pool()).await?;
+        Ok(())
+    }
+
+    #[test]
+    fn asides_do_not_get_start_task() {
+        assert!(hidden_in_session(false, true, "start_task"));
+        assert!(!hidden_in_session(false, false, "start_task"));
+        assert!(!hidden_in_session(false, true, "create_task"));
+        assert!(!hidden_in_session(false, true, "update_my_notes"));
+    }
+
+    #[test]
+    fn quest_posts_skip_the_open_mention_thread() {
+        assert!(!follows_open_thread(true));
+        assert!(follows_open_thread(false));
     }
 
     #[test]

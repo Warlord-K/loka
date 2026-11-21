@@ -75,6 +75,8 @@ pub struct ReportHit {
     pub author_agent_id: Option<Uuid>,
     pub excerpt: String,
     pub updated_at: DateTime<Utc>,
+    pub kind: String,
+    pub items: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]
@@ -342,12 +344,14 @@ impl WorldStore {
         let reports = async {
             let mut reports = sqlx::query_as::<_, ReportHit>(&format!(
                 "SELECT r.id, r.title, r.folder, r.visibility, r.author_agent_id, r.updated_at,
-                        substr(r.body, greatest(1, strpos(lower(r.body), lower($3)) - 300), 1200) AS excerpt
+                        substr(r.body, greatest(1, strpos(lower(r.body), lower($3)) - 300), 1200) AS excerpt,
+                        r.kind, {items} AS items
                  FROM world_reports r
                  WHERE r.org_id = $5 AND (r.owner_user_id = $1 OR r.visibility = 'public')
                    AND ({report_title} ILIKE $2 OR {report_body} ILIKE $2 OR r.tags @> ARRAY[lower($3)])
                  ORDER BY (r.title ILIKE $2) DESC, r.updated_at DESC
-                 LIMIT $4"
+                 LIMIT $4",
+                items = crate::canvas::item_hits_sql("$2")
             ))
             .bind(user)
             .bind(&pattern)

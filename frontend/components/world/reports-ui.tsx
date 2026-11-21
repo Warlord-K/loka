@@ -3,7 +3,8 @@
 import { quoteProps } from "./quote";
 import { SOLO } from "@/lib/edition";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { ArrowCounterClockwise, ArrowLeft, CaretDown, CaretRight, Check, ClockCounterClockwise, FileText, Folder, FolderOpen, Globe, Link as LinkIcon, ListBullets, Lock, Code, Copy, DownloadSimple, PencilSimple, Plus, Trash, Clock, Files, FolderSimple, Hash, Notebook, PushPinSimple, UserCircle, type Icon as PhosphorIcon, SidebarSimple } from "@phosphor-icons/react";
+import { latestRequests } from "@/lib/canvas-marks";
+import { ArrowCounterClockwise, SquaresFour, ArrowLeft, CaretDown, CaretRight, Check, ClockCounterClockwise, FileText, Folder, FolderOpen, Globe, Link as LinkIcon, ListBullets, Lock, Code, Copy, DownloadSimple, PencilSimple, Plus, Trash, Clock, Files, FolderSimple, Hash, Notebook, PushPinSimple, UserCircle, type Icon as PhosphorIcon, SidebarSimple } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
 import { WindowHeader, EmptyState, GHOST_ICON_BTN } from "./settings-shell";
 import { AgentFace } from "./channel-ui";
@@ -38,6 +39,15 @@ import dynamic from "next/dynamic";
 import { focusPointAt, type FocusPoint } from "@/lib/caret";
 import { downloadText, fileSlug, useCopy } from "@/lib/copy";
 import { PaneResizer, usePaneWidth } from "./pane-resizer";
+
+const ReportCanvas = dynamic(() => import("./report-canvas"), {
+  ssr: false,
+  loading: () => (
+    <div className="grid h-full place-items-center text-w-base text-w-muted">
+      <Shimmer>Opening the canvas</Shimmer>
+    </div>
+  ),
+});
 
 const DocEditor = dynamic(() => import("./doc-editor").then((m) => m.DocEditor), {
   ssr: false,
@@ -280,6 +290,7 @@ export function ReportsPanel({
   agents,
   meId,
   initialId,
+  focus,
   sideToggle,
   onClose,
   onOpenAgent,
@@ -287,6 +298,7 @@ export function ReportsPanel({
   agents: WorldAgent[];
   meId: string | null;
   initialId?: string | null;
+  focus?: { id: string | null; item?: string | null } | null;
   sideToggle?: ReactNode;
   onClose: () => void;
   onOpenAgent: (id: string) => void;
@@ -347,20 +359,24 @@ export function ReportsPanel({
       .catch(() => setAll((cur) => cur ?? []));
   }, []);
 
+  const detailRequests = useRef(latestRequests()).current;
   const loadDetail = useCallback((id: string) => {
+    const request = detailRequests.start();
     reportsApi
       .get(id)
       .then((d) => {
+        if (!detailRequests.isLatest(request)) return;
         setDetail(d);
         setMissing(false);
       })
       .catch((e) => {
+        if (!detailRequests.isLatest(request)) return;
         if (e instanceof ReportError && e.status === 404) {
           setDetail(null);
           setMissing(true);
         }
       });
-  }, []);
+  }, [detailRequests]);
 
   useEffect(() => loadAll(), [loadAll]);
 
@@ -585,8 +601,24 @@ export function ReportsPanel({
     setError(null);
   };
 
+  const newCanvas = async () => {
+    if (editing && !(await leaveEdit())) return;
+    setError(null);
+    try {
+      const day = new Date().toLocaleDateString(undefined, { month: "short", day: "numeric" });
+      const saved = await reportsApi.create({ title: `Canvas ${day}`, body: "", folder: scope.kind === "folder" ? scope.path : "", canvas: { items: [], edges: [] } });
+      setMode("read");
+      setDraft(null);
+      setSelected(saved.id);
+      loadAll();
+      window.dispatchEvent(new CustomEvent(REPORTS_STALE, { detail: { report_id: saved.id } }));
+    } catch (e) {
+      setError(e instanceof Error && e.message ? e.message : "Could not start a canvas. Try again.");
+    }
+  };
+
   const startEdit = (point: FocusPoint | null = null) => {
-    if (!detail || revision) return;
+    if (!detail || revision || detail.report.kind === "canvas") return;
     setFocusPoint(point);
     setDraft(draftOf(detail.report));
     setMode("edit");
@@ -619,7 +651,7 @@ export function ReportsPanel({
       const saved = await reportsApi.create({ title: draft.title, body: draft.body, folder: draft.folder, tags: tagList });
       selectedRef.current = saved.id;
       setSelected(saved.id);
-      setDetail({ report: saved, backlinks: [], outlinks: [], can_edit: true });
+      setDetail({ report: saved, backlinks: [], outlinks: [], can_edit: true, marks: [] });
       setDraft(draftOf(saved));
       setSaveState("saved");
       loadAll();
@@ -831,6 +863,12 @@ export function ReportsPanel({
               >
                 <span className="flex items-start gap-2">
                   <span className="min-w-0 flex-1 text-w-sm font-semibold leading-snug text-w-strong">{r.title}</span>
+                  {r.kind === "canvas" && (
+                    <span className={cn(PILL_INFO, "mt-0.5 shrink-0 gap-1")} title={r.open_marks ? `Canvas with ${r.open_marks} open marks` : "Canvas"}>
+                      <SquaresFour size={11} weight="bold" aria-hidden />
+                      Canvas{r.open_marks ? ` · ${r.open_marks}` : ""}
+                    </span>
+                  )}
                   {r.pinned && <PushPinSimple size={12} weight="fill" className="mt-1 shrink-0 text-w-faint" aria-label="Pinned" />}
                 </span>
                 <span className="mt-0.5 line-clamp-2 text-w-xs leading-relaxed text-w-text2">{excerptText(r.excerpt) || "Empty"}</span>
@@ -1077,7 +1115,7 @@ export function ReportsPanel({
               <span className="flex-1" />
             )}
             <div className="flex items-center gap-0.5">
-              {detail.can_edit && !revision && (
+              {detail.can_edit && !revision && report.kind !== "canvas" && (
                 <button type="button" onClick={() => startEdit()} className={TOOL_BTN} title="Edit (E, or double-click the page)">
                   <PencilSimple size={15} />
                   <span>Edit</span>
@@ -1304,6 +1342,10 @@ export function ReportsPanel({
         actions={
           <>
             <ScopeToggle others={othersCount} className="hidden @3xl:inline-flex" />
+            <button type="button" onClick={() => void newCanvas()} className={BTN_SECONDARY} title="Start a canvas: a board for images, notes and live cards">
+              <SquaresFour size={14} weight="bold" />
+              <span className="hidden @lg:inline">New canvas</span>
+            </button>
             <button type="button" onClick={() => startNew()} className={BTN_PRIMARY}>
               <Plus size={14} weight="bold" />
               <span className="hidden @lg:inline">New report</span>
@@ -1342,9 +1384,34 @@ export function ReportsPanel({
           </div>
         </div>
         {!libraryHidden && <PaneResizer pane={libraryPane} edge="right" label="Resize the library" className="hidden @2xl:block" />}
-        <div ref={readerRef} className={cn("min-h-0 flex-1 overflow-y-auto @container/reader", !readerOpen && "hidden @2xl:block")}>
+        <div ref={readerRef} className={cn("min-h-0 flex-1 @container/reader", report?.kind === "canvas" && mode === "read" ? "overflow-hidden" : "overflow-y-auto", !readerOpen && "hidden @2xl:block")}>
           {mode === "edit" ? (
             editor
+          ) : detail && report?.kind === "canvas" && mode !== "history" ? (
+            <ReportCanvas
+              key={report.id}
+              focus={focus && focus.id && report.id.startsWith(focus.id) ? focus : null}
+              detail={detail}
+              agents={agents}
+              meId={meId}
+              handles={handles}
+              known={known}
+              onWiki={openWiki}
+              onOpenAgent={onOpenAgent}
+              onChanged={() => {
+                loadDetail(report.id);
+                loadAll();
+              }}
+              onRename={async (title) => {
+                await reportsApi.update(report.id, { title });
+                loadDetail(report.id);
+                loadAll();
+              }}
+              onHistory={() => {
+                setRevision(null);
+                setMode("history");
+              }}
+            />
           ) : reader ? (
             reader
           ) : missing ? (

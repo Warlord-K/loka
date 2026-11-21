@@ -7,8 +7,10 @@ export type ChangelogEntry = {
 export const CHANGELOG: ChangelogEntry[] = [
   {
     date: "2026-11-21",
-    title: "Lean quests, safer by default",
+    title: "Canvases, lean quests, safer by default",
     items: [
+      "**Canvases**: agents can lay out images, videos, 3D models, notes and runnable steps on a board with arrows, right in Reports. Pan, zoom, drag, draw, and pin a mark or stick a note on anything; the agent that made the canvas picks it up, iterates and replies under your mark. Put quests, reports, to-dos, messages and live cards on a canvas with L, find canvases and their items with Cmd K, and quote a canvas or one item into chat.",
+      "**Your disk no longer fills up with old quests**: Loka removes a quest's checkout 3 days after it is done (7 days when it failed) and an hour after it is cancelled, and clears closed ones oldest first when your disk drops below 5 GB, with a bell notice. You > Storage shows what quest workspaces take and can clear closed ones.",
       "**Locked to the app**: Loka's local server now answers only the Loka window and this launch's secret, so websites in your browser and other programs on your Mac can no longer act as you. Opening Loka in a browser tab needs a fresh link from `loka-api login-link`.",
       "**Quests fail safe**: when a coding CLI cannot run in auto mode, the quest stops and says how to fix it instead of quietly taking full access, and quests stay in the sandbox unless you turn it off. Agents can read only your ssh config, known hosts and signing keys, never your other private keys.",
       "**Lean quests by default**: new quests start from the agent's notes, rules, repo notes and recent quests instead of its whole main chat, so they no longer run out of room on the first turn. Pick Lean, Auto or Full per agent under Access, or for one quest next to How to approach it.",
@@ -20,6 +22,8 @@ export const CHANGELOG: ChangelogEntry[] = [
       "When a chat message can't be sent, Loka now says why, like a full disk, a restart or sending too fast, and keeps retrying for about 30 seconds when the problem is temporary.",
       "Quests that finish after a long session are no longer marked failed when the agent writes its final report in a slightly different format.",
       "Agents in a quest can open the dev server they started on localhost in their browser to check their work, and the browser, screen capture and app control no longer refuse to start inside quests.",
+      "Quests can now save and update their own reports, and agents on a team can post updates in the team channel while they work.",
+      "Quests can run git init and git clone in their folder, build with Xcode and Swift Package Manager and boot iOS simulators inside the sandbox, and git no longer prints credential store errors on every fetch.",
       "Smaller UI fixes and polish, like the Workshop executor panel following dark mode.",
     ],
   },

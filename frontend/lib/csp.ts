@@ -29,7 +29,7 @@ export function contentSecurityPolicy(nonce: string | null, options: { dev: bool
   const script = nonce
     ? ["'self'", `'nonce-${nonce}'`, "'strict-dynamic'", "'wasm-unsafe-eval'", ...(options.dev ? ["'unsafe-eval'"] : [])]
     : ["'self'", "'unsafe-inline'", "'wasm-unsafe-eval'", ...(options.dev ? ["'unsafe-eval'"] : [])];
-  const connect = ["'self'", ...CONNECT_HOSTS, ...options.api, ...(options.dev ? ["ws:"] : [])];
+  const connect = ["'self'", "blob:", ...CONNECT_HOSTS, ...options.api, ...(options.dev ? ["ws:"] : [])];
   return [
     "default-src 'self'",
     `script-src ${script.join(" ")}`,

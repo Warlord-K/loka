@@ -382,6 +382,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/world/reports/find", get(routes::reports::find))
         .route("/world/reports/{id}", get(routes::reports::get).patch(routes::reports::update).delete(routes::reports::delete))
         .route("/world/reports/{id}/revisions", get(routes::reports::revisions))
+        .route("/world/reports/{id}/canvas", post(routes::reports::change_canvas))
+        .route("/world/reports/{id}/marks", post(routes::reports::add_mark))
+        .route("/world/reports/{id}/marks/{mark}", patch(routes::reports::change_mark).delete(routes::reports::delete_mark))
         .route("/world/reports/{id}/revisions/{revision}", get(routes::reports::revision))
         .route("/world/reports/{id}/revisions/{revision}/restore", post(routes::reports::restore))
         .route("/world/todos", get(routes::todos::list).post(routes::todos::create))
@@ -408,6 +411,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/{runner_id}/slack/watches", get(routes::runners::slack_watches))
         .route("/{runner_id}/github", post(routes::runners::github))
         .route("/{runner_id}/workspaces", post(routes::runners::workspaces))
+        .route("/{runner_id}/disk", post(routes::runners::disk_low))
         .route("/{runner_id}/stream", get(routes::runners::stream))
         .route(
             "/leases/{lease_id}/heartbeat",

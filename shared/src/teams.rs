@@ -877,6 +877,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn team_channels_reach_members_and_the_main_agent() -> Result<()> {
+        let Ok(url) = std::env::var("TEAMS_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new().max_connections(4).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email) VALUES ($1) RETURNING id")
+            .bind(format!("{}@reach.test", Uuid::new_v4()))
+            .fetch_one(&pool)
+            .await?;
+        crate::orgs::join_default_for_tests(&pool, owner, None).await?;
+        let main = agent(&pool, owner, "Main", &[]).await?;
+        let coder = agent(&pool, owner, "Coder", &[]).await?;
+        let outsider = agent(&pool, owner, "Outsider", &[]).await?;
+        crate::orgs::join_default_for_tests(&pool, owner, Some(main)).await?;
+        let suffix = &Uuid::new_v4().simple().to_string()[..6];
+        let team = store.create_team(owner, NewTeam { name: format!("Reach {suffix}"), agents: vec![coder], ..Default::default() }).await?;
+        let other = store.create_team(owner, NewTeam { name: format!("Elsewhere {suffix}"), agents: vec![outsider], ..Default::default() }).await?;
+        let channel = team.channel_id.unwrap();
+        let other_channel = other.channel_id.unwrap();
+        store.remove_member(channel, "agent", coder).await?;
+        assert!(!store.is_member(channel, "agent", coder).await?);
+
+        assert!(store.agent_reaches_channel(channel, coder, false).await?);
+        assert!(store.agent_reaches_channel(channel, coder, true).await?);
+        assert!(store.agent_reaches_channel(channel, main, true).await?);
+        assert!(!store.agent_reaches_channel(channel, outsider, true).await?);
+        assert!(!store.agent_reaches_channel(other_channel, coder, false).await?);
+        assert!(!store.agent_reaches_channel(other_channel, coder, true).await?);
+
+        let joined = store.create_channel(Some(crate::orgs::DEFAULT_ORG), &format!("joined-{suffix}"), None, owner).await?;
+        store.add_member(joined.id, "agent", outsider).await?;
+        let open = store.create_channel(Some(crate::orgs::DEFAULT_ORG), &format!("open-{suffix}"), None, owner).await?;
+        assert!(store.agent_reaches_channel(joined.id, outsider, false).await?);
+        assert!(!store.agent_reaches_channel(open.id, outsider, false).await?);
+        assert!(store.agent_reaches_channel(open.id, outsider, true).await?);
+        assert!(!store.agent_reaches_channel(Uuid::new_v4(), coder, true).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn teams_route_quests_and_feed_the_channel() -> Result<()> {
         let Ok(url) = std::env::var("TEAMS_TEST_DATABASE_URL") else {
             return Ok(());

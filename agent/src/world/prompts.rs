@@ -291,6 +291,9 @@ fn failure_hint(failure: &str, task_id: &str) -> &'static str {
         "auth" | "missing_scope" | "billing" => {
             "\nThis needs your person: the CLI's sign-in, key or billing must be fixed on their side. Tell them briefly what to fix; do not retry until they say it is done."
         }
+        "disk_full" => {
+            "\nThe device ran out of disk space. Tell your person briefly that the device needs free space (closed quest workspaces can be cleared under You > Storage); do not retry until they say there is room."
+        }
         "context_too_long" if quest => {
             "\nThe quest session ran out of context. Start the quest again with a short brief that lists what is already done instead of resuming it."
         }
@@ -602,6 +605,20 @@ fn render_event(item: &InboxItem, tasks: &[AgentTask]) -> String {
             or(&s("by"), "Your person"),
             s("text"),
             or(&s("age"), "a while")
+        ),
+        "canvas.mark" => format!(
+            "[event] canvas.mark: {} left a {} on your canvas report:{} \"{}\"{}:\n{}\nmark_id: {}\nIterate on it: change the canvas with canvas_add_items, canvas_update_items, canvas_connect or canvas_layout (or start a quest when it needs real work), then call canvas_marks with resolve set to this mark_id and a one-line reply saying what changed.",
+            sender(p),
+            if s("kind") == "sticky" { "sticky note" } else { "mark" },
+            s("report_id"),
+            one_line(&s("title"), 200),
+            match (p.get("near_item").and_then(Value::as_str), p.get("sticky_id").and_then(Value::as_str)) {
+                (Some(near), Some(sticky)) => format!(" on {} (sticky {})", one_line(near, 200), one_line(sticky, 60)),
+                (Some(near), None) => format!(" on {}", one_line(near, 200)),
+                _ => p.get("item").and_then(Value::as_str).map(|i| format!(" on {}", one_line(i, 200))).unwrap_or_default(),
+            },
+            s("text"),
+            s("mark_id")
         ),
         "todo.dismissed" => format!(
             "[event] {} dismissed \"{}\" from their To do list without taking any of the actions you suggested ({} after you added it). Mark it dismissed in your notes with update_my_notes so you do not suggest it again. Then end with an empty actions list and say nothing.",
@@ -1772,6 +1789,13 @@ mod tests {
 
     #[test]
     fn staffed_character_messages_say_where_they_came_from() {
+        let mark = render_item(&inbox(1, "canvas.mark", serde_json::json!({ "author": "Ada", "from_owner": true, "kind": "sticky", "report_id": "r1", "title": "Jinn", "item": "image i1: the look", "text": "not sure about B", "mark_id": "m1" })), &[]);
+        assert!(mark.starts_with("[event] canvas.mark: Ada [your owner, verified] left a sticky note on your canvas report:r1 \"Jinn\" on image i1: the look:\nnot sure about B"));
+        let near = render_item(&inbox(1, "canvas.mark", serde_json::json!({ "author": "Ada", "from_owner": true, "kind": "sticky", "report_id": "r1", "title": "Jinn", "item_id": "s1", "sticky_id": "s1", "item": "sticky s1: hmm", "near_item": "image b: option B", "text": "hmm", "mark_id": "m2" })), &[]);
+        assert!(near.contains("left a sticky note on your canvas report:r1 \"Jinn\" on image b: option B (sticky s1):\nhmm"));
+        let hosted = render_item(&inbox(1, "canvas.mark", serde_json::json!({ "author": "Ada", "from_owner": true, "kind": "sticky", "report_id": "r1", "title": "Jinn", "item_id": "b", "item": "image b: option B", "near_item": "image b: option B", "text": "hmm", "mark_id": "m3" })), &[]);
+        assert!(hosted.contains("on your canvas report:r1 \"Jinn\" on image b: option B:\nhmm") && !hosted.contains("(sticky"));
+        assert!(mark.contains("mark_id: m1"));
         let via = render_item(&inbox(1, "message", serde_json::json!({ "author": "Ada", "author_kind": "user", "body": "ship it", "from_owner": true, "via_npc": { "name": "Smithy", "region": "Forge Row" } })), &[]);
         assert!(via.contains("message from Ada [your owner, verified]") && via.contains("talking to you as Smithy") && via.contains("Forge Row region"));
         let plain = render_item(&inbox(2, "message", serde_json::json!({ "author": "Ada", "author_kind": "user", "body": "hi", "from_owner": true })), &[]);

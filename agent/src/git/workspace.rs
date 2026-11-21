@@ -370,13 +370,20 @@ const UNSIGNED_LEFTOVERS: &str = "Publish found uncommitted changes and commit.g
 
 const FALLBACK_SIGNING_KEYS: [&str; 3] = [".ssh/loka_signing", ".ssh/karna_signing", ".ssh/signing_key_active"];
 
+const SIGNING_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub async fn commit_signed(worktree_path: &Path, message: &str) -> Result<bool> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    commit_signed_with_home(worktree_path, message, home.as_deref()).await
+    commit_signed_with_home(worktree_path, message, home.as_deref(), None).await
 }
 
-async fn commit_signed_with_home(worktree_path: &Path, message: &str, home: Option<&Path>) -> Result<bool> {
-    let status = run_git_checked_output(worktree_path, &["status", "--porcelain"]).await?;
+async fn commit_signed_with_home(
+    worktree_path: &Path,
+    message: &str,
+    home: Option<&Path>,
+    gnupg_home: Option<&Path>,
+) -> Result<bool> {
+    let status = run_git_checked_output(worktree_path, &["status", "--porcelain", "--untracked-files=all"]).await?;
     if status.trim().is_empty() {
         return Ok(false);
     }
@@ -414,7 +421,7 @@ async fn commit_signed_with_home(worktree_path: &Path, message: &str, home: Opti
         args.push(message.clone());
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         run_git(worktree_path, &["add", "-A"]).await?;
-        match run_git(worktree_path, &args).await {
+        match run_signing_git(worktree_path, &args, gnupg_home, SIGNING_LIMIT).await {
             Err(error) => {
                 unstage(worktree_path).await?;
                 failures.push(format!("{error:#}"));
@@ -433,6 +440,44 @@ async fn commit_signed_with_home(worktree_path: &Path, message: &str, home: Opti
         "Publish could not sign the commit for the uncommitted changes, so it did not commit them: {}",
         failures.join("; ")
     )
+}
+
+async fn run_signing_git(
+    dir: &Path,
+    args: &[&str],
+    gnupg_home: Option<&Path>,
+    limit: std::time::Duration,
+) -> Result<()> {
+    let mut command = workspace_command("git", dir).await;
+    command
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("SSH_ASKPASS_REQUIRE", "never")
+        .env_remove("GPG_TTY")
+        .env_remove("SSH_ASKPASS");
+    if let Some(gnupg_home) = gnupg_home {
+        command.env("GNUPGHOME", gnupg_home);
+    }
+    let child = command.spawn().with_context(|| format!("Failed to run git {}", args.join(" ")))?;
+    let pid = child.id();
+    let output = match tokio::time::timeout(limit, child.wait_with_output()).await {
+        Ok(output) => output.with_context(|| format!("Failed to run git {}", args.join(" ")))?,
+        Err(_) => {
+            crate::cli::kill_process_trees(pid.into_iter().collect()).await;
+            bail!(
+                "git {} did not finish within {} s, so signing was given up (the key probably waits for a passphrase)",
+                args.join(" "),
+                limit.as_secs()
+            );
+        }
+    };
+    if !output.status.success() {
+        bail!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&output.stderr));
+    }
+    Ok(())
 }
 
 async fn gpgsign_enabled(worktree_path: &Path) -> Result<bool> {
@@ -1442,11 +1487,11 @@ mod tests {
         run_git(&repo.0, &["config", "user.signingkey", &key.to_string_lossy()]).await?;
         tokio::fs::write(repo.0.join("left"), "left").await?;
         let empty_home = repo.0.join("home");
-        assert!(commit_signed_with_home(&repo.0, "feat: leftovers", Some(&empty_home)).await?);
+        assert!(commit_isolated(&repo.0, "feat: leftovers", Some(&empty_home)).await?);
         assert!(commit_is_signed(&repo.0, "HEAD").await?);
         run_git(&repo.0, &["config", "commit.gpgsign", "true"]).await?;
         ensure_signed_commits(&repo.0, "main").await?;
-        assert!(!commit_signed_with_home(&repo.0, "feat: nothing", Some(&empty_home)).await?);
+        assert!(!commit_isolated(&repo.0, "feat: nothing", Some(&empty_home)).await?);
         Ok(())
     }
 
@@ -1458,10 +1503,65 @@ mod tests {
         tokio::fs::create_dir_all(home.join(".ssh")).await?;
         ssh_key(&home.join(".ssh/loka_signing")).await?;
         tokio::fs::write(repo.0.join("left"), "left").await?;
-        assert!(commit_signed_with_home(&repo.0, "feat: leftovers", Some(&home)).await?);
+        assert!(commit_isolated(&repo.0, "feat: leftovers", Some(&home)).await?);
         assert!(commit_is_signed(&repo.0, "HEAD").await?);
         let log = run_git_checked_output(&repo.0, &["log", "--format=%s", "-1"]).await?;
         assert_eq!(log.trim(), "feat: leftovers");
+        Ok(())
+    }
+
+    async fn commit_isolated(repo: &Path, message: &str, home: Option<&Path>) -> Result<bool> {
+        let gnupg = repo.join(".git/gnupg");
+        tokio::fs::create_dir_all(&gnupg).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&gnupg, std::fs::Permissions::from_mode(0o700)).await?;
+        }
+        commit_signed_with_home(repo, message, home, Some(&gnupg)).await
+    }
+
+    #[tokio::test]
+    async fn publish_sees_untracked_leftovers_when_status_hides_them() -> Result<()> {
+        let repo = test_repo().await?;
+        run_git(&repo.0, &["config", "user.signingkey", ""]).await?;
+        run_git(&repo.0, &["config", "status.showUntrackedFiles", "no"]).await?;
+        tokio::fs::create_dir_all(repo.0.join("new/dir")).await?;
+        tokio::fs::write(repo.0.join("new/dir/left"), "left").await?;
+        assert!(commit_isolated(&repo.0, "feat: leftovers", Some(&repo.0.join(".git/home"))).await?);
+        let tree = run_git_checked_output(&repo.0, &["ls-tree", "-r", "--name-only", "HEAD"]).await?;
+        assert!(tree.lines().any(|path| path == "new/dir/left"), "{tree}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_signing_program_that_waits_for_a_passphrase_is_given_up() -> Result<()> {
+        let repo = test_repo().await?;
+        let pid_file = repo.0.join(".git/signer.pid");
+        let signer = repo.0.join(".git/waiting-signer");
+        tokio::fs::write(&signer, format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n", pid_file.display())).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&signer, std::fs::Permissions::from_mode(0o755)).await?;
+        }
+        tokio::fs::write(repo.0.join("left"), "left").await?;
+        run_git(&repo.0, &["add", "left"]).await?;
+        let program = format!("gpg.program={}", signer.display());
+        let started = std::time::Instant::now();
+        let error = run_signing_git(
+            &repo.0,
+            &["-c", "gpg.format=openpgp", "-c", &program, "-c", "user.signingkey=waiting", "commit", "-S", "-m", "feat: wait"],
+            None,
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("did not finish within 2 s"), "{error:#}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(15));
+        let pid = tokio::fs::read_to_string(&pid_file).await?;
+        let alive = tokio::process::Command::new("kill").args(["-0", pid.trim()]).output().await?;
+        assert!(!alive.status.success(), "the waiting signer {} is still running", pid.trim());
         Ok(())
     }
 
@@ -1474,7 +1574,7 @@ mod tests {
         let repo = test_repo().await?;
         run_git(&repo.0, &["config", "user.signingkey", ""]).await?;
         tokio::fs::write(repo.0.join("left"), "left").await?;
-        assert!(commit_signed_with_home(&repo.0, "feat: leftovers", Some(&repo.0.join("home"))).await?);
+        assert!(commit_isolated(&repo.0, "feat: leftovers", Some(&repo.0.join("home"))).await?);
         assert!(!commit_is_signed(&repo.0, "HEAD").await?);
         let log = run_git_checked_output(&repo.0, &["log", "--format=%s", "-1"]).await?;
         assert_eq!(log.trim(), "feat: leftovers");
@@ -1489,14 +1589,14 @@ mod tests {
         run_git(&repo.0, &["config", "commit.gpgsign", "true"]).await?;
         let before = run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?;
         tokio::fs::write(repo.0.join("sprite-stack.ts"), "left").await?;
-        let error = commit_signed_with_home(&repo.0, "feat: leftovers", Some(&repo.0.join("home")))
+        let error = commit_isolated(&repo.0, "feat: leftovers", Some(&repo.0.join("home")))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("will not commit them unsigned"), "{error:#}");
         assert_eq!(run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?, before);
         assert!(staged(&repo.0).await?.is_empty());
         assert!(repo.0.join("sprite-stack.ts").is_file());
-        let error = commit_signed_with_home(&repo.0, "feat: leftovers", None).await.unwrap_err();
+        let error = commit_isolated(&repo.0, "feat: leftovers", None).await.unwrap_err();
         assert!(error.to_string().contains("will not commit them unsigned"), "{error:#}");
         Ok(())
     }
@@ -1508,7 +1608,7 @@ mod tests {
         run_git(&repo.0, &["config", "user.signingkey", &repo.0.join("missing-key").to_string_lossy()]).await?;
         let before = run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?;
         tokio::fs::write(repo.0.join("left"), "left").await?;
-        let error = commit_signed_with_home(&repo.0, "feat: leftovers", Some(&repo.0.join("home")))
+        let error = commit_isolated(&repo.0, "feat: leftovers", Some(&repo.0.join("home")))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("could not sign"), "{error:#}");
@@ -1548,7 +1648,7 @@ mod tests {
         run_git(&repo.0, &["config", "gpg.format", "ssh"]).await?;
         run_git(&repo.0, &["config", "user.signingkey", &repo.0.join("missing-key").to_string_lossy()]).await?;
         tokio::fs::write(repo.0.join("left"), "left").await?;
-        assert!(commit_signed_with_home(&repo.0, "feat: leftovers", None).await.is_err());
+        assert!(commit_isolated(&repo.0, "feat: leftovers", None).await.is_err());
         assert!(!has_rev(&repo.0, "HEAD").await);
         let indexed = run_git_checked_output(&repo.0, &["ls-files"]).await?;
         assert!(indexed.trim().is_empty());

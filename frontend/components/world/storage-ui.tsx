@@ -8,7 +8,7 @@ import { BTN_DANGER, BTN_SECONDARY } from "./styles";
 import { RelativeTime } from "./relative-time";
 import { Shimmer } from "./work-ui";
 
-type CleanupKind = "run_logs" | "quests" | "chats" | "activity";
+type CleanupKind = "run_logs" | "quests" | "chats" | "activity" | "workspaces";
 
 type AgentStorage = {
   agent_id: string;
@@ -36,15 +36,34 @@ type PastCleanup = {
   created_at: string;
 };
 
-type Report = { agents: AgentStorage[]; total_bytes: number; cleanups: PastCleanup[] };
+type WorkspaceUse = {
+  runner_id: string;
+  name: string;
+  online: boolean;
+  bytes: number;
+  tasks: number;
+  free_gb: number | null;
+  total_gb: number | null;
+  low: boolean;
+  reclaimable_bytes: number;
+  reclaimable_tasks: number;
+};
+
+type Report = { agents: AgentStorage[]; total_bytes: number; cleanups: PastCleanup[]; workspaces: WorkspaceUse[] };
 
 type Result = { kind: CleanupKind; older_than_days: number; agent_id: string | null; rows: number; bytes: number; applied: boolean };
 
-const KINDS: { kind: CleanupKind; title: string; description: string }[] = [
+const KINDS: { kind: CleanupKind; title: string; description: string; scoped?: boolean }[] = [
   { kind: "run_logs", title: "Run step logs", description: "Every step, prompt and raw output of finished runs. Usually the biggest part. Runs, costs and chats stay." },
   { kind: "quests", title: "Closed quests", description: "Done, failed and cancelled quests with their sessions, runs and logs. Lifetime cost totals stay." },
   { kind: "chats", title: "Old chat messages", description: "Messages between you, other people and your agents. Agents keep what they remember in their own sessions and notes." },
   { kind: "activity", title: "Old activity", description: "The activity feed behind quest rooms and the bell, including cleared bell items." },
+  {
+    kind: "workspaces",
+    title: "Closed quest workspaces",
+    description: "Checkouts, build output and scratch files of closed quests on your devices, oldest first. Open quests are never touched. Branches, commits and pull requests stay.",
+    scoped: false,
+  },
 ];
 
 const AGES = [
@@ -54,7 +73,7 @@ const AGES = [
   { value: "365", label: "Older than a year" },
 ];
 
-const LABEL: Record<CleanupKind, string> = { run_logs: "Run step logs", quests: "Closed quests", chats: "Chat messages", activity: "Activity" };
+const LABEL: Record<CleanupKind, string> = { run_logs: "Run step logs", quests: "Closed quests", chats: "Chat messages", activity: "Activity", workspaces: "Quest workspaces" };
 
 function size(bytes: number): string {
   if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
@@ -68,7 +87,21 @@ async function readError(r: Response): Promise<string> {
   return body?.error ?? "Something went wrong. Try again in a minute.";
 }
 
-function Cleanup({ kind, title, description, agents, onDone }: { kind: CleanupKind; title: string; description: string; agents: AgentStorage[]; onDone: () => void }) {
+function Cleanup({
+  kind,
+  title,
+  description,
+  agents,
+  scoped = true,
+  onDone,
+}: {
+  kind: CleanupKind;
+  title: string;
+  description: string;
+  agents: AgentStorage[];
+  scoped?: boolean;
+  onDone: () => void;
+}) {
   const [days, setDays] = useState("90");
   const [agent, setAgent] = useState("");
   const [preview, setPreview] = useState<Result | null>(null);
@@ -82,7 +115,7 @@ function Cleanup({ kind, title, description, agents, onDone }: { kind: CleanupKi
       const r = await fetch("/api/world/storage/cleanup", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ kind, older_than_days: Number(days), agent_id: agent || null, apply }),
+        body: JSON.stringify({ kind, older_than_days: scoped ? Number(days) : 0, agent_id: scoped && agent ? agent : null, apply }),
       });
       if (!r.ok) {
         setNote(await readError(r));
@@ -91,7 +124,13 @@ function Cleanup({ kind, title, description, agents, onDone }: { kind: CleanupKi
       const result = (await r.json()) as Result;
       if (apply) {
         setPreview(null);
-        setNote(result.applied ? `Deleted ${result.rows.toLocaleString()} items, about ${size(result.bytes)} freed.` : "Nothing was left to delete.");
+        setNote(
+          !result.applied
+            ? "Nothing was left to delete."
+            : scoped
+              ? `Deleted ${result.rows.toLocaleString()} items, about ${size(result.bytes)} freed.`
+              : `Asked your devices to remove ${result.rows.toLocaleString()} workspaces, about ${size(result.bytes)}. They finish within a minute or two.`,
+        );
         onDone();
       } else {
         setPreview(result);
@@ -105,15 +144,17 @@ function Cleanup({ kind, title, description, agents, onDone }: { kind: CleanupKi
   return (
     <SettingsRow title={title} description={description}>
       <div className="mt-3 flex flex-wrap items-center gap-2">
-        <WSelect value={days} onChange={setDays} options={AGES} ariaLabel={`${title}: how old`} size="sm" disabled={busy} />
-        <WSelect
-          value={agent || "all"}
-          onChange={(v) => setAgent(v === "all" ? "" : v)}
-          options={[{ value: "all", label: "All my agents" }, ...agents.map((a) => ({ value: a.agent_id, label: a.name }))]}
-          ariaLabel={`${title}: which agent`}
-          size="sm"
-          disabled={busy}
-        />
+        {scoped && <WSelect value={days} onChange={setDays} options={AGES} ariaLabel={`${title}: how old`} size="sm" disabled={busy} />}
+        {scoped && (
+          <WSelect
+            value={agent || "all"}
+            onChange={(v) => setAgent(v === "all" ? "" : v)}
+            options={[{ value: "all", label: "All my agents" }, ...agents.map((a) => ({ value: a.agent_id, label: a.name }))]}
+            ariaLabel={`${title}: which agent`}
+            size="sm"
+            disabled={busy}
+          />
+        )}
         {!preview && (
           <button type="button" className={BTN_SECONDARY} onClick={() => void run(false)} disabled={busy}>
             {busy ? <Shimmer>Checking</Shimmer> : "Check what would go"}
@@ -123,11 +164,11 @@ function Cleanup({ kind, title, description, agents, onDone }: { kind: CleanupKi
       {preview && (
         <div className="mt-3 rounded-lg border-2 border-dashed border-w-line2 px-3 py-2.5">
           {preview.rows === 0 ? (
-            <p className="text-w-sm text-w-muted">Nothing that old. There is nothing to delete here.</p>
+            <p className="text-w-sm text-w-muted">{scoped ? "Nothing that old. There is nothing to delete here." : "No closed quest workspaces to remove right now."}</p>
           ) : (
             <>
               <p className="text-w-sm text-w-text">
-                {preview.rows.toLocaleString()} items, about <span className="font-semibold">{size(preview.bytes)}</span>. Deleting them is permanent and cannot be undone.
+                {preview.rows.toLocaleString()} {scoped ? "items" : "workspaces"}, about <span className="font-semibold">{size(preview.bytes)}</span>. Deleting them is permanent and cannot be undone.
               </p>
               <div className="mt-2.5 flex flex-wrap gap-2">
                 <button type="button" className={BTN_DANGER} onClick={() => void run(true)} disabled={busy}>
@@ -195,6 +236,36 @@ export function StorageSection() {
         )}
       </SettingsGroup>
 
+      {report && report.workspaces.length > 0 && (
+        <SettingsGroup
+          title="Quest workspaces on your devices"
+          description="Each quest works in its own checkout on the device that runs it. Loka removes it 3 days after a quest is done (7 days when it failed) and sooner when the disk runs low."
+        >
+          <SettingsCard rows>
+            {report.workspaces.map((w) => (
+              <div key={w.runner_id} className="flex flex-wrap items-baseline gap-x-4 gap-y-1 px-4 py-3">
+                <span className="min-w-0 flex-1 truncate text-w-sm font-medium text-w-text">
+                  {w.name}
+                  {!w.online && <span className="ml-2 text-w-xs font-normal text-w-muted">offline</span>}
+                </span>
+                <span className="text-w-sm font-semibold tabular-nums text-w-strong">{size(w.bytes)}</span>
+                <span className="basis-full text-w-xs leading-relaxed text-w-muted">
+                  {w.tasks.toLocaleString()} folders, {size(w.reclaimable_bytes)} from closed quests ({w.reclaimable_tasks.toLocaleString()}).
+                  {w.free_gb !== null && (
+                    <>
+                      {" "}
+                      <span className={w.low ? "font-semibold text-w-alert" : undefined}>
+                        {w.free_gb.toLocaleString()} GB{w.total_gb ? ` of ${w.total_gb.toLocaleString()} GB` : ""} of disk free{w.low ? ", closed workspaces are being cleared" : ""}.
+                      </span>
+                    </>
+                  )}
+                </span>
+              </div>
+            ))}
+          </SettingsCard>
+        </SettingsGroup>
+      )}
+
       <SettingsGroup title="Clean up" description="Loka never deletes anything on its own. Pick what to remove and how old, check what would go, then confirm.">
         <SettingsCard rows>
           {KINDS.map((k) => (
@@ -211,7 +282,9 @@ export function StorageSection() {
               <div key={`${c.created_at}-${c.kind}`} className="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-3">
                 <Broom size={16} weight="duotone" className="shrink-0 text-w-muted" />
                 <span className="min-w-0 flex-1 text-w-sm text-w-text">
-                  {LABEL[c.kind] ?? c.kind} older than {c.older_than} days{c.agent_id ? ` for ${names.get(c.agent_id) ?? "one agent"}` : ""}: {c.rows_removed.toLocaleString()} items, {size(c.bytes_freed)}
+                  {LABEL[c.kind] ?? c.kind}
+                  {c.older_than > 0 ? ` older than ${c.older_than} days` : ""}
+                  {c.agent_id ? ` for ${names.get(c.agent_id) ?? "one agent"}` : ""}: {c.rows_removed.toLocaleString()} items, {size(c.bytes_freed)}
                   {c.by_agent_id ? `, by ${names.get(c.by_agent_id) ?? "your main agent"}` : ""}
                 </span>
                 <RelativeTime at={c.created_at} className="text-w-2xs text-w-muted" />

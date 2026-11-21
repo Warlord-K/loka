@@ -31,6 +31,7 @@ pub(crate) struct Paths {
     pub hidden: Vec<PathBuf>,
     pub readable: Vec<PathBuf>,
     pub writable: Vec<PathBuf>,
+    pub owner_temp: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,9 +99,10 @@ pub(crate) fn paths(spec: &Spec, granted: &BTreeMap<String, String>, run_temp: O
         writable.extend(home.as_deref().map(sandbox::writable_in).unwrap_or_default());
         writable.extend(home.iter().flat_map(|home| sandbox::OWNER_WRITABLE_HOME.iter().map(|rel| home.join(rel))));
     }
+    let owner_temp = if spec.read_only { Vec::new() } else { sandbox::user_temp_dirs() };
     let hidden = dedup(hidden.iter().map(|p| resolve(p)).collect());
     let writable = dedup(writable.iter().map(|p| resolve(p)).collect());
-    Paths { hidden, readable: dedup(readable.iter().map(|p| resolve(p)).collect()), writable }
+    Paths { hidden, readable: dedup(readable.iter().map(|p| resolve(p)).collect()), writable, owner_temp: dedup(owner_temp) }
 }
 
 fn quote(path: &Path) -> String {
@@ -155,6 +157,14 @@ pub(crate) fn seatbelt_profile(paths: &Paths) -> String {
     for hidden in paths.hidden.iter().filter(|h| h.ends_with("T")) {
         for spelling in [hidden.display().to_string(), hidden.display().to_string().trim_start_matches("/private").to_string()] {
             rules.push(format!("(allow file-read* file-write* (regex #\"^{}/xcrun_db\"))", regex_escape(&spelling)));
+        }
+    }
+    for dir in &paths.owner_temp {
+        for name in sandbox::OWNER_TEMP_NAMES {
+            let pattern = name.split('*').map(regex_escape).collect::<Vec<_>>().join(".*");
+            for spelling in [dir.display().to_string(), dir.display().to_string().trim_start_matches("/private").to_string()] {
+                rules.push(format!("(allow file-read* file-write* (regex #\"^{}/{pattern}\"))", regex_escape(&spelling)));
+            }
         }
     }
     rules.join("\n")
@@ -300,7 +310,22 @@ mod tests {
             hidden: vec![PathBuf::from("/home/a/.aws"), PathBuf::from("/home/a/.ssh"), PathBuf::from("/tmp")],
             readable: vec![PathBuf::from("/home/a/.ssh/known_hosts"), PathBuf::from("/tmp/run/config.json")],
             writable: vec![PathBuf::from("/work/repo"), PathBuf::from("/tmp/run")],
+            owner_temp: Vec::new(),
         }
+    }
+
+    #[test]
+    fn owner_runs_may_write_only_the_named_xcode_and_swift_temp_entries() {
+        let temp = PathBuf::from("/private/var/folders/ab/cd/T");
+        let owner = seatbelt_profile(&Paths { owner_temp: vec![temp.clone()], hidden: vec![temp.clone()], ..sample() });
+        for name in ["xcrun_db", "TemporaryDirectory\\..*", "swift-.*", "com\\.apple\\.dt\\..*"] {
+            assert!(owner.contains(&format!("(allow file-read* file-write* (regex #\"^/private/var/folders/ab/cd/T/{name}\"))")), "{name} missing in {owner}");
+            assert!(owner.contains(&format!("(allow file-read* file-write* (regex #\"^/var/folders/ab/cd/T/{name}\"))")), "{name} missing in {owner}");
+        }
+        assert!(!owner.contains("(allow file-write* (subpath \"/private/var/folders/ab/cd/T\"))"));
+        assert!(!owner.contains("loka-outbox"));
+        let guest = seatbelt_profile(&Paths { hidden: vec![temp], ..sample() });
+        assert!(!guest.contains("TemporaryDirectory"));
     }
 
     #[test]
@@ -331,13 +356,13 @@ mod tests {
 
     #[test]
     fn seatbelt_covers_both_spellings_of_private_dirs() {
-        let paths = Paths { hidden: vec![PathBuf::from("/private/var/folders/x/T")], readable: vec![], writable: vec![] };
+        let paths = Paths { hidden: vec![PathBuf::from("/private/var/folders/x/T")], readable: vec![], writable: vec![], owner_temp: Vec::new() };
         assert!(seatbelt_profile(&paths).contains("(subpath \"/private/var/folders/x/T\") (subpath \"/var/folders/x/T\")"));
     }
 
     #[test]
     fn seatbelt_quotes_paths() {
-        let paths = Paths { hidden: vec![PathBuf::from("/a\"b\\c")], readable: vec![], writable: vec![] };
+        let paths = Paths { hidden: vec![PathBuf::from("/a\"b\\c")], readable: vec![], writable: vec![], owner_temp: Vec::new() };
         assert!(seatbelt_profile(&paths).contains("(subpath \"/a\\\"b\\\\c\")"));
     }
 

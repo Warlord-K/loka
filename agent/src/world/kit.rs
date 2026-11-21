@@ -21,12 +21,12 @@ pub struct Wired {
 }
 
 pub fn world_server(agent_id: Uuid) -> Map<String, Value> {
-    world_server_for(agent_id, None)
+    world_server_for(agent_id, None, false)
 }
 
-pub fn world_server_for(agent_id: Uuid, quick: Option<Uuid>) -> Map<String, Value> {
+pub fn world_server_for(agent_id: Uuid, quick: Option<Uuid>, aside: bool) -> Map<String, Value> {
     let mut servers = Map::new();
-    if let Some(mut world) = super::mcp::config_json_for(agent_id, quick)
+    if let Some(mut world) = super::mcp::config_json_for(agent_id, quick, aside)
         .and_then(|j| serde_json::from_str::<Value>(&j).ok())
         .and_then(|v| v.pointer("/mcpServers/world").cloned())
     {

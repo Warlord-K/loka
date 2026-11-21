@@ -14,6 +14,7 @@ pub enum FailureKind {
     CliOutdated,
     Permissions,
     Vault,
+    DiskFull,
 }
 
 impl FailureKind {
@@ -31,6 +32,7 @@ impl FailureKind {
             FailureKind::CliOutdated => "cli_outdated",
             FailureKind::Permissions => "permissions",
             FailureKind::Vault => "vault",
+            FailureKind::DiskFull => "disk_full",
         }
     }
 
@@ -101,6 +103,9 @@ impl CliFailure {
             FailureKind::Permissions => {
                 "The CLI refused the permission mode Loka asked for, so it could not edit files or run commands. Loka never switches to full access on its own: pick a model with auto mode, set the agent's approval to Full, or set it to Read only. If the device's Claude settings turn full access off, allow it there.".to_string()
             }
+            FailureKind::DiskFull => {
+                "The disk on the device that ran this work is full, so nothing could be written. Loka removes closed quest workspaces when space runs low, but there was nothing left to remove. Free up space on that device, or clear closed quest workspaces under You > Storage, then retry.".to_string()
+            }
             FailureKind::Vault => {
                 "A key the agent uses is a 1Password reference (op://) that could not be read. Vault references are read only on your own Mac: install the 1Password CLI there (brew install 1password-cli), turn on 1Password > Settings > Developer > Integrate with 1Password CLI, unlock 1Password, check the reference in You > Environment, then retry.".to_string()
             }
@@ -117,6 +122,8 @@ pub fn classify(error: &str) -> Option<CliFailure> {
     let vault_failure = |line: &str| line.trim_start().starts_with(VAULT_FAILURE) || line.contains(&format!(": {VAULT_FAILURE}"));
     let kind = if raw.lines().any(vault_failure) {
         FailureKind::Vault
+    } else if has(&["no space left on device", "enospc", "os error 28", "disk quota exceeded"]) {
+        FailureKind::DiskFull
     } else if has(&["is not installed on this device", "env: node: no such file or directory", "claude: command not found"]) {
         FailureKind::CliMissing
     } else if has(&["is too old for loka", "error: unknown option '--"]) {
@@ -365,6 +372,17 @@ mod tests {
         assert_eq!(kind("stream disconnected before completion: error sending request"), Some(FailureKind::Network));
         assert_eq!(kind("exceeded retry limit, last status: 429 Too Many Requests"), Some(FailureKind::RateLimited));
         assert_eq!(kind("cargo test failed: 3 tests"), None);
+    }
+
+    #[test]
+    fn a_full_disk_is_named_instead_of_left_raw() {
+        let kind = |text: &str| classify(text).map(|failure| failure.kind);
+        assert_eq!(kind("failed to create workspace: No space left on device (os error 28)"), Some(FailureKind::DiskFull));
+        assert_eq!(kind("git worktree add failed: fatal: could not write: ENOSPC"), Some(FailureKind::DiskFull));
+        assert_eq!(kind("API Error: 529 {\"type\":\"overloaded_error\"}"), Some(FailureKind::Overloaded));
+        let text = describe("Claude Code exited with code 1: No space left on device");
+        assert!(text.starts_with("The disk on the device that ran this work is full"), "{text}");
+        assert!(text.contains("No space left on device"));
     }
 
     #[test]

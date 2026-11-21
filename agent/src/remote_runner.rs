@@ -30,6 +30,7 @@ mod media;
 mod outbox;
 mod storage;
 mod vault_refs;
+mod workspaces;
 
 use outbox::{Batch, Deliver, EventSink, Outbox, Sent};
 use storage::RunnerStorage;
@@ -98,7 +99,10 @@ struct RunnerStatus {
 
 #[derive(Deserialize)]
 struct ClosedTasks {
+    #[serde(default)]
     closed: Vec<Uuid>,
+    #[serde(default)]
+    entries: Vec<loka_shared::runners::ClosedTask>,
 }
 
 #[derive(Debug)]
@@ -255,12 +259,27 @@ impl RunnerApi {
         Ok(response.json().await?)
     }
 
-    async fn closed_tasks(&self, tasks: &[Uuid]) -> Result<Vec<Uuid>> {
-        let response = send_json(|| self.authorized(self.client.post(self.runner_url("/workspaces"))), &json!({ "tasks": tasks }))
+    async fn closed_tasks(&self, tasks: &[Uuid], pressure: bool) -> Result<Vec<loka_shared::runners::ClosedTask>> {
+        let response = send_json(|| self.authorized(self.client.post(self.runner_url("/workspaces"))), &json!({ "tasks": tasks, "pressure": pressure }))
             .await
             .context("runner workspaces request failed")?;
         ensure_success(response.status(), "runner workspaces")?;
-        Ok(response.json::<ClosedTasks>().await?.closed)
+        let body = response.json::<ClosedTasks>().await?;
+        if !body.entries.is_empty() {
+            return Ok(body.entries);
+        }
+        Ok(body
+            .closed
+            .into_iter()
+            .map(|id| loka_shared::runners::ClosedTask { id, status: "closed".into(), idle_since: None })
+            .collect())
+    }
+
+    async fn disk_low(&self, notice: &loka_shared::runners::DiskNotice) -> Result<()> {
+        let response = send_json(|| self.authorized(self.client.post(self.runner_url("/disk"))), notice)
+            .await
+            .context("runner disk notice failed")?;
+        ensure_success(response.status(), "runner disk notice")
     }
 
     async fn poll(&self, poll: &RunnerPoll) -> Result<Option<RunnerPolled>> {
@@ -741,6 +760,9 @@ async fn runner_loop(
     github_feed::spawn(api.clone(), root.clone(), github_switch.clone());
     let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel::<anyhow::Error>();
     let mut cleaned_at = Instant::now();
+    let rescan = Arc::new(Notify::new());
+    workspaces::spawn_usage(root.clone(), rescan.clone());
+    let mut clean_requested = false;
     let mut beat_at: Option<Instant> = None;
     let mut poll_outage = Outage::new("poll");
     loop {
@@ -750,9 +772,13 @@ async fn runner_loop(
         if stop_rx.try_recv().is_ok() {
             return stop_after_sigterm(&api, &warm, &running, &outbox, &freed).await;
         }
-        if cleaned_at.elapsed() >= WORKSPACE_CLEANUP_INTERVAL {
+        let cleanup_due = cleaned_at.elapsed() >= WORKSPACE_CLEANUP_INTERVAL
+            || (cleaned_at.elapsed() >= workspaces::LOW_DISK_RECHECK && workspaces::low_disk(&root));
+        if clean_requested || cleanup_due {
             cleaned_at = Instant::now();
-            if let Err(error) = remove_closed_workspaces(&api, &root).await {
+            let mode = workspaces::mode_for(&root, clean_requested);
+            clean_requested = false;
+            if let Err(error) = workspaces::sweep(&api, &root, mode, &rescan).await {
                 warn!(error = %format!("{error:#}"), "Failed to remove closed task workspaces");
             }
         }
@@ -821,6 +847,7 @@ async fn runner_loop(
                 if let Some(on) = polled.apps {
                     crate::apps::set_allowed(on);
                 }
+                clean_requested |= polled.clean_workspaces == Some(true);
                 polled
             }
             Err(error) => {
@@ -1542,21 +1569,7 @@ async fn execute_job_inner(
     for (name, value) in &provided {
         environment.entry(name.clone()).or_insert_with(|| value.clone());
     }
-    if browser || screen_launcher.is_some() || apps_launcher.is_some() {
-        environment.insert(crate::browser::ROOT_ENV.to_string(), root.display().to_string());
-    }
-    if browser {
-        for (name, value) in crate::browser::environment(root, job.agent_id, &job.kind) {
-            environment.insert(name, value);
-        }
-    }
-    if let Some(launcher) = screen_launcher {
-        environment.entry(crate::screen::LAUNCHER_ENV.to_string()).or_insert(launcher);
-    }
-    if let Some(launcher) = apps_launcher {
-        environment.entry(crate::apps::LAUNCHER_ENV.to_string()).or_insert(launcher);
-        environment.entry(crate::apps::LEASE_ENV.to_string()).or_insert(job.lease_id.to_string());
-    }
+    add_gate_environment(&mut environment, root, job, browser, screen_launcher, apps_launcher);
     if std::env::var_os("COMPOSE_PROJECT_NAME").is_none() {
         environment
             .entry("COMPOSE_PROJECT_NAME".into())
@@ -2327,55 +2340,6 @@ async fn prepare_workspace(root: &Path, workspace: &RunnerWorkspace) -> Result<P
     canonical_contained(&workspaces, &target).await
 }
 
-async fn remove_closed_workspaces(api: &RunnerApi, root: &Path) -> Result<()> {
-    let tasks_dir = root.join("workspaces").join("tasks");
-    let Ok(mut entries) = tokio::fs::read_dir(&tasks_dir).await else {
-        return Ok(());
-    };
-    let mut tasks = Vec::new();
-    while let Some(entry) = entries.next_entry().await? {
-        if let Ok(id) = entry.file_name().to_string_lossy().parse::<Uuid>() {
-            tasks.push(id);
-        }
-    }
-    if tasks.is_empty() {
-        return Ok(());
-    }
-    let trash = root.join("trash");
-    tokio::fs::create_dir_all(&trash).await?;
-    for id in api.closed_tasks(&tasks).await? {
-        let workspace = tasks_dir.join(id.to_string());
-        match remove_task_workspace(&workspace, &trash.join(id.to_string())).await {
-            Ok(()) => info!(task = %id, "Removed closed task workspace"),
-            Err(error) => warn!(error = %format!("{error:#}"), task = %id, "Failed to remove closed task workspace"),
-        }
-    }
-    tokio::spawn(async move {
-        let _ = tokio::fs::remove_dir_all(trash).await;
-    });
-    Ok(())
-}
-
-async fn remove_task_workspace(dir: &Path, trash: &Path) -> Result<()> {
-    let mut repos = Vec::new();
-    let mut children = tokio::fs::read_dir(dir).await?;
-    while let Some(child) = children.next_entry().await? {
-        if let Ok(common) = git_output(
-            &child.path(),
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        )
-        .await
-        {
-            repos.push(PathBuf::from(common.trim()));
-        }
-    }
-    tokio::fs::rename(dir, trash).await?;
-    for repo in repos {
-        run_git(&repo, &["worktree", "prune"]).await?;
-    }
-    Ok(())
-}
-
 async fn repository_path(root: &Path, repo: &str) -> Result<PathBuf> {
     let mappings = std::env::var("WORLD_RUNNER_REPOSITORIES")
         .ok()
@@ -2543,6 +2507,31 @@ fn provided_environment() -> BTreeMap<String, String> {
         .collect()
 }
 
+fn add_gate_environment(
+    environment: &mut BTreeMap<String, String>,
+    root: &Path,
+    job: &RunnerJob,
+    browser: bool,
+    screen_launcher: Option<String>,
+    apps_launcher: Option<String>,
+) {
+    if browser || screen_launcher.is_some() || apps_launcher.is_some() {
+        environment.insert(crate::browser::ROOT_ENV.to_string(), root.display().to_string());
+    }
+    if browser {
+        for (name, value) in crate::browser::environment(root, job.agent_id, &job.kind) {
+            environment.insert(name, value);
+        }
+    }
+    if let Some(launcher) = screen_launcher {
+        environment.entry(crate::screen::LAUNCHER_ENV.to_string()).or_insert(launcher);
+    }
+    if let Some(launcher) = apps_launcher {
+        environment.entry(crate::apps::LAUNCHER_ENV.to_string()).or_insert(launcher);
+        environment.entry(crate::apps::LEASE_ENV.to_string()).or_insert(job.lease_id.to_string());
+    }
+}
+
 fn filtered_environment(
     environment: &BTreeMap<String, String>,
     persistent: bool,
@@ -2708,7 +2697,8 @@ fn capabilities() -> Value {
         "folders": shared_folders_view(),
         "slack_capture": slack_capture_view(),
         "models": crate::model_catalog::snapshot(),
-        "tools": crate::tools_check::snapshot()
+        "tools": crate::tools_check::snapshot(),
+        "workspaces": workspaces::view()
     })
 }
 
@@ -3043,5 +3033,41 @@ mod tests {
             Some("existing")
         );
         assert_eq!(select_session_id(None, Some("parent"), true, true), None);
+    }
+
+    fn quest_job(kind: &str) -> RunnerJob {
+        serde_json::from_value(json!({
+            "lease_id": Uuid::new_v4(), "run_id": Uuid::new_v4(), "session_id": Uuid::new_v4(),
+            "agent_id": Uuid::new_v4(), "runner_id": Uuid::new_v4(), "kind": kind, "cli": "claude",
+            "model": "opus", "prompt": "p", "system_prompt": null,
+            "workspace": {"key": "tasks/q/world", "repo": null, "branch": null, "base_branch": null, "create": false},
+            "cli_session_id": null, "resume": false, "fork": false, "lean": false, "max_turns": 0,
+            "timeout_secs": 60, "effort": null, "fast": false, "mcp_token": "t", "publish": null, "omp_models": null,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn quest_jobs_with_a_browser_or_screen_launcher_carry_the_gate_root() {
+        let root = Path::new("/runner");
+        for kind in ["task", "followup"] {
+            assert!(crate::browser::wanted(kind) && crate::screen::wanted(kind), "{kind} must get the browser and screen");
+            let job = quest_job(kind);
+            let mut screen_only = BTreeMap::from([(crate::browser::ROOT_ENV.to_string(), "/spoofed".to_string())]);
+            add_gate_environment(&mut screen_only, root, &job, false, Some("/x/loka-agent screen a".into()), None);
+            assert_eq!(screen_only[crate::browser::ROOT_ENV], "/runner");
+            assert_eq!(screen_only[crate::screen::LAUNCHER_ENV], "/x/loka-agent screen a");
+            let mut browser_only = BTreeMap::new();
+            add_gate_environment(&mut browser_only, root, &job, true, None, None);
+            assert_eq!(browser_only[crate::browser::ROOT_ENV], "/runner");
+            let mut apps_only = BTreeMap::new();
+            add_gate_environment(&mut apps_only, root, &job, false, None, Some("/x/loka-agent apps a".into()));
+            assert_eq!(apps_only[crate::browser::ROOT_ENV], "/runner");
+            assert_eq!(apps_only[crate::apps::LEASE_ENV], job.lease_id.to_string());
+        }
+        let mut none = BTreeMap::new();
+        add_gate_environment(&mut none, root, &quest_job("task"), false, None, None);
+        assert!(none.is_empty());
+        assert!(!crate::screen::wanted("turn") && !crate::browser::wanted("turn"));
     }
 }

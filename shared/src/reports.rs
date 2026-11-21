@@ -17,7 +17,9 @@ const MERGE_SECS: i64 = 300;
 const QUIET_CHARS: usize = 600;
 const VISIBLE: &str = "(r.org_id = $9 AND (r.owner_user_id = $1 OR r.visibility = 'public'))";
 const BRIEF_COLUMNS: &str = "r.id, r.owner_user_id, r.author_agent_id, r.author_user_id, r.title, r.slug, r.tags, r.folder, r.pinned,
-  r.visibility, r.revision, r.task_id, r.created_at, r.updated_at, left(r.body, 280) AS excerpt, octet_length(r.body) AS size";
+  r.visibility, r.revision, r.task_id, r.created_at, r.updated_at, left(r.body, 280) AS excerpt, octet_length(r.body) AS size, r.kind,
+  (SELECT COUNT(*) FROM world_canvas_marks m WHERE m.report_id = r.id AND m.status = 'open') AS open_marks,
+  CASE WHEN r.kind = 'canvas' AND jsonb_typeof(r.canvas->'items') = 'array' THEN jsonb_array_length(r.canvas->'items') ELSE 0 END AS item_count";
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct Report {
@@ -39,6 +41,10 @@ pub struct Report {
     pub updated_at: DateTime<Utc>,
     #[sqlx(default)]
     pub org_id: Option<Uuid>,
+    #[sqlx(default)]
+    pub kind: String,
+    #[sqlx(default)]
+    pub canvas: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize)]
@@ -59,6 +65,9 @@ pub struct ReportBrief {
     pub updated_at: DateTime<Utc>,
     pub excerpt: String,
     pub size: i32,
+    pub kind: String,
+    pub open_marks: i64,
+    pub item_count: i32,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize)]
@@ -83,6 +92,8 @@ pub struct Revision {
     pub author_agent_id: Option<Uuid>,
     pub author_user_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
+    #[sqlx(default)]
+    pub canvas: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,14 +103,14 @@ pub enum ReportActor {
 }
 
 impl ReportActor {
-    fn agent(self) -> Option<Uuid> {
+    pub(crate) fn agent(self) -> Option<Uuid> {
         match self {
             ReportActor::Agent(id) => Some(id),
             ReportActor::User(_) => None,
         }
     }
 
-    fn user(self) -> Option<Uuid> {
+    pub(crate) fn user(self) -> Option<Uuid> {
         match self {
             ReportActor::User(id) => Some(id),
             ReportActor::Agent(_) => None,
@@ -129,6 +140,8 @@ pub struct ReportPatch {
     pub tags: Option<Vec<String>>,
     pub pinned: Option<bool>,
     pub visibility: Option<String>,
+    #[serde(skip)]
+    pub canvas: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -361,7 +374,7 @@ impl WorldStore {
         Ok((2..).map(|n| format!("{base}-{n}")).find(|s| !taken.contains(s)).unwrap_or(base))
     }
 
-    async fn resolve_report_links(&self, owner: Uuid, org: Option<Uuid>, body: &str, me: Option<Uuid>) -> Result<Vec<Uuid>> {
+    pub(crate) async fn resolve_report_links(&self, owner: Uuid, org: Option<Uuid>, body: &str, me: Option<Uuid>) -> Result<Vec<Uuid>> {
         let titles: Vec<String> = wiki_links(body).iter().map(|t| t.to_lowercase()).collect();
         let refs: Vec<String> = report_refs(body).iter().map(|r| format!("{r}%")).collect();
         if titles.is_empty() && refs.is_empty() {
@@ -401,6 +414,10 @@ impl WorldStore {
     }
 
     pub async fn create_report(&self, new: NewReport) -> Result<Report> {
+        self.insert_report(new, None).await
+    }
+
+    pub(crate) async fn insert_report(&self, new: NewReport, canvas: Option<&crate::canvas::Canvas>) -> Result<Report> {
         let title = clean_title(&new.title)?;
         check_body(&new.body)?;
         let folder = clean_folder(new.folder.as_deref().unwrap_or(""))?;
@@ -420,11 +437,15 @@ impl WorldStore {
         .bind(new.task_id)
         .fetch_one(self.pool())
         .await?;
+        if let Some(c) = canvas {
+            self.check_canvas_uploads(new.owner_user_id, org, c, &crate::canvas::Canvas::default()).await?;
+        }
+        let canvas = canvas.map(crate::canvas::Canvas::to_value);
         let links = self.resolve_report_links(new.owner_user_id, org, &new.body, None).await?;
         let mut tx = self.pool().begin().await?;
         let report = sqlx::query_as::<_, Report>(
-            "INSERT INTO world_reports (owner_user_id, author_agent_id, author_user_id, title, slug, body, tags, folder, pinned, visibility, links, task_id, org_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING *",
+            "INSERT INTO world_reports (owner_user_id, author_agent_id, author_user_id, title, slug, body, tags, folder, pinned, visibility, links, task_id, org_id, kind, canvas)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CASE WHEN $14::jsonb IS NULL THEN 'doc' ELSE 'canvas' END, $14) RETURNING *",
         )
         .bind(new.owner_user_id)
         .bind(new.by.agent())
@@ -439,11 +460,12 @@ impl WorldStore {
         .bind(&links)
         .bind(new.task_id)
         .bind(org)
+        .bind(&canvas)
         .fetch_one(&mut *tx)
         .await?;
         sqlx::query(
-            "INSERT INTO world_report_revisions (report_id, revision, title, body, folder, tags, author_agent_id, author_user_id)
-             VALUES ($1, 1, $2, $3, $4, $5, $6, $7)",
+            "INSERT INTO world_report_revisions (report_id, revision, title, body, folder, tags, author_agent_id, author_user_id, canvas)
+             VALUES ($1, 1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(report.id)
         .bind(&report.title)
@@ -452,6 +474,7 @@ impl WorldStore {
         .bind(&report.tags)
         .bind(new.by.agent())
         .bind(new.by.user())
+        .bind(&canvas)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -600,7 +623,7 @@ impl WorldStore {
 
     pub async fn report_revision(&self, id: Uuid, revision: i32) -> Result<Option<Revision>> {
         Ok(sqlx::query_as::<_, Revision>(
-            "SELECT revision, title, body, folder, tags, author_agent_id, author_user_id, created_at
+            "SELECT revision, title, body, folder, tags, author_agent_id, author_user_id, created_at, canvas
              FROM world_report_revisions WHERE report_id = $1 AND revision = $2",
         )
         .bind(id)
@@ -615,7 +638,23 @@ impl WorldStore {
             Some(t) => clean_title(t)?,
             None => current.title.clone(),
         };
-        let mut body = patch.body.clone().unwrap_or_else(|| current.body.clone());
+        let canvas = match (current.kind.as_str(), &patch.canvas) {
+            ("canvas", _) if patch.body.is_some() || patch.append.is_some() => bail!("\"{}\" is a canvas; change it with the canvas tools", current.title),
+            ("canvas", Some(value)) => {
+                let canvas = crate::canvas::Canvas::parse(Some(value))?;
+                canvas.validate()?;
+                let before = crate::canvas::Canvas::parse(current.canvas.as_ref())?;
+                self.check_canvas_uploads(current.owner_user_id, current.org_id, &canvas, &before).await?;
+                Some((canvas.summary(), canvas.to_value()))
+            }
+            _ => None,
+        };
+        let (canvas_body, canvas) = match canvas {
+            Some((body, value)) => (Some(body), Some(value)),
+            None => (None, None),
+        };
+        let canvas_changed = canvas.is_some() && canvas != current.canvas;
+        let mut body = canvas_body.or_else(|| patch.body.clone()).unwrap_or_else(|| current.body.clone());
         if let Some(extra) = patch.append.as_deref().filter(|a| !a.trim().is_empty()) {
             if !body.is_empty() && !body.ends_with("\n\n") {
                 body.push_str(if body.ends_with('\n') { "\n" } else { "\n\n" });
@@ -635,7 +674,7 @@ impl WorldStore {
             Some(_) => bail!("visibility is private or public"),
         };
         let pinned = patch.pinned.unwrap_or(current.pinned);
-        let content_changed = title != current.title || body != current.body || folder != current.folder || tags != current.tags;
+        let content_changed = canvas_changed || title != current.title || body != current.body || folder != current.folder || tags != current.tags;
         if !content_changed && visibility == current.visibility && pinned == current.pinned {
             return Ok(Some(current));
         }
@@ -643,58 +682,14 @@ impl WorldStore {
         let slug = if renamed { self.unused_report_slug(current.owner_user_id, &title, Some(id)).await? } else { current.slug.clone() };
         let links = if body != current.body { self.resolve_report_links(current.owner_user_id, current.org_id, &body, Some(id)).await? } else { current.links.clone() };
         let mut tx = self.pool().begin().await?;
-        let mut merged = false;
-        let mut revision = current.revision;
-        if content_changed {
-            let last: Option<(Option<Uuid>, Option<Uuid>, DateTime<Utc>)> = sqlx::query_as(
-                "SELECT author_agent_id, author_user_id, created_at FROM world_report_revisions
-                 WHERE report_id = $1 AND revision = $2 AND revision > 1",
-            )
-            .bind(id)
-            .bind(current.revision)
-            .fetch_optional(&mut *tx)
-            .await?;
-            merged = last.is_some_and(|(agent, user, at)| (agent, user) == (by.agent(), by.user()) && (Utc::now() - at).num_seconds() < MERGE_SECS);
-            if merged {
-                sqlx::query(
-                    "UPDATE world_report_revisions SET title = $3, body = $4, folder = $5, tags = $6, created_at = NOW()
-                     WHERE report_id = $1 AND revision = $2",
-                )
-                .bind(id)
-                .bind(revision)
-                .bind(&title)
-                .bind(&body)
-                .bind(&folder)
-                .bind(&tags)
-                .execute(&mut *tx)
-                .await?;
-            } else {
-                revision += 1;
-                sqlx::query(
-                    "INSERT INTO world_report_revisions (report_id, revision, title, body, folder, tags, author_agent_id, author_user_id)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                )
-                .bind(id)
-                .bind(revision)
-                .bind(&title)
-                .bind(&body)
-                .bind(&folder)
-                .bind(&tags)
-                .bind(by.agent())
-                .bind(by.user())
-                .execute(&mut *tx)
-                .await?;
-                sqlx::query("DELETE FROM world_report_revisions WHERE report_id = $1 AND revision > 1 AND revision <= $2 - $3")
-                    .bind(id)
-                    .bind(revision)
-                    .bind(KEEP_REVISIONS as i32)
-                    .execute(&mut *tx)
-                    .await?;
-            }
-        }
+        let (revision, merged) = if content_changed {
+            self.record_revision(&mut tx, &current, by, (&title, &body, &folder, &tags), canvas.as_ref()).await?
+        } else {
+            (current.revision, false)
+        };
         let report = sqlx::query_as::<_, Report>(
             "UPDATE world_reports SET title = $2, slug = $3, body = $4, folder = $5, tags = $6, visibility = $7, pinned = $8,
-               links = $9, revision = $10, updated_at = CASE WHEN $11 THEN NOW() ELSE updated_at END
+               links = $9, revision = $10, updated_at = CASE WHEN $11 THEN NOW() ELSE updated_at END, canvas = COALESCE($12, canvas)
              WHERE id = $1 RETURNING *",
         )
         .bind(id)
@@ -708,6 +703,7 @@ impl WorldStore {
         .bind(&links)
         .bind(revision)
         .bind(content_changed)
+        .bind(&canvas)
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -719,12 +715,75 @@ impl WorldStore {
         Ok(Some(report))
     }
 
+    pub(crate) async fn record_revision(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        current: &Report,
+        by: ReportActor,
+        (title, body, folder, tags): (&str, &str, &str, &[String]),
+        canvas: Option<&serde_json::Value>,
+    ) -> Result<(i32, bool)> {
+        let id = current.id;
+        let last: Option<(Option<Uuid>, Option<Uuid>, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT author_agent_id, author_user_id, created_at FROM world_report_revisions
+             WHERE report_id = $1 AND revision = $2 AND revision > 1",
+        )
+        .bind(id)
+        .bind(current.revision)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let merged = last.is_some_and(|(agent, user, at)| (agent, user) == (by.agent(), by.user()) && (Utc::now() - at).num_seconds() < MERGE_SECS);
+        let canvas = canvas.or(current.canvas.as_ref());
+        if merged {
+            sqlx::query(
+                "UPDATE world_report_revisions SET title = $3, body = $4, folder = $5, tags = $6, canvas = $7, created_at = NOW()
+                 WHERE report_id = $1 AND revision = $2",
+            )
+            .bind(id)
+            .bind(current.revision)
+            .bind(title)
+            .bind(body)
+            .bind(folder)
+            .bind(tags)
+            .bind(canvas)
+            .execute(&mut **tx)
+            .await?;
+            return Ok((current.revision, true));
+        }
+        let revision = current.revision + 1;
+        sqlx::query(
+            "INSERT INTO world_report_revisions (report_id, revision, title, body, folder, tags, author_agent_id, author_user_id, canvas)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(id)
+        .bind(revision)
+        .bind(title)
+        .bind(body)
+        .bind(folder)
+        .bind(tags)
+        .bind(by.agent())
+        .bind(by.user())
+        .bind(canvas)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query("DELETE FROM world_report_revisions WHERE report_id = $1 AND revision > 1 AND revision <= $2 - $3")
+            .bind(id)
+            .bind(revision)
+            .bind(KEEP_REVISIONS as i32)
+            .execute(&mut **tx)
+            .await?;
+        Ok((revision, false))
+    }
+
     pub async fn restore_report_revision(&self, id: Uuid, revision: i32, by: ReportActor) -> Result<Option<Report>> {
         let Some(old) = self.report_revision(id, revision).await? else { return Ok(None) };
         self.update_report(
             id,
             by,
-            &ReportPatch { title: Some(old.title), body: Some(old.body), folder: Some(old.folder), tags: Some(old.tags), ..Default::default() },
+            &match old.canvas {
+                Some(canvas) => ReportPatch { title: Some(old.title), folder: Some(old.folder), tags: Some(old.tags), canvas: Some(canvas), ..Default::default() },
+                None => ReportPatch { title: Some(old.title), body: Some(old.body), folder: Some(old.folder), tags: Some(old.tags), ..Default::default() },
+            },
         )
         .await
     }
@@ -742,7 +801,7 @@ impl WorldStore {
         Ok(report)
     }
 
-    async fn report_event(&self, kind: &str, report: &Report, by: ReportActor, quiet: bool) -> Result<()> {
+    pub(crate) async fn report_event(&self, kind: &str, report: &Report, by: ReportActor, quiet: bool) -> Result<()> {
         let mut event = NewEvent::new(kind).actor(by.user()).task(report.task_id).payload(json!({
             "report_id": report.id,
             "org_id": report.org_id,

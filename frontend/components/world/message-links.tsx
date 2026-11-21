@@ -47,19 +47,22 @@ export function messageUrl(ref: string): string {
 export type WorldLinkKind = "quest" | "report" | "todo";
 const WORLD_LINK_KINDS: WorldLinkKind[] = ["quest", "report", "todo"];
 const WORLD_ID = /^[0-9a-fA-F][0-9a-fA-F-]{5,35}$/;
+const WORLD_ITEM = /^[A-Za-z0-9_-]{1,40}$/;
 
 export function worldUrl(kind: WorldLinkKind, id: string): string {
   return `${window.location.origin}/world?${kind}=${id}`;
 }
 
-export function worldRefFromHref(href?: string | null): { kind: WorldLinkKind; ref: string } | null {
+export function worldRefFromHref(href?: string | null): { kind: WorldLinkKind; ref: string; item?: string } | null {
   if (!href || typeof window === "undefined" || !/^https?:/i.test(href)) return null;
   try {
     const url = new URL(href);
     if (url.pathname.replace(/\/$/, "") !== "/world") return null;
     for (const kind of WORLD_LINK_KINDS) {
       const ref = url.searchParams.get(kind);
-      if (ref && WORLD_ID.test(ref)) return { kind, ref: ref.toLowerCase() };
+      if (!ref || !WORLD_ID.test(ref)) continue;
+      const item = kind === "report" ? url.searchParams.get("item") : null;
+      return item && WORLD_ITEM.test(item) ? { kind, ref: ref.toLowerCase(), item } : { kind, ref: ref.toLowerCase() };
     }
   } catch {
     return null;

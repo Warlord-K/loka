@@ -311,6 +311,13 @@ pub async fn poll(
             Err(error) => tracing::warn!(%error, %runner_id, "screen access lookup failed during runner poll"),
         }
     }
+    if request.heartbeat.is_some() {
+        match state.runners.take_workspace_cleanup(runner_id).await {
+            Ok(true) => polled.clean_workspaces = Some(true),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(%error, %runner_id, "workspace cleanup lookup failed during runner poll"),
+        }
+    }
     if polled.status == "paused" {
         return Ok(Json(polled));
     }
@@ -439,6 +446,8 @@ pub async fn github(
 #[derive(serde::Deserialize)]
 pub struct WorkspaceTasks {
     tasks: Vec<Uuid>,
+    #[serde(default)]
+    pressure: bool,
 }
 
 pub async fn workspaces(
@@ -448,12 +457,24 @@ pub async fn workspaces(
     Json(request): Json<WorkspaceTasks>,
 ) -> Result<Json<Value>, ApiError> {
     authenticate_runner(&state, &headers, Some(runner_id)).await?;
-    let closed = state
+    let entries = state
         .runners
-        .closed_tasks(runner_id, &request.tasks)
+        .closed_tasks(runner_id, &request.tasks, request.pressure)
         .await
         .map_err(internal)?;
-    Ok(Json(json!({ "closed": closed })))
+    let closed: Vec<Uuid> = entries.iter().map(|entry| entry.id).collect();
+    Ok(Json(json!({ "closed": closed, "entries": entries })))
+}
+
+pub async fn disk_low(
+    State(state): State<AppState>,
+    Path(runner_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(notice): Json<loka_shared::runners::DiskNotice>,
+) -> Result<Json<Value>, ApiError> {
+    authenticate_runner(&state, &headers, Some(runner_id)).await?;
+    let sent = state.runners.warn_disk_low(runner_id, &notice).await.map_err(internal)?;
+    Ok(Json(json!({ "sent": sent })))
 }
 
 #[derive(Default, serde::Deserialize)]

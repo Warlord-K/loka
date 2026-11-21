@@ -1,9 +1,11 @@
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use serde_json::Value;
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
+use crate::runners::{RunnerStore, CHANNEL_RUNNER_JOBS};
 use crate::world::{WorldStore, COMPACT_PROMPT};
 
 pub const MIN_DAYS: i32 = 7;
@@ -16,10 +18,12 @@ pub enum CleanupKind {
     Chats,
     Quests,
     Activity,
+    Workspaces,
 }
 
 impl CleanupKind {
-    pub const ALL: [CleanupKind; 4] = [CleanupKind::RunLogs, CleanupKind::Chats, CleanupKind::Quests, CleanupKind::Activity];
+    pub const ALL: [CleanupKind; 5] =
+        [CleanupKind::RunLogs, CleanupKind::Chats, CleanupKind::Quests, CleanupKind::Activity, CleanupKind::Workspaces];
 
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim() {
@@ -27,6 +31,7 @@ impl CleanupKind {
             "chats" | "messages" => Some(Self::Chats),
             "quests" => Some(Self::Quests),
             "activity" | "events" => Some(Self::Activity),
+            "workspaces" | "workspace" | "disk" => Some(Self::Workspaces),
             _ => None,
         }
     }
@@ -37,6 +42,7 @@ impl CleanupKind {
             Self::Chats => "chats",
             Self::Quests => "quests",
             Self::Activity => "activity",
+            Self::Workspaces => "workspaces",
         }
     }
 
@@ -46,6 +52,7 @@ impl CleanupKind {
             Self::Chats => "chat messages with your agents",
             Self::Quests => "finished, failed and cancelled quests with their sessions, runs and logs (lifetime cost stays)",
             Self::Activity => "activity feed events, including cleared bell items",
+            Self::Workspaces => "workspaces of closed quests on your devices (worktrees, build output and scratch files; branches, commits and pull requests stay)",
         }
     }
 }
@@ -79,10 +86,25 @@ pub struct PastCleanup {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceUse {
+    pub runner_id: Uuid,
+    pub name: String,
+    pub online: bool,
+    pub bytes: i64,
+    pub tasks: i64,
+    pub free_gb: Option<i64>,
+    pub total_gb: Option<i64>,
+    pub low: bool,
+    pub reclaimable_bytes: i64,
+    pub reclaimable_tasks: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct StorageReport {
     pub agents: Vec<AgentStorage>,
     pub total_bytes: i64,
     pub cleanups: Vec<PastCleanup>,
+    pub workspaces: Vec<WorkspaceUse>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -154,10 +176,91 @@ impl WorldStore {
         .fetch_all(self.pool())
         .await?;
         let total_bytes = agents.iter().map(|a| a.total_bytes).sum();
-        Ok(StorageReport { agents, total_bytes, cleanups })
+        let workspaces = self.workspace_use(owner).await?;
+        Ok(StorageReport { agents, total_bytes, cleanups, workspaces })
+    }
+
+    pub async fn workspace_use(&self, owner: Uuid) -> Result<Vec<WorkspaceUse>> {
+        let runners = sqlx::query_as::<_, (Uuid, String, String, Value)>(
+            "SELECT id, name, status, capabilities->'workspaces' FROM world_runners
+              WHERE owner_user_id = $1 AND status <> 'revoked' AND jsonb_typeof(capabilities->'workspaces') = 'object'
+              ORDER BY name",
+        )
+        .bind(owner)
+        .fetch_all(self.pool())
+        .await?;
+        let store = RunnerStore::new(self.pool().clone());
+        let mut found = Vec::new();
+        for (runner_id, name, status, view) in runners {
+            let largest: Vec<(Uuid, i64)> = view["largest"]
+                .as_array()
+                .map(|list| list.iter().filter_map(|row| Some((row["id"].as_str()?.parse().ok()?, row["bytes"].as_i64()?))).collect())
+                .unwrap_or_default();
+            let ids: Vec<Uuid> = largest.iter().map(|(id, _)| *id).collect();
+            let closed: Vec<Uuid> = store.closed_tasks(runner_id, &ids, true).await?.into_iter().map(|task| task.id).collect();
+            let reclaimable: Vec<i64> = largest.iter().filter(|(id, _)| closed.contains(id)).map(|(_, bytes)| *bytes).collect();
+            found.push(WorkspaceUse {
+                runner_id,
+                name,
+                online: status == "online",
+                bytes: view["bytes"].as_i64().unwrap_or(0),
+                tasks: view["tasks"].as_i64().unwrap_or(0),
+                free_gb: view["free_gb"].as_i64(),
+                total_gb: view["total_gb"].as_i64(),
+                low: view["low"].as_bool().unwrap_or(false),
+                reclaimable_bytes: reclaimable.iter().sum(),
+                reclaimable_tasks: reclaimable.len() as i64,
+            });
+        }
+        Ok(found)
+    }
+
+    async fn clean_workspaces(&self, request: CleanupRequest, apply: bool) -> Result<CleanupResult> {
+        if request.agent.is_some() {
+            bail!("workspaces are cleaned for all of your agents at once");
+        }
+        let usage = self.workspace_use(request.owner).await?;
+        let rows: i64 = usage.iter().map(|u| u.reclaimable_tasks).sum();
+        let bytes: i64 = usage.iter().map(|u| u.reclaimable_bytes).sum();
+        let runners: Vec<Uuid> = usage.iter().filter(|u| u.reclaimable_tasks > 0).map(|u| u.runner_id).collect();
+        let applied = apply && rows > 0;
+        if applied {
+            let mut tx = self.pool().begin().await?;
+            sqlx::query("UPDATE world_runners SET clean_workspaces_at = NOW() WHERE id = ANY($1)")
+                .bind(&runners)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "INSERT INTO world_cleanups (user_id, org_id, agent_id, by_agent_id, kind, older_than, rows_removed, bytes_freed)
+                 VALUES ($1, $2, NULL, $3, 'workspaces', 0, $4, $5)",
+            )
+            .bind(request.owner)
+            .bind(request.org)
+            .bind(request.by_agent)
+            .bind(rows)
+            .bind(bytes)
+            .execute(&mut *tx)
+            .await?;
+            for runner in &runners {
+                sqlx::query("SELECT pg_notify($1, $2)").bind(CHANNEL_RUNNER_JOBS).bind(runner.to_string()).execute(&mut *tx).await?;
+            }
+            tx.commit().await?;
+        }
+        Ok(CleanupResult {
+            kind: CleanupKind::Workspaces,
+            older_than_days: 0,
+            agent_id: None,
+            rows,
+            bytes,
+            applied,
+            what: CleanupKind::Workspaces.describe(),
+        })
     }
 
     pub async fn clean_up(&self, request: CleanupRequest, apply: bool) -> Result<CleanupResult> {
+        if request.kind == CleanupKind::Workspaces {
+            return self.clean_workspaces(request, apply).await;
+        }
         if !(MIN_DAYS..=MAX_DAYS).contains(&request.older_than_days) {
             bail!("older_than_days must be between {MIN_DAYS} and {MAX_DAYS}");
         }
@@ -179,6 +282,7 @@ impl WorldStore {
             CleanupKind::Chats => chats(&mut tx, &request, apply).await?,
             CleanupKind::Quests => quests(&mut tx, &request, apply).await?,
             CleanupKind::Activity => activity(&mut tx, &request, apply).await?,
+            CleanupKind::Workspaces => unreachable!("workspaces are handled before the transaction"),
         };
         if apply && rows > 0 {
             sqlx::query(

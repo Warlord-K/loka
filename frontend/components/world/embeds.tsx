@@ -1,19 +1,21 @@
 "use client";
 
 import { useEffect, useState, type ReactNode } from "react";
-import { ArrowSquareOut, CheckSquare, FileText, Hash, Square, Timer } from "@phosphor-icons/react";
+import { ArrowSquareOut, CheckSquare, FileText, FlowArrow, Hash, Square, Timer, UserCircle } from "@phosphor-icons/react";
 import { cn, safeDecode } from "@/lib/utils";
-import { messageTime, dayLabel, worldApi, type ChannelSummary, type TaskBrief, type Todo } from "@/lib/world";
+import { messageTime, dayLabel, worldApi, type ChannelSummary, type TaskBrief, type Todo, type WorldAgent } from "@/lib/world";
+import { AgentFace } from "./channel-ui";
 import { MessageLink, messageRefFromHref, worldRefFromHref } from "./message-links";
 import { SetupCard } from "./setup-hint";
 import { SlackMark } from "./panels";
 import { StatusIcon, statusLabel } from "./quest-ui";
 import { countdown, focusTodo, isTimerTodo } from "./todos-ui";
-import { openReport, REPORTS_STALE, reportsApi, type ReportBrief } from "@/lib/reports";
+import { canvasItemKind, canvasItemLabel, openReport, REPORTS_STALE, reportsApi, type CanvasItem, type ReportBrief } from "@/lib/reports";
 
 const REF_SOURCE = "ch\\d{1,18}|[0-9a-fA-F][0-9a-fA-F-]{5,35}";
 const ID_SOURCE = "[0-9a-fA-F][0-9a-fA-F-]{5,35}";
 const ID = new RegExp(`^(?:${ID_SOURCE})$`);
+const ITEM_SOURCE = "#[A-Za-z0-9_-]{1,40}";
 
 function matchesId(id: string, ref: string): boolean {
   return id.replace(/-/g, "").startsWith(ref.replace(/-/g, ""));
@@ -23,7 +25,8 @@ export type Embed =
   | { kind: "msg"; ref: string }
   | { kind: "todo"; ref: string }
   | { kind: "quest"; ref: string }
-  | { kind: "report"; ref: string }
+  | { kind: "report"; ref: string; item?: string }
+  | { kind: "agent"; ref: string }
   | { kind: "setup"; key: string }
   | { kind: "channel"; id: string }
   | { kind: "slack"; url: string; workspace: string; thread: boolean }
@@ -49,6 +52,10 @@ export function embedFromHref(href?: string | null): Embed | null {
   if (linked) return linked;
   const setup = href.match(SETUP);
   if (setup) return { kind: "setup", key: setup[1].toLowerCase().replace(/-/g, "_") };
+  const item = href.match(new RegExp(`^report:(${ID_SOURCE})(${ITEM_SOURCE})$`, "i"));
+  if (item) return { kind: "report", ref: item[1].toLowerCase(), item: item[2].slice(1) };
+  const agent = href.match(/^agent:([A-Za-z0-9][A-Za-z0-9_-]{0,63})$/i);
+  if (agent) return { kind: "agent", ref: agent[1].toLowerCase() };
   const scheme = href.match(/^(todo|quest|report):(.+)$/i);
   if (scheme) return ID.test(scheme[2]) ? { kind: scheme[1].toLowerCase() as "todo" | "quest" | "report", ref: scheme[2].toLowerCase() } : null;
   if (href.startsWith("#channel-")) return { kind: "channel", id: href.slice(9) };
@@ -66,8 +73,8 @@ export function allowedEmbedUrl(url: string): boolean {
 }
 
 const SETUP = /^setup:([a-z][a-z_-]{1,31})$/i;
-const CARD_LINE = new RegExp(`^([ \\t]*)((?:msg|todo|quest|report):(?:${REF_SOURCE})|setup:[A-Za-z][A-Za-z_-]{1,31}|https?:\\/\\/\\S+)[ \\t]*$`, "gm");
-const BARE = new RegExp(`(^|[\\s(])(msg|todo|quest|report):(${REF_SOURCE})`, "gi");
+const CARD_LINE = new RegExp(`^([ \\t]*)((?:msg|todo|quest|report):(?:${REF_SOURCE})(?:${ITEM_SOURCE})?|setup:[A-Za-z][A-Za-z_-]{1,31}|https?:\\/\\/\\S+)[ \\t]*$`, "gm");
+const BARE = new RegExp(`(^|[\\s(])(msg|todo|quest|report):(${REF_SOURCE})(${ITEM_SOURCE})?`, "gi");
 const CHANNEL = /(^|[\s(])#([A-Za-z][\w-]{0,79})/g;
 
 export function linkEmbeds(text: string, channels: Map<string, string>): string {
@@ -76,9 +83,10 @@ export function linkEmbeds(text: string, channels: Map<string, string>): string 
       const href = target.replace(/[.,;:!?)]+$/, "");
       return embedFromHref(href) ? `${lead}[](${href} "card")` : whole;
     })
-    .replace(BARE, (whole, lead: string, scheme: string, ref: string, offset: number, all: string) => {
+    .replace(BARE, (whole, lead: string, scheme: string, ref: string, item: string | undefined, offset: number, all: string) => {
       if (lead === "(" && all[offset - 1] === "]") return whole;
-      return `${lead}[${scheme}:${ref}](${scheme.toLowerCase()}:${ref})`;
+      const tail = item && scheme.toLowerCase() === "report" ? item : "";
+      return `${lead}[${scheme}:${ref}${tail}](${scheme.toLowerCase()}:${ref}${tail})${item && !tail ? item : ""}`;
     })
     .replace(CHANNEL, (whole, lead: string, name: string) => {
       const id = channels.get(name.toLowerCase());
@@ -114,6 +122,7 @@ function cached<T>(load: () => Promise<T>, ttl: number, stale?: string): Cached<
 const todosOnce = cached<Todo[]>(() => worldApi.todos(), 15_000, "world:todos-stale");
 const questsOnce = cached<TaskBrief[]>(() => worldApi.tasks(), 15_000);
 const channelsOnce = cached<ChannelSummary[]>(() => worldApi.channels(), 60_000);
+const agentsOnce = cached<WorldAgent[]>(() => worldApi.agents(), 60_000);
 const slackCache = new Map<string, Promise<SlackDetail | null>>();
 const slackSeen = new Map<string, SlackDetail | null>();
 
@@ -260,6 +269,29 @@ function QuestEmbed({ refId, label, card }: { refId: string; label?: string; car
   );
 }
 
+function AgentEmbed({ refId, label, card }: { refId: string; label?: string; card: boolean }) {
+  const agents = useLoaded(agentsOnce, "agents");
+  const icon = <UserCircle size={12} weight="bold" />;
+  if (!agents) return <Shell card={card} icon={icon} label={label || "agent"} />;
+  const agent = agents.find((a) => a.slug.toLowerCase() === refId || matchesId(a.id, refId));
+  if (!agent) return <Missing label={label || "an agent you cannot open"} />;
+  return (
+    <Shell
+      card={card}
+      icon={<AgentFace agent={agent} size={14} />}
+      label={label || agent.name}
+      byline={["Agent", `@${agent.slug}`, agent.is_main ? "main" : null].filter(Boolean).join(" · ")}
+      body={
+        <>
+          <span className="block font-semibold">{agent.name}</span>
+          {agent.expertise && <span className="block text-w-text2">{agent.expertise}</span>}
+        </>
+      }
+      onClick={() => window.dispatchEvent(new CustomEvent("world:open-agent", { detail: { id: agent.id } }))}
+    />
+  );
+}
+
 const reportCache = new Map<string, Promise<ReportBrief | null>>();
 const reportSeen = new Map<string, ReportBrief | null>();
 if (typeof window !== "undefined")
@@ -291,7 +323,66 @@ function plainExcerpt(text: string): string {
     .trim();
 }
 
-function ReportEmbed({ refId, label, card }: { refId: string; label?: string; card: boolean }) {
+const itemCache = new Map<string, Promise<CanvasItem | null>>();
+if (typeof window !== "undefined") window.addEventListener(REPORTS_STALE, () => itemCache.clear());
+
+function canvasItem(report: string, item: string): Promise<CanvasItem | null> {
+  const key = `${report}#${item}`;
+  const hit = itemCache.get(key);
+  if (hit) return hit;
+  const pending = reportsApi
+    .get(report)
+    .then((d) => d.report.canvas?.items.find((i) => i.id === item) ?? null)
+    .catch(() => null);
+  itemCache.set(key, pending);
+  return pending;
+}
+
+function CanvasItemEmbed({ report, itemId, label, card }: { report: ReportBrief; itemId: string; label?: string; card: boolean }) {
+  const [state, setState] = useState<{ key: string; item: CanvasItem | null } | null>(null);
+  const key = `${report.id}#${itemId}`;
+  useEffect(() => {
+    let live = true;
+    void canvasItem(report.id, itemId).then((item) => live && setState({ key, item }));
+    return () => {
+      live = false;
+    };
+  }, [report.id, itemId, key]);
+  const item = state?.key === key ? state.item : undefined;
+  const target = item?.kind === "ref" ? embedFromHref(item.target) : null;
+  if (target && card)
+    return (
+      <span className="my-1 flex w-full max-w-lg flex-col">
+        <EmbedView embed={target} card />
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            openReport(report.id, itemId);
+          }}
+          className="inline-flex items-center gap-1 self-start rounded-md px-1 text-w-xs font-semibold text-w-link hover:bg-w-sand"
+        >
+          <FlowArrow size={11} weight="bold" />
+          On canvas {report.title}
+        </button>
+      </span>
+    );
+  const what = item ? canvasItemKind(item) : "Item";
+  const text = item ? canvasItemLabel(item) || what : item === null ? "This item is no longer on the canvas" : "";
+  return (
+    <Shell
+      card={card}
+      icon={<FlowArrow size={12} weight="bold" />}
+      label={label || `${what} on ${report.title}`}
+      muted={item === null}
+      byline={[`${what} on canvas`, report.title].join(" · ")}
+      body={text || undefined}
+      onClick={() => openReport(report.id, itemId)}
+    />
+  );
+}
+
+function ReportEmbed({ refId, item, label, card }: { refId: string; item?: string; label?: string; card: boolean }) {
   const [state, setState] = useState<{ ref: string; report: ReportBrief | null } | null>(() => (reportSeen.has(refId) ? { ref: refId, report: reportSeen.get(refId) ?? null } : null));
   useEffect(() => {
     let live = true;
@@ -304,12 +395,17 @@ function ReportEmbed({ refId, label, card }: { refId: string; label?: string; ca
   if (!state || state.ref !== refId) return <Shell card={card} icon={icon} label={label || "report"} />;
   const report = state.report;
   if (!report) return <Missing label={label || "a report you cannot open"} />;
+  const canvas = report.kind === "canvas";
+  if (canvas && item) return <CanvasItemEmbed report={report} itemId={item} label={label} card={card} />;
+  const what = canvas
+    ? [`Canvas · ${report.item_count} ${report.item_count === 1 ? "item" : "items"}`, report.open_marks ? `${report.open_marks} open ${report.open_marks === 1 ? "mark" : "marks"}` : null]
+    : ["Report"];
   return (
     <Shell
       card={card}
-      icon={icon}
+      icon={canvas ? <FlowArrow size={12} weight="bold" /> : icon}
       label={label || report.title}
-      byline={["Report", report.folder || null, `${dayLabel(report.updated_at)} ${messageTime(report.updated_at)}`].filter(Boolean).join(" · ")}
+      byline={[...what, report.folder || null, `${dayLabel(report.updated_at)} ${messageTime(report.updated_at)}`].filter(Boolean).join(" · ")}
       body={
         <>
           <span className="block font-semibold">{report.title}</span>
@@ -471,8 +567,10 @@ export function EmbedView({ embed, label, card }: { embed: Embed; label?: string
       return <TodoEmbed refId={embed.ref} label={label} card={card} />;
     case "quest":
       return <QuestEmbed refId={embed.ref} label={label} card={card} />;
+    case "agent":
+      return <AgentEmbed refId={embed.ref} label={label} card={card} />;
     case "report":
-      return <ReportEmbed refId={embed.ref} label={label} card={card} />;
+      return <ReportEmbed refId={embed.ref} item={embed.item} label={label} card={card} />;
     case "setup":
       return <SetupCard featureKey={embed.key} />;
     case "channel":

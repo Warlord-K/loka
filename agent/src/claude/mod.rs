@@ -372,6 +372,9 @@ pub(crate) fn command(opts: &CliOptions<'_>, mcp_config_path: Option<&Path>, lau
     let settings = if (opts.lean && !lean_reads) || skip_user_settings { with_auth(&mut cmd, settings) } else { settings };
     if let Some(mut settings) = settings {
         sandbox::open_for_owner(&mut settings);
+        if sandbox_mode != sandbox::Mode::Off {
+            cmd.env("GIT_TEMPLATE_DIR", "");
+        }
         if mode == Permission::Auto {
             settings["autoMode"] = serde_json::json!({ "allow": owner_allow(&opts.environment) });
         }
@@ -1090,6 +1093,28 @@ mod tests {
         let settings: serde_json::Value = serde_json::from_str(after(&fast, "--settings").unwrap()).unwrap();
         assert_eq!(settings["fastMode"], serde_json::json!(true));
         assert_eq!(settings["permissions"]["deny"], serde_json::json!(["Read(//proc/**)", "Read(//tmp/**)"]));
+    }
+
+    #[test]
+    fn owner_runs_skip_git_hook_templates_so_init_and_clone_work_beside_the_protected_hooks_dir() {
+        let env = |opts: &CliOptions<'_>| {
+            let cmd = command(opts, None, &Launch::assume("claude")).expect("command builds");
+            cmd.as_std().get_envs().find(|(name, _)| *name == "GIT_TEMPLATE_DIR").map(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+        };
+        let owner = options(false, Vec::new(), false, Approval::Auto, "sonnet");
+        assert_eq!(env(&owner), Some(Some(String::new())));
+        let lean = options(true, Vec::new(), false, Approval::Auto, "sonnet");
+        assert_eq!(env(&lean), None);
+        let dir = std::env::temp_dir().join(format!("claude-templates-{}", uuid::Uuid::new_v4().simple()));
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&dir)
+            .env("GIT_TEMPLATE_DIR", "")
+            .status()
+            .unwrap();
+        assert!(init.success());
+        assert!(!dir.join(".git/hooks").exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

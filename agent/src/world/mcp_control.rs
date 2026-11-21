@@ -124,13 +124,13 @@ impl Server {
             }), &["agent", "key"]));
         }
         if self.caller.is_main && self.caller.owner_user_id.is_some() {
-            tools.push(tool("storage", "See how much space your person's agents take in Loka (chats, run history, run step logs, activity), per agent, with when each was last active and past cleanups. Read only. Use it when they ask what is using space or want to tidy up, then suggest a clean_up.", json!({}), &[]));
-            tools.push(tool("clean_up", &format!("Permanently delete old data of your person's agents to free space. Kinds: run_logs (step logs, prompts and raw output of finished runs; cost and run list stay), chats (chat messages older than the cutoff), quests (closed quests with their sessions, runs and logs; lifetime cost stays), activity (old activity feed events and cleared bell items). Without confirm it only previews what would go and how much space it frees: always preview first, tell your person exactly what will be deleted, and that it cannot be undone. Pass confirm true {OWNER_ONLY}, after they agreed to that exact cleanup."), json!({
-                "kind": s("run_logs, chats, quests or activity"),
-                "older_than_days": { "type": "integer", "description": "Only data older than this many days, 7 to 3650" },
+            tools.push(tool("storage", "See how much space your person's agents take in Loka (chats, run history, run step logs, activity), per agent, with when each was last active and past cleanups, plus the disk their devices spend on quest workspaces (total, free space, and how much belongs to closed quests). Read only. Use it when they ask what is using space or want to tidy up, then suggest a clean_up.", json!({}), &[]));
+            tools.push(tool("clean_up", &format!("Permanently delete old data of your person's agents to free space. Kinds: run_logs (step logs, prompts and raw output of finished runs; cost and run list stay), chats (chat messages older than the cutoff), quests (closed quests with their sessions, runs and logs; lifetime cost stays), activity (old activity feed events and cleared bell items), workspaces (checkouts, build output and scratch files of closed quests on your person's devices, oldest first; branches, commits and pull requests stay, older_than_days and agent do not apply). Without confirm it only previews what would go and how much space it frees: always preview first, tell your person exactly what will be deleted, and that it cannot be undone. Pass confirm true {OWNER_ONLY}, after they agreed to that exact cleanup."), json!({
+                "kind": s("run_logs, chats, quests, activity or workspaces"),
+                "older_than_days": { "type": "integer", "description": "Only data older than this many days, 7 to 3650 (not used for workspaces)" },
                 "agent": s("Agent name or slug, optional, defaults to all of your person's agents"),
                 "confirm": { "type": "boolean", "description": "Really delete, default false (preview)" }
-            }), &["kind", "older_than_days"]));
+            }), &["kind"]));
         }
         if self.can(powers::OVERSEE) && self.caller.owner_user_id.is_some() {
             tools.push(tool("notifications", &format!("Read your person's notification bell, newest last: open asks, agent messages, mentions, reminders, failed quests and stuck agents. Items clear themselves when answered or opened; nothing is cleared unless you pass mark_seen, {OWNER_ONLY}."), json!({
@@ -712,15 +712,35 @@ impl Server {
                             a.last_active.map(|t| t.format("%Y-%m-%d").to_string()).unwrap_or_else(|| "never".into())
                         ));
                     }
+                    for w in &report.workspaces {
+                        lines.push(format!(
+                            "- Quest workspaces on {}{}: {} in {} folders, {} of it from closed quests that a cleanup would remove{}",
+                            w.name,
+                            if w.online { "" } else { " (offline)" },
+                            size(w.bytes),
+                            w.tasks,
+                            size(w.reclaimable_bytes),
+                            match (w.free_gb, w.low) {
+                                (Some(free), true) => format!(" | only {free} GB of disk free, closed workspaces are cleared automatically below 5 GB"),
+                                (Some(free), false) => format!(" | {free} GB of disk free"),
+                                _ => String::new(),
+                            }
+                        ));
+                    }
                     for c in report.cleanups.iter().take(5) {
-                        lines.push(format!("Past cleanup {}: {} older than {} days, freed {}", c.created_at.format("%Y-%m-%d"), c.kind, c.older_than, size(c.bytes_freed)));
+                        let age = if c.older_than > 0 { format!(" older than {} days", c.older_than) } else { String::new() };
+                        lines.push(format!("Past cleanup {}: {}{age}, freed {}", c.created_at.format("%Y-%m-%d"), c.kind, size(c.bytes_freed)));
                     }
                     return Ok(lines.join("\n"));
                 }
                 let kind = arg("kind")
                     .and_then(loka_shared::cleanup::CleanupKind::parse)
-                    .ok_or_else(|| anyhow!("kind must be run_logs, chats, quests or activity"))?;
-                let days = args.get("older_than_days").and_then(Value::as_i64).ok_or_else(|| anyhow!("older_than_days is required"))? as i32;
+                    .ok_or_else(|| anyhow!("kind must be run_logs, chats, quests, activity or workspaces"))?;
+                let days = match args.get("older_than_days").and_then(Value::as_i64) {
+                    Some(days) => days as i32,
+                    None if kind == loka_shared::cleanup::CleanupKind::Workspaces => 0,
+                    None => bail!("older_than_days is required"),
+                };
                 let agent = match arg("agent") {
                     Some(n) => Some(self.managed_agent(n).await?.id),
                     None => None,
@@ -743,6 +763,19 @@ impl Server {
                         apply,
                     )
                     .await?;
+                if result.kind == loka_shared::cleanup::CleanupKind::Workspaces {
+                    return Ok(if result.rows == 0 {
+                        "Nothing to clean: no closed quest workspaces on your person's devices (open quests are never touched, and a workspace stays an hour after its last run).".to_string()
+                    } else if result.applied {
+                        format!("Asked the devices to remove {} closed quest workspaces, about {}. They do it within a minute; branches, commits and pull requests stay. This cannot be undone.", result.rows, size(result.bytes))
+                    } else {
+                        format!(
+                            "Preview: {} closed quest workspaces, about {}, on your person's devices. Nothing removed yet. Tell your person that open quests are kept and that this is permanent for those folders; call again with confirm true only after they agree.",
+                            result.rows,
+                            size(result.bytes)
+                        )
+                    });
+                }
                 Ok(if result.rows == 0 {
                     format!("Nothing to clean: no {} older than {days} days.", result.what)
                 } else if result.applied {

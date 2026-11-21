@@ -150,6 +150,38 @@ fn git_common_dir(dir: &Path) -> Option<PathBuf> {
     (!path.starts_with(dir)).then_some(path)
 }
 
+pub(crate) const OWNER_TEMP_NAMES: &[&str] = &["xcrun_db*", "TemporaryDirectory.*", "swift-*", "com.apple.dt.*"];
+
+pub(crate) const OWNER_MACH_SERVICES: &[&str] = &["com.apple.CoreSimulator.*"];
+
+#[cfg(target_os = "macos")]
+pub(crate) fn user_temp_dirs() -> Vec<PathBuf> {
+    let mut buf = vec![0 as libc::c_char; 1024];
+    let len = unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, buf.as_mut_ptr(), buf.len()) };
+    if len == 0 || len > buf.len() {
+        return Vec::new();
+    }
+    let dir = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().trim_end_matches('/').to_string();
+    let mut dirs = vec![PathBuf::from(&dir)];
+    if let Ok(real) = std::fs::canonicalize(&dir) {
+        if !dirs.contains(&real) {
+            dirs.push(real);
+        }
+    }
+    dirs
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn user_temp_dirs() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+pub(crate) fn owner_temp_patterns(dirs: &[PathBuf]) -> Vec<String> {
+    dirs.iter()
+        .flat_map(|dir| OWNER_TEMP_NAMES.iter().flat_map(move |name| [format!("{}/{name}", dir.display()), format!("{}/{name}/**", dir.display())]))
+        .collect()
+}
+
 pub fn git_write_roots(dir: &Path) -> Vec<String> {
     let mut dirs = vec![dir.to_path_buf()];
     if !dir.join(".git").exists() {
@@ -259,6 +291,8 @@ pub fn settings(
         .map(|name| json!({ "name": name, "mode": "deny" }))
         .collect();
     let allow_write: Vec<String> = WRITABLE_CACHES.iter().map(|p| p.to_string()).chain(writable.iter().cloned()).collect();
+    let deny_write: Vec<String> =
+        writable.iter().flat_map(|root| ["config", "config.worktree"].map(|name| format!("{}/{name}", root.trim_end_matches('/')))).collect();
     let mut sandbox = json!({
         "enabled": true,
         "failIfUnavailable": mode == Mode::Strict,
@@ -268,6 +302,7 @@ pub fn settings(
             "denyRead": deny_read,
             "allowRead": allow_read,
             "allowWrite": allow_write,
+            "denyWrite": deny_write,
         },
         "credentials": { "envVars": env },
     });
@@ -348,6 +383,8 @@ pub fn open_for_owner(settings: &mut Value) {
         return;
     };
     sandbox["network"]["allowLocalBinding"] = json!(true);
+    sandbox["network"]["allowMachLookup"] = json!(OWNER_MACH_SERVICES);
+    sandbox["filesystem"]["allowGitConfig"] = json!(true);
     if let Some(domains) = sandbox["network"]["allowedDomains"].as_array_mut() {
         domains.extend(PACKAGE_HOSTS.iter().map(|host| Value::String(host.to_string())));
     }
@@ -361,6 +398,7 @@ pub fn open_for_owner(settings: &mut Value) {
     }
     if let Some(write) = sandbox["filesystem"]["allowWrite"].as_array_mut() {
         write.extend(OWNER_WRITABLE_HOME.iter().map(|rel| Value::String(format!("~/{rel}"))));
+        write.extend(owner_temp_patterns(&user_temp_dirs()).into_iter().map(Value::String));
     }
 }
 
@@ -389,6 +427,36 @@ mod tests {
         let mut fast_only = json!({ "fastMode": true });
         open_for_owner(&mut fast_only);
         assert_eq!(fast_only, json!({ "fastMode": true }));
+    }
+
+    #[test]
+    fn owner_jobs_get_scoped_temp_simulator_and_git_init_access_while_guests_and_shared_clones_stay_closed() {
+        let roots = vec!["/runner/repos/o/r/.git".to_string()];
+        let mut owner = settings(Mode::Auto, &BTreeMap::new(), None, &roots, false).unwrap();
+        let guest = owner.clone();
+        open_for_owner(&mut owner);
+        assert_eq!(owner["sandbox"]["filesystem"]["allowGitConfig"], json!(true));
+        assert!(guest["sandbox"]["filesystem"].get("allowGitConfig").is_none());
+        let deny = owner["sandbox"]["filesystem"]["denyWrite"].as_array().unwrap();
+        for name in ["config", "config.worktree"] {
+            assert!(deny.iter().any(|p| *p == format!("/runner/repos/o/r/.git/{name}")), "{name} of the shared clone must stay protected");
+        }
+        assert_eq!(owner["sandbox"]["network"]["allowMachLookup"], json!(["com.apple.CoreSimulator.*"]));
+        assert!(guest["sandbox"]["network"].get("allowMachLookup").is_none());
+        let write: Vec<&str> = owner["sandbox"]["filesystem"]["allowWrite"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        let guest_write: Vec<&str> = guest["sandbox"]["filesystem"]["allowWrite"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        assert!(!guest_write.iter().any(|p| p.contains("TemporaryDirectory")));
+        let temp = owner_temp_patterns(&[PathBuf::from("/var/folders/ab/cd/T")]);
+        assert!(temp.contains(&"/var/folders/ab/cd/T/xcrun_db*".to_string()));
+        assert!(temp.contains(&"/var/folders/ab/cd/T/TemporaryDirectory.*/**".to_string()));
+        assert!(!temp.iter().any(|p| p == "/var/folders/ab/cd/T" || p.ends_with("/T/**") || p.contains("loka-")));
+        if cfg!(target_os = "macos") {
+            let dirs = user_temp_dirs();
+            assert!(!dirs.is_empty());
+            for pattern in owner_temp_patterns(&dirs) {
+                assert!(write.contains(&pattern.as_str()), "{pattern} missing from allowWrite");
+            }
+        }
     }
 
     #[test]

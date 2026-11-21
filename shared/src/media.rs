@@ -19,7 +19,7 @@ pub fn is_video(mime: &str) -> bool {
 }
 
 pub fn limit_for(mime: &str) -> usize {
-    if is_video(mime) {
+    if is_video(mime) || mime == crate::canvas::MODEL_MIME {
         MAX_VIDEO
     } else {
         MAX_IMAGE
@@ -39,6 +39,9 @@ pub fn sniff(bytes: &[u8]) -> Option<&'static str> {
     if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
         return Some("image/webp");
     }
+    if bytes.starts_with(b"glTF") {
+        return Some(crate::canvas::MODEL_MIME);
+    }
     if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
         return Some("video/webm");
     }
@@ -50,7 +53,7 @@ pub fn sniff(bytes: &[u8]) -> Option<&'static str> {
 
 pub fn checked(bytes: &[u8]) -> Result<&'static str> {
     let Some(mime) = sniff(bytes) else {
-        bail!("only PNG, JPEG, GIF, WebP, MP4, MOV and WebM files can be shown");
+        bail!("only PNG, JPEG, GIF, WebP, MP4, MOV, WebM and GLB files can be shown");
     };
     let limit = limit_for(mime);
     if bytes.len() > limit {
@@ -166,6 +169,8 @@ mod tests {
         assert_eq!(sniff(&[0x1a, 0x45, 0xdf, 0xa3, 1]), Some("video/webm"));
         assert_eq!(sniff(b"\0\0\0\x18ftypmp42xxxx"), Some("video/mp4"));
         assert_eq!(sniff(b"\0\0\0\x14ftypqt  xxxx"), Some("video/quicktime"));
+        assert_eq!(sniff(b"glTF\x02\0\0\0"), Some(crate::canvas::MODEL_MIME));
+        assert_eq!(limit_for(crate::canvas::MODEL_MIME), MAX_VIDEO);
         assert_eq!(sniff(b"<svg xmlns"), None);
         assert!(checked(b"#!/bin/sh\necho hi").is_err());
     }

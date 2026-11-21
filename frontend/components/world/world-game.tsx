@@ -215,6 +215,8 @@ function bellWorthy(ev: WorldEvent, me: string | undefined): boolean {
       return p.paused === true;
     case "agent.status":
       return p.status === "error";
+    case "runner.disk_low":
+      return true;
     default:
       return false;
   }
@@ -2094,7 +2096,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
   const [chatOpen, setChatOpen] = useState(false);
   const [proOpen, setProOpen] = useState(false);
   const [listsOpen, setListsOpen] = useState(false);
-  const [reports, setReports] = useState<{ id: string | null } | null>(null);
+  const [reports, setReports] = useState<{ id: string | null; item?: string | null } | null>(null);
   const [side, setSideState] = useState<{ id: string | null; open: boolean; auto?: boolean }>({ id: null, open: false });
   const sidePane = usePaneWidth("side-chat", 28, 20, 48);
   const setSide = useCallback((next: { id: string | null; open: boolean; auto?: boolean }) => {
@@ -2304,18 +2306,22 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     const onOpenReport = (e: Event) => {
       keepTalking();
       setNotesOpen(false);
-      setReports({ id: (e as CustomEvent<{ id?: string | null }>).detail?.id ?? null });
+      const detail = (e as CustomEvent<{ id?: string | null; item?: string | null }>).detail;
+      setReports({ id: detail?.id ?? null, item: detail?.item ?? null });
     };
     window.addEventListener("world:open-report", onOpenReport);
     const params = new URLSearchParams(window.location.search);
     const linkedReport = params.get("report");
     const linkedTodo = params.get("todo");
+    const linkedItem = params.get("item");
     if (linkedReport || linkedTodo) {
       params.delete("report");
+      params.delete("item");
       params.delete("todo");
       const rest = params.toString();
       window.history.replaceState(null, "", `${window.location.pathname}${rest ? `?${rest}` : ""}${window.location.hash}`);
-      if (linkedReport && /^[0-9a-f-]{6,36}$/i.test(linkedReport)) setReports({ id: linkedReport.toLowerCase() });
+      if (linkedReport && /^[0-9a-f-]{6,36}$/i.test(linkedReport))
+        setReports({ id: linkedReport.toLowerCase(), item: linkedItem && /^[A-Za-z0-9_-]{1,40}$/.test(linkedItem) ? linkedItem : null });
       if (linkedTodo && /^[0-9a-f-]{6,36}$/i.test(linkedTodo)) {
         setListsOpen(true);
         focusTodo(linkedTodo.toLowerCase());
@@ -2724,7 +2730,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       }
       if (ev.type.startsWith("item.")) void loadItems();
       if (ev.type.startsWith("todo.")) window.dispatchEvent(new Event("world:todos-stale"));
-      if (ev.type.startsWith("report.")) window.dispatchEvent(new CustomEvent(REPORTS_STALE, { detail: ev.payload }));
+      if (ev.type.startsWith("report.") || ev.type.startsWith("canvas.")) window.dispatchEvent(new CustomEvent(REPORTS_STALE, { detail: ev.payload }));
       if (ev.type === "report.created" && ev.agent_id && !ev.payload.quiet && ev.payload.owner_user_id === meRef.current?.id) {
         const id = String(ev.payload.report_id ?? "");
         pushToast({ id: ev.seq, kind: "report.created", target: "reports", bell: true, text: `New report: ${String(ev.payload.title ?? "")}`, onClick: () => setReports({ id }) });
@@ -2991,6 +2997,16 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     closePanels();
     setDialog({ kind: "resident", id });
   }, [closePanels]);
+
+  useEffect(() => {
+    const onOpenAgent = (e: Event) => {
+      const wanted = (e as CustomEvent<{ id?: string }>).detail?.id?.toLowerCase();
+      const found = wanted ? agentsRef.current.find((a) => a.id === wanted || a.slug.toLowerCase() === wanted) : undefined;
+      if (found) openAgent(found.id);
+    };
+    window.addEventListener("world:open-agent", onOpenAgent);
+    return () => window.removeEventListener("world:open-agent", onOpenAgent);
+  }, [openAgent]);
 
   const sideHostRef = useRef(false);
   sideHostRef.current = !!reports || listsOpen;
@@ -4222,6 +4238,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
                   agents={agents}
                   meId={me?.id ?? null}
                   initialId={reports.id}
+                  focus={reports.id && reports.item ? reports : null}
                   sideToggle={sideToggle}
                   onClose={() => setReports(null)}
                   onOpenAgent={(id) => {

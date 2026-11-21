@@ -258,6 +258,7 @@ when the look matters (a page you checked, a change you made, a bug you found): 
 the result. Keep recordings short, a few steps at most.
 
 Uploads, downloads, PDFs, traces, the clipboard, raw CDP and browser launch options are not available.
+Do not start Chrome, Chromium or Playwright yourself: the sandbox blocks the Mach port a browser needs, so it crashes on start. Only this command reaches the browser, and only when it is written out exactly as above.
 {leave}
 
 Rules:

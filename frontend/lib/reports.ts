@@ -15,11 +15,76 @@ export interface ReportBrief {
   updated_at: string;
   excerpt: string;
   size: number;
+  kind: ReportKind;
+  open_marks: number;
+  item_count: number;
 }
 
-export interface Report extends Omit<ReportBrief, "excerpt" | "size"> {
+export type ReportKind = "doc" | "canvas";
+
+export type CanvasKind = "image" | "video" | "model" | "note" | "sticky" | "ref" | "run" | "frame" | "ink" | "ui";
+
+export type StickyColor = "lemon" | "rose" | "mint" | "aqua" | "honey" | "sand";
+
+export interface CanvasItem {
+  id: string;
+  kind: CanvasKind;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  text?: string;
+  caption?: string;
+  upload_id?: string;
+  target?: string;
+  command?: string;
+  color?: StickyColor;
+  locked?: boolean;
+  points?: [number, number][];
+  spec?: unknown;
+  by?: string;
+}
+
+export interface CanvasEdge {
+  id: string;
+  from: string;
+  to: string;
+  label?: string;
+}
+
+export interface CanvasDoc {
+  items: CanvasItem[];
+  edges: CanvasEdge[];
+}
+
+export type CanvasOp =
+  | { op: "add"; items: Partial<CanvasItem>[]; edges?: Omit<CanvasEdge, "id">[] }
+  | { op: "update"; items: (Partial<CanvasItem> & { id: string })[] }
+  | { op: "remove"; ids: string[] }
+  | { op: "connect"; edges: (Omit<CanvasEdge, "id"> & { id?: string })[] }
+  | { op: "disconnect"; ids: string[] };
+
+export interface CanvasMark {
+  id: string;
+  report_id: string;
+  item_id: string | null;
+  x: number;
+  y: number;
+  kind: "pin" | "sticky";
+  body: string;
+  status: "open" | "resolved";
+  reply: string | null;
+  author_user_id: string | null;
+  resolved_by_agent_id: string | null;
+  resolved_by_user_id: string | null;
+  created_at: string;
+  resolved_at: string | null;
+}
+
+export interface Report extends Omit<ReportBrief, "excerpt" | "size" | "open_marks" | "item_count"> {
   body: string;
   links: string[];
+  canvas: CanvasDoc | null;
 }
 
 export interface ReportDetail {
@@ -27,6 +92,7 @@ export interface ReportDetail {
   backlinks: ReportBrief[];
   outlinks: ReportBrief[];
   can_edit: boolean;
+  marks: CanvasMark[];
 }
 
 export interface RevisionBrief {
@@ -42,6 +108,7 @@ export interface RevisionBrief {
 
 export interface Revision extends Omit<RevisionBrief, "size"> {
   body: string;
+  canvas: CanvasDoc | null;
 }
 
 export interface ReportPatch {
@@ -71,8 +138,15 @@ async function json<T>(res: Response): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-const send = (url: string, method: string, body?: unknown) =>
-  fetch(url, { method, headers: body === undefined ? undefined : { "content-type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body) });
+type SendOptions = { keepalive?: boolean };
+
+const send = (url: string, method: string, body?: unknown, opts: SendOptions = {}) =>
+  fetch(url, {
+    method,
+    headers: body === undefined ? undefined : { "content-type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    keepalive: opts.keepalive,
+  });
 
 export const REPORTS_STALE = "world:reports-stale";
 
@@ -84,7 +158,16 @@ export const reportsApi = {
   },
   find: (key: string) => fetch(`/api/world/reports/find?key=${encodeURIComponent(key)}`, { cache: "no-store" }).then((r) => json<ReportBrief>(r)),
   get: (id: string) => fetch(`/api/world/reports/${id}`, { cache: "no-store" }).then((r) => json<ReportDetail>(r)),
-  create: (body: { title: string; body: string; folder?: string; tags?: string[] }) => send("/api/world/reports", "POST", body).then((r) => json<Report>(r)),
+  create: (body: { title: string; body: string; folder?: string; tags?: string[]; canvas?: CanvasDoc }) => send("/api/world/reports", "POST", body).then((r) => json<Report>(r)),
+  changeCanvas: (id: string, ops: CanvasOp[], opts?: SendOptions) => send(`/api/world/reports/${id}/canvas`, "POST", { ops }, opts).then((r) => json<Report>(r)),
+  addMark: (id: string, mark: { item_id?: string | null; x: number; y: number; kind: "pin" | "sticky"; body: string }) =>
+    send(`/api/world/reports/${id}/marks`, "POST", mark).then((r) => json<CanvasMark>(r)),
+  setMark: (id: string, mark: string, resolved: boolean, reply?: string) =>
+    send(`/api/world/reports/${id}/marks/${mark}`, "PATCH", { resolved, reply }).then((r) => json<CanvasMark>(r)),
+  removeMark: async (id: string, mark: string, opts?: SendOptions) => {
+    const res = await send(`/api/world/reports/${id}/marks/${mark}`, "DELETE", undefined, opts);
+    if (!res.ok) throw new ReportError(res.status, res.statusText);
+  },
   update: (id: string, patch: ReportPatch) => send(`/api/world/reports/${id}`, "PATCH", patch).then((r) => json<Report>(r)),
   remove: async (id: string) => {
     const res = await send(`/api/world/reports/${id}`, "DELETE");
@@ -95,9 +178,33 @@ export const reportsApi = {
   restore: (id: string, n: number) => send(`/api/world/reports/${id}/revisions/${n}/restore`, "POST").then((r) => json<Report>(r)),
 };
 
-export function openReport(id?: string | null) {
-  window.dispatchEvent(new CustomEvent("world:open-report", { detail: { id: id ?? null } }));
+export function openReport(id?: string | null, item?: string | null) {
+  window.dispatchEvent(new CustomEvent("world:open-report", { detail: { id: id ?? null, item: item ?? null } }));
 }
+
+export function canvasItemLabel(item: CanvasItem): string {
+  const text = item.caption || item.text || item.target || item.command || (item.kind === "ui" ? "Card" : "");
+  return text.replace(/\s+/g, " ").trim().slice(0, 160);
+}
+
+const REF_LABEL: Record<string, string> = { quest: "Quest", report: "Report", todo: "To-do", msg: "Message", agent: "Agent" };
+
+export function canvasItemKind(item: CanvasItem): string {
+  return item.kind === "ref" ? (REF_LABEL[(item.target ?? "").split(":")[0]] ?? "Card") : CANVAS_KIND_LABEL[item.kind];
+}
+
+export const CANVAS_KIND_LABEL: Record<CanvasKind, string> = {
+  image: "Image",
+  video: "Video",
+  model: "3D model",
+  note: "Note",
+  sticky: "Sticky",
+  ref: "Card",
+  run: "Step",
+  frame: "Frame",
+  ink: "Drawing",
+  ui: "Card",
+};
 
 export function headingSlug(text: string): string {
   return (

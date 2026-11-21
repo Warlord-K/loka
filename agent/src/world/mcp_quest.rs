@@ -185,6 +185,7 @@ mod tests {
             include_str!("loka_tools.rs"),
             include_str!("music_tools.rs"),
             include_str!("reports_tools.rs"),
+            include_str!("canvas_tools.rs"),
             include_str!("teams_tools.rs"),
         ]
         .join("\n");
@@ -202,5 +203,5 @@ mod tests {
         }
     }
 
-    const FIELDS: &[&str] = &["upload_ids", "start_task", "milestones_done", "part_of", "time_limit_minutes", "plan_first", "ci_feedback", "read_only", "slack_channel", "slack_thread", "attempt_variants", "review_comments", "start_line", "never_started", "cli_error", "no_report", "timed_out", "task_id", "github_feed", "live_voice", "delete_after_days", "run_logs"];
+    const FIELDS: &[&str] = &["upload_ids", "upload_id", "remove_arrows", "start_task", "milestones_done", "part_of", "time_limit_minutes", "plan_first", "ci_feedback", "read_only", "slack_channel", "slack_thread", "attempt_variants", "review_comments", "start_line", "never_started", "cli_error", "no_report", "timed_out", "task_id", "github_feed", "live_voice", "delete_after_days", "run_logs"];
 }

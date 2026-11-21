@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 
 const TEXT_CHARS: usize = 2000;
-const CONTEXT_CHARS: usize = 4000;
+pub const CONTEXT_CHARS: usize = 4000;
 const LABEL_CHARS: usize = 120;
 const SOURCE_KINDS: &[&str] = &["msg:ch", "msg:", "report:", "todo:", "quest:", "agent:"];
 
@@ -13,6 +13,9 @@ fn capped(value: Option<&Value>, max: usize) -> Option<String> {
 fn source(value: Option<&Value>) -> Option<String> {
     let raw = value?.as_str()?.trim();
     let kind = SOURCE_KINDS.iter().find(|kind| raw.starts_with(*kind))?;
+    if *kind == "report:" && raw.contains('#') {
+        return crate::canvas::quote_source(raw).map(|_| raw.to_string());
+    }
     let id = &raw[kind.len()..];
     let valid = !id.is_empty()
         && id.len() <= 36
@@ -76,5 +79,7 @@ mod tests {
         assert!(clean(Some(&json!({ "text": "x", "source": "msg:ch4a" }))).unwrap().get("source").is_none());
         assert_eq!(clean(Some(&json!({ "text": "a".repeat(5000) }))).unwrap()["text"].as_str().unwrap().len(), TEXT_CHARS);
         assert_eq!(render(&json!({})), "");
+        assert_eq!(clean(Some(&json!({ "text": "x", "source": "report:abcdef12#i1a2" }))).unwrap()["source"], "report:abcdef12#i1a2");
+        assert!(clean(Some(&json!({ "text": "x", "source": "report:abcdef12#bad item" }))).unwrap().get("source").is_none());
     }
 }

@@ -12,6 +12,7 @@ import {
   GitPullRequest,
   HandWaving,
   Handshake,
+  HardDrives,
   Hourglass,
   Lighthouse,
   MapTrifold,
@@ -72,6 +73,8 @@ export function eventGlyph(type: string, error = false): EventGlyph {
     case "agent.budget":
     case "org.budget":
       return { icon: Coins, tone: "gold", label: "Budget" };
+    case "runner.disk_low":
+      return { icon: HardDrives, tone: "danger", label: "Disk almost full" };
     case "agent.transferred":
       return { icon: Handshake, tone: "quiet", label: "Handed over" };
     case "message.created":

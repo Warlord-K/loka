@@ -4,6 +4,7 @@ use axum::{
     Extension, Json,
 };
 use loka_shared::access::Role;
+use loka_shared::canvas::{self, Canvas, Mark, NewMark};
 use loka_shared::reports::{self, NewReport, Report, ReportActor, ReportBrief, ReportFilter, ReportPatch, Revision, RevisionBrief};
 use serde::{Deserialize, Serialize};
 use tracing::error;
@@ -80,6 +81,7 @@ pub struct CreateReport {
     visibility: Option<String>,
     #[serde(default)]
     pinned: bool,
+    canvas: Option<serde_json::Value>,
 }
 
 pub async fn create(
@@ -87,22 +89,24 @@ pub async fn create(
     Extension(user): Extension<UserId>,
     Json(body): Json<CreateReport>,
 ) -> Result<Json<Report>, (StatusCode, String)> {
-    state
-        .world
-        .create_report(NewReport {
-            owner_user_id: user.0,
-            by: ReportActor::User(user.0),
-            title: body.title,
-            body: body.body,
-            folder: body.folder,
-            tags: body.tags,
-            visibility: body.visibility,
-            pinned: body.pinned,
-            task_id: None,
-        })
-        .await
-        .map(Json)
-        .map_err(invalid)
+    let new = NewReport {
+        owner_user_id: user.0,
+        by: ReportActor::User(user.0),
+        title: body.title,
+        body: body.body,
+        folder: body.folder,
+        tags: body.tags,
+        visibility: body.visibility,
+        pinned: body.pinned,
+        task_id: None,
+    };
+    match body.canvas {
+        Some(value) => {
+            let canvas = Canvas::from_raw(&value, "person").map_err(invalid)?;
+            state.world.create_canvas(new, canvas).await.map(Json).map_err(invalid)
+        }
+        None => state.world.create_report(new).await.map(Json).map_err(invalid),
+    }
 }
 
 #[derive(Serialize)]
@@ -111,6 +115,7 @@ pub struct ReportDetail {
     backlinks: Vec<ReportBrief>,
     outlinks: Vec<ReportBrief>,
     can_edit: bool,
+    marks: Vec<Mark>,
 }
 
 pub async fn get(
@@ -124,7 +129,8 @@ pub async fn get(
     let backlinks = state.world.report_backlinks(user.0, org, id).await.map_err(internal)?;
     let outlinks = state.world.report_outlinks(user.0, org, &report).await.map_err(internal)?;
     let can_edit = role >= Role::Write && reports::can_edit(&report, user.0, role, org);
-    Ok(Json(ReportDetail { report, backlinks, outlinks, can_edit }))
+    let marks = if report.kind == "canvas" { state.world.canvas_marks(id).await.map_err(internal)? } else { Vec::new() };
+    Ok(Json(ReportDetail { report, backlinks, outlinks, can_edit, marks }))
 }
 
 pub async fn update(
@@ -189,4 +195,143 @@ pub async fn restore(
         .map_err(invalid)?
         .map(Json)
         .ok_or((StatusCode::NOT_FOUND, String::new()))
+}
+
+#[derive(Deserialize)]
+pub struct CanvasChange {
+    ops: serde_json::Value,
+}
+
+pub async fn change_canvas(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserId>,
+    Extension(role): Extension<Role>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<CanvasChange>,
+) -> Result<Json<Report>, (StatusCode, String)> {
+    editable(&state, user.0, role, id).await.map_err(status)?;
+    let ops = canvas::parse_ops(&body.ops).map_err(invalid)?;
+    state
+        .world
+        .change_canvas(id, ReportActor::User(user.0), ops)
+        .await
+        .map_err(invalid)?
+        .map(|(report, _)| Json(report))
+        .ok_or((StatusCode::NOT_FOUND, String::new()))
+}
+
+pub async fn add_mark(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserId>,
+    Extension(role): Extension<Role>,
+    Path(id): Path<Uuid>,
+    Json(mark): Json<NewMark>,
+) -> Result<Json<Mark>, (StatusCode, String)> {
+    let report = editable(&state, user.0, role, id).await.map_err(status)?;
+    state.world.add_canvas_mark(&report, user.0, mark).await.map(Json).map_err(invalid)
+}
+
+#[derive(Deserialize)]
+pub struct MarkChange {
+    resolved: bool,
+    reply: Option<String>,
+}
+
+pub async fn change_mark(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserId>,
+    Extension(role): Extension<Role>,
+    Path((id, mark)): Path<(Uuid, Uuid)>,
+    Json(body): Json<MarkChange>,
+) -> Result<Json<Mark>, (StatusCode, String)> {
+    let report = editable(&state, user.0, role, id).await.map_err(status)?;
+    state
+        .world
+        .resolve_canvas_mark(&report, mark, ReportActor::User(user.0), body.reply, !body.resolved)
+        .await
+        .map_err(invalid)?
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, String::new()))
+}
+
+pub async fn delete_mark(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserId>,
+    Extension(role): Extension<Role>,
+    Path((id, mark)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let report = editable(&state, user.0, role, id).await.map_err(status)?;
+    match state.world.remove_canvas_mark(&report, mark, ReportActor::User(user.0)).await.map_err(invalid)? {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err((StatusCode::NOT_FOUND, String::new())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    async fn state(url: &str) -> anyhow::Result<AppState> {
+        let db = loka_shared::db::Database::connect(url).await?;
+        let pool = db.pool().clone();
+        Ok(AppState {
+            db,
+            config: crate::config::ApiConfig { repos: vec![], backends: indexmap::IndexMap::new(), skills: vec![], mcp_servers: vec![] },
+            world: loka_shared::world::WorldStore::new(pool.clone()),
+            runners: loka_shared::runners::RunnerStore::new(pool),
+            world_tx: tokio::sync::broadcast::channel(8).0,
+            runner_tx: crate::runner_wakes::RunnerWakes::default(),
+            term: crate::terminal::TermHub::new(),
+        })
+    }
+
+    async fn member(state: &AppState, email: String) -> anyhow::Result<Uuid> {
+        let user: Uuid = sqlx::query_scalar("INSERT INTO users (email, name) VALUES ($1, 'Mark tester') RETURNING id").bind(email).fetch_one(state.db.pool()).await?;
+        sqlx::query("INSERT INTO org_members (org_id, user_id, role) VALUES ($1, $2, 'member') ON CONFLICT (org_id, user_id) DO NOTHING")
+            .bind(loka_shared::orgs::DEFAULT_ORG)
+            .bind(user)
+            .execute(state.db.pool())
+            .await?;
+        sqlx::query("UPDATE users SET active_org_id = $2 WHERE id = $1").bind(user).bind(loka_shared::orgs::DEFAULT_ORG).execute(state.db.pool()).await?;
+        Ok(user)
+    }
+
+    #[tokio::test]
+    async fn owners_delete_marks_and_others_cannot() -> anyhow::Result<()> {
+        let Ok(url) = std::env::var("REPORTS_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let state = state(&url).await?;
+        let tag = Uuid::new_v4().simple().to_string();
+        let owner = member(&state, format!("{tag}@marks.test")).await?;
+        let other = member(&state, format!("{tag}-x@marks.test")).await?;
+        let canvas = Canvas::from_raw(&json!({ "items": [{ "id": "n", "kind": "note", "text": "Wall" }] }), "person")?;
+        let new = NewReport {
+            owner_user_id: owner,
+            by: ReportActor::User(owner),
+            title: "Wall plan".into(),
+            body: String::new(),
+            folder: None,
+            tags: vec![],
+            visibility: None,
+            pinned: false,
+            task_id: None,
+        };
+        let report = state.world.create_canvas(new, canvas).await?;
+        let mark = state.world.add_canvas_mark(&report, owner, NewMark { item_id: Some("n".into()), body: "taller".into(), ..Default::default() }).await?;
+        let delete = |user: Uuid| delete_mark(State(state.clone()), Extension(UserId(user)), Extension(Role::Write), Path((report.id, mark.id)));
+
+        assert_eq!(delete(other).await.unwrap_err().0, StatusCode::NOT_FOUND);
+        assert_eq!(state.world.canvas_marks(report.id).await?.len(), 1);
+        assert_eq!(delete(owner).await.map_err(|e| anyhow::anyhow!("{e:?}"))?, StatusCode::NO_CONTENT);
+        assert!(state.world.canvas_marks(report.id).await?.is_empty());
+        assert_eq!(delete(owner).await.unwrap_err().0, StatusCode::NOT_FOUND);
+
+        sqlx::query("DELETE FROM world_events WHERE payload->>'owner_user_id' = $1").bind(owner.to_string()).execute(state.db.pool()).await?;
+        sqlx::query("DELETE FROM world_reports WHERE owner_user_id = $1").bind(owner).execute(state.db.pool()).await?;
+        sqlx::query("DELETE FROM org_members WHERE user_id = ANY($1)").bind(vec![owner, other]).execute(state.db.pool()).await?;
+        sqlx::query("DELETE FROM users WHERE id = ANY($1)").bind(vec![owner, other]).execute(state.db.pool()).await?;
+        Ok(())
+    }
 }

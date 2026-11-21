@@ -1279,13 +1279,14 @@ fn write_slack_key(path: &Path) -> Result<(), std::io::Error> {
     write_private(path, key.as_bytes())
 }
 
+fn git_config_text(include: Option<&Path>) -> String {
+    let include = include.map(|path| format!("[include]\n\tpath = {}\n", path.display())).unwrap_or_default();
+    let github = "\thelper =\n\thelper = !gh auth git-credential\n";
+    format!("{include}[credential \"https://github.com\"]\n{github}[credential \"https://gist.github.com\"]\n{github}")
+}
+
 fn write_git_config(path: &Path) -> Result<(), std::io::Error> {
-    let include = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".gitconfig"))
-        .filter(|path| path.is_file())
-        .map(|path| format!("[include]\n\tpath = {}\n", path.display()))
-        .unwrap_or_default();
+    let include = std::env::var_os("HOME").map(PathBuf::from).map(|home| home.join(".gitconfig")).filter(|path| path.is_file());
     let mut options = OpenOptions::new();
     options.create(true).truncate(true).write(true);
     #[cfg(unix)]
@@ -1294,7 +1295,7 @@ fn write_git_config(path: &Path) -> Result<(), std::io::Error> {
         options.mode(0o600);
     }
     let mut file = options.open(path)?;
-    file.write_all(format!("{include}[credential \"https://github.com\"]\n\thelper = !gh auth git-credential\n[credential \"https://gist.github.com\"]\n\thelper = !gh auth git-credential\n").as_bytes())
+    file.write_all(git_config_text(include.as_deref()).as_bytes())
 }
 
 fn opencode_enabled() -> bool {
@@ -1494,6 +1495,55 @@ mod tests {
             let permission = format!("allow-{}", command.replace('_', "-"));
             assert!(allowed.contains(&permission.as_str()), "{permission} missing from capabilities/main.json");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn github_credentials_skip_the_keychain_and_store_helpers() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("world-git-credentials-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let generic_log = dir.join("generic.log");
+        let gh_log = dir.join("gh.log");
+        let user_config = dir.join("user.gitconfig");
+        let generic = dir.join("git-credential-generic");
+        std::fs::write(&generic, format!("#!/bin/sh\necho \"$@\" >> '{}'\n", generic_log.display())).unwrap();
+        std::fs::set_permissions(&generic, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&user_config, format!("[credential]\n\thelper = {}\n", generic.display())).unwrap();
+        let config = dir.join("gitconfig");
+        std::fs::write(&config, git_config_text(Some(&user_config))).unwrap();
+        let gh = dir.join("gh");
+        std::fs::write(&gh, format!("#!/bin/sh\necho \"$@\" >> '{}'\n", gh_log.display())).unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default());
+        let approve = |host: &str| {
+            let mut child = Command::new("git")
+                .args(["credential", "approve"])
+                .env("GIT_CONFIG_GLOBAL", &config)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("PATH", &path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(format!("protocol=https\nhost={host}\nusername=x\npassword=y\n\n").as_bytes())
+                .unwrap();
+            child.wait().unwrap();
+        };
+        approve("github.com");
+        assert!(gh_log.is_file());
+        assert!(!generic_log.exists());
+        approve("gist.github.com");
+        assert!(!generic_log.exists());
+        approve("example.com");
+        assert!(generic_log.is_file());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

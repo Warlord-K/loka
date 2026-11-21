@@ -18,6 +18,9 @@ mod music_tools;
 #[path = "world/reports_tools.rs"]
 mod reports_tools;
 
+#[path = "world/canvas_tools.rs"]
+mod canvas_tools;
+
 #[path = "world/teams_tools.rs"]
 mod teams_tools;
 

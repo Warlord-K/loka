@@ -1059,7 +1059,17 @@ export interface SearchMessageHit {
 export interface SearchResults {
   agents: { id: string; name: string; slug: string; avatar_emoji: string; expertise: string | null; tags: string[] }[];
   messages: SearchMessageHit[];
-  reports?: { id: string; title: string; folder: string; visibility: string; author_agent_id: string | null; excerpt: string; updated_at: string }[];
+  reports?: {
+    id: string;
+    title: string;
+    folder: string;
+    visibility: string;
+    author_agent_id: string | null;
+    excerpt: string;
+    updated_at: string;
+    kind?: "doc" | "canvas";
+    items?: { id: string; kind: string; label: string }[];
+  }[];
   quests: { id: string; title: string; status: string; assigned_agent_id: string | null; updated_at: string | null }[];
   todos: { id: string; text: string; status: string; priority: number; added_at: string }[];
   lists: { id: string; kind?: "list" | "timer"; name: string; status: string; updated_at: string }[];

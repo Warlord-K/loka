@@ -877,7 +877,10 @@ pub async fn post_message(
         .await
         .map_err(internal)?
         .unwrap_or_else(|| "someone".to_string());
-    let quote = loka_shared::quotes::clean(body.quote.as_ref());
+    let mut quote = loka_shared::quotes::clean(body.quote.as_ref());
+    if let (Some(q), Some(org)) = (quote.as_mut(), viewer.org) {
+        state.world.expand_canvas_quote(user.0, org, q, loka_shared::canvas::QuoteCards::Resolved).await.map_err(internal)?;
+    }
     let setup_card = match text.is_empty() {
         true => None,
         false => crate::routes::setup_scan::card_kind(&state, id, body.answers).await?,
@@ -2425,7 +2428,10 @@ pub async fn post_channel(
                 if body.spoken {
                     meta["spoken"] = json!(true);
                 }
-                if let Some(quote) = loka_shared::quotes::clean(body.quote.as_ref()) {
+                if let Some(mut quote) = loka_shared::quotes::clean(body.quote.as_ref()) {
+                    if let Some(org) = viewer.org {
+                        state.world.expand_canvas_quote(user.0, org, &mut quote, loka_shared::canvas::QuoteCards::RefsOnly).await.map_err(internal)?;
+                    }
                     meta["quote"] = quote;
                 }
                 meta

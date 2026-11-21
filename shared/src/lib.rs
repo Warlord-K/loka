@@ -35,6 +35,7 @@ pub mod progress;
 pub mod readiness;
 pub mod remote;
 pub mod reports;
+pub mod canvas;
 pub mod loka;
 pub mod loka_env;
 pub mod media;

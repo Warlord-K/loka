@@ -6,7 +6,7 @@ import { AgentFace } from "./channel-ui";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Command } from "cmdk";
 import Glide from "./glide";
-import { AppleLogo, ArrowsClockwise, Crown, Lightning, ArrowCounterClockwise, Bell, BookOpenText, Buildings, CalendarDots, ChatCircleDots, CheckSquare, CircleHalf, ClockCounterClockwise, Code, Coins, Compass, Star, Desktop, DeviceMobile, DownloadSimple, FileText, Gavel, GraduationCap, Hash, Hammer, House, IdentificationBadge, IdentificationCard, Key, Keyboard, ListChecks, MagnifyingGlass, MapTrifold, Microphone, Monitor, Moon, MusicNotes, Pause, PaperPlaneRight, Play, Plugs, Plus, PuzzlePiece, Rss, Scroll, ShareNetwork, SignOut, SkipForward, SlackLogo, Smiley, Sparkle, SpeakerHigh, SpeakerSlash, Square, Sun, Sword, TerminalWindow, TextAa, Timer, Trophy, UploadSimple, User, UserCircle, UserSwitch, UsersThree, X } from "@phosphor-icons/react";
+import { AppleLogo, ArrowsClockwise, Crown, Lightning, ArrowCounterClockwise, Bell, BookOpenText, Buildings, CalendarDots, ChatCircleDots, CheckSquare, CircleHalf, ClockCounterClockwise, Code, Coins, Compass, Star, Desktop, DeviceMobile, DownloadSimple, FileText, FlowArrow, Gavel, GraduationCap, Hash, Hammer, House, IdentificationBadge, IdentificationCard, Key, Keyboard, ListChecks, MagnifyingGlass, MapTrifold, Microphone, Monitor, Moon, MusicNotes, Pause, PaperPlaneRight, Play, Plugs, Plus, PuzzlePiece, Rss, Scroll, ShareNetwork, SignOut, SkipForward, SlackLogo, Smiley, Sparkle, SpeakerHigh, SpeakerSlash, Square, Sun, Sword, TerminalWindow, TextAa, Timer, Trophy, UploadSimple, User, UserCircle, UserSwitch, UsersThree, X } from "@phosphor-icons/react";
 import { openQuickChat } from "./quick-chat";
 import { cn } from "@/lib/utils";
 import { worldApi, type SearchResults, type WorldAgent } from "@/lib/world";
@@ -14,7 +14,7 @@ import { openMessage } from "./message-links";
 import { StatusIcon } from "./quest-ui";
 import { CHUNKY } from "./styles";
 import { focusTodo } from "./todos-ui";
-import { openReport } from "@/lib/reports";
+import { CANVAS_KIND_LABEL, openReport, type CanvasKind } from "@/lib/reports";
 import { CHANGELOG, changelogDate, openChangelog } from "@/lib/changelog";
 import { desktopApi, isDesktopApp } from "@/lib/desktop";
 import { stepTextScale } from "@/lib/text-scale";
@@ -531,19 +531,31 @@ export function DesktopCommandPalette({
             <>
               {(results.reports?.length ?? 0) > 0 && (
                 <HitGroup heading="Reports">
-                  {results.reports?.map((report) => (
+                  {results.reports?.map((report) => [
                     <Command.Item key={report.id} value={`hit:report:${report.id}`} onSelect={() => select(() => openReport(report.id))} className={cn(ITEM, "items-start")}>
-                      <FileText size={16} weight="duotone" className="mt-0.5 shrink-0 text-w-link" />
+                      {report.kind === "canvas" ? <FlowArrow size={16} weight="duotone" className="mt-0.5 shrink-0 text-w-link" /> : <FileText size={16} weight="duotone" className="mt-0.5 shrink-0 text-w-link" />}
                       <span className="min-w-0 flex-1">
                         <span className="flex items-baseline gap-1.5 text-w-xs text-w-muted">
                           <span className="truncate font-medium text-w-text">{report.title}</span>
+                          {report.kind === "canvas" && <span className="shrink-0">Canvas</span>}
                           {report.folder && <span className="truncate">{report.folder}</span>}
                         </span>
-                        {report.excerpt && <span className="line-clamp-2 text-w-sm leading-snug">{report.excerpt}</span>}
+                        {report.excerpt && !report.items?.length && <span className="line-clamp-2 text-w-sm leading-snug">{report.excerpt}</span>}
                       </span>
                       <span className="shrink-0 pt-0.5 text-w-2xs text-w-muted">{shortDate(report.updated_at)}</span>
-                    </Command.Item>
-                  ))}
+                    </Command.Item>,
+                    ...(report.items ?? []).map((item) => (
+                      <Command.Item
+                        key={`${report.id}#${item.id}`}
+                        value={`hit:canvas-item:${report.id}#${item.id}`}
+                        onSelect={() => select(() => openReport(report.id, item.id))}
+                        className={cn(ITEM, "items-start pl-9")}
+                      >
+                        <span className="mt-0.5 w-12 shrink-0 text-w-2xs font-semibold text-w-muted">{CANVAS_KIND_LABEL[item.kind as CanvasKind] ?? "Item"}</span>
+                        <span className="line-clamp-2 min-w-0 flex-1 text-w-sm leading-snug">{item.label.replace(/[#*_`>]+/g, " ").replace(/\s+/g, " ").trim()}</span>
+                      </Command.Item>
+                    )),
+                  ])}
                 </HitGroup>
               )}
               {results.messages.length > 0 && (

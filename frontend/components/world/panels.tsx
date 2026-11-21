@@ -1369,6 +1369,8 @@ export function describeNotification(e: WorldEvent, names: Map<string, string>):
       return `${who} needs your decision: ${str("text")}`;
     case "agent.budget":
       return p.paused ? `${who} paused for today: ${str("text")}` : `${who} is near its daily budget: ${str("text")}`;
+    case "runner.disk_low":
+      return str("message") || `${str("runner_name") || "A device"} is almost out of disk space.`;
     case "channel.message":
       return `${str("author")} mentioned you in ${str("channel")}: ${str("body").slice(0, 140)}`;
     case "slack.notification": {

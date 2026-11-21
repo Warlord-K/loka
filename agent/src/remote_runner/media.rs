@@ -25,10 +25,25 @@ pub(super) fn prune(dir: &Path) {
     }
 }
 
+const CANVAS_FILE_TOOLS: [&str; 2] = ["create_canvas", "canvas_add_items"];
+const MAX_CANVAS_FILES: usize = 24;
+
+fn item_files(request: &Value) -> bool {
+    request
+        .pointer("/params/arguments/items")
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.iter().any(|item| item.get("file").and_then(Value::as_str).is_some_and(|f| !f.trim().is_empty())))
+}
+
 pub(super) fn wants_files(request: &Value) -> bool {
-    request.get("method").and_then(Value::as_str) == Some("tools/call")
-        && request.pointer("/params/name").and_then(Value::as_str) == Some("show_media")
-        && request.pointer("/params/arguments/files").and_then(Value::as_array).is_some_and(|files| !files.is_empty())
+    if request.get("method").and_then(Value::as_str) != Some("tools/call") {
+        return false;
+    }
+    match request.pointer("/params/name").and_then(Value::as_str) {
+        Some("show_media") => request.pointer("/params/arguments/files").and_then(Value::as_array).is_some_and(|files| !files.is_empty()),
+        Some(name) => CANVAS_FILE_TOOLS.contains(&name) && item_files(request),
+        None => false,
+    }
 }
 
 pub(super) fn refusal(request: &Value, message: &str) -> Value {
@@ -85,7 +100,27 @@ async fn upload(api: &RunnerApi, lease_id: Uuid, token: &str, path: &Path) -> Re
     answer.get("id").and_then(Value::as_str).map(String::from).ok_or_else(|| format!("{name}: the upload gave no id"))
 }
 
+async fn upload_item_files(api: &RunnerApi, lease_id: Uuid, token: &str, roots: &[PathBuf], request: &mut Value) -> Result<(), String> {
+    let Some(items) = request.pointer_mut("/params/arguments/items").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    if items.iter().filter(|item| item.get("file").is_some()).count() > MAX_CANVAS_FILES {
+        return Err(format!("place at most {MAX_CANVAS_FILES} files at a time"));
+    }
+    for item in items.iter_mut() {
+        let Some(fields) = item.as_object_mut() else { continue };
+        let Some(file) = fields.remove("file") else { continue };
+        let file = file.as_str().ok_or_else(|| "file is a path".to_string())?.to_string();
+        let path = resolve(&file, roots)?;
+        fields.insert("upload_id".into(), Value::String(upload(api, lease_id, token, &path).await?));
+    }
+    Ok(())
+}
+
 pub(super) async fn upload_files(api: &RunnerApi, lease_id: Uuid, token: &str, roots: &[PathBuf], request: &mut Value) -> Result<(), String> {
+    if request.pointer("/params/name").and_then(Value::as_str) != Some("show_media") {
+        return upload_item_files(api, lease_id, token, roots, request).await;
+    }
     let files: Vec<String> = request
         .pointer("/params/arguments/files")
         .and_then(Value::as_array)
@@ -140,5 +175,10 @@ mod tests {
         assert!(wants_files(&call(json!({ "files": ["a.png"] }))));
         assert!(!wants_files(&call(json!({ "urls": ["https://x.test/a.png"] }))));
         assert!(!wants_files(&json!({ "method": "tools/call", "params": { "name": "list_tasks", "arguments": { "files": ["a"] } } })));
+        let canvas = |name: &str, items: Value| json!({ "method": "tools/call", "params": { "name": name, "arguments": { "items": items } } });
+        assert!(wants_files(&canvas("canvas_add_items", json!([{ "kind": "image", "file": "a.png" }]))));
+        assert!(wants_files(&canvas("create_canvas", json!([{ "kind": "note", "text": "x" }, { "kind": "model", "file": "m.glb" }]))));
+        assert!(!wants_files(&canvas("canvas_add_items", json!([{ "kind": "note", "text": "x" }]))));
+        assert!(!wants_files(&canvas("canvas_update_items", json!([{ "id": "a", "file": "a.png" }]))));
     }
 }

@@ -309,6 +309,23 @@ impl WorldStore {
         .await?)
     }
 
+    pub async fn agent_reaches_channel(&self, channel_id: Uuid, agent: Uuid, public_too: bool) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT ($3 AND c.kind = 'channel')
+                 OR EXISTS (SELECT 1 FROM channel_members m WHERE m.channel_id = c.id AND m.member_kind = 'agent' AND m.member_id = $2)
+                 OR EXISTS (SELECT 1 FROM agent_teams t WHERE t.channel_id = c.id AND (
+                        EXISTS (SELECT 1 FROM agent_team_members tm WHERE tm.team_id = t.id AND tm.member_kind = 'agent' AND tm.member_id = $2)
+                     OR EXISTS (SELECT 1 FROM org_members om WHERE om.user_id = t.owner_user_id AND om.org_id = c.org_id AND om.main_agent_id = $2)))
+             FROM channels c WHERE c.id = $1",
+        )
+        .bind(channel_id)
+        .bind(agent)
+        .bind(public_too)
+        .fetch_optional(self.pool())
+        .await?
+        .unwrap_or(false))
+    }
+
     pub async fn channel_messages(&self, channel_id: Uuid, after: Option<i64>, limit: i64) -> Result<Vec<ChannelMessage>> {
         self.channel_messages_page(channel_id, after, None, limit).await
     }
