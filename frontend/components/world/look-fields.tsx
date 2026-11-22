@@ -1,11 +1,12 @@
 "use client";
 
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { cn } from "@/lib/utils";
 import { HATS, LOOK_ACCESSORIES, SPECIES_OPTIONS, lookFor } from "@/lib/looks";
 import type { Accessory } from "./types";
 import { portraitUrl } from "./characters";
 import { AgentAvatar } from "./channel-ui";
+import { figurePreview } from "./sprites";
 import { WCombobox } from "./controls";
 import { FOCUS, PILL_INK, PILL_NEUTRAL } from "./styles";
 
@@ -20,7 +21,7 @@ function label(value: string): string {
   return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
-const SPECIES_CHOICES = SPECIES_OPTIONS.map((value) => ({ value, label: label(value), hint: value === "person" ? "default" : undefined }));
+const SPECIES_CHOICES = SPECIES_OPTIONS.map((value) => ({ value, label: label(value), hint: value === "human" ? "default" : undefined }));
 
 export function toggleAccessory(list: Accessory[], item: Accessory): Accessory[] {
   if (list.includes(item)) return list.filter((a) => a !== item);
@@ -43,17 +44,32 @@ export function LookFields({
   accessories: Accessory[];
   onAccessories: (value: Accessory[]) => void;
 }) {
-  const preview = useMemo(
-    () => portraitUrl(lookFor({ slug: slug || "new-agent", persona: "", look: { ...(look ?? {}), species: species.trim() || "person", accessories } }), 6),
+  const resolved = useMemo(
+    () => lookFor({ slug: slug || "new-agent", persona: "", look: { ...(look ?? {}), species: species.trim() || "human", accessories } }),
     [slug, look, species, accessories],
   );
+  const preview = useMemo(() => portraitUrl(resolved, 6), [resolved]);
+  const [figure, setFigure] = useState<{ for: typeof resolved; url: string } | null>(null);
+  useEffect(() => {
+    let live = true;
+    void figurePreview(resolved).then((url) => {
+      if (live) setFigure(url ? { for: resolved, url } : null);
+    });
+    return () => {
+      live = false;
+    };
+  }, [resolved]);
   return (
     <div className="flex gap-3">
-      <AgentAvatar portrait={preview} size="5rem" tall soft className="mt-6" />
+      {figure?.for === resolved ? (
+        <img src={figure.url} alt="" className="mt-6 h-20 w-20 shrink-0 object-contain object-bottom [image-rendering:pixelated]" />
+      ) : (
+        <AgentAvatar portrait={preview} size="5rem" tall soft className="mt-6" />
+      )}
       <div className="min-w-0 flex-1 space-y-2.5">
         <label className="block">
           <span className="mb-1.5 block text-w-sm font-medium text-w-text2">Species</span>
-          <WCombobox ariaLabel="Species" className="w-full" value={species} onChange={onSpecies} placeholder="Person" options={SPECIES_CHOICES} />
+          <WCombobox ariaLabel="Species" className="w-full" value={species} onChange={onSpecies} placeholder="Human" options={SPECIES_CHOICES} />
         </label>
         <div>
           <span className="mb-1.5 block text-w-sm font-medium text-w-text2">Accessories</span>
@@ -73,7 +89,7 @@ export function LookFields({
               );
             })}
           </div>
-          <p className="mt-1.5 text-w-xs text-w-muted">One hat at a time. Any species not in the list shows as a person.</p>
+          <p className="mt-1.5 text-w-xs text-w-muted">One hat at a time. Any species not in the list shows as a human.</p>
         </div>
       </div>
     </div>

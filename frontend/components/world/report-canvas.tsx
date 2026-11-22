@@ -23,6 +23,7 @@ import {
   type NodeProps,
 } from "@xyflow/react";
 import {
+  ArrowsOut,
   ArrowUpRight,
   Cards,
   ChatCircleDots,
@@ -53,6 +54,7 @@ import { worldApi, type SearchResults, type WorldAgent } from "@/lib/world";
 import { canvasItemKind, canvasItemLabel, openReport, ReportError, reportsApi, wikify, type CanvasDoc, type CanvasItem, type CanvasMark, type CanvasOp, type ReportBrief, type ReportDetail, type StickyColor } from "@/lib/reports";
 import { RichText } from "./chat-kit";
 import { embedFromHref, EmbedView } from "./embeds";
+import { Lightbox } from "./media-view";
 import { UiCard } from "./lazy";
 import { MAIN_TARGET, sendQuote } from "./quote";
 import { RunCommandContext, type RunCommand } from "./run-command";
@@ -122,6 +124,7 @@ interface Ctx {
   resolve: (mark: CanvasMark, resolved: boolean) => void;
   removeMark: (mark: CanvasMark) => void;
   resize: (item: CanvasItem, box: { x: number; y: number; width: number; height: number }) => void;
+  openMedia: (item: CanvasItem) => void;
 }
 
 const CanvasCtx = createContext<Ctx | null>(null);
@@ -190,11 +193,29 @@ function ItemCard({ item }: { item: CanvasItem }) {
   );
 }
 
+const isPreviewable = (item: CanvasItem) => item.kind === "image" || item.kind === "video";
+
+function ImageItem({ item }: { item: CanvasItem }) {
+  const { openMedia } = useCtx();
+  const ref = useRef<HTMLImageElement>(null);
+  useEffect(() => {
+    const img = ref.current;
+    if (!img) return;
+    const onDouble = (e: MouseEvent) => {
+      e.stopPropagation();
+      openMedia(item);
+    };
+    img.addEventListener("dblclick", onDouble);
+    return () => img.removeEventListener("dblclick", onDouble);
+  }, [item, openMedia]);
+  return <img ref={ref} src={upload(item.upload_id)} alt={item.caption ?? "Image"} draggable={false} className="h-full w-full cursor-zoom-in rounded-md bg-w-sand object-cover" />;
+}
+
 function ItemBody({ item }: { item: CanvasItem }) {
   const { handles, onOpenAgent, runner, known, onWiki } = useCtx();
   switch (item.kind) {
     case "image":
-      return <img src={upload(item.upload_id)} alt={item.caption ?? "Image"} draggable={false} className="h-full w-full rounded-md bg-w-sand object-cover" />;
+      return <ImageItem item={item} />;
     case "video":
       return <video src={upload(item.upload_id)} controls muted playsInline preload="metadata" className="nodrag h-full w-full rounded-md bg-w-ink object-contain" />;
     case "model":
@@ -255,7 +276,7 @@ function ItemBody({ item }: { item: CanvasItem }) {
 }
 
 function ItemView({ data, selected }: NodeProps<ItemNode>) {
-  const { canEdit, resize, single, quoteItem, linkItem } = useCtx();
+  const { canEdit, resize, single, quoteItem, linkItem, openMedia } = useCtx();
   const item = data.item;
   const media = item.kind === "image" || item.kind === "video" || item.kind === "model";
   return (
@@ -263,6 +284,7 @@ function ItemView({ data, selected }: NodeProps<ItemNode>) {
       <NodeToolbar isVisible={single === item.id && item.kind !== "ink"} position={Position.Top} offset={item.kind === "frame" ? 34 : 10}>
         <div className="flex items-center gap-0.5 rounded-lg border-2 border-w-ink bg-w-paper p-0.5 shadow-[0_3px_0_rgb(var(--w-ink))]">
           <span className="px-1.5 text-w-2xs font-semibold text-w-muted">{canvasItemKind(item)}</span>
+          {isPreviewable(item) && <ClusterButton icon={ArrowsOut} label="Open larger" onClick={() => openMedia(item)} />}
           <ClusterButton icon={Quotes} label="Quote in chat" onClick={() => quoteItem(item)} />
           <ClusterButton icon={LinkIcon} label="Copy a link to this item" onClick={() => linkItem(item)} />
         </div>
@@ -433,6 +455,7 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
   const [naming, setNaming] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [viewing, setViewing] = useState<string | null>(null);
   const [copied, copy] = useCopy();
   const dragging = useRef(false);
   const riders = useRef<{ anchor: { id: string; x: number; y: number }; starts: Map<string, { x: number; y: number }>; pins: Map<string, { x: number; y: number }> } | null>(null);
@@ -739,6 +762,8 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
   });
 
   const fit = () => void flow.fitView({ padding: 0.15, duration: reduced() ? 0 : 260 });
+  const openMedia = useCallback((item: CanvasItem) => setViewing(item.id), []);
+  const closeMedia = useCallback(() => setViewing(null), []);
   const focused = useRef<unknown>(null);
   useEffect(() => {
     const id = focus?.item;
@@ -793,7 +818,10 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
     resolve,
     removeMark,
     resize,
+    openMedia,
   };
+  const media = doc.items.filter(isPreviewable).map((i) => ({ id: i.id, mime: i.kind === "video" ? "video/mp4" : "image/png", name: i.caption ?? canvasItemKind(i), url: upload(i.upload_id) }));
+  const viewingAt = media.findIndex((m) => m.id === viewing);
   const links: { label: string; list: ReportBrief[] }[] = [
     { label: "Linked from", list: detail.backlinks },
     { label: "Links to", list: detail.outlinks },
@@ -1128,6 +1156,7 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
           <ClusterButton icon={CornersOut} label="Fit to view" onClick={fit} />
         </div>
       </div>
+      <AnimatePresence>{viewingAt >= 0 && <Lightbox key="media" items={media} start={viewingAt} onClose={closeMedia} />}</AnimatePresence>
     </CanvasCtx.Provider>
   );
 }

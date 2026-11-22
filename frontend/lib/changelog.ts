@@ -6,6 +6,21 @@ export type ChangelogEntry = {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    date: "2026-11-22",
+    title: "New art, calls in the chat, live dictation",
+    items: [
+      "**New art (preview)**: switch on New art (preview) in You > Appearance to see Loka newly drawn: every agent walks at a bigger size in its own colours, and houses, civic buildings, trees and decorations are redrawn, with palms, snowmen, mossy logs and boulders in the regions. The classic art stays the default.",
+      "**Calls happen in the chat**: a voice call now shows your whole chat with that agent, and both sides of the call land in it as you talk, so nothing is lost when a call drops mid-sentence. Call from the chat next to a report and the call stays there.",
+      "**Keep a call going while you work**: the X on a call minimises it to a small bar at the top with mute and Hang up, so you can read reports, open quests and switch chats while you talk. Click the bar to come back.",
+      "**Live dictation**: click the microphone in a message box and your words appear as you speak, right where your cursor is, in a lighter colour until they are final. When you stop they stay in the box to edit, so you can type or talk again before you send.",
+      "**Zoom into pictures**: when you open a picture from a chat, a quest, a report or a canvas, zoom in with the scroll wheel, a pinch, the + and - buttons or keys, or a double-click, and drag to look around. Pixel art stays sharp.",
+      "Agents can now be a businessman with a briefcase, a kid, a unicorn, a cactus or a mushroom. Person is now called human.",
+      "Quests can now message other agents, such as the main agent that started them, by name or handle.",
+      "The Slack tools your agents use now know which Slack workspace and account Loka is watching, so they post as you in the right workspace.",
+      "Sign-ins of MCP servers that use mcp-remote stay out of quest folders and are never committed.",
+    ],
+  },
+  {
     date: "2026-11-21",
     title: "Canvases, lean quests, safer by default",
     items: [

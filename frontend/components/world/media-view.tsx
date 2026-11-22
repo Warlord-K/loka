@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { AnimatePresence, motion } from "framer-motion";
 import { ArrowSquareOut, CaretDown, CaretLeft, CaretRight, DownloadSimple, FilmStrip, X } from "@phosphor-icons/react";
@@ -9,6 +9,7 @@ import { cn } from "@/lib/utils";
 import type { Attachment } from "@/lib/world";
 import { MODAL_MOTION, SCRIM_MOTION } from "./motion";
 import { ICON_BTN } from "./styles";
+import { ZoomableImage } from "./zoomable-image";
 
 const IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 const VIDEO_TYPES = ["video/mp4", "video/webm", "video/quicktime"];
@@ -26,21 +27,31 @@ export function mediaSummary(items: Attachment[]): string {
   return [part(pictures, "picture", "pictures"), part(videos, "video", "videos")].filter(Boolean).join(" and ");
 }
 
+const typesIntoField = (target: EventTarget | null) => target instanceof HTMLElement && !!target.closest("input,textarea,select,[contenteditable]:not([contenteditable=false])");
+
 export function Lightbox({ items, start = 0, onClose }: { items: Attachment[]; start?: number; onClose: () => void }) {
   const [at, setAt] = useState(Math.min(start, items.length - 1));
   const item = items[at] ?? items[0];
   const many = items.length > 1;
+  const zoomKeys = useRef<((e: KeyboardEvent) => boolean) | null>(null);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
+      if (typesIntoField(e.target) || document.querySelector("[cmdk-dialog]")) return;
+      if (zoomKeys.current?.(e)) {
         e.preventDefault();
-        e.stopPropagation();
+        e.stopImmediatePropagation();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopImmediatePropagation();
         onClose();
       } else if (many && (e.key === "ArrowRight" || e.key === "ArrowLeft")) {
         e.preventDefault();
-        e.stopPropagation();
+        e.stopImmediatePropagation();
         const step = e.key === "ArrowRight" ? 1 : -1;
         setAt((i) => (i + step + items.length) % items.length);
+      } else if (!e.metaKey && !e.ctrlKey && !e.altKey) {
+        if (e.key === "Backspace" || e.key === "Delete") e.preventDefault();
+        e.stopImmediatePropagation();
       }
     };
     window.addEventListener("keydown", onKey, true);
@@ -50,8 +61,8 @@ export function Lightbox({ items, start = 0, onClose }: { items: Attachment[]; s
   const url = mediaUrl(item);
   const desktop = isDesktopApp();
   return createPortal(
-    <motion.div {...SCRIM_MOTION} className="fixed inset-0 z-[96] grid place-items-center bg-w-scrim/80 p-4" onClick={onClose} role="dialog" aria-modal="true" aria-label={item.name || "Media"}>
-      <motion.div {...MODAL_MOTION} className="relative flex max-h-full max-w-full flex-col items-center gap-2" onClick={(e) => e.stopPropagation()}>
+    <motion.div {...SCRIM_MOTION} className="fixed inset-0 z-[96] grid place-items-center bg-w-scrim/80 p-2 sm:p-4" onClick={onClose} role="dialog" aria-modal="true" aria-label={item.name || "Media"}>
+      <motion.div {...MODAL_MOTION} className="relative flex h-full w-full flex-col items-center gap-2" onClick={(e) => e.stopPropagation()}>
         <div className="flex w-full items-center justify-end gap-1">
           <span className="mr-auto min-w-0 truncate text-w-sm text-w-onscrim">
             {item.name}
@@ -81,9 +92,11 @@ export function Lightbox({ items, start = 0, onClose }: { items: Attachment[]; s
           </button>
         </div>
         {isVideo(item.mime) ? (
-          <video key={url} src={url} controls autoPlay playsInline className="max-h-[80vh] max-w-[90vw] rounded-lg border-2 border-w-ink bg-black" />
+          <div className="grid min-h-0 w-full flex-1 place-items-center" onClick={(e) => e.target === e.currentTarget && onClose()}>
+            <video key={url} src={url} controls autoPlay playsInline className="max-h-full max-w-full rounded-lg border-2 border-w-ink bg-black" />
+          </div>
         ) : (
-          <img key={url} src={url} alt={item.name || "Picture"} className="max-h-[80vh] max-w-[90vw] rounded-lg border-2 border-w-ink bg-w-field object-contain" />
+          <ZoomableImage key={url} src={url} alt={item.name || "Picture"} keys={zoomKeys} onDismiss={onClose} />
         )}
       </motion.div>
     </motion.div>,

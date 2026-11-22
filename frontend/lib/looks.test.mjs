@@ -1,14 +1,28 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { LOOK_ACCESSORIES, SPECIES_OPTIONS, declaredAccessories, gearAccessories, lookFor, speciesFor, unknownAccessories, withGear } from "./looks.ts";
+import { HATS, LOOK_ACCESSORIES, SPECIES_OPTIONS, declaredAccessories, gearAccessories, humanBodyFor, lookFor, speciesFor, unknownAccessories, withGear, withoutHats } from "./looks.ts";
 
 const agent = (look, persona = "") => ({ slug: "test-agent", persona, look });
 
-test("every listed species except person draws a species", () => {
+test("every listed species except the human bodies draws a species", () => {
   for (const name of SPECIES_OPTIONS) {
-    if (name === "person") assert.equal(speciesFor(name), undefined);
-    else assert.ok(speciesFor(name), name);
+    if (["human", "businessman", "kid"].includes(name)) {
+      assert.equal(speciesFor(name), undefined, name);
+      assert.equal(humanBodyFor(name), name);
+    } else assert.ok(speciesFor(name), name);
   }
+});
+
+test("person and other non-animal species are humans, businessmen carry a briefcase", () => {
+  assert.equal(lookFor(agent({ species: "person" })).body, "human");
+  assert.equal(lookFor(agent({ species: "wizard of oz" })).body, "human");
+  const suit = lookFor(agent({ species: "businessman" }));
+  assert.equal(suit.body, "businessman");
+  assert.deepEqual(suit.accessories, ["briefcase"]);
+  assert.equal(lookFor(agent({ species: "businesswoman", accessories: ["glasses"] })).accessories.includes("briefcase"), false);
+  assert.equal(lookFor(agent({ species: "child" })).body, "kid");
+  assert.deepEqual(declaredAccessories(["briefcase"]), ["briefcase"]);
+  assert.ok(LOOK_ACCESSORIES.includes("briefcase"));
 });
 
 test("octopus and bunny have their own features", () => {
@@ -18,7 +32,7 @@ test("octopus and bunny have their own features", () => {
   assert.ok(lookFor(agent({ species: "squid" })).accessories.includes("tentacles"));
 });
 
-test("unknown species fall back to a person", () => {
+test("unknown species fall back to a human", () => {
   const person = lookFor(agent({ species: "person" }));
   const unknown = lookFor(agent({ species: "zorblax" }));
   assert.deepEqual(unknown, person);
@@ -88,4 +102,33 @@ test("ducks and penguins from persona or look words keep their old colours", () 
   assert.equal(lookFor(agent({}, "a calm penguin")).hair, "#d8433a");
   assert.equal(lookFor(agent({ archetype: "penguin" })).skin, "#57b65a");
   assert.notEqual(lookFor(agent({ archetype: "penguin", palette: "icy blue" })).skin, "#57b65a");
+});
+
+test("the new art draws no hats but keeps every other accessory", () => {
+  for (const hat of HATS) {
+    const look = lookFor(agent({ species: "human", accessories: [hat, "glasses", "scarf"] }));
+    assert.ok(look.accessories.includes(hat), hat);
+    assert.deepEqual(withoutHats(look).accessories, ["glasses", "scarf"], hat);
+  }
+  const suit = lookFor(agent({ species: "businessman", accessories: ["crown", "briefcase"] }));
+  assert.deepEqual(withoutHats(suit).accessories, ["briefcase"]);
+  const geared = { ...lookFor(agent({ species: "fox" })), accessories: withGear(lookFor(agent({ species: "fox" })).accessories, ["wizard"]) };
+  assert.deepEqual(withoutHats(geared).accessories, ["ears-pointed", "snout"]);
+  const bare = lookFor(agent({ species: "human", accessories: ["glasses"] }));
+  assert.equal(withoutHats(bare), bare);
+});
+
+test("the new species and business bodies come only from a declared species, never persona words", () => {
+  for (const words of ["a unicorn startup founder", "keeps a cactus on the desk", "loves mushroom risotto", "a toadstool collector", "runs the cacti garden", "a businessman at heart", "a businesswoman who ships", "an executive assistant", "every business person needs one"]) {
+    assert.equal(speciesFor("", words), undefined, words);
+    const look = lookFor(agent({}, words));
+    assert.equal(look.body, "human", words);
+    assert.equal(look.accessories.includes("briefcase"), false, words);
+    for (const feature of ["horn", "cactus", "mushroom-cap"]) assert.equal(look.accessories.includes(feature), false, words);
+  }
+  assert.equal(lookFor(agent({ species: "unicorn" })).body, "unicorn");
+  assert.equal(lookFor(agent({ species: "cacti" })).body, "cactus");
+  assert.equal(lookFor(agent({ species: "toadstool" })).body, "mushroom");
+  assert.equal(lookFor(agent({ species: "executive" })).body, "businessman");
+  assert.ok(lookFor(agent({ species: "mushroom" })).accessories.includes("mushroom-cap"));
 });

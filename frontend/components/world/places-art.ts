@@ -1,5 +1,6 @@
 import type { Sprite } from "./art";
 import { context, disc, ellipse, makeCanvas, rect, shade, type Ctx } from "./pixels";
+import { rememberThing } from "./sprites";
 
 export type CivicId = "clock" | "library" | "forge" | "post" | "market" | "observatory";
 
@@ -266,5 +267,8 @@ const MAKERS: Record<CivicId, () => CivicSprite> = {
 };
 
 export function makeCivic(id: CivicId): CivicSprite {
-  return MAKERS[id]();
+  const civic = MAKERS[id]();
+  rememberThing(civic.day, `civic_${id}`);
+  rememberThing(civic.night, `civic_${id}`, {}, true);
+  return civic;
 }

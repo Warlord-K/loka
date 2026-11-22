@@ -395,6 +395,23 @@ impl WorldStore {
             .unwrap_or(true))
     }
 
+    pub async fn new_art(&self, user: Uuid) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, bool>("SELECT new_art FROM users WHERE id = $1")
+            .bind(user)
+            .fetch_optional(self.pool())
+            .await?
+            .unwrap_or(false))
+    }
+
+    pub async fn set_new_art(&self, user: Uuid, on: bool) -> Result<()> {
+        sqlx::query("UPDATE users SET new_art = $2 WHERE id = $1")
+            .bind(user)
+            .bind(on)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
     pub async fn set_mention_wakes_main(&self, user: Uuid, on: bool) -> Result<()> {
         sqlx::query("UPDATE users SET mention_wakes_main = $2 WHERE id = $1")
             .bind(user)

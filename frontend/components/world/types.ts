@@ -5,6 +5,7 @@ export type Accessory =
   | "bun"
   | "glasses"
   | "apron"
+  | "briefcase"
   | "scarf"
   | "headband"
   | "beard"
@@ -41,7 +42,10 @@ export type Accessory =
   | "stripes"
   | "crown"
   | "cape"
-  | "headphones";
+  | "headphones"
+  | "horn"
+  | "cactus"
+  | "mushroom-cap";
 
 export interface LokaLook {
   skin: string;
@@ -50,6 +54,7 @@ export interface LokaLook {
   pants: string;
   accent?: string;
   accessories?: Accessory[];
+  body?: string;
 }
 
 export type Trade = "carpenter" | "smith" | "alchemist" | "wizard" | "warrior";

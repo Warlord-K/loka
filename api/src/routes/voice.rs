@@ -447,6 +447,9 @@ pub async fn status(State(state): State<AppState>, Path(id): Path<Uuid>) -> Resu
 pub struct Line {
     role: String,
     text: String,
+    key: Option<String>,
+    #[serde(default)]
+    partial: bool,
 }
 
 #[derive(Deserialize)]
@@ -475,12 +478,35 @@ pub async fn lines(
     let author = state.world.user_display_name(user.0).await.map_err(internal)?.unwrap_or_else(|| "someone".to_string());
     let thread = (agent.owner_user_id != Some(user.0)).then_some(user.0);
     let mut stored = 0;
+    let mut finals = 0;
     for line in &body.lines {
         let text = tidy(&line.text, 4000);
         if text.is_empty() {
             continue;
         }
         let user_line = line.role == "user";
+        if let Some(turn) = line.key.as_deref().and_then(loka_shared::voice::turn_key).filter(|_| !call.is_empty()) {
+            let changed = state
+                .world
+                .save_call_turn(loka_shared::voice::CallTurn {
+                    agent_id: id,
+                    call_id: &call,
+                    turn: &turn,
+                    from_user: user_line.then_some(user.0),
+                    body: &text,
+                    partial: line.partial,
+                    thread,
+                })
+                .await
+                .map_err(internal)?;
+            if changed {
+                stored += 1;
+                if !line.partial {
+                    finals += 1;
+                }
+            }
+            continue;
+        }
         state
             .world
             .insert_message(NewMessage {
@@ -496,11 +522,12 @@ pub async fn lines(
             .await
             .map_err(internal)?;
         stored += 1;
+        finals += 1;
     }
     if stored > 0 {
         state
             .world
-            .emit(NewEvent::new("voice.transcript").agent(id).actor(Some(user.0)).payload(loka_shared::guests::in_thread(json!({ "lines": stored, "call_id": call }), thread)), None)
+            .emit(NewEvent::new("voice.transcript").agent(id).actor(Some(user.0)).payload(loka_shared::guests::in_thread(json!({ "lines": stored, "call_id": call, "quiet": finals == 0 }), thread)), None)
             .await
             .map_err(internal)?;
     }

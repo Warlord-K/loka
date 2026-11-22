@@ -1,6 +1,7 @@
 import { decode, encode } from "@msgpack/msgpack";
 import { holdMusic } from "./music";
 import { holdSounds } from "./sounds";
+import { CallTurns } from "@/lib/call-turns";
 
 export type LivePhase = "connecting" | "listening" | "hearing" | "thinking" | "speaking";
 
@@ -57,7 +58,6 @@ type Session = {
   session: Record<string, unknown>;
 };
 
-type Line = { role: "user" | "agent"; text: string };
 type Event = Record<string, unknown> & { type?: string };
 
 const WORKLET = `class Tap extends AudioWorkletProcessor {
@@ -181,8 +181,8 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
   let waiting = 0;
   let playhead = 0;
   const sources = new Set<AudioBufferSourceNode>();
-  const transcript: Line[] = [];
-  const pending: Line[] = [];
+  const turns = new CallTurns();
+  let endSent = false;
   const userText = new Map<string, string>();
   const agentText = new Map<string, string>();
   const finished = new Set<string>();
@@ -195,11 +195,14 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
   let sessionRetried = false;
   let configured = false;
   let flushTimer = 0;
+  let flushDue = 0;
   let stopTimer = 0;
   let uncommitted = false;
   let committing = false;
   let transcribing = true;
   const awaitingUser = new Set<string>();
+  let userSeq = 0;
+  let agentSeq = 0;
   let saving: Promise<void> = Promise.resolve();
 
   const setPhase = (p: LivePhase) => {
@@ -216,16 +219,18 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
     else if (started) setPhase("listening");
   };
 
-  const schedule = () => {
+  const schedule = (ms: number) => {
+    const due = Date.now() + ms;
+    if (flushTimer && flushDue <= due) return;
     window.clearTimeout(flushTimer);
-    flushTimer = window.setTimeout(() => void flush(false), 4000);
+    flushDue = due;
+    flushTimer = window.setTimeout(() => {
+      flushTimer = 0;
+      void flush(false);
+    }, ms);
   };
-  const record = (role: "user" | "agent", text: string) => {
-    const t = text.trim();
-    if (!t) return;
-    transcript.push({ role, text: t });
-    pending.push({ role, text: t });
-    schedule();
+  const record = (role: "user" | "agent", key: string, text: string, partial = false) => {
+    if (turns.set(role, key, text, partial)) schedule(partial ? 4000 : 400);
   };
   const hearUser = (itemKey: string, text: string) => {
     const t = text.trim();
@@ -234,33 +239,32 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
     if (rest === null) {
       lastUser = { key: `u-${itemKey}`, text: t };
       h.onCaption(lastUser.key, "you", t);
-      record("user", t);
+      record("user", lastUser.key, t);
       return;
     }
-    const prev = lastUser.text;
     lastUser = { ...lastUser, text: t };
     h.onCaption(lastUser.key, "you", t);
     if (!rest.trim()) return;
-    const tail = transcript[transcript.length - 1];
-    if (tail?.role === "user" && tail.text === prev) tail.text = t;
-    else transcript.push({ role: "user", text: rest });
-    const queued = pending[pending.length - 1];
-    if (queued?.role === "user" && queued.text === prev) queued.text = t;
-    else pending.push({ role: "user", text: rest });
-    schedule();
+    record("user", lastUser.key, t);
   };
   const userKey = (itemKey: string, text: string) =>
     lastUser.text && (suffixAfter(lastUser.text, text) !== null || suffixAfter(text, lastUser.text) !== null) ? lastUser.key : `u-${itemKey}`;
   const context = () =>
-    transcript
+    turns
+      .transcript()
       .slice(-30)
       .map((l) => `${l.role === "user" ? "them" : "you"}: ${l.text}`)
       .join("\n");
-  const save = async (end: boolean, request?: string) => {
-    const lines = pending.splice(0, pending.length);
-    if (!lines.length && !end && !request) return;
+  const save = async (wantsEnd: boolean, request?: string) => {
+    const end = wantsEnd && !endSent;
+    if (end) endSent = true;
+    const lines = turns.unsaved(Date.now(), !wantsEnd);
+    if (!lines.length && !end && !request) {
+      if (turns.holding()) schedule(1000);
+      return;
+    }
     const body = JSON.stringify({
-      lines,
+      lines: lines.map((l) => ({ role: l.role, text: l.text, key: l.key, partial: Boolean(l.partial) })),
       call_id: callId,
       request,
       context: request || end ? context() : undefined,
@@ -270,11 +274,15 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
     for (let attempt = 0; attempt < (end ? 4 : 1); attempt++) {
       if (attempt) await new Promise((resolve) => window.setTimeout(resolve, 600 * attempt));
       const r = await fetch(`${base}/lines`, { method: "POST", headers: { "content-type": "application/json" }, body, keepalive: end && body.length < 60_000 }).catch(() => null);
-      if (r?.ok) return;
+      if (r?.ok) {
+        turns.markSaved(lines);
+        if (turns.holding()) schedule(1000);
+        return;
+      }
       if (r && r.status >= 400 && r.status < 500 && r.status !== 429) break;
     }
     if (end) h.onError("Part of this call could not be saved to the chat.");
-    else pending.unshift(...lines);
+    else if (lines.length) schedule(3000);
   };
   const flush = (end: boolean, request?: string) => {
     const next = saving.then(() => save(end, request));
@@ -340,7 +348,10 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
     if (!full) return;
     finished.add(key);
     h.onCaption(key, "them", full);
-    record("agent", full);
+    record("agent", key, full);
+  };
+  const keepCutTurns = () => {
+    for (const [key, text] of agentText) if (!finished.has(key)) record("agent", key, text, true);
   };
 
   const sendUpdates = () => {
@@ -415,7 +426,10 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
     if (type === "input_audio_buffer.committed") {
       uncommitted = false;
       committing = false;
-      if (str(ev.item_id)) awaitingUser.add(str(ev.item_id));
+      if (str(ev.item_id)) {
+        awaitingUser.add(str(ev.item_id));
+        turns.reserve("user", `u-${str(ev.item_id)}`);
+      }
       return;
     }
     if (type === "input_audio_buffer.speech_started") {
@@ -447,7 +461,8 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
       if (!dropAudio) play(str(ev.delta));
       return;
     }
-    const itemKey = str(ev.item_id) || str(ev.response_id) || "turn";
+    const ids = str(ev.item_id) || str(ev.response_id);
+    const itemKey = ids || `turn${userSeq}`;
     if (USER_PARTIAL.has(type)) {
       const text = type.endsWith(".delta") ? (userText.get(itemKey) ?? "") + str(ev.delta) : str(ev.transcript);
       userText.set(itemKey, text);
@@ -455,33 +470,28 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
       if (key !== lastUser.key || tokens(text).length >= tokens(lastUser.text).length) h.onCaption(key, "you", text, true);
       return;
     }
-    if (type === USER_FAILED) {
+    if (type === USER_FAILED || USER_DONE.has(type)) {
       awaitingUser.delete(itemKey);
-      const text = userText.get(itemKey) ?? "";
+      const text = (type === USER_FAILED ? "" : str(ev.transcript)) || userText.get(itemKey) || "";
       if (!finished.has(`u-${itemKey}`) && text.trim()) {
         finished.add(`u-${itemKey}`);
         hearUser(itemKey, text);
       }
+      turns.release(`u-${itemKey}`);
+      if (!ids) userSeq++;
       return;
     }
-    if (USER_DONE.has(type)) {
-      awaitingUser.delete(itemKey);
-      const text = str(ev.transcript) || userText.get(itemKey) || "";
-      if (!finished.has(`u-${itemKey}`) && text.trim()) {
-        finished.add(`u-${itemKey}`);
-        hearUser(itemKey, text);
-      }
-      return;
-    }
-    const replyKey = `a-${str(ev.response_id) || itemKey}`;
+    const replyKey = `a-${str(ev.response_id) || ids || `turn${agentSeq}`}`;
     if (AGENT_DELTA.has(type)) {
       const text = (agentText.get(replyKey) ?? "") + str(ev.delta);
       agentText.set(replyKey, text);
       h.onCaption(replyKey, "them", text);
+      if (!finished.has(replyKey)) record("agent", replyKey, text, true);
       return;
     }
     if (AGENT_DONE.has(type)) {
       finishAgent(replyKey, str(ev.transcript) || str(ev.text) || undefined);
+      if (!ids) agentSeq++;
       return;
     }
     if (type === "response.function_call_arguments.done") {
@@ -495,6 +505,7 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
       }
       const key = `a-${response.id ?? str(ev.response_id)}`;
       for (const k of [key, ...agentText.keys()]) if (agentText.has(k)) finishAgent(k);
+      if (!ids && !response.id) agentSeq++;
       responding = false;
       settle();
       sendUpdates();
@@ -525,7 +536,7 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
     settle();
     if (greeting.text) {
       h.onCaption("greeting", "them", greeting.text);
-      record("agent", greeting.text);
+      record("agent", "greeting", greeting.text);
     }
   }
   ws.onopen = () => {
@@ -578,6 +589,12 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
     sendUpdates();
   };
   window.addEventListener("world-event", onWorld);
+  const onLeave = () => {
+    keepCutTurns();
+    finishUsers();
+    void flush(true);
+  };
+  window.addEventListener("pagehide", onLeave);
 
   const levels = new Uint8Array(analyser.fftSize);
   const outLevels = new Uint8Array(outTap.fftSize);
@@ -652,7 +669,8 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
         await waitForUsers(committing ? 3000 : 2000);
       }
       hearing = false;
-      for (const k of agentText.keys()) finishAgent(k);
+      window.removeEventListener("pagehide", onLeave);
+      keepCutTurns();
       finishUsers();
       if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close(1000);
       await ctx.close().catch(() => undefined);

@@ -2177,14 +2177,27 @@ fn attach_slack(servers: &mut serde_json::Map<String, Value>) {
         servers.retain(|_, server| !is_slack_server(server));
         return;
     };
-    slack_servers(servers, &script, &key);
+    let identity = std::env::var("WORLD_RUNNER_ROOT")
+        .ok()
+        .and_then(|root| std::fs::read(Path::new(&root).join("slack-capture.json")).ok())
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|status| status.get("identity").cloned());
+    slack_servers(servers, &script, &key, identity.as_ref());
 }
 
 fn is_slack_server(server: &Value) -> bool {
     loka_shared::environment::is_mac_slack_server(server)
 }
 
-fn slack_servers(servers: &mut serde_json::Map<String, Value>, script: &str, key: &str) {
+fn slack_servers(servers: &mut serde_json::Map<String, Value>, script: &str, key: &str, identity: Option<&Value>) {
+    let mut identity_env = serde_json::Map::new();
+    if let Some(identity) = identity {
+        for (source, target) in [("team_id", "WORLD_SLACK_TEAM_ID"), ("user_id", "WORLD_SLACK_USER_ID")] {
+            if let Some(value) = identity.get(source).and_then(Value::as_str) {
+                identity_env.insert(target.into(), json!(value));
+            }
+        }
+    }
     let mut wired = false;
     for server in servers.values_mut() {
         if !is_slack_server(server) {
@@ -2192,18 +2205,21 @@ fn slack_servers(servers: &mut serde_json::Map<String, Value>, script: &str, key
         }
         let mut env = server.get("env").and_then(Value::as_object).cloned().unwrap_or_default();
         env.insert("WORLD_SLACK_CONNECTION_KEY".into(), json!(key));
+        env.extend(identity_env.clone());
         server["command"] = json!("/usr/bin/python3");
         server["args"] = json!(["-E", "-s", script]);
         server["env"] = Value::Object(env);
         wired = true;
     }
     if !wired {
+        let mut env = identity_env;
+        env.insert("WORLD_SLACK_CONNECTION_KEY".into(), json!(key));
         servers.insert(
             "slack".to_string(),
             json!({
                 "command": "/usr/bin/python3",
                 "args": ["-E", "-s", script],
-                "env": { "WORLD_SLACK_CONNECTION_KEY": key },
+                "env": env,
                 "default_tools_approval_mode": "approve",
             }),
         );
@@ -2859,7 +2875,7 @@ mod tests {
     #[test]
     fn slack_sender_is_added_or_refreshed_with_the_current_key() {
         let mut fresh = serde_json::Map::new();
-        slack_servers(&mut fresh, "/app/slack_mcp.py", "new-key");
+        slack_servers(&mut fresh, "/app/slack_mcp.py", "new-key", None);
         assert_eq!(fresh["slack"]["env"]["WORLD_SLACK_CONNECTION_KEY"], "new-key");
         assert_eq!(fresh["slack"]["args"], json!(["-E", "-s", "/app/slack_mcp.py"]));
 
@@ -2868,11 +2884,24 @@ mod tests {
             "my-slack".into(),
             json!({"command": "python3", "args": ["/old/slack_mcp.py"], "env": {"WORLD_SLACK_CONNECTION_KEY": "stale", "WORLD_SLACK_TEAM_ID": "T1"}}),
         );
-        slack_servers(&mut installed, "/app/slack_mcp.py", "new-key");
+        slack_servers(&mut installed, "/app/slack_mcp.py", "new-key", None);
         assert_eq!(installed.len(), 1);
         assert_eq!(installed["my-slack"]["env"]["WORLD_SLACK_CONNECTION_KEY"], "new-key");
         assert_eq!(installed["my-slack"]["env"]["WORLD_SLACK_TEAM_ID"], "T1");
         assert_eq!(installed["my-slack"]["args"], json!(["-E", "-s", "/app/slack_mcp.py"]));
+
+        slack_servers(&mut installed, "/app/slack_mcp.py", "new-key", Some(&json!({ "team_id": "T2", "user_id": "U2" })));
+        assert_eq!(installed["my-slack"]["env"]["WORLD_SLACK_TEAM_ID"], "T2");
+        assert_eq!(installed["my-slack"]["env"]["WORLD_SLACK_USER_ID"], "U2");
+    }
+
+    #[test]
+    fn slack_sender_receives_capture_identity() {
+        let mut servers = serde_json::Map::new();
+        let identity = json!({ "team_id": "T123", "user_id": "U456" });
+        slack_servers(&mut servers, "/app/slack_mcp.py", "key", Some(&identity));
+        assert_eq!(servers["slack"]["env"]["WORLD_SLACK_TEAM_ID"], "T123");
+        assert_eq!(servers["slack"]["env"]["WORLD_SLACK_USER_ID"], "U456");
     }
 
     #[test]

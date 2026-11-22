@@ -83,7 +83,7 @@ export function CreateAgentDialog({ onCreated, onClose }: { onCreated: (agent: W
         cli,
         model: model.trim(),
         role: "worker",
-        look: accessories.length ? { species: species.trim() || "person", accessories } : { species: species.trim() || "person" },
+        look: accessories.length ? { species: species.trim() || "human", accessories } : { species: species.trim() || "human" },
         gear: { quest: gear.trim() },
         visibility: "private",
         tags,

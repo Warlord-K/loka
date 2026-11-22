@@ -318,6 +318,71 @@ export async function record(): Promise<Recording> {
   };
 }
 
+export interface Capture {
+  rate: number;
+  stop: () => void;
+}
+
+export async function capture(onFrame: (frame: Float32Array) => void): Promise<Capture> {
+  const ctx = new AudioContext();
+  void ctx.resume();
+  let stream: MediaStream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
+  } catch (e) {
+    void ctx.close();
+    throw e;
+  }
+  void ctx.resume();
+  speech().stop();
+  const release = holdAudio();
+  const source = ctx.createMediaStreamSource(stream);
+  const node = ctx.createScriptProcessor(4096, 1, 1);
+  node.onaudioprocess = (e) => onFrame(e.inputBuffer.getChannelData(0).slice());
+  source.connect(node);
+  node.connect(ctx.destination);
+  let open = true;
+  return {
+    rate: ctx.sampleRate,
+    stop: () => {
+      if (!open) return;
+      open = false;
+      node.onaudioprocess = null;
+      node.disconnect();
+      source.disconnect();
+      stream.getTracks().forEach((t) => t.stop());
+      void ctx.close();
+      release();
+    },
+  };
+}
+
+export function joinFrames(frames: Float32Array[]): Float32Array {
+  const out = new Float32Array(frames.reduce((n, f) => n + f.length, 0));
+  let at = 0;
+  for (const f of frames) {
+    out.set(f, at);
+    at += f.length;
+  }
+  return out;
+}
+
+export async function resample(input: Float32Array, from: number, to = 16000): Promise<Float32Array> {
+  if (from === to || !input.length) return input;
+  try {
+    const offline = new OfflineAudioContext(1, Math.ceil((input.length * to) / from), to);
+    const buffer = offline.createBuffer(1, input.length, from);
+    buffer.copyToChannel(input as Float32Array<ArrayBuffer>, 0);
+    const src = offline.createBufferSource();
+    src.buffer = buffer;
+    src.connect(offline.destination);
+    src.start();
+    return (await offline.startRendering()).getChannelData(0).slice();
+  } catch {
+    return downsample(input, from, to);
+  }
+}
+
 export interface Vad {
   close: () => void;
   level: () => number;
@@ -394,7 +459,7 @@ export async function listen(opts: {
   };
 }
 
-function downsample(input: Float32Array, from: number, to: number): Float32Array {
+export function downsample(input: Float32Array, from: number, to: number): Float32Array {
   if (from === to) return input;
   const ratio = from / to;
   const out = new Float32Array(Math.floor(input.length / ratio));

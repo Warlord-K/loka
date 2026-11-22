@@ -63,6 +63,8 @@ const QUEST_CHANNEL_TOOLS: &[(&str, &str)] = &[
     ("post_to_channel", "Post a short update in your team channel or a channel you are in. Put long detail in a thread (thread: msg:chN)."),
 ];
 
+const QUEST_MESSAGE_TOOLS: &[(&str, &str)] = &[("message_agent", "Send a message to another agent, such as the main agent that started this quest (by name or handle), to hand over a report id or flag something. Do not wait for the reply.")];
+
 const QUEST_CHANNEL_REFUSAL: &str = "task sessions can only use your team channels and channels you are in";
 
 const QUICK_HIDDEN: &[&str] = &["update_my_notes", "reset_context", "start_task"];
@@ -96,7 +98,7 @@ fn follows_open_thread(read_only: bool) -> bool {
 }
 
 fn tool_allowed(read_only: bool, name: &str) -> bool {
-    !read_only || matches!(name, "show_media" | "ask_to_use_apps") || QUEST_CHANNEL_TOOLS.iter().any(|(tool, _)| *tool == name) || quest::QUEST_TOOLS.contains(&name) || READ_ONLY_TOOLS.contains(&name) || super::reports_tools::READ_TOOLS.contains(&name) || super::reports_tools::QUEST_WRITE_TOOLS.contains(&name) || super::canvas_tools::CANVAS_TOOLS.contains(&name) || super::teams_tools::READ_TOOLS.contains(&name)
+    !read_only || matches!(name, "show_media" | "ask_to_use_apps") || QUEST_CHANNEL_TOOLS.iter().chain(QUEST_MESSAGE_TOOLS).any(|(tool, _)| *tool == name) || quest::QUEST_TOOLS.contains(&name) || READ_ONLY_TOOLS.contains(&name) || super::reports_tools::READ_TOOLS.contains(&name) || super::reports_tools::QUEST_WRITE_TOOLS.contains(&name) || super::canvas_tools::CANVAS_TOOLS.contains(&name) || super::teams_tools::READ_TOOLS.contains(&name)
 }
 
 fn docs_path(page: &str) -> Result<String> {
@@ -146,18 +148,19 @@ async fn read_docs(page: &str) -> Result<String> {
 }
 
 pub(crate) const LOOK_SPECIES: &[&str] = &[
-    "person", "octopus", "bunny", "crab", "dino", "dragon", "frog", "penguin", "duck", "shark", "robot", "ghost",
+    "human", "businessman", "kid", "octopus", "bunny", "crab", "dino", "dragon", "frog", "penguin", "duck", "shark", "robot", "ghost",
     "axolotl", "bee", "fox", "cat", "dog", "panda", "bear", "raccoon", "sloth", "owl", "peacock", "parrot", "mouse",
+    "unicorn", "cactus", "mushroom",
 ];
 
 pub(crate) const LOOK_ACCESSORIES: &[&str] = &[
     "glasses", "headphones", "crown", "wizard", "beanie", "cap", "hardhat", "mortarboard", "headband", "bun",
-    "beard", "scarf", "cape", "cloak", "apron",
+    "beard", "scarf", "cape", "cloak", "apron", "briefcase",
 ];
 
 pub(crate) fn look_guide(lead: &str) -> String {
     format!(
-        "{lead} species is one of {} (aliases like squid, rabbit, dinosaur, android or kitten work too); any other species draws a person. accessories is a list from {} (one hat at a time: wizard, beanie, cap, hardhat, mortarboard, crown). archetype, outfit and palette are free text.",
+        "{lead} species is one of {} (aliases like squid, rabbit, dinosaur, android, kitten, toadstool or succulent work too); person and any other species draw a human. accessories is a list from {} (one hat at a time: wizard, beanie, cap, hardhat, mortarboard, crown). archetype, outfit and palette are free text.",
         LOOK_SPECIES.join(", "),
         LOOK_ACCESSORIES.join(", "),
     )
@@ -252,7 +255,7 @@ impl Server {
         tools.retain(|tool| tool.get("name").and_then(Value::as_str).is_some_and(|name| self.allows(name)));
         if self.read_only {
             for tool in &mut tools {
-                let short = tool.get("name").and_then(Value::as_str).and_then(|name| QUEST_CHANNEL_TOOLS.iter().find(|(t, _)| *t == name)).map(|(_, d)| *d);
+                let short = tool.get("name").and_then(Value::as_str).and_then(|name| QUEST_CHANNEL_TOOLS.iter().chain(QUEST_MESSAGE_TOOLS).find(|(t, _)| *t == name)).map(|(_, d)| *d);
                 if let Some(short) = short {
                     tool["description"] = json!(short);
                 }
@@ -3042,12 +3045,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn look_guide_lists_every_species_and_the_person_fallback() {
+    fn look_guide_lists_every_species_and_the_human_fallback() {
         let guide = look_guide("Appearance.");
         for name in ["octopus", "bunny", "crown", "wizard", "headphones", "cape"] {
             assert!(guide.contains(name), "{name}");
         }
-        assert!(guide.contains("any other species draws a person"));
+        assert!(guide.contains("person and any other species draw a human"));
         let looks = include_str!("../../../frontend/lib/looks.ts");
         for name in LOOK_SPECIES.iter().chain(LOOK_ACCESSORIES) {
             assert!(looks.contains(&format!("\"{name}\"")), "{name} is missing from frontend/lib/looks.ts");
@@ -3079,10 +3082,10 @@ mod tests {
         for name in ["list_tasks", "agent_activity", "world_agents", "list_items", "read_channel", "post_to_channel"] {
             assert!(tool_allowed(true, name), "{name}");
         }
-        for name in ["write_report", "update_report", "get_report", "list_reports"] {
+        for name in ["write_report", "update_report", "get_report", "list_reports", "message_agent"] {
             assert!(tool_allowed(true, name), "{name}");
         }
-        for name in ["delete_report", "read_thread", "find_messages", "recent_events", "list_todos", "kit", "message_agent", "create_task", "environment_keys", "grant_environment_key", "add_todo", "slack_post", "update_my_notes", "list_feeds", "cancel_task"] {
+        for name in ["delete_report", "read_thread", "find_messages", "recent_events", "list_todos", "kit", "create_task", "environment_keys", "grant_environment_key", "add_todo", "slack_post", "update_my_notes", "list_feeds", "cancel_task"] {
             assert!(!tool_allowed(true, name), "{name}");
             assert!(tool_allowed(false, name), "{name}");
         }

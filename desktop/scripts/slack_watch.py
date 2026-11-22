@@ -376,6 +376,14 @@ class Workspace:
         return found
 
 
+def _status(error, workspaces):
+    return {
+        "type": "status",
+        "error": error,
+        "workspaces": [{"team_id": w.team_id, "user_id": w.user_id, "team": w.team} for w in workspaces],
+    }
+
+
 class Watcher:
     def __init__(self, interval):
         self.interval = interval
@@ -398,13 +406,7 @@ class Watcher:
         self.workspaces = [Workspace(session, self.http) for session in sessions]
         for workspace in self.workspaces:
             self.state[workspace.team_id] = {"user_id": workspace.user_id, "started": now_ts(), "cursors": {}}
-        emit(
-            {
-                "type": "status",
-                "error": None,
-                "workspaces": [{"team_id": w.team_id, "team": w.team} for w in self.workspaces],
-            }
-        )
+        emit(_status(None, self.workspaces))
 
     def step(self):
         for workspace in self.workspaces:
@@ -424,12 +426,12 @@ class Watcher:
             except RateLimited as limited:
                 time.sleep(max(limited.retry_after, self.interval))
             except SlackSessionError as error:
-                emit({"type": "status", "error": str(error), "workspaces": []})
+                emit(_status(str(error), []))
                 time.sleep(60)
             except SlackWatchError as error:
                 if str(error) in {"invalid_auth", "token_revoked", "not_authed", "account_inactive"}:
                     self.workspaces = []
-                emit({"type": "status", "error": str(error), "workspaces": [{"team_id": w.team_id, "team": w.team} for w in self.workspaces]})
+                emit(_status(str(error), self.workspaces))
                 backoff = min(backoff * 2, 120)
                 time.sleep(backoff)
 

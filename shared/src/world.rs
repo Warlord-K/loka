@@ -1582,6 +1582,7 @@ impl WorldStore {
     }
 
     pub async fn find_agent_in(&self, org: Option<Uuid>, name_or_slug: &str) -> Result<Option<WorldAgent>> {
+        let name_or_slug = name_or_slug.trim().trim_start_matches('@').trim();
         let sql = format!(
             "SELECT {AGENT_COLUMNS} FROM agent_profiles
              WHERE ($2::uuid IS NULL OR agent_profiles.org_id = $2)
@@ -1592,11 +1593,29 @@ impl WorldStore {
                       (id::text = $1 OR lower(slug) = lower($1) OR lower(name) = lower($1)) DESC
              LIMIT 1"
         );
-        Ok(sqlx::query_as::<_, WorldAgent>(&sql)
-            .bind(name_or_slug.trim())
+        let found = sqlx::query_as::<_, WorldAgent>(&sql)
+            .bind(name_or_slug)
             .bind(org)
             .fetch_optional(&self.pool)
-            .await?)
+            .await?;
+        if found.is_some() {
+            return Ok(found);
+        }
+        self.main_agent_of_person(org, name_or_slug).await
+    }
+
+    async fn main_agent_of_person(&self, org: Option<Uuid>, name: &str) -> Result<Option<WorldAgent>> {
+        let sql = format!(
+            "SELECT {AGENT_COLUMNS} FROM agent_profiles
+             WHERE ($2::uuid IS NULL OR agent_profiles.org_id = $2)
+               AND agent_profiles.id IN (
+                   SELECT om.main_agent_id FROM org_members om JOIN users u ON u.id = om.user_id
+                   WHERE lower(u.name) = lower($1) AND om.main_agent_id IS NOT NULL
+                     AND ($2::uuid IS NULL OR om.org_id = $2))
+             LIMIT 2"
+        );
+        let mut found = sqlx::query_as::<_, WorldAgent>(&sql).bind(name).bind(org).fetch_all(&self.pool).await?;
+        Ok(if found.len() == 1 { found.pop() } else { None })
     }
 
     pub async fn rename_handle(&self, id: Uuid, handle: &str) -> std::result::Result<HandleRename, RenameHandleError> {
@@ -8309,6 +8328,56 @@ mod tests {
         assert!(matches!(first, Ok(_) | Err(RenameHandleError::Taken(_))) && matches!(second, Ok(_) | Err(RenameHandleError::Taken(_))));
         sqlx::query("DELETE FROM users WHERE id = $1").bind(person).execute(&pool).await?;
         sqlx::query("DELETE FROM agent_profiles WHERE id IN ($1, $2)").bind(agent_a).bind(agent_b).execute(&pool).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_person_name_resolves_to_their_main_agent() -> anyhow::Result<()> {
+        let Ok(url) = std::env::var("HANDLE_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new().max_connections(2).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let slug = format!("prya-{tag}");
+        let main: Uuid = sqlx::query_scalar("INSERT INTO agent_profiles (slug, name, cli, model) VALUES ($1, 'Mainly', 'claude', 'haiku') RETURNING id")
+            .bind(&slug)
+            .fetch_one(&pool)
+            .await?;
+        let other: Uuid = sqlx::query_scalar("INSERT INTO agent_profiles (slug, name, cli, model) VALUES ($1, 'Side', 'claude', 'haiku') RETURNING id")
+            .bind(format!("side-{tag}"))
+            .fetch_one(&pool)
+            .await?;
+        let person: Uuid = sqlx::query_scalar("INSERT INTO users (email, name) VALUES ($1, $2) RETURNING id")
+            .bind(format!("abhi-{tag}@test.dev"))
+            .bind(format!("Abhi {tag}"))
+            .fetch_one(&pool)
+            .await?;
+        crate::orgs::join_default_for_tests(&pool, person, Some(main)).await?;
+        let by_person = store.find_agent(&format!("abhi {tag}")).await?.expect("person name resolves to the main agent");
+        assert_eq!(by_person.id, main);
+        assert_eq!(store.find_agent(&format!("@Abhi {tag}")).await?.expect("with an at sign").id, main);
+        assert_eq!(store.find_agent(&slug).await?.expect("handle still resolves").id, main);
+        assert_eq!(store.find_agent(&format!("@{slug}")).await?.expect("handle with an at sign").id, main);
+        assert_eq!(store.find_agent(&format!("@{}", slug.to_uppercase())).await?.expect("at sign and case").id, main);
+        let twin: Uuid = sqlx::query_scalar("INSERT INTO users (email, name) VALUES ($1, $2) RETURNING id")
+            .bind(format!("abhi-twin-{tag}@test.dev"))
+            .bind(format!("ABHI {tag}"))
+            .fetch_one(&pool)
+            .await?;
+        let twin_main: Uuid = sqlx::query_scalar("INSERT INTO agent_profiles (slug, name, cli, model) VALUES ($1, 'Twin', 'claude', 'haiku') RETURNING id")
+            .bind(format!("twin-{tag}"))
+            .fetch_one(&pool)
+            .await?;
+        crate::orgs::join_default_for_tests(&pool, twin, Some(twin_main)).await?;
+        assert!(store.find_agent(&format!("abhi {tag}")).await?.is_none(), "two people with the same name resolve to nobody");
+        sqlx::query("DELETE FROM users WHERE id = $1").bind(twin).execute(&pool).await?;
+        sqlx::query("DELETE FROM agent_profiles WHERE id = $1").bind(twin_main).execute(&pool).await?;
+        assert_eq!(store.find_agent(&format!("abhi {tag}")).await?.expect("unique again").id, main);
+        assert_eq!(store.find_agent("Side").await?.map(|a| a.id), Some(other));
+        assert!(store.find_agent(&format!("nobody-{tag}")).await?.is_none());
+        sqlx::query("DELETE FROM users WHERE id = $1").bind(person).execute(&pool).await?;
+        sqlx::query("DELETE FROM agent_profiles WHERE id IN ($1, $2)").bind(main).bind(other).execute(&pool).await?;
         Ok(())
     }
 }

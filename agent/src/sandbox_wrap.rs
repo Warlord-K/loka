@@ -71,7 +71,8 @@ pub(crate) fn paths(spec: &Spec, granted: &BTreeMap<String, String>, run_temp: O
     let home = home();
     let mut hidden: Vec<PathBuf> = sandbox::HIDDEN_PATHS.iter().filter_map(|p| expand(p, home.as_deref())).collect();
     hidden.extend(home.as_ref().map(|home| home.join(sandbox::OWNER_SSH)));
-    hidden.extend(crate::cli::runner_private_paths());
+    let hub_runs_servers = crate::mcp_hub::get().is_some();
+    hidden.extend(crate::cli::runner_private_paths().into_iter().filter(|path| hub_runs_servers || !path.ends_with(crate::cli::MCP_AUTH_DIR)));
     for name in crate::cli::CREDENTIAL_FILE_ENV {
         for value in [granted.get(*name).map(OsString::from), std::env::var_os(name)].into_iter().flatten() {
             if !value.is_empty() {

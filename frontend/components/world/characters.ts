@@ -1,5 +1,6 @@
 import type { LokaLook } from "./types";
 import { context, makeCanvas, mirror, mix, outline, shade } from "./pixels";
+import { rememberLook } from "./sprites";
 
 export type Dir = "down" | "up" | "left" | "right";
 export type CharacterSheet = Record<Dir, HTMLCanvasElement[]>;
@@ -133,6 +134,10 @@ function accessorize(g: Grid, look: LokaLook, dir: "down" | "up" | "side"): void
   if (acc.includes("apron")) {
     if (dir === "down") for (let r = 9; r <= 11; r++) replaceRow(g, r, ["C", "c"], "W", 4, 8);
     if (dir === "side") for (let r = 9; r <= 11; r++) replaceRow(g, r, ["C", "c"], "W", 3, 5);
+  }
+  if (acc.includes("briefcase")) {
+    const x = dir === "down" ? 10 : dir === "up" ? 0 : 4;
+    for (const [dx, dy] of [[0, 12], [1, 12], [0, 13], [1, 13]]) set(g, x + dx, dy + PAD, "B");
   }
   if (acc.includes("glasses")) {
     if (dir === "down") {
@@ -397,6 +402,40 @@ function accessorize(g: Grid, look: LokaLook, dir: "down" | "up" | "side"): void
       ear([[0, 4], [0, 5], [1, 4], [1, 5], [10, 4], [10, 5], [11, 4], [11, 5]], "A");
     }
   }
+  if (acc.includes("horn")) {
+    if (dir === "side") ear([[3, -1], [2, -1], [2, -2], [1, -3]], "U");
+    else ear([[5, -1], [6, -1], [5, -2], [6, -2], [6, -3]], "U");
+    if (dir === "side") set(g, 2, PAD - 1, "u");
+    else set(g, 6, PAD - 2, "u");
+  }
+  if (acc.includes("cactus")) {
+    for (let r = 0; r <= 7; r++) {
+      replaceRow(g, r, ["H"], "S");
+      replaceRow(g, r, ["h"], "s");
+    }
+    for (let r = 8; r <= 11; r++) {
+      replaceRow(g, r, ["C"], "S");
+      replaceRow(g, r, ["c"], "s");
+    }
+    for (let r = 12; r <= 15; r++) replaceRow(g, r, ["P", "B", "S", "s"], ".");
+    const x0 = dir === "side" ? 3 : 2;
+    const x1 = dir === "side" ? 9 : 10;
+    for (let x = x0 - 1; x < x1 + 1; x++) set(g, x, 12 + PAD, "K");
+    for (let r = 13; r <= 14; r++) for (let x = x0; x < x1; x++) set(g, x, r + PAD, "O");
+    if (dir === "side") ear([[2, 8], [1, 8], [1, 7], [1, 6]], "S");
+    else ear([[0, 8], [0, 7], [0, 6], [1, 9], [11, 8], [11, 7], [11, 6], [10, 9]], "S");
+    ear([[3, 1], [8, 2], [4, 9], [8, 10]], "W");
+    ear([[5, -1], [6, -1]], "R");
+    set(g, 5, PAD - 2, "y");
+  }
+  if (acc.includes("mushroom-cap")) {
+    for (let x = 3; x < 9; x++) set(g, x, PAD - 2, "H");
+    for (let x = 1; x < 11; x++) set(g, x, PAD - 1, "H");
+    for (const r of [0, 1]) for (let x = 0; x < W; x++) set(g, x, r + PAD, "H");
+    for (let x = 1; x < 11; x++) set(g, x, 2 + PAD, "h");
+    if (dir !== "side") ear([[4, -1], [8, 0], [2, 1], [6, 1]], "W");
+    else ear([[3, -1], [7, 0], [9, 1], [5, 1]], "W");
+  }
   if (acc.includes("crown")) {
     replaceRow(g, 0, ["H", "h", "."], "U", 3, 9);
     ear([[3, -1], [5, -1], [6, -1], [8, -1]], "U");
@@ -493,7 +532,9 @@ export function buildSheet(look: LokaLook): CharacterSheet {
   const sideStep = frame(look, "side", LEGS_SIDE.a, BODY_SIDE);
   const left = [sideIdle, sideStep, sideIdle, sideStep];
   const right = left.map(mirror);
-  return { down, up, left, right };
+  const sheet = { down, up, left, right };
+  rememberLook(sheet, look);
+  return sheet;
 }
 
 export function portraitUrl(look: LokaLook, scale = 6): string {

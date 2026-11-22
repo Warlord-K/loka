@@ -23,6 +23,7 @@ import { CIVIC, parseOpens, type CivicId } from "./places";
 import { makeCivic } from "./places-art";
 import { areaName, civicIn, linksOf, type Edge, type Link } from "./districts";
 import { makeArch, makeBanner, makeCampfire, makeLantern, makeWaySign } from "./regions-art";
+import { placeArt, type Placed } from "./sprites";
 import { context, makeCanvas, rect, rgbOf, rng, shade } from "./pixels";
 
 export const T = 16;
@@ -238,19 +239,57 @@ export interface Geo {
 export const REGION_GEO: Geo = { w: MAP_W, h: MAP_H, river: 30, bridge: [26, 29], plaza: { x: 28, y: 17.5 } };
 const HEARTH_GEO: Geo = { w: HEARTH_W, h: HEARTH_H, river: 44, bridge: [38, 41], plaza: { x: 40, y: 23.5 } };
 
+export const LOT_W = 9;
+export const LOT_H = 7;
+const DOOR_ROW = 5;
+
+function blockFootprint(k: Kit, tx: number, ty: number): void {
+  for (let y = ty + 2; y < ty + 5; y++) for (let x = tx - 1; x < tx + LOT_W - 1; x++) kitBlock(k, x, y);
+}
+
+type Spot2 = { x: number; y: number };
+
+function artSign(art: Placed | null, fallback: Spot2 & { w: number }): Spot2 & { w: number } {
+  if (!art?.art.sign) return fallback;
+  const [sx, sy, sw, sh] = art.art.sign;
+  return { ...art.at([sx + sw / 2, sy + sh / 2]), w: sw / art.art.density };
+}
+
+export function artPoints(art: Placed | null, name: string, fallback: Spot2[]): Spot2[] {
+  if (!art) return fallback;
+  return (art.art.points[name] ?? []).map(art.at);
+}
+
+const ART_ANCHORS: Record<string, string> = { clock: "clock_face", clockRim: "clock_rim", flagTop: "flag" };
+const LANTERN_ABOVE_DOOR = 32;
+
+function roofTop(art: Placed | null, ty: number): number {
+  return art ? Math.min(ty - 1, Math.floor(art.y / T)) : ty - 1;
+}
+
 export function placeCivic(k: Kit, id: CivicId, name: string, tx: number, ty: number): void {
-  kitReserve(k, tx - 1, ty - 1, tx + 7, ty + 6);
   const s = makeCivic(id);
   const baseX = tx * T;
   const baseY = (ty + 5) * T;
   const ox = baseX - 4;
   const oy = baseY - s.day.img.height;
+  const art = placeArt(s.day, baseX, baseY);
+  kitReserve(k, tx - 1, ty - 1, tx + LOT_W - 1, ty + LOT_H - 1);
+  kitBuild(k, tx - 1, roofTop(art, ty), tx + LOT_W - 1, ty + LOT_H - 1);
   k.objects.push({ x: baseX, y: baseY, sprite: s.day, night: s.night });
-  for (let y = ty + 2; y < ty + 5; y++) for (let x = tx; x < tx + 6; x++) kitBlock(k, x, y);
-  if (s.sign.w) k.labels.push({ x: ox + s.sign.x, y: oy + s.sign.y, w: s.sign.w, text: name });
-  for (const w of s.windows) k.lights.push({ x: ox + w.x, y: oy + w.y, r: 34, color: [255, 190, 110], kind: "window", phase: k.r() * 10 });
-  if (s.chimney) k.chimneys.push({ x: ox + s.chimney.x, y: oy + s.chimney.y, owner: `civic:${id}` });
-  const anchors = Object.fromEntries(Object.entries(s.anchors).map(([key, p]) => [key, { x: ox + p.x, y: oy + p.y }]));
+  blockFootprint(k, tx, ty);
+  const sign = artSign(art, { x: ox + s.sign.x, y: oy + s.sign.y, w: s.sign.w });
+  if (sign.w) k.labels.push({ ...sign, text: name });
+  const chimney = artPoints(art, "chimney", s.chimney ? [{ x: ox + s.chimney.x, y: oy + s.chimney.y }] : [])[0];
+  if (chimney) k.chimneys.push({ ...chimney, owner: `civic:${id}` });
+  const anchors: Record<string, Spot2> = {};
+  for (const key of new Set([...Object.keys(s.anchors), ...Object.keys(ART_ANCHORS)])) {
+    const p = s.anchors[key];
+    const spot = artPoints(art, ART_ANCHORS[key] ?? key, p ? [{ x: ox + p.x, y: oy + p.y }] : [])[0];
+    if (spot) anchors[key] = spot;
+  }
+  const door = artPoints(art, "door", [])[0];
+  if (id === "library" && door) anchors.glow = { x: door.x, y: door.y - LANTERN_ABOVE_DOOR };
   k.places.push({ id: `civic:${id}`, kind: "civic", ref: id, name, anchors, ...doorOf(tx, ty) });
   if (id === "forge") {
     kitBlock(k, tx + 5, ty + 5);
@@ -268,6 +307,8 @@ export interface Kit {
   tiles: Uint8Array;
   solid: Uint8Array;
   reserved: Uint8Array;
+  built: Uint8Array;
+  kept: Uint8Array;
   objects: WorldObject[];
   lights: Light[];
   labels: Label[];
@@ -286,6 +327,8 @@ export function makeKit(r: () => number, w = MAP_W, h = MAP_H): Kit {
     tiles: new Uint8Array(w * h),
     solid: new Uint8Array(w * h),
     reserved: new Uint8Array(w * h),
+    built: new Uint8Array(w * h),
+    kept: new Uint8Array(w * h),
     objects: [],
     lights: [],
     labels: [],
@@ -295,6 +338,10 @@ export function makeKit(r: () => number, w = MAP_W, h = MAP_H): Kit {
     critters: [],
     portalSlots: [],
   };
+}
+
+export function kitBuild(k: Kit, x0: number, y0: number, x1: number, y1: number): void {
+  for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) if (kin(k, x, y)) k.built[kix(k, x, y)] = 1;
 }
 
 export function kitBlock(k: Kit, x: number, y: number): void {
@@ -307,6 +354,16 @@ export function kitReserve(k: Kit, x0: number, y0: number, x1: number, y1: numbe
   for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) if (kin(k, x, y)) k.reserved[kix(k, x, y)] = 1;
 }
 
+export function kitKeep(k: Kit, x0: number, y0: number, x1: number, y1: number): void {
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      if (!kin(k, x, y)) continue;
+      k.reserved[kix(k, x, y)] = 1;
+      k.kept[kix(k, x, y)] = 1;
+    }
+  }
+}
+
 let lampSprites: [Sprite, Sprite] | null = null;
 
 export function kitLamp(k: Kit, tx: number, ty: number): Light {
@@ -315,7 +372,8 @@ export function kitLamp(k: Kit, tx: number, ty: number): Light {
   const x = tx * T + 8;
   const y = ty * T + 13;
   k.objects.push({ x, y, sprite: lampSprites[0], night: lampSprites[1] });
-  const light: Light = { x, y: y - 22, r: 46, color: [255, 200, 120], kind: "lamp", phase: k.r() * 10 };
+  const head = artPoints(placeArt(lampSprites[0], x, y), "light", [{ x, y: y - 22 }])[0] ?? { x, y: y - 22 };
+  const light: Light = { ...head, r: 46, color: [255, 200, 120], kind: "lamp", phase: k.r() * 10 };
   k.lights.push(light);
   return light;
 }
@@ -354,23 +412,23 @@ export function placeBuilding(k: Kit, item: MapItem, tx: number, ty: number): vo
   const baseX = tx * T;
   const baseY = (ty + 5) * T;
   k.objects.push({ x: baseX, y: baseY, sprite: b.day, night: b.night });
-  for (let y = ty + 2; y < ty + 5; y++) for (let x = tx; x < tx + 6; x++) kitBlock(k, x, y);
-  k.labels.push({ x: baseX - 4 + b.sign.x, y: baseY - 96 + b.sign.y, w: b.sign.w, text: item.name.slice(0, 18) });
-  for (const w of b.windows) {
-    k.lights.push({ x: baseX - 4 + w.x, y: baseY - 96 + w.y, r: 34, color: [255, 190, 110], kind: "window", phase: rr() * 10 });
-  }
-  k.chimneys.push({ x: baseX - 4 + b.chimney.x, y: baseY - 96 + b.chimney.y });
+  blockFootprint(k, tx, ty);
+  const art = placeArt(b.day, baseX, baseY);
+  k.labels.push({ ...artSign(art, { x: baseX - 4 + b.sign.x, y: baseY - 96 + b.sign.y, w: b.sign.w }), text: item.name.slice(0, 18) });
+  const chimney = artPoints(art, "chimney", [{ x: baseX - 4 + b.chimney.x, y: baseY - 96 + b.chimney.y }])[0];
+  if (chimney) k.chimneys.push(chimney);
   k.placements[item.id] = { x: (tx + 3) * T, y: (ty + 6) * T + 8 };
   if (parseOpens(item.data.opens)) k.places.push({ id: `item:${item.id}`, kind: "building", ref: item.id, name: item.name, anchors: {}, ...doorOf(tx, ty) });
 }
 
 export function placeCampus(k: Kit, tx: number, ty: number): void {
-  for (const [wx, text] of [[tx - 6, "Lecture halls"], [tx + 6, "Study rooms"]] as [number, string][]) {
+  for (const [wx, text] of [[tx - LOT_W, "Lecture halls"], [tx + LOT_W, "Study rooms"]] as [number, string][]) {
     const wing = makeBuilding({ roof: "#3f6fb0", wall: "#efe7f8", awning: ["#4b3a8c", "#fbf3e0"] });
-    k.objects.push({ x: wx * T, y: (ty + 6) * T, sprite: wing.day, night: wing.night });
-    k.labels.push({ x: wx * T - 4 + wing.sign.x, y: (ty + 6) * T - 96 + wing.sign.y, w: wing.sign.w, text });
-    for (let y = ty + 3; y < ty + 6; y++) for (let x = wx; x < wx + 6; x++) kitBlock(k, x, y);
-    for (const w of wing.windows) k.lights.push({ x: wx * T - 4 + w.x, y: (ty + 6) * T - 96 + w.y, r: 30, color: [200, 180, 255], kind: "window", phase: k.r() * 10 });
+    const baseY = (ty + 6) * T;
+    k.objects.push({ x: wx * T, y: baseY, sprite: wing.day, night: wing.night });
+    const art = placeArt(wing.day, wx * T, baseY);
+    k.labels.push({ ...artSign(art, { x: wx * T - 4 + wing.sign.x, y: baseY - 96 + wing.sign.y, w: wing.sign.w }), text });
+    blockFootprint(k, wx, ty + 1);
   }
   placeAcademy(k, tx, ty);
   const place = k.places[k.places.length - 1];
@@ -388,15 +446,16 @@ export function placeAcademy(k: Kit, tx: number, ty: number): void {
   const baseX = tx * T;
   const baseY = (ty + 5) * T;
   k.objects.push({ x: baseX, y: baseY, sprite: b.day, night: b.night });
-  for (let y = ty + 2; y < ty + 5; y++) for (let x = tx; x < tx + 6; x++) kitBlock(k, x, y);
-  k.labels.push({ x: baseX - 4 + b.sign.x, y: baseY - 96 + b.sign.y, w: b.sign.w, text: "Academy" });
-  for (const w of b.windows) k.lights.push({ x: baseX - 4 + w.x, y: baseY - 96 + w.y, r: 34, color: [200, 180, 255], kind: "window", phase: k.r() * 10 });
+  blockFootprint(k, tx, ty);
+  const art = placeArt(b.day, baseX, baseY);
+  k.labels.push({ ...artSign(art, { x: baseX - 4 + b.sign.x, y: baseY - 96 + b.sign.y, w: b.sign.w }), text: "Academy" });
   k.placements.academy = { x: (tx + 3) * T, y: (ty + 6) * T + 8 };
   k.places.push({ id: "academy", kind: "academy", ref: "academy", name: "Academy", anchors: {}, ...doorOf(tx, ty) });
 }
 
 export function placePortal(k: Kit, id: string, name: string, to: string | null, tx: number, ty: number, style: "arch" | "sign"): void {
   kitReserve(k, tx - 2, ty - 2, tx + 4, ty + 2);
+  kitBuild(k, tx - 2, ty - 2, tx + 4, ty + 2);
   k.placements[id] = { x: (tx + 1) * T, y: (ty + 1) * T + 8 };
   const door = { x: (tx + 1) * T, y: ty * T + 12 };
   if (style === "arch") {
@@ -404,12 +463,14 @@ export function placePortal(k: Kit, id: string, name: string, to: string | null,
     kitBlock(k, tx - 1, ty);
     kitBlock(k, tx + 2, ty);
     k.objects.push({ x: (tx + 1) * T, y: ty * T + 15, sprite });
-    k.labels.push({ x: (tx + 1) * T, y: ty * T + 15 - sprite.ay - 4, w: 26, text: name.slice(0, 18) });
+    const art = placeArt(sprite, (tx + 1) * T, ty * T + 15);
+    k.labels.push({ x: (tx + 1) * T, y: (art ? art.y : ty * T + 15 - sprite.ay) - 4, w: 26, text: name.slice(0, 18) });
   } else {
     const sprite = makeWaySign();
     kitBlock(k, tx + 2, ty);
     k.objects.push({ x: (tx + 2) * T + 8, y: ty * T + 14, sprite });
-    k.labels.push({ x: (tx + 2) * T + 8, y: ty * T + 14 - sprite.ay - 3, w: 22, text: name.slice(0, 18) });
+    const art = placeArt(sprite, (tx + 2) * T + 8, ty * T + 14);
+    k.labels.push({ x: (tx + 2) * T + 8, y: (art ? art.y + art.h * 0.3 : ty * T + 14 - sprite.ay) - 3, w: 22, text: name.slice(0, 18) });
   }
   k.places.push({ id: `portal:${id}`, kind: "portal", ref: id, name, to, anchors: {}, door, goals: [[tx, ty], [tx + 1, ty]], zone: [tx, ty, tx + 1, ty] });
 }
@@ -454,7 +515,7 @@ export function openExits(k: Kit, links: Link[], nameOf: (id: string) => string)
   for (const l of links) {
     for (const [x, y] of edgeTiles(k, l, 4)) {
       k.solid[kix(k, x, y)] = 0;
-      k.reserved[kix(k, x, y)] = 1;
+      kitKeep(k, x, y, x + 1, y + 1);
     }
     const name = nameOf(l.to);
     const side = l.edge === "w" || l.edge === "e";
@@ -473,7 +534,7 @@ export function openExits(k: Kit, links: Link[], nameOf: (id: string) => string)
       : [l.at + 2, k.h - 4];
     if (k.solid[kix(k, sx, sy)] && !(sx < 3 || sy < 3 || sx >= k.w - 3 || sy >= k.h - 3)) continue;
     k.solid[kix(k, sx, sy)] = 1;
-    k.reserved[kix(k, sx, sy)] = 1;
+    kitKeep(k, sx, sy, sx + 1, sy + 1);
     k.objects.push({ x: sx * T + 8, y: sy * T + 13, sprite: sign });
     k.labels.push({ x: sx * T + 8, y: sy * T + 13 - 17.5, w: 18, text: `To ${name}`.slice(0, 20) });
   }
@@ -528,12 +589,22 @@ export function decorSprite(id: string): Sprite | null {
   return null;
 }
 
-export function findLot(k: Kit, rr: () => number): { x: number; y: number } | null {
+export function lotRoof(): number {
+  const b = makeBuilding({ roof: "#b8513a", wall: "#f3e6c8", awning: ["#e8b64a", "#fbf3e0"] });
+  const art = placeArt(b.day, 0, 5 * T);
+  return Math.max(1, Math.ceil(-(art ? art.y : 5 * T - b.day.ay) / T));
+}
+
+export function findLot(k: Kit, rr: () => number, roof = lotRoof()): { x: number; y: number } | null {
   for (let n = 0; n < 4000; n++) {
-    const tx = 4 + Math.floor(rr() * (k.w - 12));
-    const ty = 3 + Math.floor(rr() * (k.h - 10));
+    const tx = 3 + Math.floor(rr() * (k.w - LOT_W - 4));
+    const ty = roof + 2 + Math.floor(rr() * (k.h - LOT_H - roof - 2));
     let ok = true;
-    for (let y = ty; y < ty + 6 && ok; y++) for (let x = tx; x < tx + 7 && ok; x++) if (!kin(k, x, y) || k.reserved[kix(k, x, y)]) ok = false;
+    for (let y = ty - roof; y < ty + LOT_H && ok; y++) {
+      for (let x = tx - 1; x < tx + LOT_W - 1 && ok; x++) {
+        if (!kin(k, x, y) || k.kept[kix(k, x, y)] || (y <= ty + DOOR_ROW && k.built[kix(k, x, y)]) || (y > ty && k.reserved[kix(k, x, y)])) ok = false;
+      }
+    }
     if (ok) return { x: tx, y: ty };
   }
   return null;
@@ -544,13 +615,15 @@ export function placeItems(k: Kit, items: MapItem[], pendingBuildings: MapItem[]
   const crate = makeCrate();
   const barrel = makeBarrel();
   const signpost = makeSignpost();
+  const roof = lotRoof();
   for (const item of items) {
     const rr = rng(seedOf(item.id));
     if (item.kind === "building") {
       if (!pendingBuildings.includes(item)) continue;
-      const spot = findLot(k, rr);
+      const spot = findLot(k, rr, roof);
       if (!spot) continue;
-      kitReserve(k, spot.x, spot.y, spot.x + 7, spot.y + 6);
+      kitReserve(k, spot.x - 1, spot.y + 1, spot.x + LOT_W - 1, spot.y + LOT_H);
+      kitBuild(k, spot.x - 1, spot.y - roof, spot.x + LOT_W - 1, spot.y + DOOR_ROW + 1);
       placeBuilding(k, item, spot.x, spot.y);
       continue;
     }
@@ -781,19 +854,21 @@ export function buildWorld(guide: Resident | null, residents: Resident[], items:
   for (const c of civic) {
     const [tx, ty] = c.slot;
     placeCivic(k, c.id, c.name, tx, ty);
-    if (c.id === "market") marketLamp = addLamp(tx + 6, ty + 4);
-    else addLamp(tx - 1, ty + 4);
+    if (c.id === "market") marketLamp = addLamp(tx + LOT_W - 1, ty + 4);
+    else addLamp(tx - 2, ty + 4);
   }
   const buildingQueue = items.filter((i) => i.kind === "building");
+  const roof = lotRoof();
 
   for (const { slot, resident, i } of assigned) {
     const [tx, ty] = slot;
     const meadow = i >= TOWN_SLOTS.length;
-    reserve(tx - 1, ty - 1, tx + 7, ty + 6);
+    reserve(tx - 1, ty - 1, tx + LOT_W - 1, ty + LOT_H - 1);
+    kitBuild(k, tx - 1, ty - roof, tx + LOT_W - 1, ty + LOT_H - 1);
     const claimed = resident ? null : buildingQueue.shift();
     if (claimed) {
       placeBuilding(k, claimed, tx, ty);
-      addLamp(tx - 1, ty + 4);
+      addLamp(tx - 2, ty + 4);
       continue;
     }
     if (!resident) {
@@ -805,24 +880,23 @@ export function buildWorld(guide: Resident | null, residents: Resident[], items:
       objects.push({ x: tx * T + 56, y: ty * T + 4 * T + 14, sprite: signpost });
       labels.push({ x: tx * T + 56, y: ty * T + 4 * T + 14 - 17.5, w: 18, text: "Open plot" });
       plots.push({ index: i, tx, ty, x: tx * T + 56, y: (ty + 5) * T + 4 });
-      if (!meadow) addLamp(tx - 1, ty + 4);
+      if (!meadow) addLamp(tx - 2, ty + 4);
       continue;
     }
     const b = makeBuilding(resident.shop);
     const baseX = tx * T;
     const baseY = (ty + 5) * T;
     objects.push({ x: baseX, y: baseY, sprite: b.day, night: b.night });
-    for (let y = ty + 2; y < ty + 5; y++) for (let x = tx; x < tx + 6; x++) block(x, y);
-    labels.push({ x: baseX - 4 + b.sign.x, y: baseY - 96 + b.sign.y, w: b.sign.w, text: resident.business });
-    for (const w of b.windows) {
-      lights.push({ x: baseX - 4 + w.x, y: baseY - 96 + w.y, r: 34, color: [255, 190, 110], kind: "window", phase: r() * 10 });
-    }
-    chimneys.push({ x: baseX - 4 + b.chimney.x, y: baseY - 96 + b.chimney.y, owner: resident.id });
+    blockFootprint(k, tx, ty);
+    const art = placeArt(b.day, baseX, baseY);
+    labels.push({ ...artSign(art, { x: baseX - 4 + b.sign.x, y: baseY - 96 + b.sign.y, w: b.sign.w }), text: resident.business });
+    const chimney = artPoints(art, "chimney", [{ x: baseX - 4 + b.chimney.x, y: baseY - 96 + b.chimney.y }])[0];
+    if (chimney) chimneys.push({ ...chimney, owner: resident.id });
     addNpc(resident, tx + 4, ty + 5, "down", { x: baseX + 44, y: baseY - 100 });
     places.push({ id: `house:${resident.id}`, kind: "house", ref: resident.id, name: resident.business, anchors: {}, ...doorOf(tx, ty) });
-    addLamp(tx - 1, ty + 4);
-    block(tx + 6, ty + 4);
-    objects.push({ x: (tx + 6) * T + 8, y: (ty + 4) * T + 13, sprite: r() > 0.5 ? crate : barrel });
+    addLamp(tx - 2, ty + 4);
+    block(tx + LOT_W - 1, ty + 4);
+    objects.push({ x: (tx + LOT_W - 1) * T + 8, y: (ty + 4) * T + 13, sprite: r() > 0.5 ? crate : barrel });
   }
 
   if (guide) addNpc(guide, 37, 27, "down", null, true);
@@ -832,8 +906,8 @@ export function buildWorld(guide: Resident | null, residents: Resident[], items:
   const banyan = makeBanyan(r);
   objects.push({ x: cx * T, y: (cy + 1) * T, sprite: banyan });
   for (let y = cy - 2; y < cy + 1; y++) for (let x = cx - 2; x < cx + 2; x++) block(x, y);
-  reserve(cx - 4, cy - 4, cx + 4, cy + 2);
-  banyan.bulbs.forEach((b, i) => {
+  kitKeep(k, cx - 4, cy - 4, cx + 4, cy + 2);
+  if (!placeArt(banyan, cx * T, (cy + 1) * T)) banyan.bulbs.forEach((b, i) => {
     lights.push({
       x: cx * T - banyan.ax + b.x,
       y: (cy + 1) * T - banyan.ay + b.y,
@@ -1064,13 +1138,13 @@ function paintGround(tiles: Uint8Array, reserved: Uint8Array, r: () => number, g
       const px = x * T;
       const py = y * T;
       if (type === GRASS || type === WATER) {
-        for (let i = 0; i < 7; i++) rect(ctx, px + Math.floor(r() * T), py + Math.floor(r() * T), 1, 1, i % 2 ? "#86c96d" : "#58a04d");
+        for (let i = 0; i < 7; i++) rect(ctx, px + Math.floor(r() * T), py + Math.floor(r() * T), 1, 1, i % 2 ? "#89be69" : "#58924f");
         if (r() < 0.35) {
           const gx = px + 2 + Math.floor(r() * 11);
           const gy = py + 3 + Math.floor(r() * 10);
-          rect(ctx, gx, gy, 1, 2, "#4f944a");
-          rect(ctx, gx + 2, gy, 1, 2, "#4f944a");
-          rect(ctx, gx + 1, gy + 1, 1, 2, "#4f944a");
+          rect(ctx, gx, gy, 1, 2, "#4f884b");
+          rect(ctx, gx + 2, gy, 1, 2, "#4f884b");
+          rect(ctx, gx + 1, gy + 1, 1, 2, "#4f884b");
         }
         if (!reserved[y * g.w + x] && r() < 0.12) {
           const col = ["#ffffff", "#ffe066", "#ff9ab0", "#b7a0ff"][Math.floor(r() * 4)];
@@ -1083,16 +1157,16 @@ function paintGround(tiles: Uint8Array, reserved: Uint8Array, r: () => number, g
           }
         }
       } else if (type === PATH || type === BRIDGE) {
-        rect(ctx, px, py, T, T, "#dcbc8c");
-        for (let i = 0; i < 10; i++) rect(ctx, px + Math.floor(r() * T), py + Math.floor(r() * T), 1, 1, i % 3 ? "#c9a577" : "#ead3a8");
-        if (r() < 0.4) rect(ctx, px + Math.floor(r() * 13), py + Math.floor(r() * 13), 2, 2, "#b8946a");
+        rect(ctx, px, py, T, T, "#d7b486");
+        for (let i = 0; i < 10; i++) rect(ctx, px + Math.floor(r() * T), py + Math.floor(r() * T), 1, 1, i % 3 ? "#c49d73" : "#e5cba0");
+        if (r() < 0.4) rect(ctx, px + Math.floor(r() * 13), py + Math.floor(r() * 13), 2, 2, "#b38d67");
       } else if (type === PLAZA) {
-        rect(ctx, px, py, T, T, "#b3a896");
+        rect(ctx, px, py, T, T, "#aea291");
         for (let sy = 0; sy < 2; sy++) {
           for (let sx = 0; sx < 2; sx++) {
             const off = (y + sy) % 2 ? 4 : 0;
             const bx = px + sx * 8 + off - (off && sx === 1 ? 8 : 0);
-            const tone = ["#d4cab8", "#cbc0ad", "#dcd3c2", "#c4b8a4"][Math.floor(r() * 4)];
+            const tone = ["#cfc3b2", "#c6b9a7", "#d7ccbb", "#bfb19e"][Math.floor(r() * 4)];
             rect(ctx, bx + 1, py + sy * 8 + 1, 7, 7, tone);
             rect(ctx, bx + 1, py + sy * 8 + 1, 7, 1, shade(tone, 0.15));
           }
@@ -1100,9 +1174,9 @@ function paintGround(tiles: Uint8Array, reserved: Uint8Array, r: () => number, g
         const d = Math.hypot(x + 0.5 - g.plaza.x, (y + 0.5 - g.plaza.y) * 1.3);
         if (d > 3.6 && d < 4.4) rect(ctx, px, py, T, T, "rgba(120,100,80,0.18)");
       } else if (type === SOIL) {
-        rect(ctx, px, py, T, T, "#a37a4c");
-        for (let row = 1; row < T; row += 4) rect(ctx, px, py + row, T, 1, "#8c653c");
-        for (let i = 0; i < 5; i++) rect(ctx, px + Math.floor(r() * T), py + Math.floor(r() * T), 1, 1, "#bf9464");
+        rect(ctx, px, py, T, T, "#9c734c");
+        for (let row = 1; row < T; row += 4) rect(ctx, px, py + row, T, 1, "#855f3d");
+        for (let i = 0; i < 5; i++) rect(ctx, px + Math.floor(r() * T), py + Math.floor(r() * T), 1, 1, "#ba8c61");
       }
     }
   }
@@ -1120,43 +1194,43 @@ function paintGround(tiles: Uint8Array, reserved: Uint8Array, r: () => number, g
             for (let n = 0; n < depth; n++) {
               const ex = dx === 0 ? px + i : dx < 0 ? px + n : px + T - 1 - n;
               const ey = dy === 0 ? py + i : dy < 0 ? py + n : py + T - 1 - n;
-              rect(ctx, ex, ey, 1, 1, n === depth - 1 ? "#5fa452" : "#6ab45a");
+              rect(ctx, ex, ey, 1, 1, n === depth - 1 ? "#5e9653" : "#6fa957");
             }
           }
         }
       }
       if (type === GRASS || type === PATH) {
         if (at(x, y + 1) === WATER) {
-          rect(ctx, px, py + T - 4, T, 4, "#a8844f");
-          rect(ctx, px, py + T - 2, T, 2, "#7d5f38");
-          for (let i = 0; i < 4; i++) rect(ctx, px + Math.floor(r() * T), py + T - 5, 2, 1, "#8f7445");
+          rect(ctx, px, py + T - 4, T, 4, "#a07d4f");
+          rect(ctx, px, py + T - 2, T, 2, "#775a38");
+          for (let i = 0; i < 4; i++) rect(ctx, px + Math.floor(r() * T), py + T - 5, 2, 1, "#896e45");
         }
         if (at(x, y - 1) === WATER) {
-          rect(ctx, px, py, T, 3, "#a8844f");
-          rect(ctx, px, py, T, 1, "#6e5230");
+          rect(ctx, px, py, T, 3, "#a07d4f");
+          rect(ctx, px, py, T, 1, "#694d30");
         }
         if (at(x - 1, y) === WATER) {
-          rect(ctx, px, py, 3, T, "#a8844f");
-          rect(ctx, px, py, 1, T, "#6e5230");
+          rect(ctx, px, py, 3, T, "#a07d4f");
+          rect(ctx, px, py, 1, T, "#694d30");
         }
         if (at(x + 1, y) === WATER) {
-          rect(ctx, px + T - 3, py, 3, T, "#a8844f");
-          rect(ctx, px + T - 1, py, 1, T, "#6e5230");
+          rect(ctx, px + T - 3, py, 3, T, "#a07d4f");
+          rect(ctx, px + T - 1, py, 1, T, "#694d30");
         }
       }
       if (type === BRIDGE) {
-        rect(ctx, px, py, T, T, "#9a6a3c");
+        rect(ctx, px, py, T, T, "#93643d");
         for (let row = 0; row < T; row += 4) {
-          rect(ctx, px, py + row, T, 3, row % 8 ? "#a8703f" : "#b07a48");
-          rect(ctx, px, py + row + 3, T, 1, "#6e4a2e");
+          rect(ctx, px, py + row, T, 3, row % 8 ? "#a06940" : "#a87349");
+          rect(ctx, px, py + row + 3, T, 1, "#69462e");
         }
         if (x === g.bridge[0]) {
-          rect(ctx, px, py, 3, T, "#5a3c25");
-          rect(ctx, px + 1, py, 1, T, "#7a5234");
+          rect(ctx, px, py, 3, T, "#563925");
+          rect(ctx, px + 1, py, 1, T, "#744e34");
         }
         if (x === g.bridge[1]) {
-          rect(ctx, px + T - 3, py, 3, T, "#5a3c25");
-          rect(ctx, px + T - 2, py, 1, T, "#7a5234");
+          rect(ctx, px + T - 3, py, 3, T, "#563925");
+          rect(ctx, px + T - 2, py, 1, T, "#744e34");
         }
       }
     }

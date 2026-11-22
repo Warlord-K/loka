@@ -81,11 +81,12 @@ pub(crate) const LOKA_APP_PRIVATE: &[&str] = &[
     "Library/Application Support/dev.ygpt.loka/pids",
     "Library/Logs/Loka",
 ];
+pub(crate) const MCP_AUTH_DIR: &str = "mcp-auth";
 
 pub(crate) fn runner_private_paths() -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = std::env::var_os("WORLD_RUNNER_ROOT")
         .filter(|root| !root.is_empty())
-        .map(|root| ["leases", "runner.log", "identity", "browser"].iter().map(|name| Path::new(&root).join(name)).collect())
+        .map(|root| private_paths_in(Path::new(&root)))
         .unwrap_or_default();
     if paths.is_empty() {
         return paths;
@@ -94,6 +95,10 @@ pub(crate) fn runner_private_paths() -> Vec<PathBuf> {
         paths.extend(LOKA_APP_PRIVATE.iter().map(|rel| Path::new(&home).join(rel)));
     }
     paths
+}
+
+fn private_paths_in(root: &Path) -> Vec<PathBuf> {
+    ["leases", "runner.log", "identity", "browser", MCP_AUTH_DIR].iter().map(|name| root.join(name)).collect()
 }
 
 tokio::task_local! {
@@ -1409,6 +1414,12 @@ fn shorten_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+
+    #[test]
+    fn mcp_logins_are_private_to_the_runner() {
+        let root = Path::new("/runner");
+        assert!(super::private_paths_in(root).contains(&root.join("mcp-auth")));
+    }
 
     #[test]
     fn long_runner_roots_get_short_socket_paths() {

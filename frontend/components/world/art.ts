@@ -1,10 +1,16 @@
 import type { LokaShopStyle } from "./types";
 import { context, disc, ellipse, makeCanvas, outline, rect, shade, type Ctx } from "./pixels";
+import { rememberThing } from "./sprites";
 
 export interface Sprite {
   img: HTMLCanvasElement;
   ax: number;
   ay: number;
+}
+
+function keyed(key: string, sprite: Sprite, colours: Record<string, string> = {}, night = false): Sprite {
+  rememberThing(sprite, key, colours, night);
+  return sprite;
 }
 
 export type TreeKind = "green" | "blossom" | "autumn" | "pine";
@@ -54,7 +60,7 @@ export function makeTree(kind: TreeKind, r: () => number): Sprite {
   speckle(ctx, r, 2, 4, 30, 24, hi, 10);
   if (kind === "blossom") speckle(ctx, r, 2, 4, 30, 30, "#ffffff", 8);
   if (kind === "autumn") speckle(ctx, r, 2, 4, 30, 30, "#f9dd8a", 8);
-  return { img: c, ax: 17, ay: 43 };
+  return keyed(`tree_${kind}`, { img: c, ax: 17, ay: 43 });
 }
 
 function makePine(r: () => number): Sprite {
@@ -77,7 +83,7 @@ function makePine(r: () => number): Sprite {
   }
   rect(ctx, 14, 3, 2, 4, "#2c6e47");
   speckle(ctx, r, 2, 4, 26, 36, "#4a9a62", 18);
-  return { img: c, ax: 15, ay: 47 };
+  return keyed("tree_pine", { img: c, ax: 15, ay: 47 });
 }
 
 export function makeBush(r: () => number, flowers: string | null): Sprite {
@@ -90,7 +96,7 @@ export function makeBush(r: () => number, flowers: string | null): Sprite {
   disc(ctx, 8, 5, 3, "#57a852");
   disc(ctx, 13, 6, 2, "#6fbb5c");
   if (flowers) speckle(ctx, r, 2, 1, 16, 11, flowers, 7);
-  return { img: c, ax: 10, ay: 13 };
+  return keyed(flowers ? "bush_flowers" : "bush", { img: c, ax: 10, ay: 13 });
 }
 
 export function makeRock(r: () => number): Sprite {
@@ -101,7 +107,7 @@ export function makeRock(r: () => number): Sprite {
   ellipse(ctx, 6, 4, 4, 2, "#a9adb5");
   rect(ctx, 4, 3, 2, 1, "#c8ccd2");
   if (r() > 0.5) rect(ctx, 8, 6, 3, 1, "#6d9a55");
-  return { img: c, ax: 7, ay: 8 };
+  return keyed("rock", { img: c, ax: 7, ay: 8 });
 }
 
 export function makeReeds(r: () => number): Sprite {
@@ -113,7 +119,7 @@ export function makeReeds(r: () => number): Sprite {
     rect(ctx, x, 15 - h, 1, h, i % 2 ? "#4d8a3f" : "#3b7034");
     if (i % 2 === 0) rect(ctx, x, 15 - h, 1, 3, "#7a4a2a");
   }
-  return { img: c, ax: 6, ay: 15 };
+  return keyed("reeds", { img: c, ax: 6, ay: 15 });
 }
 
 export function makeLamp(lit: boolean): Sprite {
@@ -128,7 +134,7 @@ export function makeLamp(lit: boolean): Sprite {
   rect(ctx, 3, 4, 6, 5, lit ? "#ffd77a" : "#efe2b8");
   rect(ctx, 4, 5, 2, 2, lit ? "#fff4c8" : "#fbf5e0");
   rect(ctx, 2, 10, 8, 1, "#2f2a33");
-  return { img: c, ax: 6, ay: 28 };
+  return keyed("lamp", { img: c, ax: 6, ay: 28 }, {}, lit);
 }
 
 export function makeBench(): Sprite {
@@ -141,7 +147,7 @@ export function makeBench(): Sprite {
   rect(ctx, 2, 6, 26, 1, "#b58050");
   rect(ctx, 4, 4, 2, 10, "#4a2f1d");
   rect(ctx, 24, 4, 2, 10, "#4a2f1d");
-  return { img: c, ax: 15, ay: 14 };
+  return keyed("bench", { img: c, ax: 15, ay: 14 });
 }
 
 export function makeCrate(): Sprite {
@@ -160,7 +166,7 @@ export function makeCrate(): Sprite {
   rect(ctx, 3, 0, 4, 3, "#e8b64a");
   rect(ctx, 8, 0, 4, 3, "#d9534f");
   rect(ctx, 4, 0, 1, 1, "#57a852");
-  return { img: c, ax: 8, ay: 14 };
+  return keyed("crate", { img: c, ax: 8, ay: 14 });
 }
 
 export function makeBarrel(): Sprite {
@@ -173,7 +179,7 @@ export function makeBarrel(): Sprite {
   rect(ctx, 1, 4, 12, 1, "#4a3a36");
   rect(ctx, 1, 10, 12, 1, "#4a3a36");
   rect(ctx, 2, 1, 10, 2, "#6e4a2e");
-  return { img: c, ax: 7, ay: 14 };
+  return keyed("barrel", { img: c, ax: 7, ay: 14 });
 }
 
 export function makePlanter(flower: string): Sprite {
@@ -189,7 +195,7 @@ export function makePlanter(flower: string): Sprite {
     rect(ctx, x, y, 2, 2, flower);
     rect(ctx, x, y, 1, 1, "#fff6d8");
   }
-  return { img: c, ax: 8, ay: 16 };
+  return keyed("planter", { img: c, ax: 8, ay: 16 });
 }
 
 export function makeSignpost(): Sprite {
@@ -202,7 +208,7 @@ export function makeSignpost(): Sprite {
   rect(ctx, 2, 10, 20, 1, "#d3b981");
   rect(ctx, 2, 2, 1, 1, "#6e4a2e");
   rect(ctx, 21, 2, 1, 1, "#6e4a2e");
-  return { img: c, ax: 12, ay: 24 };
+  return keyed("signpost", { img: c, ax: 12, ay: 24 });
 }
 
 export function makeStake(): Sprite {
@@ -212,7 +218,7 @@ export function makeStake(): Sprite {
   rect(ctx, 1, 1, 3, 1, "#a8703f");
   rect(ctx, 2, 0, 1, 1, "#8a5a33");
   rect(ctx, 0, 3, 5, 1, "#e0c68e");
-  return { img: c, ax: 2, ay: 10 };
+  return keyed("stake", { img: c, ax: 2, ay: 10 });
 }
 
 export function makeNoticeboard(): Sprite {
@@ -235,7 +241,7 @@ export function makeNoticeboard(): Sprite {
   rect(ctx, 14, 14, 7, 5, "#f3c6d2");
   rect(ctx, 8, 8, 1, 1, "#d9534f");
   rect(ctx, 17, 7, 1, 1, "#2e6fdb");
-  return { img: c, ax: 17, ay: 28 };
+  return keyed("noticeboard", { img: c, ax: 17, ay: 28 });
 }
 
 export interface BuildingSprite {
@@ -324,7 +330,7 @@ export function makeBuilding(style: LokaShopStyle): BuildingSprite {
   const make = (lit: boolean): Sprite => {
     const c = makeCanvas(104, 96);
     drawBuilding(context(c), style, lit);
-    return { img: c, ax: 4, ay: 96 };
+    return keyed("shop", { img: c, ax: 4, ay: 96 }, { roof: style.roof, wall: style.wall, awning: style.awning[0], awning2: style.awning[1] }, lit);
   };
   return {
     day: make(false),
@@ -384,7 +390,9 @@ export function makeBanyan(r: () => number): BanyanSprite {
     rect(ctx, x, y, 2, 2, color);
     bulbs.push({ x: x + 1, y: y + 1, color });
   }
-  return { img: c, ax: 60, ay: 96, bulbs };
+  const banyan = { img: c, ax: 60, ay: 96, bulbs };
+  rememberThing(banyan, "banyan");
+  return banyan;
 }
 
 export function makeFan(): HTMLCanvasElement {

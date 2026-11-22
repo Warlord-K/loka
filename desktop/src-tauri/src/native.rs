@@ -21,6 +21,7 @@ const SLACK_WATCH_REFRESH: Duration = Duration::from_secs(60);
 const SLACK_PYTHON: &str = "/usr/bin/python3";
 const FEATURES: &[&str] = &["workbench", "home_terminal", "folders", "local", "updates", "update_auto", "update_parts", "open_paths"];
 const DOCS_URL: &str = "https://loka.ygpt.dev/docs";
+const SLACK_IDENTITY_WAIT: Duration = Duration::from_secs(40);
 
 struct NativeState {
     root: PathBuf,
@@ -28,8 +29,28 @@ struct NativeState {
     log_path: PathBuf,
     config: Mutex<NativeConfig>,
     runner: Arc<Supervised>,
-    slack: Mutex<Option<Child>>,
+    slack: Mutex<SlackWatcher>,
     slack_status: Mutex<SlackView>,
+    slack_settled: tokio::sync::watch::Sender<bool>,
+}
+
+#[derive(Default)]
+struct SlackWatcher {
+    generation: u64,
+    child: Option<Child>,
+    identity: Option<serde_json::Value>,
+}
+
+impl SlackWatcher {
+    fn replace(&mut self, child: Option<Child>) -> (u64, Option<Child>) {
+        self.generation += 1;
+        self.identity = None;
+        (self.generation, std::mem::replace(&mut self.child, child))
+    }
+
+    fn owns(&self, generation: u64) -> bool {
+        self.generation == generation && self.child.is_some()
+    }
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -199,8 +220,9 @@ pub fn run() {
                 log_path,
                 config: Mutex::new(config),
                 runner,
-                slack: Mutex::new(None),
+                slack: Mutex::new(SlackWatcher::default()),
                 slack_status: Mutex::new(SlackView::default()),
+                slack_settled: tokio::sync::watch::channel(true).0,
             });
             app.manage(Arc::new(stack));
             app.manage(components);
@@ -354,8 +376,12 @@ async fn boot_steps(app: &AppHandle, stack: &Stack) -> Result<(), (String, &'sta
     stack.start_api().await?;
     show_loading(app, "Connecting this Mac");
     ensure_runner(app).await.map_err(|error| (error, "api"))?;
-    let _ = start_worker(app);
     let _ = start_slack(app);
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        wait_for_slack(&handle.state::<NativeState>(), SLACK_IDENTITY_WAIT).await;
+        let _ = start_worker(&handle);
+    });
     show_loading(app, "Opening Loka");
     stack.start_web().await
 }
@@ -869,7 +895,7 @@ fn slack_view(app: &AppHandle, enabled: bool) -> Result<SlackView, String> {
     let state = app.state::<NativeState>();
     let running = {
         let mut slack = state.slack.lock().map_err(lock_error)?;
-        match slack.as_mut() {
+        match slack.child.as_mut() {
             Some(child) => child.try_wait().map_err(display_error)?.is_none(),
             None => false,
         }
@@ -914,6 +940,7 @@ fn publish_slack_status(app: &AppHandle) {
         "running": view.running,
         "workspaces": view.workspaces,
         "error": view.last_error,
+        "identity": state.slack.lock().ok().and_then(|slack| slack.identity.clone()),
     });
     let _ = save_json(&state.root.join("runner").join(SLACK_STATUS_FILE), &status);
 }
@@ -930,12 +957,12 @@ fn start_slack(app: &AppHandle) -> Result<(), String> {
     }
     {
         let mut slack = state.slack.lock().map_err(lock_error)?;
-        if let Some(child) = slack.as_mut() {
+        if let Some(child) = slack.child.as_mut() {
             if child.try_wait().map_err(display_error)?.is_none() {
                 return Ok(());
             }
         }
-        *slack = None;
+        slack.child = None;
     }
     let key_path = state.root.join(SLACK_KEY_FILE);
     if !key_path.is_file() {
@@ -975,24 +1002,26 @@ fn start_slack(app: &AppHandle) -> Result<(), String> {
         .take()
         .ok_or_else(|| "The Slack watcher has no output.".to_string())?;
     let stdin = child.stdin.take();
-    let pid = child.id();
-    *state.slack.lock().map_err(lock_error)? = Some(child);
+    let (generation, previous) = adopt_slack(&state, child)?;
+    if let Some(mut previous) = previous {
+        terminate_process_tree(&mut previous);
+    }
     if let Some(stdin) = stdin {
         let handle = app.clone();
         let (id, secret) = (runner_id.clone(), runner_secret.clone());
-        std::thread::spawn(move || feed_slack_watches(handle, stdin, id, secret, pid));
+        std::thread::spawn(move || feed_slack_watches(handle, stdin, id, secret, generation));
     }
     let handle = app.clone();
-    std::thread::spawn(move || relay_slack(handle, stdout, runner_id, runner_secret, pid));
+    std::thread::spawn(move || relay_slack(handle, stdout, runner_id, runner_secret, generation));
     publish_slack_status(app);
     Ok(())
 }
 
-fn feed_slack_watches(app: AppHandle, mut stdin: std::process::ChildStdin, runner_id: String, runner_secret: String, pid: u32) {
+fn feed_slack_watches(app: AppHandle, mut stdin: std::process::ChildStdin, runner_id: String, runner_secret: String, generation: u64) {
     use std::io::Write;
     let client = local_client().unwrap_or_default();
     let endpoint = format!("{}/api/runner/{runner_id}/slack/watches", api_origin(&app));
-    while slack_child_is(&app, pid) {
+    while slack_owns(&app, generation) {
         let fetched = tauri::async_runtime::block_on(async {
             let response = client
                 .get(&endpoint)
@@ -1016,15 +1045,85 @@ fn feed_slack_watches(app: AppHandle, mut stdin: std::process::ChildStdin, runne
     }
 }
 
-fn slack_child_is(app: &AppHandle, pid: u32) -> bool {
+fn slack_owns(app: &AppHandle, generation: u64) -> bool {
     app.state::<NativeState>()
         .slack
         .lock()
-        .map(|slack| slack.as_ref().is_some_and(|child| child.id() == pid))
+        .map(|slack| slack.owns(generation))
         .unwrap_or(false)
 }
 
-fn relay_slack(app: AppHandle, stdout: std::process::ChildStdout, runner_id: String, runner_secret: String, pid: u32) {
+async fn wait_for_slack(state: &NativeState, limit: Duration) {
+    let mut settled = state.slack_settled.subscribe();
+    let _ = tokio::time::timeout(limit, settled.wait_for(|settled| *settled)).await;
+}
+
+fn adopt_slack(state: &NativeState, child: Child) -> Result<(u64, Option<Child>), String> {
+    let mut slack = state.slack.lock().map_err(lock_error)?;
+    state.slack_settled.send_replace(false);
+    Ok(slack.replace(Some(child)))
+}
+
+fn release_slack(state: &NativeState) -> Option<Child> {
+    let mut slack = state.slack.lock().ok()?;
+    state.slack_settled.send_replace(true);
+    slack.replace(None).1
+}
+
+fn record_slack_status(state: &NativeState, generation: u64, message: &serde_json::Value) -> bool {
+    let Ok(mut slack) = state.slack.lock() else {
+        return false;
+    };
+    if !slack.owns(generation) {
+        return false;
+    }
+    let workspaces = message["workspaces"].as_array().cloned().unwrap_or_default();
+    slack.identity = match workspaces.as_slice() {
+        [workspace] => workspace["team_id"]
+            .as_str()
+            .zip(workspace["user_id"].as_str())
+            .map(|(team_id, user_id)| serde_json::json!({ "team_id": team_id, "user_id": user_id })),
+        _ => None,
+    };
+    let teams = workspaces
+        .iter()
+        .filter_map(|workspace| workspace["team"].as_str().map(String::from))
+        .collect::<Vec<_>>();
+    let error = message["error"].as_str().map(slack_error_text);
+    if let Ok(mut view) = state.slack_status.lock() {
+        if !teams.is_empty() || error.is_none() {
+            view.workspaces = teams;
+        }
+        view.last_error = error;
+    }
+    true
+}
+
+fn record_slack_delivery(state: &NativeState, generation: u64, delivered: Result<(), String>) -> bool {
+    let Ok(slack) = state.slack.lock() else {
+        return false;
+    };
+    if !slack.owns(generation) {
+        return false;
+    }
+    if let Ok(mut view) = state.slack_status.lock() {
+        match delivered {
+            Ok(()) => view.delivered += 1,
+            Err(error) => view.last_error = Some(error),
+        }
+    }
+    true
+}
+
+fn settle_slack(state: &NativeState, generation: u64) {
+    if let Ok(slack) = state.slack.lock() {
+        if slack.owns(generation) {
+            state.slack_settled.send_replace(true);
+        }
+    }
+}
+
+fn relay_slack(app: AppHandle, stdout: std::process::ChildStdout, runner_id: String, runner_secret: String, generation: u64) {
     let client = local_client().unwrap_or_default();
     let endpoint = format!("{}/api/runner/{runner_id}/slack", api_origin(&app));
     for line in BufReader::new(stdout).lines() {
@@ -1036,22 +1135,11 @@ fn relay_slack(app: AppHandle, stdout: std::process::ChildStdout, runner_id: Str
         };
         match message.get("type").and_then(serde_json::Value::as_str) {
             Some("status") => {
-                let workspaces = message["workspaces"]
-                    .as_array()
-                    .map(|list| {
-                        list.iter()
-                            .filter_map(|workspace| workspace["team"].as_str().map(String::from))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let error = message["error"].as_str().map(slack_error_text);
-                if let Ok(mut view) = app.state::<NativeState>().slack_status.lock() {
-                    if !workspaces.is_empty() || error.is_none() {
-                        view.workspaces = workspaces;
-                    }
-                    view.last_error = error;
+                if !record_slack_status(&app.state::<NativeState>(), generation, &message) {
+                    break;
                 }
                 publish_slack_status(&app);
+                settle_slack(&app.state::<NativeState>(), generation);
             }
             Some("notification") => {
                 let delivered = tauri::async_runtime::block_on(deliver_slack(
@@ -1059,13 +1147,11 @@ fn relay_slack(app: AppHandle, stdout: std::process::ChildStdout, runner_id: Str
                     &endpoint,
                     &runner_secret,
                     &message,
+                    || slack_owns(&app, generation),
                 ));
                 let failed = delivered.is_err();
-                if let Ok(mut view) = app.state::<NativeState>().slack_status.lock() {
-                    match delivered {
-                        Ok(()) => view.delivered += 1,
-                        Err(error) => view.last_error = Some(error),
-                    }
+                if !record_slack_delivery(&app.state::<NativeState>(), generation, delivered) {
+                    break;
                 }
                 if failed {
                     publish_slack_status(&app);
@@ -1074,20 +1160,23 @@ fn relay_slack(app: AppHandle, stdout: std::process::ChildStdout, runner_id: Str
             _ => {}
         }
     }
-    if !slack_child_is(&app, pid) {
-        return;
-    }
-    let reason = app.state::<NativeState>().slack_status.lock().ok().and_then(|view| view.last_error.clone());
-    set_slack_error(&app, Some(stopped_text(reason.as_deref())));
-    std::thread::sleep(Duration::from_secs(30));
     let state = app.state::<NativeState>();
-    let enabled = state.config.lock().map(|config| config.slack_enabled).unwrap_or(false);
-    if enabled && slack_child_is(&app, pid) {
-        if let Ok(mut slack) = state.slack.lock() {
-            if let Some(mut child) = slack.take() {
-                let _ = child.wait();
-            }
+    {
+        let Ok(slack) = state.slack.lock() else {
+            return;
+        };
+        if !slack.owns(generation) {
+            return;
         }
+        if let Ok(mut view) = state.slack_status.lock() {
+            view.last_error = Some(stopped_text(view.last_error.as_deref()));
+        }
+    }
+    publish_slack_status(&app);
+    settle_slack(&state, generation);
+    std::thread::sleep(Duration::from_secs(30));
+    let enabled = state.config.lock().map(|config| config.slack_enabled).unwrap_or(false);
+    if enabled && slack_owns(&app, generation) {
         let _ = start_slack(&app);
     }
 }
@@ -1097,12 +1186,16 @@ async fn deliver_slack(
     endpoint: &str,
     runner_secret: &str,
     notification: &serde_json::Value,
+    current: impl Fn() -> bool,
 ) -> Result<(), String> {
     let body = serde_json::json!({ "notifications": [notification] });
     let mut last = String::new();
     for attempt in 0..3u64 {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_secs(2 * attempt)).await;
+        }
+        if !current() {
+            return Err("The Slack watcher was replaced.".into());
         }
         let request = client
             .post(endpoint)
@@ -1177,13 +1270,9 @@ pub(crate) fn pause_worker_for_update(app: &AppHandle) {
 
 fn stop_slack(app: &AppHandle) {
     let state = app.state::<NativeState>();
-    let Ok(mut slack) = state.slack.lock() else {
-        return;
-    };
-    let Some(mut child) = slack.take() else {
-        return;
-    };
-    terminate_process_tree(&mut child);
+    if let Some(mut child) = release_slack(&state) {
+        terminate_process_tree(&mut child);
+    }
 }
 
 fn stop_worker(app: &AppHandle) {
@@ -1460,6 +1549,75 @@ fn lock_error<T>(_: std::sync::PoisonError<T>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    fn test_state() -> NativeState {
+        NativeState {
+            root: PathBuf::new(),
+            config_path: PathBuf::new(),
+            log_path: PathBuf::new(),
+            config: Mutex::new(NativeConfig::default()),
+            runner: Supervised::new("runner", PathBuf::new(), Path::new(""), libc::SIGTERM, true, Duration::from_secs(1), || {
+                Err("unused".to_string())
+            }),
+            slack: Mutex::new(SlackWatcher::default()),
+            slack_status: Mutex::new(SlackView::default()),
+            slack_settled: tokio::sync::watch::channel(true).0,
+        }
+    }
+
+    #[test]
+    fn only_the_current_slack_watcher_publishes_identity_before_the_runner_starts() {
+        let state = test_state();
+        let watcher = || Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let status = serde_json::json!({
+            "type": "status",
+            "error": null,
+            "workspaces": [{"team_id": "T1", "user_id": "U1", "team": "Acme"}],
+        });
+        let identity = |state: &NativeState| state.slack.lock().unwrap().identity.clone();
+
+        let (old, _) = adopt_slack(&state, watcher()).unwrap();
+        assert!(!*state.slack_settled.borrow());
+        assert!(record_slack_status(&state, old, &status));
+        assert!(!*state.slack_settled.borrow());
+        assert_eq!(identity(&state), Some(serde_json::json!({"team_id": "T1", "user_id": "U1"})));
+        settle_slack(&state, old);
+        assert!(*state.slack_settled.borrow());
+
+        let (new, mut replaced) = adopt_slack(&state, watcher()).unwrap();
+        assert!(!*state.slack_settled.borrow());
+        assert_eq!(identity(&state), None);
+        assert!(!record_slack_status(&state, old, &status));
+        assert!(!record_slack_delivery(&state, old, Ok(())));
+        settle_slack(&state, old);
+        assert!(!*state.slack_settled.borrow());
+        assert_eq!(identity(&state), None);
+        assert_eq!(state.slack_status.lock().unwrap().delivered, 0);
+
+        let mut stopped = release_slack(&state).unwrap();
+        assert!(*state.slack_settled.borrow());
+        assert!(!record_slack_status(&state, new, &status));
+        assert_eq!(identity(&state), None);
+        for child in [replaced.as_mut().unwrap(), &mut stopped] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    #[test]
+    fn the_runner_never_waits_longer_than_the_limit_for_a_watcher_that_stays_silent() {
+        let state = test_state();
+        let started = Instant::now();
+        tauri::async_runtime::block_on(wait_for_slack(&state, Duration::from_secs(5)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        state.slack_settled.send_replace(false);
+        let started = Instant::now();
+        tauri::async_runtime::block_on(wait_for_slack(&state, Duration::from_millis(200)));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!*state.slack_settled.borrow());
+    }
 
     #[test]
     fn a_stopped_watcher_keeps_its_reason() {

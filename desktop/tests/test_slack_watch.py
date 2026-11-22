@@ -228,6 +228,13 @@ def test_watch_list_arrives_on_stdin():
     assert watcher.watches["threads"] == {("C2", "1.000001"): (None, None)}
 
 
+def test_workspace_status_includes_identity_for_retained_workspaces():
+    workspace = FakeWorkspace({})
+    status = slack_watch._status("slack_network_failed", [workspace])
+    assert status["workspaces"] == [{"team_id": "T1", "user_id": "UME", "team": "Acme"}]
+    assert status["error"] == "slack_network_failed"
+
+
 def test_readable_formats_slack_markup():
     workspace = FakeWorkspace({"users.info": _users, "conversations.info": {"channel": {"name": "eng"}}})
     assert workspace.readable("hi <@UBO> see <#C1> and <https://x.dev|docs> <!here> &amp;") == "hi @Bo see #eng and docs @here &"

@@ -366,6 +366,20 @@ pub async fn create_worktree(
     Ok(())
 }
 
+const NEVER_COMMITTED: [&str; 2] = [":(exclude,glob)**/.mcp-auth/**", ":(exclude,glob)**/\\*\\*\\*/**"];
+
+async fn stage_all(worktree_path: &Path) -> Result<()> {
+    let mut args = vec!["add", "-A", "--", "."];
+    args.extend(NEVER_COMMITTED);
+    run_git(worktree_path, &args).await
+}
+
+async fn pending_changes(worktree_path: &Path, untracked: &str) -> Result<String> {
+    let mut args = vec!["status", "--porcelain", untracked, "--", "."];
+    args.extend(NEVER_COMMITTED);
+    run_git_checked_output(worktree_path, &args).await
+}
+
 const UNSIGNED_LEFTOVERS: &str = "Publish found uncommitted changes and commit.gpgsign is on, but no signing key could sign them, so it will not commit them unsigned. Commit them yourself with a signed commit, or set user.signingkey (or add ~/.ssh/loka_signing), then publish again.";
 
 const FALLBACK_SIGNING_KEYS: [&str; 3] = [".ssh/loka_signing", ".ssh/karna_signing", ".ssh/signing_key_active"];
@@ -383,7 +397,7 @@ async fn commit_signed_with_home(
     home: Option<&Path>,
     gnupg_home: Option<&Path>,
 ) -> Result<bool> {
-    let status = run_git_checked_output(worktree_path, &["status", "--porcelain", "--untracked-files=all"]).await?;
+    let status = pending_changes(worktree_path, "--untracked-files=all").await?;
     if status.trim().is_empty() {
         return Ok(false);
     }
@@ -407,7 +421,7 @@ async fn commit_signed_with_home(
     }
     let only_default_key = only_default_key && attempts.len() == 1;
     if attempts.is_empty() {
-        run_git(worktree_path, &["add", "-A"]).await?;
+        stage_all(worktree_path).await?;
         if let Err(error) = run_git(worktree_path, &["commit", "-m", &message]).await {
             unstage(worktree_path).await?;
             return Err(error);
@@ -420,7 +434,7 @@ async fn commit_signed_with_home(
         args.extend(["commit", "-S", "-m"].map(String::from));
         args.push(message.clone());
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        run_git(worktree_path, &["add", "-A"]).await?;
+        stage_all(worktree_path).await?;
         match run_signing_git(worktree_path, &args, gnupg_home, SIGNING_LIMIT).await {
             Err(error) => {
                 unstage(worktree_path).await?;
@@ -1978,6 +1992,29 @@ mod tests {
         run_git_output(&repo.0, &["diff", "--no-ext-diff", "--no-textconv", "HEAD"]).await?;
         run_git(&repo.0, &["checkout", "--", "."]).await?;
         assert!(!marker.exists(), "a repo filter ran in runtime git");
+        Ok(())
+    }
+
+    async fn plant_logins(repo: &Path) -> Result<()> {
+        for dir in [".mcp-auth/owner/server", "nested/.mcp-auth", "***", "nested/***/deep"] {
+            tokio::fs::create_dir_all(repo.join(dir)).await?;
+            tokio::fs::write(repo.join(dir).join("tokens.json"), "secret").await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mcp_logins_are_never_committed() -> Result<()> {
+        let repo = test_repo().await?;
+        plant_logins(&repo.0).await?;
+        assert!(!commit_signed_with_home(&repo.0, "feat: nothing real", None, None).await?);
+        tokio::fs::write(repo.0.join("real.txt"), "real").await?;
+        tokio::fs::write(repo.0.join("nested").join("kept.txt"), "kept").await?;
+        assert!(commit_signed_with_home(&repo.0, "feat: real work", None, None).await?);
+        let files = run_git_checked_output(&repo.0, &["ls-tree", "-r", "--name-only", "HEAD"]).await?;
+        let files: Vec<&str> = files.lines().collect();
+        assert_eq!(files, ["base", "nested/kept.txt", "real.txt"]);
+        assert!(repo.0.join(".mcp-auth/owner/server/tokens.json").exists());
         Ok(())
     }
 }

@@ -2558,6 +2558,7 @@ pub struct Me {
     status_emoji: Option<String>,
     status_text: Option<String>,
     mention_wakes_main: bool,
+    new_art: bool,
     onboarding: bool,
     org: Option<MeOrg>,
 }
@@ -2584,6 +2585,7 @@ fn me_view((id, name, email, main_agent_id, status_emoji, status_text): loka_sha
         status_emoji,
         status_text,
         mention_wakes_main: true,
+        new_art: false,
         onboarding: false,
         org: None,
     }
@@ -2611,6 +2613,7 @@ pub async fn get_me(
     let mut me = me_view(row, role);
     with_org(&state, &mut me, &viewer).await?;
     me.mention_wakes_main = state.world.mention_wakes_main(user.0).await.map_err(internal)?;
+    me.new_art = state.world.new_art(user.0).await.map_err(internal)?;
     me.onboarding = role >= Role::Write && state.world.onboarding_pending(user.0).await.map_err(internal)?;
     Ok(Json(me))
 }
@@ -2621,6 +2624,7 @@ pub struct SetMe {
     main_agent_id: Option<Uuid>,
     status: Option<SetStatus>,
     mention_wakes_main: Option<bool>,
+    new_art: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -2663,10 +2667,14 @@ pub async fn set_me(
     if let Some(on) = body.mention_wakes_main {
         state.world.set_mention_wakes_main(user.0, on).await.map_err(internal)?;
     }
+    if let Some(on) = body.new_art {
+        state.world.set_new_art(user.0, on).await.map_err(internal)?;
+    }
     let row = state.world.me(user.0).await.map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
     let mut me = me_view(row, role);
     with_org(&state, &mut me, &viewer).await?;
     me.mention_wakes_main = state.world.mention_wakes_main(user.0).await.map_err(internal)?;
+    me.new_art = state.world.new_art(user.0).await.map_err(internal)?;
     me.onboarding = role >= Role::Write && state.world.onboarding_pending(user.0).await.map_err(internal)?;
     Ok(Json(me))
 }

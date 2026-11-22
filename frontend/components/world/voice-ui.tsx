@@ -5,7 +5,8 @@ import { Microphone, Phone, SpeakerHigh, SpeakerSlash, X } from "@phosphor-icons
 import { escapeTaken, takeEscape } from "@/lib/escape";
 import { cn } from "@/lib/utils";
 import { Keycap, isMac } from "./keycap";
-import { MODEL_PROBLEM, micProblem, record, speech, type Recording, type SpeechStatus } from "./speech";
+import { anchorAt, shouldCut, splice, spokenText, type DictationAnchor, type Spliced } from "@/lib/dictation";
+import { MODEL_PROBLEM, capture, downsample, joinFrames, micProblem, record, resample, speech, type Capture, type Recording, type SpeechStatus } from "./speech";
 import { BTN_SECONDARY_SM, HUD_ICON, HUD_SEG } from "./styles";
 import { Shimmer } from "./work-ui";
 
@@ -95,6 +96,209 @@ export function useHoldToTalk(onText: (text: string) => void) {
     rec.current?.cancel();
     rec.current = null;
   }, []);
+
+  return { state, error, start, stop, cancel, clearError: () => setError(null) };
+}
+
+type Segment = { frames: Float32Array[]; samples: number; audible: boolean; heard: number; text: string; final: boolean; closed: boolean };
+
+type Dictation = {
+  capture: Capture | null;
+  rate: number;
+  segments: Segment[];
+  ended: boolean;
+  working: boolean;
+  floor: number;
+  silentMs: number;
+  lastInterim: number;
+  total: number;
+};
+
+const INTERIM_GAP_MS = 250;
+const MIN_SPOKEN_SECONDS = 0.3;
+const PREROLL_SECONDS = 0.5;
+const QUIET_SPEECH = 0.004;
+
+function newSegment(): Segment {
+  return { frames: [], samples: 0, audible: false, heard: 0, text: "", final: false, closed: false };
+}
+
+export type DictationHandlers = {
+  onText: (firm: string, provisional: string) => void;
+  onDone: (text: string, failed: boolean) => void;
+  onCancel: () => void;
+};
+
+export function useDictation(handlers: DictationHandlers) {
+  const live = useRef<Dictation | null>(null);
+  const on = useRef(handlers);
+  on.current = handlers;
+  const [state, setState] = useState<TalkState>("idle");
+  const [error, setError] = useState<string | null>(null);
+
+  const emit = (d: Dictation) => {
+    const { firm, provisional } = spokenText(d.segments);
+    on.current.onText(firm, provisional);
+  };
+
+  const finish = (d: Dictation, problem: string | null) => {
+    if (live.current !== d) return;
+    live.current = null;
+    d.capture?.stop();
+    const { firm } = spokenText(d.segments.map((s) => ({ text: s.final ? s.text : "", final: true })));
+    const spokenSeconds = d.total / d.rate;
+    setState("idle");
+    on.current.onDone(firm, problem !== null);
+    if (problem) setError(problem);
+    else if (!firm && spokenSeconds >= MIN_SPOKEN_SECONDS) setError("Did not catch that. Try again a little closer to the microphone.");
+  };
+
+  const pump = (d: Dictation) => {
+    if (d.working || live.current !== d) return;
+    const pending = d.segments.find((s) => s.closed && !s.final);
+    const current = d.segments[d.segments.length - 1];
+    if (pending) {
+      const audio = joinFrames(pending.frames);
+      pending.frames = [];
+      if (!pending.audible || audio.length < d.rate * MIN_SPOKEN_SECONDS) {
+        pending.text = "";
+        pending.final = true;
+        emit(d);
+        pump(d);
+        return;
+      }
+      d.working = true;
+      void resample(audio, d.rate)
+        .then((pcm) => speech().transcribe(pcm))
+        .then(
+          (text) => {
+            d.working = false;
+            if (live.current !== d) return;
+            pending.text = cleanTranscript(text);
+            pending.final = true;
+            emit(d);
+            pump(d);
+          },
+          () => {
+            d.working = false;
+            finish(d, MODEL_PROBLEM);
+          },
+        );
+      return;
+    }
+    if (d.ended) {
+      finish(d, null);
+      return;
+    }
+    if (!current.audible || current.samples - current.heard < d.rate * MIN_SPOKEN_SECONDS || performance.now() - d.lastInterim < INTERIM_GAP_MS) return;
+    current.heard = current.samples;
+    d.working = true;
+    const audio = downsample(joinFrames(current.frames), d.rate, 16000);
+    void speech()
+      .transcribe(audio)
+      .then(
+        (text) => {
+          d.working = false;
+          d.lastInterim = performance.now();
+          if (live.current !== d) return;
+          if (!current.final) {
+            current.text = cleanTranscript(text);
+            emit(d);
+          }
+          pump(d);
+        },
+        () => {
+          d.working = false;
+          finish(d, MODEL_PROBLEM);
+        },
+      );
+  };
+
+  const hear = (d: Dictation, frame: Float32Array) => {
+    if (live.current !== d || d.ended) return;
+    let sum = 0;
+    for (let i = 0; i < frame.length; i++) sum += frame[i] * frame[i];
+    const rms = Math.sqrt(sum / frame.length);
+    const frameMs = (frame.length / d.rate) * 1000;
+    const threshold = Math.max(0.012, d.floor * 3);
+    const current = d.segments[d.segments.length - 1];
+    const loud = rms > threshold;
+    const audible = loud || rms > Math.max(QUIET_SPEECH, d.floor * 2);
+    d.total += frame.length;
+    current.frames.push(frame);
+    current.samples += frame.length;
+    if (audible) current.audible = true;
+    while (!current.audible && current.frames.length > 1 && current.samples - current.frames[0].length >= d.rate * PREROLL_SECONDS) {
+      current.samples -= current.frames.shift()!.length;
+    }
+    if (!loud) d.floor = rms < d.floor ? d.floor * 0.9 + rms * 0.1 : d.floor * 0.995 + rms * 0.005;
+    d.silentMs = audible ? 0 : d.silentMs + frameMs;
+    if (current.audible && shouldCut({ segmentMs: (current.samples / d.rate) * 1000, silentMs: d.silentMs })) {
+      current.closed = true;
+      d.segments.push(newSegment());
+    }
+    pump(d);
+  };
+
+  const start = useCallback(() => {
+    if (live.current) return;
+    setError(null);
+    speech().unlock();
+    speech().warm("stt");
+    const d: Dictation = { capture: null, rate: 16000, segments: [newSegment()], ended: false, working: false, floor: 0.004, silentMs: 0, lastInterim: 0, total: 0 };
+    live.current = d;
+    setState("starting");
+    capture((frame) => hear(d, frame))
+      .then((c) => {
+        if (live.current !== d) {
+          c.stop();
+          return;
+        }
+        d.capture = c;
+        d.rate = c.rate;
+        if (d.ended) {
+          finish(d, null);
+          return;
+        }
+        setState("listening");
+      })
+      .catch((e: unknown) => {
+        if (live.current !== d) return;
+        live.current = null;
+        setState("idle");
+        on.current.onCancel();
+        setError(micProblem(e));
+      });
+  }, []);
+
+  const stop = useCallback(() => {
+    const d = live.current;
+    if (!d || d.ended) return;
+    d.ended = true;
+    if (!d.capture) return;
+    d.capture.stop();
+    const current = d.segments[d.segments.length - 1];
+    current.closed = true;
+    setState("transcribing");
+    pump(d);
+  }, []);
+
+  const cancel = useCallback(() => {
+    const d = live.current;
+    if (!d) return;
+    live.current = null;
+    d.capture?.stop();
+    setState("idle");
+    on.current.onCancel();
+  }, []);
+
+  useEffect(
+    () => () => {
+      live.current?.capture?.stop();
+      live.current = null;
+    },
+    [],
+  );
 
   return { state, error, start, stop, cancel, clearError: () => setError(null) };
 }
@@ -246,15 +450,128 @@ export function VoiceField({ value, onChange, onDictated, multiline, composer, c
     watch.observe(el);
     return () => watch.disconnect();
   }, [composer, value]);
-  const { state, start, stop, cancel, error, clearError } = useHoldToTalk((text) => {
-    const cur = latest.current;
-    onChange(cur && !/\s$/.test(cur) ? `${cur} ${text}` : `${cur}${text}`);
-    onDictated?.();
+  const box = useRef<HTMLTextAreaElement | HTMLInputElement | null>(null);
+  const mirror = useRef<HTMLDivElement | null>(null);
+  const anchor = useRef<DictationAnchor | null>(null);
+  const original = useRef("");
+  const caretTo = useRef<number | null>(null);
+  const written = useRef<string | null>(null);
+  const sendAfter = useRef(false);
+  const [shown, setShown] = useState<Spliced | null>(null);
+  const attach = (el: HTMLTextAreaElement | HTMLInputElement | null) => {
+    box.current = el;
+    if (composer) area.current = el as HTMLTextAreaElement | null;
+    if (inputRef) inputRef.current = el;
+  };
+  const write = (next: Spliced) => {
+    caretTo.current = next.end;
+    written.current = next.value;
+    onChange(next.value);
+  };
+  const { state, start, stop, cancel, error, clearError } = useDictation({
+    onText: (firm, provisional) => {
+      if (!anchor.current) return;
+      const next = splice(anchor.current, firm, provisional);
+      setShown(next);
+      write(next);
+    },
+    onDone: (text, failed) => {
+      const at = anchor.current;
+      anchor.current = null;
+      written.current = null;
+      if (failed) sendAfter.current = false;
+      setShown(null);
+      if (!at) return;
+      if (!text) {
+        caretTo.current = null;
+        onChange(original.current);
+        return;
+      }
+      write(splice(at, text, ""));
+      onDictated?.();
+    },
+    onCancel: () => {
+      const had = anchor.current;
+      anchor.current = null;
+      written.current = null;
+      sendAfter.current = false;
+      setShown(null);
+      caretTo.current = null;
+      if (had) onChange(original.current);
+    },
   });
+  const begin = () => {
+    if (anchor.current) return;
+    const el = box.current;
+    const now = latest.current;
+    anchor.current = el && document.activeElement === el ? anchorAt(now, el.selectionStart, el.selectionEnd) : anchorAt(now, null, null);
+    original.current = now;
+    written.current = now;
+    start();
+  };
+  const busy = state !== "idle";
+  const sendWhenDone = () => {
+    sendAfter.current = true;
+    stop();
+  };
+  useEffect(() => {
+    if (!anchor.current || written.current === null || value === written.current) return;
+    anchor.current = null;
+    written.current = null;
+    sendAfter.current = false;
+    setShown(null);
+    cancel();
+  }, [value, cancel]);
+  useEffect(() => {
+    const form = box.current?.form;
+    if (!busy || !form) return;
+    const hold = (e: SubmitEvent) => {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      sendWhenDone();
+    };
+    form.addEventListener("submit", hold, true);
+    return () => form.removeEventListener("submit", hold, true);
+  });
+  useEffect(() => {
+    if (busy || !sendAfter.current) return;
+    sendAfter.current = false;
+    box.current?.form?.requestSubmit();
+  }, [busy, value]);
+  useEffect(() => {
+    const el = box.current;
+    const caret = caretTo.current;
+    if (el && caret !== null) {
+      caretTo.current = null;
+      if (document.activeElement === el) el.setSelectionRange(caret, caret);
+      else if (anchor.current && !anchor.current.after) el.scrollTop = el.scrollHeight;
+    }
+    if (el && mirror.current) {
+      mirror.current.scrollTop = el.scrollTop;
+      mirror.current.scrollLeft = el.scrollLeft;
+    }
+  }, [value, shown]);
+  const syncMirror = (e: React.UIEvent<HTMLTextAreaElement | HTMLInputElement>) => {
+    if (!mirror.current) return;
+    mirror.current.scrollTop = e.currentTarget.scrollTop;
+    mirror.current.scrollLeft = e.currentTarget.scrollLeft;
+  };
+  const fitMirror = (div: HTMLDivElement | null) => {
+    mirror.current = div;
+    const el = box.current;
+    if (!div || !el) return;
+    const look = getComputedStyle(el);
+    for (const side of ["Top", "Right", "Bottom", "Left"] as const) {
+      div.style[`border${side}Width`] = look[`border${side}Width`];
+      div.style[`padding${side}`] = look[`padding${side}`];
+    }
+    div.scrollTop = el.scrollTop;
+    div.scrollLeft = el.scrollLeft;
+  };
+  const provisional = shown && shown.provisionalStart < shown.end && shown.value === value ? shown : null;
   const pressedAt = useRef(0);
   const latched = useRef(false);
   const viaKeys = useRef(false);
-  const busy = state !== "idle";
   const live = useRef(state);
   live.current = state;
 
@@ -287,39 +604,47 @@ export function VoiceField({ value, onChange, onDictated, multiline, composer, c
     e.preventDefault();
     if (e.repeat || busy) return true;
     viaKeys.current = true;
-    start();
+    begin();
     return true;
   };
 
-  const tip = error ?? (state === "transcribing" ? "Turning your voice into words" : state === "listening" ? "Tap to stop and add the words" : `Tap or hold to talk (${pushKeys().join(" ")} while typing)`);
+  const tip = error ?? (state === "transcribing" ? "Finishing the words" : state === "listening" ? "Tap to stop" : `Tap or hold to talk (${pushKeys().join(" ")} while typing)`);
   const field =
-    "w-full rounded-lg border-2 border-w-ink bg-w-field py-2 pl-3 pr-11 text-w-base outline-none placeholder:text-w-faint focus:ring-2 focus:ring-w-teal";
+    "block w-full rounded-lg border-2 border-w-ink bg-w-field py-2 pl-3 pr-11 text-w-base outline-none placeholder:text-w-faint focus:ring-2 focus:ring-w-teal";
+  const shape = composer ? "resize-none overflow-y-auto leading-snug" : multiline ? "min-h-[5rem] resize-y" : "";
+  const look = cn(field, shape, provisional && "text-transparent caret-w-ink");
   const hint = viaKeys.current ? (
     <>
-      Release <PushToTalkKeys /> to add the words
+      Release <PushToTalkKeys /> to stop
     </>
   ) : (
     "Tap the mic to stop"
   );
+  const shared = {
+    "aria-label": ariaLabel,
+    placeholder: busy ? `${TALK_TEXT[state]}...` : placeholder,
+    value,
+    readOnly: busy,
+    onChange: (e: React.ChangeEvent<HTMLTextAreaElement | HTMLInputElement>) => onChange(e.target.value),
+    onScroll: syncMirror,
+  };
   return (
     <div className={cn("relative min-w-0 flex-1", className)}>
       {composer ? (
         <textarea
-          ref={(el) => {
-            area.current = el;
-            if (inputRef) inputRef.current = el;
-          }}
+          {...shared}
+          ref={attach}
           rows={1}
-          aria-label={ariaLabel}
-          placeholder={busy ? `${TALK_TEXT[state]}...` : placeholder}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
           onKeyDown={(e) => {
             if (pushToTalk(e)) return;
             if (onKey?.(e)) return;
             if (e.key !== "Enter" || e.nativeEvent.isComposing) return;
             if (e.shiftKey) return;
             e.preventDefault();
+            if (busy) {
+              sendWhenDone();
+              return;
+            }
             const el = e.currentTarget;
             if (e.ctrlKey || e.altKey) {
               const { selectionStart: from, selectionEnd: to } = el;
@@ -328,35 +653,34 @@ export function VoiceField({ value, onChange, onDictated, multiline, composer, c
               requestAnimationFrame(() => el.setSelectionRange(from + 1, from + 1));
               return;
             }
-            if (busy) return;
             el.form?.requestSubmit();
           }}
-          className={cn(field, "block resize-none overflow-y-auto leading-snug")}
+          className={look}
         />
       ) : multiline ? (
-        <textarea
-          aria-label={ariaLabel}
-          placeholder={busy ? `${TALK_TEXT[state]}...` : placeholder}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          onKeyDown={(e) => void pushToTalk(e)}
-          className={cn(field, "min-h-[5rem] resize-y")}
-        />
+        <textarea {...shared} ref={attach} onKeyDown={(e) => void pushToTalk(e)} className={look} />
       ) : (
-        <input
-          ref={inputRef as React.Ref<HTMLInputElement>}
-          aria-label={ariaLabel}
-          placeholder={busy ? `${TALK_TEXT[state]}...` : placeholder}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          onKeyDown={(e) => void pushToTalk(e)}
-          className={field}
-        />
+        <input {...shared} ref={attach} onKeyDown={(e) => void pushToTalk(e)} className={look} />
+      )}
+      {provisional && (
+        <div
+          ref={fitMirror}
+          aria-hidden
+          className={cn(
+            "pointer-events-none absolute inset-0 overflow-hidden rounded-lg border-solid border-transparent text-w-base",
+            composer ? "whitespace-pre-wrap break-words leading-snug" : multiline ? "whitespace-pre-wrap break-words" : "whitespace-pre",
+          )}
+        >
+          {provisional.value.slice(0, provisional.provisionalStart)}
+          <span className="text-w-quiet">{provisional.value.slice(provisional.provisionalStart, provisional.end)}</span>
+          {provisional.value.slice(provisional.end)}
+          {"\u200b"}
+        </div>
       )}
       <button
         type="button"
         title={tip}
-        aria-label={state === "listening" ? "Stop and add the words" : "Talk"}
+        aria-label={state === "listening" ? "Stop dictating" : "Talk"}
         aria-pressed={state === "listening"}
         onPointerDown={(e) => {
           e.preventDefault();
@@ -370,7 +694,7 @@ export function VoiceField({ value, onChange, onDictated, multiline, composer, c
           e.currentTarget.setPointerCapture(e.pointerId);
           pressedAt.current = Date.now();
           viaKeys.current = false;
-          start();
+          begin();
         }}
         onPointerUp={() => {
           if (!pressedAt.current) return;
@@ -387,7 +711,7 @@ export function VoiceField({ value, onChange, onDictated, multiline, composer, c
           if (e.key !== "Enter" && e.key !== " ") return;
           e.preventDefault();
           if (busy) void stop();
-          else start();
+          else begin();
         }}
         className={cn(
           "absolute grid place-items-center transition-colors duration-150",

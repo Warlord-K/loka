@@ -1,7 +1,7 @@
 "use client";
 
 import { focusTodo } from "./todos-ui";
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { ArrowRight, Archive, CaretDown, ArrowLeft, CaretRight, Waveform, ChatCircleDots, ClockCounterClockwise, GitFork, GearSix, MoonStars, Scroll, Sun, SunHorizon, Clock, Sword, Ear, Lightning, Pause, Play, Plus, X, House, PawPrint, Tree, MapPin, Info, Star, User as UserIcon, UsersThree, UsersFour } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
@@ -35,7 +35,9 @@ import type { Opens, Progress, RegionDetail, Region, Surface } from "@/lib/loka"
 import { portraitUrl } from "./characters";
 import { targetKey, LokaEngine, type Target, type TimeOfDay } from "./engine";
 import { arrivalFor, buildWorld, HEARTH, type World } from "./world";
+import { buildWorld as buildClassicWorld } from "./world-classic";
 import { buildRegionWorld, lookOfNpc, mapItemOf } from "./regions";
+import { buildRegionWorld as buildClassicRegionWorld } from "./regions-classic";
 import { areaName, districtOf, districtRegion } from "./districts";
 import { campusRoom, classDoor, hallRoom, skillSlug, type CampusData } from "./campus";
 import { LokaFailure, lokaApi, playerLookWith, readVisited, saveVisited, useCosmetics, useSharedProgress, useWorldEvent } from "./loka-client";
@@ -70,6 +72,7 @@ import { OPEN_TERMINAL_EVENT } from "./run-command";
 import { ChatPanel } from "./chat";
 import { engineChoice, VoiceMode } from "./voice-mode";
 import { primeLiveAudio } from "./live-voice";
+import { callReducer, NO_CALL } from "@/lib/call-state";
 import { EquipCard, OmpModelsSection } from "./omp-models";
 import { ContextButton, ContextMeter, useAgentContext } from "./context-control";
 import { ApprovalRow, QuestContextRow, ReviewerRow, KitSection, MainAgentRow, PowersSection, ResetContextRow, TidyHistoryRow, UsageSection, RemoveAgentButton, ArchiveAgentRow, SchedulesSection, SubscriptionsSection, FeedsSection, TagChips } from "./agent-manage";
@@ -130,6 +133,7 @@ import { FindBar } from "./find-bar";
 import { PaneResizer, usePaneWidth } from "./pane-resizer";
 import { cliName, modelName, runtimeName } from "@/lib/model-names";
 import { SEND_RETRY_DELAYS, notSent, sendFailure } from "@/lib/send-failure";
+import { chooseNewArt, newArtOn, retryDelay, showNewArt } from "./sprites";
 
 const Workbench = dynamic(() => import("./workbench/workbench").then((m) => m.Workbench), {
   ssr: false,
@@ -369,9 +373,11 @@ function AgentDialog({
   embedded = false,
   compact = false,
   progress = null,
+  onCallSlot,
 }: {
   embedded?: boolean;
   compact?: boolean;
+  onCallSlot?: (el: HTMLElement, on: boolean) => void;
   progress?: string | null;
   meId: string | null;
   viewer: QuestViewer | null;
@@ -393,6 +399,19 @@ function AgentDialog({
   onVoiceSent: (agentId: string) => void;
 }) {
   const [tab, setTab] = useState<"talk" | "aside" | "work" | "settings">(() => takeAgentTab(agent.id) ?? (access.use ? "talk" : "work"));
+  const callSlotEl = useRef<HTMLElement | null>(null);
+  const callSlotRef = useCallback(
+    (el: HTMLDivElement | null) => {
+      if (el) {
+        callSlotEl.current = el;
+        onCallSlot?.(el, true);
+      } else if (callSlotEl.current) {
+        onCallSlot?.(callSlotEl.current, false);
+        callSlotEl.current = null;
+      }
+    },
+    [onCallSlot],
+  );
   useAgentTabRequests(agent.id, setTab);
   const [forkArmed, setForkArmed] = useState(false);
   const [about, setAbout] = useState(false);
@@ -501,7 +520,7 @@ function AgentDialog({
     };
   }, [inTalk, agent.id, markSeen]);
 
-  const refresh = useCallback(() => {
+  const refreshMessages = useCallback(() => {
     if (access.use)
       worldApi
         .messages(agent.id)
@@ -515,22 +534,27 @@ function AgentDialog({
         )
         .catch(() => {})
         .finally(() => setHistoryFor(agent.id));
+  }, [agent.id, access.use]);
+
+  const refresh = useCallback(() => {
+    refreshMessages();
     if (!access.read) return;
     worldApi
       .tasks()
       .then((all) => setTasks(all.filter((t) => t.assigned_agent_id === agent.id).slice(0, 12)))
       .catch(() => {});
-  }, [agent.id, access.use, access.read]);
+  }, [agent.id, access.read, refreshMessages]);
 
   useEffect(() => {
     refresh();
     const onEvent = (e: Event) => {
       const ev = (e as CustomEvent<WorldEvent>).detail;
-      if ((ev.agent_id === agent.id && ev.type !== "agent.progress" && ev.type !== "agent.context") || (ev.type === "task.updated" && ev.payload.from_agent_id === agent.id)) refresh();
+      if (ev.type === "voice.transcript" && ev.agent_id === agent.id) refreshMessages();
+      else if ((ev.agent_id === agent.id && ev.type !== "agent.progress" && ev.type !== "agent.context") || (ev.type === "task.updated" && ev.payload.from_agent_id === agent.id)) refresh();
     };
     window.addEventListener("world-event", onEvent);
     return () => window.removeEventListener("world-event", onEvent);
-  }, [agent.id, refresh]);
+  }, [agent.id, refresh, refreshMessages]);
   useRefetchOnResume(refresh);
 
   const lastId = messages[messages.length - 1]?.id;
@@ -948,6 +972,7 @@ function AgentDialog({
             ),
           )}
       </div>
+      {onCallSlot && <div ref={callSlotRef} className="shrink-0" />}
 
       <div key={tab} className={cn("min-h-[12.5rem] flex-1 overflow-y-auto px-4 pb-2 pt-4 @lg:px-5 @lg:pt-5", (tab === "talk" || tab === "aside") && "flex flex-col")}>
         {!access.read && !access.use ? (
@@ -1135,7 +1160,7 @@ function AgentDialog({
                         {opts && (opts.model || opts.effort || opts.fast) && (
                           <span className="font-mono text-w-2xs text-w-faint">{[opts.model, opts.effort && `${opts.effort} effort`, opts.fast && "fast"].filter(Boolean).join(" · ")}</span>
                         )}
-                        <MessageStamp createdAt={m.created_at} editedAt={m.edited_at} />
+                        <MessageStamp createdAt={m.created_at} editedAt={m.meta?.kind === "voice" ? null : m.edited_at} />
                         <span className="font-semibold text-w-strong">{name}</span>
                       </p>
                     )}
@@ -1192,7 +1217,7 @@ function AgentDialog({
                       name={name}
                       onOpen={speaker ? () => onOpenAgent(speaker.id) : undefined}
                       createdAt={m.created_at}
-                      editedAt={m.edited_at}
+                      editedAt={m.meta?.kind === "voice" ? null : m.edited_at}
                       badges={
                         <>
                           {speaker && sender && <span className="text-w-2xs text-w-muted">to {agent.name}</span>}
@@ -1217,7 +1242,7 @@ function AgentDialog({
                     <RunCommandContext.Provider value={ownsAgent && tab === "talk" && m.author_kind === "agent" ? runCommand : null}>
                       <LocalPathContext.Provider value={ownsAgent ? agent : null}>
                         <div {...quoteProps(`msg:${m.id}`, `${m.author_kind === "agent" ? agent.name : "Loka"}'s message`, `agent:${agent.id}`)}>
-                          <RichText text={m.body} handles={handles} onOpenAgent={onOpenAgent} className={m.author_kind === "system" ? "text-w-muted" : "text-w-text"} />
+                          <RichText text={m.meta?.partial ? `${m.body} ...` : m.body} handles={handles} onOpenAgent={onOpenAgent} className={m.author_kind === "system" ? "text-w-muted" : "text-w-text"} />
                         </div>
                       </LocalPathContext.Provider>
                     </RunCommandContext.Provider>
@@ -1407,7 +1432,7 @@ function AgentSettings({ agent, onUpdated }: { agent: WorldAgent; onUpdated: (ag
   const [cli, setCli] = useState(baseCli);
   const [model, setModel] = useState(baseModel);
   const [species, setSpecies] = useState(
-    typeof agent.look.species === "string" && agent.look.species !== "person" ? agent.look.species : "",
+    typeof agent.look.species === "string" && agent.look.species !== "person" && agent.look.species !== "human" ? agent.look.species : "",
   );
   const [accessories, setAccessories] = useState<Accessory[]>(() => declaredAccessories(agent.look.accessories));
   const [gear, setGear] = useState(typeof agent.gear.quest === "string" ? agent.gear.quest : "");
@@ -1448,7 +1473,7 @@ function AgentSettings({ agent, onUpdated }: { agent: WorldAgent; onUpdated: (ag
     setState("saving");
     try {
       const look = { ...agent.look };
-      look.species = species.trim() || "person";
+      look.species = species.trim() || "human";
       const keptAccessories = [...accessories, ...unknownAccessories(agent.look.accessories)];
       if (keptAccessories.length) look.accessories = keptAccessories;
       else delete look.accessories;
@@ -2080,7 +2105,19 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
   const [dialog, setDialog] = useState<Target | null>(null);
   const [board, setBoard] = useState<boolean | "teams">(false);
   const [creatingAgent, setCreatingAgent] = useState(false);
-  const [voiceAgentId, setVoiceAgentId] = useState<string | null>(null);
+  const [call, callDispatch] = useReducer(callReducer, NO_CALL);
+  const voiceAgentId = call.agentId;
+  const [callSlot, setCallSlot] = useState<HTMLElement | null>(null);
+  const [callPill, setCallPill] = useState(false);
+  const onCallSlot = useCallback((el: HTMLElement, on: boolean) => setCallSlot((cur) => (on ? el : cur === el ? null : cur)), []);
+  const [wide, setWide] = useState(false);
+  useEffect(() => {
+    const query = window.matchMedia("(min-width: 1024px)");
+    const update = () => setWide(query.matches);
+    update();
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  }, []);
   const inCallRef = useRef(false);
   inCallRef.current = voiceAgentId !== null;
   const talkPressedAt = useRef(0);
@@ -2142,6 +2179,23 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
   const [chatLast, setChatLast] = useState<{ agentId: string | null; channelId: string | null }>({ agentId: null, channelId: null });
   const [progress, setProgress] = useState<Record<string, string>>({});
   const [me, setMe] = useState<Me | null>(initialMe);
+  const wantsNewArt = !!me?.new_art;
+  const [art, setArt] = useState<"classic" | "new">(() => (wantsNewArt && newArtOn() ? "new" : "classic"));
+  const [artTries, setArtTries] = useState(0);
+  useEffect(() => {
+    let live = true;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    void chooseNewArt(wantsNewArt).then((on) => {
+      if (!live) return;
+      setArt(on ? "new" : "classic");
+      if (on) setArtTries(0);
+      else if (wantsNewArt) retry = setTimeout(() => setArtTries((n) => n + 1), retryDelay(artTries));
+    });
+    return () => {
+      live = false;
+      clearTimeout(retry);
+    };
+  }, [wantsNewArt, artTries]);
   const { teams: worldTeams } = useTeams(!!me);
   const teamGroupsRef = useRef<string[][]>([]);
   useEffect(() => {
@@ -2202,6 +2256,16 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       method: "PATCH",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ name }),
+    });
+    if (!res.ok) return false;
+    setMe((await res.json()) as Me);
+    return true;
+  }, []);
+  const setNewArt = useCallback(async (on: boolean) => {
+    const res = await fetch("/api/world/me", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ new_art: on }),
     });
     if (!res.ok) return false;
     setMe((await res.json()) as Me);
@@ -2543,11 +2607,14 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     setTouch(isTouch);
     const guide = list.find((a) => a.id === mainId);
     const residents = list.filter((a) => a.id !== mainId).map((a) => residentFor(a));
-    const world = district
-      ? buildRegionWorld(districtRegion(district), [], cameFrom.current, { district, decor: decorKey ? decorKey.split(",") : [] })
+    showNewArt(art === "new");
+    const regionWorld = art === "new" ? buildRegionWorld : buildClassicRegionWorld;
+    const homeWorld = art === "new" ? buildWorld : buildClassicWorld;
+    const world: World = district
+      ? regionWorld(districtRegion(district), [], cameFrom.current, { district, decor: decorKey ? decorKey.split(",") : [] })
       : inRegion && detail
-        ? buildRegionWorld(detail.region, detail.items.map((i) => mapItemOf(i, list)).filter((m): m is MapItem => m !== null), cameFrom.current)
-        : buildWorld(guide ? residentFor(guide, true) : null, residents, itemsRef.current.map((i) => mapItemOf(i, list)).filter((m): m is MapItem => m !== null));
+        ? regionWorld(detail.region, detail.items.map((i) => mapItemOf(i, list)).filter((m): m is MapItem => m !== null), cameFrom.current)
+        : homeWorld(guide ? residentFor(guide, true) : null, residents, itemsRef.current.map((i) => mapItemOf(i, list)).filter((m): m is MapItem => m !== null));
     const previous = engineRef.current;
     const prior = handoff.current;
     const sameRegion = prior?.region === world.region;
@@ -2594,16 +2661,16 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       engine.destroy();
       if (engineRef.current === engine) engineRef.current = null;
     };
-  }, [loaded, roster, mapKey, open, onLeave, mainId, regionId, regionKey, decorKey]);
+  }, [loaded, art, roster, mapKey, open, onLeave, mainId, regionId, regionKey, decorKey]);
 
   useEffect(() => {
     engineRef.current?.setPlayerLook(playerLookWith(playerLookKey ? playerLookKey.split(",") : []));
   }, [playerLookKey, engineGen]);
 
-  const windowOpen = Boolean(dialog) || Boolean(sheet) || Boolean(loka) || Boolean(board) || creatingAgent || Boolean(voiceAgentId) || history !== false || quick !== false || chatOpen || listsOpen || Boolean(reports) || changelogOpen || terminalOpen || youOpen || folderShop;
+  const windowOpen = Boolean(dialog) || Boolean(sheet) || Boolean(loka) || Boolean(board) || creatingAgent || history !== false || quick !== false || chatOpen || listsOpen || Boolean(reports) || changelogOpen || terminalOpen || youOpen || folderShop;
   const overlay = windowOpen || paletteOpen || Boolean(workbench);
   const hudHide = overlay ? "invisible opacity-0" : "visible opacity-100";
-  const menu = windowOpen && (creatingAgent || Boolean(voiceAgentId) || dialog?.kind !== "plot");
+  const menu = windowOpen && (creatingAgent || dialog?.kind !== "plot");
   const otherMenu = Boolean(board) || creatingAgent || Boolean(voiceAgentId) || history !== false || quick !== false || chatOpen || notesOpen || listsOpen || youOpen || dialog?.kind === "plot" || paletteOpen;
   const canRead = atLeast(me, "read");
   const canWrite = atLeast(me, "write");
@@ -2976,7 +3043,6 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     setDialog(null);
     setBoard(false);
     setCreatingAgent(false);
-    setVoiceAgentId(null);
     setHistory(false);
     setHistoryFocus(null);
     setNotesOpen(false);
@@ -3363,15 +3429,21 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     setInjected({ text, nonce: Date.now(), agentId: target.id });
   });
   const voiceAgent = voiceAgentId ? agents.find((a) => a.id === voiceAgentId) ?? null : null;
-  const openVoice = (id?: string) => {
+  const minimiseCall = useCallback(() => callDispatch({ type: "minimise" }), []);
+  const openVoice = (id?: string, inChat = false) => {
+    if (call.agentId && (!id || call.agentId === id)) {
+      if (!inChat) restoreCall();
+      else callDispatch({ type: "restore" });
+      return;
+    }
     const target = id ? agents.find((a) => a.id === id) ?? null : talkTarget();
     if (!target) {
       pushToast({ id: Date.now(), text: "Walk up to someone, or summon your main agent, before starting a voice chat." });
       return;
     }
     if (engineChoice() === "live") primeLiveAudio();
-    setDialog(null);
-    setVoiceAgentId(target.id);
+    callDispatch({ type: "start", agentId: target.id });
+    if (!inChat) setDialog({ kind: "resident", id: target.id });
   };
   const talkRef = useRef(talk);
   talkRef.current = talk;
@@ -3458,7 +3530,8 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       agents={agents}
       onOpenAgent={opts.onOpenAgent}
       canInstall={isAdmin}
-      onVoice={() => openVoice(agent.id)}
+      onVoice={() => openVoice(agent.id, true)}
+      onCallSlot={agent.id === call.agentId && !call.minimised && (!opts.compact || wide) ? onCallSlot : undefined}
       onAgentUpdated={(updated) => {
         storeAgent(updated);
         void load();
@@ -3485,6 +3558,16 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       const rank = (x: WorldAgent) => (x.id === mainId ? 0 : x.status === "waiting" || x.status === "error" ? 1 : x.owner_user_id === me?.id ? 2 : 3);
       return rank(a) - rank(b) || a.name.localeCompare(b.name);
     });
+  const restoreCall = () => {
+    const id = call.agentId;
+    if (!id) return;
+    callDispatch({ type: "restore" });
+    if (callSlot?.isConnected) return;
+    const shown = (sideAgent?.id === id && wide) || (dialog?.kind === "resident" && dialog.id === id && !reports && !listsOpen);
+    if (shown) return;
+    if (wide && (reports || listsOpen) && side.open && chatAgents.some((a) => a.id === id)) setSide({ id, open: true, auto: side.auto });
+    else openAgent(id);
+  };
   sideFrom.current = reports || listsOpen ? null : dialog?.kind === "resident" ? dialog.id : chatOpen && !chatChannel ? chatLast.agentId : null;
   const sideAgent = side.open ? chatAgents.find((a) => a.id === side.id) ?? chatAgents.find((a) => a.id === mainId) ?? chatAgents[0] ?? null : null;
   const sideToggle = chatAgents.length ? (
@@ -3780,37 +3863,35 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     else openSection("world-environment");
   };
 
-  const windowKey = voiceAgent
-    ? "voice"
-    : creatingAgent
-      ? "create"
-      : youOpen
-        ? "you"
-        : terminalOpen
-          ? "terminal"
-          : folderShop
-            ? "workshop"
-            : changelogOpen
-              ? "changelog"
-              : reports
-                ? "reports"
-                : listsOpen
-                  ? "lists"
-                  : chatOpen
-                      ? "chat"
-                      : quick !== false
-                        ? "quick"
-                      : history !== false
-                        ? "history"
-                        : board
-                          ? "board"
-                          : loka && !dialogAgent
-                            ? `loka:${loka.kind}`
-                            : sheet && !dialogAgent
-                              ? "sheet"
-                              : dialogAgent
-                                ? `agent:${dialogAgent.id}`
-                                : dialog?.kind ?? "none";
+  const windowKey = creatingAgent
+    ? "create"
+    : youOpen
+      ? "you"
+      : terminalOpen
+        ? "terminal"
+        : folderShop
+          ? "workshop"
+          : changelogOpen
+            ? "changelog"
+            : reports
+              ? "reports"
+              : listsOpen
+                ? "lists"
+                : chatOpen
+                    ? "chat"
+                    : quick !== false
+                      ? "quick"
+                    : history !== false
+                      ? "history"
+                      : board
+                        ? "board"
+                        : loka && !dialogAgent
+                          ? `loka:${loka.kind}`
+                          : sheet && !dialogAgent
+                            ? "sheet"
+                            : dialogAgent
+                              ? `agent:${dialogAgent.id}`
+                              : dialog?.kind ?? "none";
 
   return (
     <MotionConfig reducedMotion="user">
@@ -4148,6 +4229,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
           {...scrimMotion(menu ? 2 : 0)}
           className={cn(
             "absolute inset-0 z-30 flex justify-center p-3 sm:p-6",
+            callPill && "pt-[calc(max(0.5rem,env(safe-area-inset-top))_+_3.25rem)] sm:pt-[calc(max(0.5rem,env(safe-area-inset-top))_+_3.25rem)]",
             menu ? "items-stretch bg-w-scrim/55 backdrop-blur-[2px]" : "items-end bg-w-scrim/30",
           )}
           onPointerDown={(e) => {
@@ -4163,7 +4245,6 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
               else if (folderShop) setFolderShop(false);
               else if (youOpen) setYouOpen(false);
               else if (creatingAgent) setCreatingAgent(false);
-              else if (voiceAgentId) setVoiceAgentId(null);
               else if (loka) setLoka(null);
               else if (sheet) setSheet(null);
               else closeDialog();
@@ -4177,20 +4258,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
             data-find-scope
             className={cn("w-full origin-center", menu ? "mx-auto flex h-full flex-col" : "max-w-3xl 2xl:max-w-4xl")}
           >
-            {voiceAgent ? (
-              <VoiceMode
-                agent={voiceAgent}
-                portrait={portraitUrl(residentFor(voiceAgent).look, 6)}
-                onClose={() => {
-                  setVoiceAgentId(null);
-                  canvasRef.current?.focus();
-                }}
-                onOpenChat={() => {
-                  setVoiceAgentId(null);
-                  setDialog({ kind: "resident", id: voiceAgent.id });
-                }}
-              />
-            ) : creatingAgent ? (
+            {creatingAgent ? (
               <CreateAgentDialog
                 onCreated={(agent) => {
                   storeAgent(agent);
@@ -4209,6 +4277,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
                 onToggleVoice={toggleVoiceReplies}
                 onRename={rename}
                 onStatus={setStatus}
+                onNewArt={setNewArt}
                 onOpenAssistant={() => {
                   setYouOpen(false);
                   void summonAssistant();
@@ -4435,6 +4504,23 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
         </motion.div>
       )}
       </AnimatePresence>
+
+      {voiceAgent && (
+        <VoiceMode
+          key={voiceAgent.id}
+          agent={voiceAgent}
+          portrait={portraitUrl(residentFor(voiceAgent).look, 6)}
+          minimised={call.minimised}
+          slot={callSlot}
+          onMinimise={minimiseCall}
+          onRestore={restoreCall}
+          onHangUp={() => {
+            callDispatch({ type: "hang_up" });
+            if (!windowOpen) canvasRef.current?.focus();
+          }}
+          onPill={setCallPill}
+        />
+      )}
 
       {workbench && (
         <Workbench

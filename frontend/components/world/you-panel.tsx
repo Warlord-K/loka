@@ -2,7 +2,7 @@
 
 import { SOLO } from "@/lib/edition";
 import { AgentAvatar, AgentFace } from "./channel-ui";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { ArrowsClockwise, Broom, Code, Crown, Desktop, GithubLogo, Star, Key, Keyboard, ListChecks, Microphone, Palette, Play, Plus, Scroll, ShareNetwork, SpeakerHigh, UserCircle } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
 import { ShortcutList } from "./shortcuts";
@@ -24,6 +24,7 @@ import { ApiTokensSection } from "./api-tokens";
 import { StorageSection } from "./storage-ui";
 import { useThemeMode, type ThemeMode } from "./theme";
 import { previewSound, SOUND_KINDS, useSoundPrefs } from "./sounds";
+import { newArtStatus, onNewArtStatus } from "./sprites";
 import { UpdatesPage, useUpdates } from "./updates-ui";
 import { GHOST_ICON_BTN, SettingsCard, SettingsGroup, SettingsRow, SettingsShell, Switch, type SettingsNavItem, EmptyState } from "./settings-shell";
 import { runtimeName } from "@/lib/model-names";
@@ -105,26 +106,63 @@ const THEMES: { value: ThemeMode; label: string }[] = [
   { value: "dark", label: "Dark" },
 ];
 
-function AppearancePage() {
+function AppearancePage({ newArt, onNewArt }: { newArt: boolean; onNewArt: (on: boolean) => Promise<boolean> }) {
   const [mode, setMode] = useThemeMode();
+  const [art, setArt] = useState(newArt);
+  const [saving, setSaving] = useState(false);
+  const [saveFailed, setSaveFailed] = useState(false);
+  const artStatus = useSyncExternalStore(onNewArtStatus, newArtStatus, () => "ok" as const);
+  useEffect(() => setArt(newArt), [newArt]);
+  const toggleArt = async (on: boolean) => {
+    setArt(on);
+    setSaving(true);
+    setSaveFailed(false);
+    try {
+      if (!(await onNewArt(on))) throw new Error("New art setting was not saved");
+    } catch {
+      setArt(!on);
+      setSaveFailed(true);
+    } finally {
+      setSaving(false);
+    }
+  };
   return (
-    <SettingsGroup title="Theme">
-      <SettingsCard rows>
-        <SettingsRow
-          title="Color theme"
-          description="System follows your computer's light or dark setting. Saved on this device."
-          control={
-            <div role="radiogroup" aria-label="Theme" className={SEGMENT}>
-              {THEMES.map((t) => (
-                <button key={t.value} type="button" role="radio" aria-checked={mode === t.value} onClick={() => setMode(t.value)} className={cn(SEGMENT_ITEM, mode === t.value ? SEGMENT_ON : SEGMENT_OFF)}>
-                  {t.label}
-                </button>
-              ))}
-            </div>
-          }
-        />
-      </SettingsCard>
-    </SettingsGroup>
+    <>
+      <SettingsGroup title="Theme">
+        <SettingsCard rows>
+          <SettingsRow
+            title="Color theme"
+            description="System follows your computer's light or dark setting. Saved on this device."
+            control={
+              <div role="radiogroup" aria-label="Theme" className={SEGMENT}>
+                {THEMES.map((t) => (
+                  <button key={t.value} type="button" role="radio" aria-checked={mode === t.value} onClick={() => setMode(t.value)} className={cn(SEGMENT_ITEM, mode === t.value ? SEGMENT_ON : SEGMENT_OFF)}>
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+            }
+          />
+        </SettingsCard>
+      </SettingsGroup>
+      <SettingsGroup title="Art">
+        <SettingsCard rows>
+          <SettingsRow
+            title="New art (preview)"
+            description="Draws Loka in the new art: bigger agents in their own colours and redrawn houses, trees and decorations. Off keeps the classic art. Saved to your account."
+            control={<Switch label="New art (preview)" disabled={saving} checked={art} onChange={(on) => void toggleArt(on)} />}
+          >
+            {saveFailed ? (
+              <p role="status" className="text-w-xs leading-relaxed text-w-danger">Could not save the art setting. Check your connection and try again.</p>
+            ) : art && artStatus === "failed" ? (
+              <p role="status" className="text-w-xs leading-relaxed text-w-warn">New art could not load, showing classic art. It will retry.</p>
+            ) : art && artStatus === "partial" ? (
+              <p role="status" className="text-w-xs leading-relaxed text-w-muted">Some figures are still loading and use the classic look for now.</p>
+            ) : null}
+          </SettingsRow>
+        </SettingsCard>
+      </SettingsGroup>
+    </>
   );
 }
 
@@ -242,6 +280,7 @@ export function YouPanel({
   onToggleVoice,
   onRename,
   onStatus,
+  onNewArt,
   onOpenAssistant,
   onOpenPro,
   controlPlane,
@@ -254,6 +293,7 @@ export function YouPanel({
   onToggleVoice: () => void;
   onRename: (name: string) => Promise<boolean>;
   onStatus: (emoji: string, text: string) => Promise<boolean>;
+  onNewArt: (on: boolean) => Promise<boolean>;
   onOpenAssistant: () => void;
   onOpenPro: () => void;
   controlPlane: "connecting" | "online" | "offline";
@@ -291,7 +331,7 @@ export function YouPanel({
         { id: "tokens", label: SOLO ? "Connect other tools" : "API tokens", group: "Connections", icon: Code, keywords: "mcp claude cursor api tokens" },
         { id: "pro", label: "Loka Pro", group: "Account", icon: Crown, keywords: "pro team organizations iphone ipad watch share waitlist" },
         canWrite && { id: "storage", label: "Storage", group: "Account", icon: Broom, keywords: "space size cleanup clean delete old disk usage tidy" },
-        { id: "appearance", label: "Appearance", group: "Preferences", icon: Palette, keywords: "theme dark light" },
+        { id: "appearance", label: "Appearance", group: "Preferences", icon: Palette, keywords: "theme dark light art new art preview style" },
         { id: "sounds", label: "Sounds", group: "Preferences", icon: SpeakerHigh, keywords: "volume audio" },
         canWrite && { id: "voice", label: "Voice", group: "Preferences", icon: Microphone, keywords: "speech dictate speak" },
         { id: "shortcuts", label: "Shortcuts", group: "Preferences", icon: Keyboard, keywords: "keys keyboard hotkeys" },
@@ -528,7 +568,7 @@ export function YouPanel({
       )}
 
       {active === "storage" && canWrite && <StorageSection />}
-      {active === "appearance" && <AppearancePage />}
+      {active === "appearance" && <AppearancePage newArt={!!me?.new_art} onNewArt={onNewArt} />}
       {active === "sounds" && <SoundsPage />}
       {active === "updates" && <UpdatesPage state={updates} autoNote="Updates to only the server or the web app apply in place, with no restart." />}
 

@@ -1,0 +1,2271 @@
+{
+ "title": "Loka style A redesign part 2, polish pass: brighter buildings, one camera, cuter trees",
+ "conventions": {
+  "density": "sprite px per art px. World sprites are 2x: draw each sprite px at P/2 device px. Agents stay 4x (P/4).",
+  "size": "1.25x of today's on-screen size, so doors clear 1.5x agents. Re-shrink from finals/ for any other size, never scale a PNG.",
+  "snap": "Snap rule B: css = max(2, floor(min(w/320, h/192))), P = 4*floor(css*min(dpr,2)/4 + 0.5). P is always even, so 2x sprites stay pixel exact.",
+  "anchor": "Ground contact point in sprite px, bottom centre (x = w/2, y = h). Drop shadows are not baked: draw an ellipse rx = 0.42*w, ry = 0.07*w at the anchor.",
+  "footprint": "Suggested blocked tiles (16 art px) at the anchor row. Buildings: ceil(art_w/16) x 4 (today: 6 x 3). Others: 1 row.",
+  "glow": "No glow. Windows, lamps and the portal are never lit at night: glow is null on every item, and night is only the darker tint.",
+  "sign": "Blank board rect in sprite px where the engine draws the place name (divide by 2 for art px).",
+  "palette": "Own palette per sprite (median cut from its final plus up to 3 kept accents, plum ink outline). Indexed PNG with 1 transparent index. Polish pass: wood lifted toward honey, grey stone warmed toward cream, plum ink outline kept.",
+  "points": "Named spots in sprite px from the sprite's top-left. [x, y] is a point, [x, y, w, h] a rect. door is the bottom centre of the door opening, sign repeats the sign rect, chimney and smoke are where smoke starts, light, flame and clock_face are centres. Shop variants share the shop's points. For a re-shrink to new_w x new_h, multiply x and w by new_w/w and y and h by new_h/h. {} means no useful spot."
+ },
+ "items": [
+  {
+   "name": "shop",
+   "kind": "building",
+   "file": "sprites/shop.png",
+   "w": 260,
+   "h": 242,
+   "density": 2,
+   "art_size": [
+    130.0,
+    121.0
+   ],
+   "anchor": {
+    "x": 130,
+    "y": 242
+   },
+   "footprint": [
+    9,
+    4
+   ],
+   "palette": [
+    "#fff3db",
+    "#f0daaf",
+    "#edd8b9",
+    "#fdcd62",
+    "#ceb6b2",
+    "#cdae94",
+    "#bca9af",
+    "#e2a174",
+    "#f6966a",
+    "#d5a261",
+    "#d7946c",
+    "#c0976f",
+    "#bc8e6b",
+    "#6b9c4c",
+    "#b193a4",
+    "#cd8c68",
+    "#b49077",
+    "#b56967",
+    "#c75b4f",
+    "#92819c",
+    "#4d5470",
+    "#884e5e",
+    "#783e42",
+    "#a03c43",
+    "#802d47",
+    "#5f264b",
+    "#2d0c24",
+    "#f3d67f",
+    "#beab5b",
+    "#cb2748"
+   ],
+   "glow": null,
+   "bytes": 9537,
+   "ram_bytes": 251680,
+   "today_maker": "shop",
+   "final": "finals/shop_final.png",
+   "fal_source": "shop_rich_v1_0.png",
+   "sign": {
+    "x": 76,
+    "y": 117,
+    "w": 108,
+    "h": 21
+   },
+   "variants": {
+    "shop_roof_b8513a.png": {
+     "file": "variants/shop_roof_b8513a.png",
+     "roof": "#b8513a"
+    },
+    "shop_roof_3f6fb0.png": {
+     "file": "variants/shop_roof_3f6fb0.png",
+     "roof": "#3f6fb0"
+    },
+    "shop_roof_6c4f9e.png": {
+     "file": "variants/shop_roof_6c4f9e.png",
+     "roof": "#6c4f9e"
+    },
+    "shop_roof_2f7a5a.png": {
+     "file": "variants/shop_roof_2f7a5a.png",
+     "roof": "#2f7a5a"
+    },
+    "shop_roof_a05a2c.png": {
+     "file": "variants/shop_roof_a05a2c.png",
+     "roof": "#a05a2c"
+    },
+    "shop_roof_9d3f5c.png": {
+     "file": "variants/shop_roof_9d3f5c.png",
+     "roof": "#9d3f5c"
+    },
+    "shop_academy.png": {
+     "file": "variants/shop_academy.png",
+     "roof": "#4b3a8c"
+    },
+    "shop_campus.png": {
+     "file": "variants/shop_campus.png",
+     "roof": "#3f6fb0",
+     "awning": "#4b3a8c"
+    }
+   },
+   "masks": {
+    "roof": "variants/shop_roof_mask.png",
+    "awning": "variants/shop_awning_mask.png"
+   },
+   "polish": "recolour",
+   "points": {
+    "door": [
+     130,
+     226
+    ],
+    "chimney": [
+     210,
+     2
+    ],
+    "sign": [
+     76,
+     117,
+     108,
+     21
+    ]
+   }
+  },
+  {
+   "name": "civic_clock",
+   "kind": "building",
+   "file": "sprites/civic_clock.png",
+   "w": 220,
+   "h": 254,
+   "density": 2,
+   "art_size": [
+    110.0,
+    127.0
+   ],
+   "anchor": {
+    "x": 110,
+    "y": 254
+   },
+   "footprint": [
+    7,
+    4
+   ],
+   "palette": [
+    "#fefefe",
+    "#fcebd9",
+    "#faebca",
+    "#faeacb",
+    "#fae7c6",
+    "#f1ddbf",
+    "#edd7b1",
+    "#e1caac",
+    "#fbc270",
+    "#f6a96d",
+    "#e6a150",
+    "#c8aba5",
+    "#b8a1b9",
+    "#7089b5",
+    "#eb9a67",
+    "#df8c61",
+    "#cd7b5a",
+    "#cc6b52",
+    "#aa8a98",
+    "#b6695c",
+    "#9abb60",
+    "#679464",
+    "#b35c43",
+    "#966268",
+    "#9b4951",
+    "#7b4252",
+    "#486264",
+    "#5d2f47",
+    "#2d0c24",
+    "#f0df5f",
+    "#d9ab4d",
+    "#ca393f"
+   ],
+   "glow": null,
+   "bytes": 8504,
+   "ram_bytes": 223520,
+   "today_maker": "civic_clock",
+   "final": "finals/civic_clock_final.png",
+   "fal_source": "clock_v4_0.png",
+   "sign": {
+    "x": 78,
+    "y": 143,
+    "w": 64,
+    "h": 12
+   },
+   "polish": "regenerated",
+   "points": {
+    "door": [
+     110,
+     232
+    ],
+    "clock_face": [
+     110,
+     97
+    ],
+    "bell": [
+     110,
+     64
+    ],
+    "sign": [
+     78,
+     143,
+     64,
+     12
+    ]
+   }
+  },
+  {
+   "name": "civic_library",
+   "kind": "building",
+   "file": "sprites/civic_library.png",
+   "w": 260,
+   "h": 263,
+   "density": 2,
+   "art_size": [
+    130.0,
+    131.5
+   ],
+   "anchor": {
+    "x": 130,
+    "y": 263
+   },
+   "footprint": [
+    9,
+    4
+   ],
+   "palette": [
+    "#fffaeb",
+    "#feedd8",
+    "#f8e9d4",
+    "#f1e1cc",
+    "#e8d5c1",
+    "#f3dbb5",
+    "#efd3ae",
+    "#e2cbb5",
+    "#d5bda7",
+    "#ccb3c1",
+    "#c9abad",
+    "#b39d90",
+    "#a8aab1",
+    "#9b7c94",
+    "#8ba1b8",
+    "#7297ba",
+    "#c59172",
+    "#ac735f",
+    "#6b92b6",
+    "#6e9c60",
+    "#5780a6",
+    "#53789e",
+    "#54688f",
+    "#8c628f",
+    "#7f5066",
+    "#454b6e",
+    "#582e4d",
+    "#3b3859",
+    "#2d0c24",
+    "#b5cd60",
+    "#e7ac72",
+    "#d3895c"
+   ],
+   "glow": null,
+   "bytes": 14598,
+   "ram_bytes": 273520,
+   "today_maker": "civic_library",
+   "final": "finals/civic_library_final.png",
+   "fal_source": "library_v4_0.png",
+   "sign": {
+    "x": 74,
+    "y": 101,
+    "w": 112,
+    "h": 22
+   },
+   "polish": "regenerated",
+   "points": {
+    "door": [
+     130,
+     210
+    ],
+    "sign": [
+     74,
+     101,
+     112,
+     22
+    ]
+   }
+  },
+  {
+   "name": "civic_forge",
+   "kind": "building",
+   "file": "sprites/civic_forge.png",
+   "w": 250,
+   "h": 243,
+   "density": 2,
+   "art_size": [
+    125.0,
+    121.5
+   ],
+   "anchor": {
+    "x": 125,
+    "y": 243
+   },
+   "footprint": [
+    8,
+    4
+   ],
+   "palette": [
+    "#fef8e3",
+    "#deccbd",
+    "#c7beb2",
+    "#d1b59c",
+    "#c3b9ad",
+    "#bdb4a6",
+    "#bcae9e",
+    "#fbba7e",
+    "#e49f70",
+    "#b5a99a",
+    "#b1a595",
+    "#ab9d8b",
+    "#7fa8c6",
+    "#73a0c0",
+    "#c79a77",
+    "#b68a6a",
+    "#b4815e",
+    "#598eb4",
+    "#4d84ab",
+    "#7f4654",
+    "#975758",
+    "#823e40",
+    "#574366",
+    "#5b2750",
+    "#48325b",
+    "#2d0c24",
+    "#ffb162",
+    "#6aabd2",
+    "#d57649"
+   ],
+   "glow": null,
+   "bytes": 11689,
+   "ram_bytes": 243000,
+   "today_maker": "civic_forge",
+   "final": "finals/civic_forge_final.png",
+   "fal_source": "forge_v1_0.png",
+   "sign": {
+    "x": 85,
+    "y": 125,
+    "w": 69,
+    "h": 17
+   },
+   "polish": "recolour",
+   "points": {
+    "door": [
+     126,
+     233
+    ],
+    "chimney": [
+     34,
+     2
+    ],
+    "forge_fire": [
+     190,
+     192
+    ],
+    "sign": [
+     85,
+     125,
+     69,
+     17
+    ]
+   }
+  },
+  {
+   "name": "civic_post",
+   "kind": "building",
+   "file": "sprites/civic_post.png",
+   "w": 250,
+   "h": 237,
+   "density": 2,
+   "art_size": [
+    125.0,
+    118.5
+   ],
+   "anchor": {
+    "x": 125,
+    "y": 237
+   },
+   "footprint": [
+    8,
+    4
+   ],
+   "palette": [
+    "#f8f4f0",
+    "#eceae6",
+    "#dbd0d0",
+    "#f5dfbb",
+    "#d4beae",
+    "#c1b8c8",
+    "#e79e73",
+    "#b6abab",
+    "#d5916b",
+    "#c19d7e",
+    "#9a8ba5",
+    "#b38b6d",
+    "#7ba3c4",
+    "#c46359",
+    "#bc5550",
+    "#ac7c62",
+    "#874e50",
+    "#5d85aa",
+    "#4b6b96",
+    "#57547a",
+    "#405787",
+    "#a5414e",
+    "#93394f",
+    "#76344d",
+    "#413769",
+    "#2d0c24",
+    "#e1ae98",
+    "#5896cd",
+    "#4c7cbf"
+   ],
+   "glow": null,
+   "bytes": 9401,
+   "ram_bytes": 237000,
+   "today_maker": "civic_post",
+   "final": "finals/civic_post_final.png",
+   "fal_source": "post_v1_0.png",
+   "sign": {
+    "x": 83,
+    "y": 55,
+    "w": 67,
+    "h": 17
+   },
+   "polish": "recolour",
+   "points": {
+    "door": [
+     117,
+     207
+    ],
+    "mailbox": [
+     55,
+     205
+    ],
+    "flag": [
+     233,
+     132
+    ],
+    "sign": [
+     83,
+     55,
+     67,
+     17
+    ]
+   }
+  },
+  {
+   "name": "civic_market",
+   "kind": "building",
+   "file": "sprites/civic_market.png",
+   "w": 244,
+   "h": 168,
+   "density": 2,
+   "art_size": [
+    122.0,
+    84.0
+   ],
+   "anchor": {
+    "x": 122,
+    "y": 168
+   },
+   "footprint": [
+    8,
+    4
+   ],
+   "palette": [
+    "#fdf3e1",
+    "#feebca",
+    "#fce6c2",
+    "#f8d689",
+    "#e5d3d0",
+    "#ebd6b7",
+    "#dfc8b0",
+    "#d6b7a5",
+    "#acc4a3",
+    "#f6bf7e",
+    "#e8a157",
+    "#bdaabd",
+    "#bfa2a6",
+    "#96b7a0",
+    "#86af9f",
+    "#a9c868",
+    "#739f69",
+    "#6ea39d",
+    "#c48663",
+    "#a88894",
+    "#6b9c98",
+    "#767c9d",
+    "#5d888e",
+    "#507985",
+    "#b66c4f",
+    "#975d58",
+    "#77434a",
+    "#436076",
+    "#49203f",
+    "#2d0c24",
+    "#ebd057",
+    "#f28b48",
+    "#d95051"
+   ],
+   "glow": null,
+   "bytes": 8284,
+   "ram_bytes": 163968,
+   "today_maker": "civic_market",
+   "final": "finals/civic_market_final.png",
+   "fal_source": "market_v8_0.png",
+   "sign": {
+    "x": 79,
+    "y": 40,
+    "w": 86,
+    "h": 17
+   },
+   "polish": "regenerated",
+   "points": {
+    "door": [
+     125,
+     146
+    ],
+    "sign": [
+     79,
+     40,
+     86,
+     17
+    ]
+   }
+  },
+  {
+   "name": "civic_observatory",
+   "kind": "building",
+   "file": "sprites/civic_observatory.png",
+   "w": 220,
+   "h": 253,
+   "density": 2,
+   "art_size": [
+    110.0,
+    126.5
+   ],
+   "anchor": {
+    "x": 110,
+    "y": 253
+   },
+   "footprint": [
+    7,
+    4
+   ],
+   "palette": [
+    "#ecede8",
+    "#e2f0f1",
+    "#e5eae1",
+    "#d7d4d9",
+    "#d4cfc5",
+    "#aa99b8",
+    "#cac3b9",
+    "#bfb7a7",
+    "#c5dae5",
+    "#a3d9ce",
+    "#b8c8e0",
+    "#7fcbbb",
+    "#6bc2b1",
+    "#53b9a4",
+    "#48b19c",
+    "#e0ac80",
+    "#806f9b",
+    "#bd9473",
+    "#8a515a",
+    "#42a18e",
+    "#3b9180",
+    "#337e6f",
+    "#2d6e61",
+    "#643852",
+    "#010001",
+    "#fbcb86",
+    "#dc9f61",
+    "#c37647"
+   ],
+   "glow": null,
+   "bytes": 9903,
+   "ram_bytes": 222640,
+   "today_maker": "civic_observatory",
+   "final": "finals/civic_observatory_final.png",
+   "fal_source": "observatory_v1_0.png",
+   "sign": {
+    "x": 86,
+    "y": 146,
+    "w": 48,
+    "h": 14
+   },
+   "polish": "recolour",
+   "points": {
+    "door": [
+     110,
+     232
+    ],
+    "lens": [
+     174,
+     6
+    ],
+    "lens_ground": [
+     12,
+     195
+    ],
+    "sign": [
+     86,
+     146,
+     48,
+     14
+    ]
+   }
+  },
+  {
+   "name": "banyan",
+   "kind": "place",
+   "file": "sprites/banyan.png",
+   "w": 276,
+   "h": 219,
+   "density": 2,
+   "art_size": [
+    138.0,
+    109.5
+   ],
+   "anchor": {
+    "x": 138,
+    "y": 219
+   },
+   "footprint": [
+    5,
+    1
+   ],
+   "palette": [
+    "#e4d6cc",
+    "#dbd87d",
+    "#b8c46e",
+    "#84b4a6",
+    "#c7a688",
+    "#99b264",
+    "#82a75c",
+    "#659c97",
+    "#b3947c",
+    "#a88875",
+    "#6f9a5e",
+    "#608d65",
+    "#58858d",
+    "#567b65",
+    "#996867",
+    "#8a5962",
+    "#525f81",
+    "#846682",
+    "#4a7071",
+    "#446463",
+    "#455c71",
+    "#3b5467",
+    "#794c61",
+    "#6a3d5e",
+    "#4f4862",
+    "#592a54",
+    "#463a51",
+    "#2d0c24"
+   ],
+   "glow": null,
+   "bytes": 15187,
+   "ram_bytes": 241776,
+   "today_maker": "banyan",
+   "final": "finals/banyan_final.png",
+   "fal_source": "banyan_v1_0.png",
+   "polish": "recolour",
+   "points": {}
+  },
+  {
+   "name": "portal_arch",
+   "kind": "place",
+   "file": "sprites/portal_arch.png",
+   "w": 156,
+   "h": 121,
+   "density": 2,
+   "art_size": [
+    78.0,
+    60.5
+   ],
+   "anchor": {
+    "x": 78,
+    "y": 121
+   },
+   "footprint": [
+    3,
+    1
+   ],
+   "palette": [
+    "#fcdbb7",
+    "#dfc9b4",
+    "#d6c1ae",
+    "#c7c0b5",
+    "#cab6ab",
+    "#c3bdb3",
+    "#c2bcb2",
+    "#c1baaf",
+    "#c1bbb2",
+    "#d7b194",
+    "#bbb4a9",
+    "#b4ada1",
+    "#c2a99c",
+    "#aea699",
+    "#aba191",
+    "#a29681",
+    "#959d4d",
+    "#978a76",
+    "#677b49",
+    "#5e4a6b",
+    "#2d0c24",
+    "#f3c764",
+    "#d4af5c",
+    "#d79d59"
+   ],
+   "glow": null,
+   "bytes": 4073,
+   "ram_bytes": 75504,
+   "today_maker": "portal_arch",
+   "final": "finals/portal_arch_final.png",
+   "fal_source": "portal_v1_0.png",
+   "polish": "recolour",
+   "points": {
+    "portal": [
+     79,
+     76
+    ],
+    "opening": [
+     40,
+     30,
+     78,
+     91
+    ],
+    "gem": [
+     77,
+     17
+    ]
+   }
+  },
+  {
+   "name": "noticeboard",
+   "kind": "place",
+   "file": "sprites/noticeboard.png",
+   "w": 67,
+   "h": 68,
+   "density": 2,
+   "art_size": [
+    33.5,
+    34.0
+   ],
+   "anchor": {
+    "x": 33,
+    "y": 68
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#f2dbb9",
+    "#f9a072",
+    "#de9c70",
+    "#c6aa97",
+    "#cf9670",
+    "#bb906d",
+    "#bc8b61",
+    "#b18165",
+    "#a78f82",
+    "#c46059",
+    "#a9444e",
+    "#8a4949",
+    "#823b45",
+    "#733149",
+    "#2d0c24",
+    "#ffb987",
+    "#ab9892",
+    "#cc453f"
+   ],
+   "glow": null,
+   "bytes": 1104,
+   "ram_bytes": 18224,
+   "today_maker": "noticeboard",
+   "final": "finals/noticeboard_final.png",
+   "fal_source": "noticeboard.png",
+   "polish": "recolour",
+   "points": {
+    "board": [
+     12,
+     18,
+     44,
+     32
+    ]
+   }
+  },
+  {
+   "name": "waysign",
+   "kind": "place",
+   "file": "sprites/waysign.png",
+   "w": 36,
+   "h": 60,
+   "density": 2,
+   "art_size": [
+    18.0,
+    30.0
+   ],
+   "anchor": {
+    "x": 18,
+    "y": 60
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#a794a0",
+    "#d5a477",
+    "#f0ae7b",
+    "#ba8c64",
+    "#bc8b5e",
+    "#c0956e",
+    "#b5835e",
+    "#af7f63",
+    "#82464b",
+    "#2d0c24",
+    "#fbbd87"
+   ],
+   "glow": null,
+   "bytes": 463,
+   "ram_bytes": 8640,
+   "today_maker": "waysign",
+   "final": "finals/waysign_final.png",
+   "fal_source": "waysign.png",
+   "polish": "recolour",
+   "points": {
+    "sign": [
+     5,
+     8,
+     26,
+     8
+    ],
+    "sign_lower": [
+     5,
+     23,
+     24,
+     7
+    ]
+   }
+  },
+  {
+   "name": "lantern_post",
+   "kind": "place",
+   "file": "sprites/lantern_post.png",
+   "w": 24,
+   "h": 50,
+   "density": 2,
+   "art_size": [
+    12.0,
+    25.0
+   ],
+   "anchor": {
+    "x": 12,
+    "y": 50
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#faeacb",
+    "#e9ad72",
+    "#bf8e61",
+    "#a69faf",
+    "#b38261",
+    "#5a6893",
+    "#8d4c4a",
+    "#444571",
+    "#2d0c24",
+    "#ffd084",
+    "#ffc678",
+    "#f4b366"
+   ],
+   "glow": null,
+   "bytes": 385,
+   "ram_bytes": 4800,
+   "today_maker": "lantern",
+   "final": "finals/lantern_post_final.png",
+   "fal_source": "lantern_post.png",
+   "polish": "recolour",
+   "points": {
+    "light": [
+     17,
+     23
+    ]
+   }
+  },
+  {
+   "name": "campfire",
+   "kind": "place",
+   "file": "sprites/campfire.png",
+   "w": 30,
+   "h": 36,
+   "density": 2,
+   "art_size": [
+    15.0,
+    18.0
+   ],
+   "anchor": {
+    "x": 15,
+    "y": 36
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#fff5c7",
+    "#ffde88",
+    "#f6c091",
+    "#dbc7b6",
+    "#ffae62",
+    "#dea371",
+    "#9e949f",
+    "#c4b2ab",
+    "#db955f",
+    "#ba8664",
+    "#877995",
+    "#6e415c",
+    "#2d0c24",
+    "#ffcb6e",
+    "#f3b164",
+    "#cb7a44"
+   ],
+   "glow": null,
+   "bytes": 470,
+   "ram_bytes": 4320,
+   "today_maker": "campfire",
+   "final": "finals/campfire_final.png",
+   "fal_source": "campfire.png",
+   "polish": "recolour",
+   "points": {
+    "flame": [
+     15,
+     19
+    ],
+    "smoke": [
+     14,
+     2
+    ]
+   }
+  },
+  {
+   "name": "banner",
+   "kind": "place",
+   "file": "sprites/banner.png",
+   "w": 32,
+   "h": 64,
+   "density": 2,
+   "art_size": [
+    16.0,
+    32.0
+   ],
+   "anchor": {
+    "x": 16,
+    "y": 64
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#e7d0c2",
+    "#7795b7",
+    "#bd8e6d",
+    "#6b8db1",
+    "#5a7daa",
+    "#5276a7",
+    "#4d70a1",
+    "#874a4c",
+    "#436093",
+    "#375085",
+    "#2d0c24",
+    "#f3b781",
+    "#e4ac71"
+   ],
+   "glow": null,
+   "bytes": 537,
+   "ram_bytes": 8192,
+   "today_maker": "banner",
+   "final": "finals/banner_final.png",
+   "fal_source": "banner.png",
+   "polish": "recolour",
+   "points": {
+    "cloth": [
+     6,
+     10,
+     22,
+     30
+    ],
+    "emblem": [
+     16,
+     24
+    ]
+   }
+  },
+  {
+   "name": "stake",
+   "kind": "decoration",
+   "file": "sprites/stake.png",
+   "w": 12,
+   "h": 19,
+   "density": 2,
+   "art_size": [
+    6.0,
+    9.5
+   ],
+   "anchor": {
+    "x": 6,
+    "y": 19
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#e6ac7c",
+    "#ba8a61",
+    "#b17f61",
+    "#8a4a4a",
+    "#72344a",
+    "#2d0c24"
+   ],
+   "glow": null,
+   "bytes": 194,
+   "ram_bytes": 912,
+   "today_maker": "stake",
+   "final": "finals/stake_final.png",
+   "fal_source": "stake.png",
+   "polish": "recolour",
+   "points": {}
+  },
+  {
+   "name": "tree_green",
+   "kind": "decoration",
+   "file": "sprites/tree_green.png",
+   "w": 78,
+   "h": 85,
+   "density": 2,
+   "art_size": [
+    39.0,
+    42.5
+   ],
+   "anchor": {
+    "x": 39,
+    "y": 85
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#efcd74",
+    "#b1735c",
+    "#97b35a",
+    "#a5b45a",
+    "#93b058",
+    "#c1bc6b",
+    "#7ea259",
+    "#6e9656",
+    "#618a4c",
+    "#608e57",
+    "#5e8b56",
+    "#8d5456",
+    "#5a8856",
+    "#507d59",
+    "#4a765a",
+    "#42645b",
+    "#41585b",
+    "#403e50",
+    "#6c3952",
+    "#2d0c24",
+    "#c9855a",
+    "#cb835b"
+   ],
+   "glow": null,
+   "bytes": 2074,
+   "ram_bytes": 26520,
+   "today_maker": "tree_green",
+   "final": "finals/tree_green_final.png",
+   "fal_source": "tree_green.png",
+   "polish": "regenerated, trunk extended",
+   "points": {}
+  },
+  {
+   "name": "tree_blossom",
+   "kind": "decoration",
+   "file": "sprites/tree_blossom.png",
+   "w": 78,
+   "h": 84,
+   "density": 2,
+   "art_size": [
+    39.0,
+    42.0
+   ],
+   "anchor": {
+    "x": 39,
+    "y": 84
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#feeaee",
+    "#fed8e2",
+    "#fed2dd",
+    "#fdc7d4",
+    "#fdbdcb",
+    "#fcc1cf",
+    "#fcb7c7",
+    "#f9acc0",
+    "#f6a3ba",
+    "#f49fb6",
+    "#ac8277",
+    "#f49bb3",
+    "#bb99a5",
+    "#f296af",
+    "#e88daa",
+    "#dd81a3",
+    "#cf7199",
+    "#c66690",
+    "#9a5a72",
+    "#713f58",
+    "#2d0c24"
+   ],
+   "glow": null,
+   "bytes": 2285,
+   "ram_bytes": 26208,
+   "today_maker": "tree_blossom",
+   "final": "finals/tree_blossom_final.png",
+   "fal_source": "tree_blossom.png",
+   "polish": "regenerated, trunk extended",
+   "points": {}
+  },
+  {
+   "name": "tree_autumn",
+   "kind": "decoration",
+   "file": "sprites/tree_autumn.png",
+   "w": 78,
+   "h": 83,
+   "density": 2,
+   "art_size": [
+    39.0,
+    41.5
+   ],
+   "anchor": {
+    "x": 39,
+    "y": 83
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#feb55a",
+    "#fea552",
+    "#fe964b",
+    "#fe9346",
+    "#fc9548",
+    "#fc8f45",
+    "#f58241",
+    "#e3734b",
+    "#ea753c",
+    "#a96c5d",
+    "#e7713b",
+    "#e56e37",
+    "#db623b",
+    "#cc5239",
+    "#844e56",
+    "#ba433b",
+    "#9e3736",
+    "#752b3e",
+    "#2d0c24",
+    "#e3966a",
+    "#cc875d"
+   ],
+   "glow": null,
+   "bytes": 2094,
+   "ram_bytes": 25896,
+   "today_maker": "tree_autumn",
+   "final": "finals/tree_autumn_final.png",
+   "fal_source": "tree_autumn.png",
+   "polish": "regenerated, trunk extended",
+   "points": {}
+  },
+  {
+   "name": "tree_pine",
+   "kind": "decoration",
+   "file": "sprites/tree_pine.png",
+   "w": 64,
+   "h": 89,
+   "density": 2,
+   "art_size": [
+    32.0,
+    44.5
+   ],
+   "anchor": {
+    "x": 32,
+    "y": 89
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#a5b06b",
+    "#81a061",
+    "#6c975e",
+    "#628e5e",
+    "#55845d",
+    "#4e7b5e",
+    "#4a795c",
+    "#49765a",
+    "#a66b5b",
+    "#436a5b",
+    "#41605b",
+    "#3d585b",
+    "#3b5457",
+    "#754354",
+    "#3d3c4f",
+    "#2d0c24",
+    "#c68056"
+   ],
+   "glow": null,
+   "bytes": 1546,
+   "ram_bytes": 22784,
+   "today_maker": "tree_pine",
+   "final": "finals/tree_pine_final.png",
+   "fal_source": "tree_pine.png",
+   "polish": "regenerated, trunk extended",
+   "points": {}
+  },
+  {
+   "name": "tree_pine_snow",
+   "kind": "decoration",
+   "file": "sprites/tree_pine_snow.png",
+   "w": 64,
+   "h": 91,
+   "density": 2,
+   "art_size": [
+    32.0,
+    45.5
+   ],
+   "anchor": {
+    "x": 32,
+    "y": 91
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#f5fbff",
+    "#f0f9ff",
+    "#eef7ff",
+    "#ebe9f2",
+    "#d6d7f1",
+    "#d1d2ee",
+    "#bbbbdd",
+    "#b2b2d9",
+    "#9b9fb0",
+    "#7f8090",
+    "#6f946c",
+    "#597871",
+    "#516f6b",
+    "#435f68",
+    "#385461",
+    "#2d0c24",
+    "#a66b5b",
+    "#754354",
+    "#c68056"
+   ],
+   "glow": null,
+   "bytes": 1631,
+   "ram_bytes": 23296,
+   "today_maker": "tree_pine_frost",
+   "final": "finals/tree_pine_snow_final.png",
+   "fal_source": "tree_pine_snow.png",
+   "polish": "regenerated, trunk extended",
+   "points": {}
+  },
+  {
+   "name": "bush",
+   "kind": "decoration",
+   "file": "sprites/bush.png",
+   "w": 40,
+   "h": 36,
+   "density": 2,
+   "art_size": [
+    20.0,
+    18.0
+   ],
+   "anchor": {
+    "x": 20,
+    "y": 36
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#e8dd6f",
+    "#adc259",
+    "#98b655",
+    "#7ea752",
+    "#6e9951",
+    "#578455",
+    "#4f755e",
+    "#47695c",
+    "#36595c",
+    "#355255",
+    "#2d0c24",
+    "#dcd968",
+    "#cfd25c"
+   ],
+   "glow": null,
+   "bytes": 677,
+   "ram_bytes": 5760,
+   "today_maker": "bush",
+   "final": "finals/bush_final.png",
+   "fal_source": "bush.png",
+   "polish": "regenerated",
+   "points": {}
+  },
+  {
+   "name": "bush_flowers",
+   "kind": "decoration",
+   "file": "sprites/bush_flowers.png",
+   "w": 41,
+   "h": 36,
+   "density": 2,
+   "art_size": [
+    20.5,
+    18.0
+   ],
+   "anchor": {
+    "x": 20,
+    "y": 36
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#fae1ea",
+    "#f9d174",
+    "#adc05d",
+    "#8ea75f",
+    "#79a451",
+    "#c0ab9d",
+    "#749e50",
+    "#6a9751",
+    "#618d52",
+    "#f07eab",
+    "#588355",
+    "#4f785a",
+    "#3f645a",
+    "#49414d",
+    "#375a56",
+    "#2d0c24",
+    "#f0bf6e",
+    "#fa9f6c",
+    "#eb7e89"
+   ],
+   "glow": null,
+   "bytes": 733,
+   "ram_bytes": 5904,
+   "today_maker": "bush_flowers",
+   "final": "finals/bush_flowers_final.png",
+   "fal_source": "bush_flowers.png",
+   "polish": "regenerated",
+   "points": {}
+  },
+  {
+   "name": "rock",
+   "kind": "decoration",
+   "file": "sprites/rock.png",
+   "w": 28,
+   "h": 24,
+   "density": 2,
+   "art_size": [
+    14.0,
+    12.0
+   ],
+   "anchor": {
+    "x": 14,
+    "y": 24
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#eadfd3",
+    "#d1c5be",
+    "#c0b5b0",
+    "#ada1a4",
+    "#a1969b",
+    "#9a8f96",
+    "#897c8c",
+    "#827587",
+    "#726279",
+    "#65556f",
+    "#5a4a64",
+    "#2d0c24"
+   ],
+   "glow": null,
+   "bytes": 402,
+   "ram_bytes": 2688,
+   "today_maker": "rock",
+   "final": "finals/rock_final.png",
+   "fal_source": "rock.png",
+   "points": {}
+  },
+  {
+   "name": "reeds",
+   "kind": "decoration",
+   "file": "sprites/reeds.png",
+   "w": 16,
+   "h": 32,
+   "density": 2,
+   "art_size": [
+    8.0,
+    16.0
+   ],
+   "anchor": {
+    "x": 8,
+    "y": 32
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#9fb259",
+    "#be7f4d",
+    "#7a9850",
+    "#9b9390",
+    "#668a4d",
+    "#8a5140",
+    "#433e46",
+    "#516c4c",
+    "#3f564c",
+    "#364c44",
+    "#2d0c24",
+    "#da9459",
+    "#d79156"
+   ],
+   "glow": null,
+   "bytes": 322,
+   "ram_bytes": 2048,
+   "today_maker": "reeds",
+   "final": "finals/reeds_final.png",
+   "fal_source": "reeds.png",
+   "points": {}
+  },
+  {
+   "name": "cactus",
+   "kind": "decoration",
+   "file": "sprites/cactus.png",
+   "w": 36,
+   "h": 47,
+   "density": 2,
+   "art_size": [
+    18.0,
+    23.5
+   ],
+   "anchor": {
+    "x": 18,
+    "y": 47
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#cdb67c",
+    "#9da558",
+    "#819751",
+    "#9a7c67",
+    "#6a8d4c",
+    "#62854c",
+    "#587a4c",
+    "#806050",
+    "#4b6d4a",
+    "#416348",
+    "#615445",
+    "#3a5844",
+    "#2d0c24",
+    "#d2ba5d"
+   ],
+   "glow": null,
+   "bytes": 641,
+   "ram_bytes": 6768,
+   "today_maker": "cactus",
+   "final": "finals/cactus_final.png",
+   "fal_source": "cactus.png",
+   "points": {}
+  },
+  {
+   "name": "ice_rock",
+   "kind": "decoration",
+   "file": "sprites/ice_rock.png",
+   "w": 22,
+   "h": 24,
+   "density": 2,
+   "art_size": [
+    11.0,
+    12.0
+   ],
+   "anchor": {
+    "x": 11,
+    "y": 24
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#fbfefe",
+    "#e6f8fd",
+    "#d4f0fa",
+    "#caeef8",
+    "#ede1d1",
+    "#c0e0f2",
+    "#aed2e8",
+    "#a8c8e0",
+    "#97bbd8",
+    "#86a7cb",
+    "#7692b8",
+    "#2d0c24"
+   ],
+   "glow": null,
+   "bytes": 355,
+   "ram_bytes": 2112,
+   "today_maker": "ice_rock",
+   "final": "finals/ice_rock_final.png",
+   "fal_source": "ice_rock.png",
+   "points": {}
+  },
+  {
+   "name": "lamp",
+   "kind": "decoration",
+   "file": "sprites/lamp.png",
+   "w": 13,
+   "h": 72,
+   "density": 2,
+   "art_size": [
+    6.5,
+    36.0
+   ],
+   "anchor": {
+    "x": 6,
+    "y": 72
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#d9d7d6",
+    "#9e98a9",
+    "#b37d5c",
+    "#7c7c98",
+    "#86697d",
+    "#6c6a8e",
+    "#686186",
+    "#704045",
+    "#4e4e73",
+    "#44395a",
+    "#2d0c24"
+   ],
+   "glow": null,
+   "bytes": 350,
+   "ram_bytes": 3744,
+   "today_maker": "lamp",
+   "final": "finals/lamp_final.png",
+   "fal_source": "lamp.png",
+   "polish": "recolour",
+   "points": {
+    "light": [
+     6,
+     14
+    ]
+   }
+  },
+  {
+   "name": "bench",
+   "kind": "decoration",
+   "file": "sprites/bench.png",
+   "w": 37,
+   "h": 32,
+   "density": 2,
+   "art_size": [
+    18.5,
+    16.0
+   ],
+   "anchor": {
+    "x": 18,
+    "y": 32
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#f3e7d9",
+    "#dba878",
+    "#ca9d72",
+    "#beaeb2",
+    "#be936c",
+    "#b78660",
+    "#9d8a99",
+    "#b17e60",
+    "#8d4c48",
+    "#71698b",
+    "#834446",
+    "#2d0c24"
+   ],
+   "glow": null,
+   "bytes": 408,
+   "ram_bytes": 4736,
+   "today_maker": "bench",
+   "final": "finals/bench_final.png",
+   "fal_source": "bench.png",
+   "polish": "recolour",
+   "points": {
+    "seat": [
+     18,
+     20
+    ]
+   }
+  },
+  {
+   "name": "crate",
+   "kind": "decoration",
+   "file": "sprites/crate.png",
+   "w": 24,
+   "h": 36,
+   "density": 2,
+   "art_size": [
+    12.0,
+    18.0
+   ],
+   "anchor": {
+    "x": 12,
+    "y": 36
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#dba877",
+    "#cc9e72",
+    "#c0936b",
+    "#b98b67",
+    "#b57f5d",
+    "#b17f61",
+    "#977a8c",
+    "#8f4d48",
+    "#814146",
+    "#743648",
+    "#652746",
+    "#2d0c24"
+   ],
+   "glow": null,
+   "bytes": 461,
+   "ram_bytes": 3456,
+   "today_maker": "crate",
+   "final": "finals/crate_final.png",
+   "fal_source": "crate.png",
+   "polish": "recolour",
+   "points": {}
+  },
+  {
+   "name": "barrel",
+   "kind": "decoration",
+   "file": "sprites/barrel.png",
+   "w": 23,
+   "h": 32,
+   "density": 2,
+   "art_size": [
+    11.5,
+    16.0
+   ],
+   "anchor": {
+    "x": 11,
+    "y": 32
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#aaa0ab",
+    "#ba8e69",
+    "#b4815f",
+    "#905352",
+    "#864647",
+    "#787090",
+    "#7a3c47",
+    "#70374f",
+    "#672d4c",
+    "#493d5f",
+    "#2d0c24"
+   ],
+   "glow": null,
+   "bytes": 379,
+   "ram_bytes": 2944,
+   "today_maker": "barrel",
+   "final": "finals/barrel_final.png",
+   "fal_source": "barrel.png",
+   "polish": "recolour",
+   "points": {}
+  },
+  {
+   "name": "planter",
+   "kind": "decoration",
+   "file": "sprites/planter.png",
+   "w": 28,
+   "h": 38,
+   "density": 2,
+   "art_size": [
+    14.0,
+    19.0
+   ],
+   "anchor": {
+    "x": 14,
+    "y": 38
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#feb7c1",
+    "#a6c26d",
+    "#df8ca2",
+    "#79a35d",
+    "#cd9f75",
+    "#b38262",
+    "#c96684",
+    "#737478",
+    "#4f7d5a",
+    "#ab446d",
+    "#8e4d49",
+    "#804045",
+    "#74384b",
+    "#30585b",
+    "#2d0c24",
+    "#ffcb82",
+    "#dd8b73"
+   ],
+   "glow": null,
+   "bytes": 547,
+   "ram_bytes": 4256,
+   "today_maker": "planter",
+   "final": "finals/planter_final.png",
+   "fal_source": "planter.png",
+   "polish": "recolour",
+   "points": {}
+  },
+  {
+   "name": "signpost",
+   "kind": "decoration",
+   "file": "sprites/signpost.png",
+   "w": 39,
+   "h": 58,
+   "density": 2,
+   "art_size": [
+    19.5,
+    29.0
+   ],
+   "anchor": {
+    "x": 19,
+    "y": 58
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#ba895f",
+    "#c99c72",
+    "#e7ae7c",
+    "#b88760",
+    "#ba875d",
+    "#b07f63",
+    "#b39aa9",
+    "#84454c",
+    "#6e314a",
+    "#2d0c24"
+   ],
+   "glow": null,
+   "bytes": 422,
+   "ram_bytes": 9048,
+   "today_maker": "signpost",
+   "final": "finals/signpost_final.png",
+   "fal_source": "signpost.png",
+   "polish": "recolour",
+   "points": {
+    "sign": [
+     2,
+     10,
+     35,
+     21
+    ]
+   }
+  },
+  {
+   "name": "palm",
+   "kind": "region",
+   "file": "sprites/palm.png",
+   "w": 76,
+   "h": 99,
+   "density": 2,
+   "art_size": [
+    38.0,
+    49.5
+   ],
+   "anchor": {
+    "x": 38,
+    "y": 99
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#eedc6f",
+    "#b3cd5a",
+    "#a8ca5a",
+    "#9cc556",
+    "#eeb872",
+    "#8ab55c",
+    "#76a956",
+    "#6b995c",
+    "#d39165",
+    "#b47878",
+    "#5a815f",
+    "#41655c",
+    "#996254",
+    "#614749",
+    "#2d0c24",
+    "#ffde8d",
+    "#f7de87",
+    "#e2d76e"
+   ],
+   "glow": null,
+   "bytes": 1491,
+   "ram_bytes": 30096,
+   "today_maker": null,
+   "final": "finals/palm_final.png",
+   "fal_source": "palm.png",
+   "polish": "regenerated, trunk extended",
+   "points": {}
+  },
+  {
+   "name": "snowman",
+   "kind": "region",
+   "file": "sprites/snowman.png",
+   "w": 40,
+   "h": 48,
+   "density": 2,
+   "art_size": [
+    20.0,
+    24.0
+   ],
+   "anchor": {
+    "x": 20,
+    "y": 48
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#f1feff",
+    "#f0dfcc",
+    "#e9fdfe",
+    "#f6a994",
+    "#bbd8f3",
+    "#92a2c6",
+    "#f37247",
+    "#d43a44",
+    "#58516b",
+    "#8f3e40",
+    "#2d0c24",
+    "#f8854c",
+    "#e9643a",
+    "#c03d3d"
+   ],
+   "glow": null,
+   "bytes": 619,
+   "ram_bytes": 7680,
+   "today_maker": null,
+   "final": "finals/snowman_final.png",
+   "fal_source": "snowman.png",
+   "points": {}
+  },
+  {
+   "name": "mossy_log",
+   "kind": "region",
+   "file": "sprites/mossy_log.png",
+   "w": 68,
+   "h": 46,
+   "density": 2,
+   "art_size": [
+    34.0,
+    23.0
+   ],
+   "anchor": {
+    "x": 34,
+    "y": 46
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#e4c5b2",
+    "#99a74c",
+    "#d88860",
+    "#69765a",
+    "#b4734b",
+    "#91563f",
+    "#834946",
+    "#585964",
+    "#c02f49",
+    "#6f355e",
+    "#5a2d61",
+    "#70393f",
+    "#462853",
+    "#2d0c24",
+    "#fb7865",
+    "#f1635c",
+    "#d23648"
+   ],
+   "glow": null,
+   "bytes": 801,
+   "ram_bytes": 12512,
+   "today_maker": null,
+   "final": "finals/mossy_log_final.png",
+   "fal_source": "mossy_log.png",
+   "points": {}
+  },
+  {
+   "name": "sandstone",
+   "kind": "region",
+   "file": "sprites/sandstone.png",
+   "w": 52,
+   "h": 46,
+   "density": 2,
+   "art_size": [
+    26.0,
+    23.0
+   ],
+   "anchor": {
+    "x": 26,
+    "y": 46
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#f9d49a",
+    "#f9cf90",
+    "#9f8395",
+    "#f2b171",
+    "#eb9f64",
+    "#e28e58",
+    "#d0794f",
+    "#cc734a",
+    "#b96549",
+    "#ae5c45",
+    "#8e4a41",
+    "#2d0c24"
+   ],
+   "glow": null,
+   "bytes": 752,
+   "ram_bytes": 9568,
+   "today_maker": null,
+   "final": "finals/sandstone_final.png",
+   "fal_source": "sandstone.png",
+   "points": {}
+  },
+  {
+   "name": "bollard",
+   "kind": "region",
+   "file": "sprites/bollard.png",
+   "w": 24,
+   "h": 39,
+   "density": 2,
+   "art_size": [
+    12.0,
+    19.5
+   ],
+   "anchor": {
+    "x": 12,
+    "y": 39
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#dbc7b3",
+    "#edb77b",
+    "#cf8958",
+    "#b89682",
+    "#be784a",
+    "#a16144",
+    "#876267",
+    "#8f533e",
+    "#713c39",
+    "#624257",
+    "#2d0c24",
+    "#e9b375",
+    "#dda169",
+    "#e19e67"
+   ],
+   "glow": null,
+   "bytes": 498,
+   "ram_bytes": 3744,
+   "today_maker": null,
+   "final": "finals/bollard_final.png",
+   "fal_source": "bollard.png",
+   "points": {}
+  },
+  {
+   "name": "boulder",
+   "kind": "region",
+   "file": "sprites/boulder.png",
+   "w": 56,
+   "h": 58,
+   "density": 2,
+   "art_size": [
+    28.0,
+    29.0
+   ],
+   "anchor": {
+    "x": 28,
+    "y": 58
+   },
+   "footprint": [
+    1,
+    1
+   ],
+   "palette": [
+    "#c2b9b9",
+    "#83aa4b",
+    "#9f969b",
+    "#8e8290",
+    "#7f7087",
+    "#5c8649",
+    "#7a6b82",
+    "#685c79",
+    "#3a5c4f",
+    "#544972",
+    "#4c3e63",
+    "#2d0c24",
+    "#a6cd53",
+    "#9ec74d"
+   ],
+   "glow": null,
+   "bytes": 886,
+   "ram_bytes": 12992,
+   "today_maker": null,
+   "final": "finals/boulder_final.png",
+   "fal_source": "boulder.png",
+   "points": {}
+  }
+ ],
+ "changed": [
+  "shop",
+  "civic_clock",
+  "civic_library",
+  "civic_forge",
+  "civic_post",
+  "civic_market",
+  "civic_observatory",
+  "banyan",
+  "portal_arch",
+  "noticeboard",
+  "waysign",
+  "lantern_post",
+  "campfire",
+  "banner",
+  "stake",
+  "tree_green",
+  "tree_blossom",
+  "tree_autumn",
+  "tree_pine",
+  "tree_pine_snow",
+  "bush",
+  "bush_flowers",
+  "lamp",
+  "bench",
+  "crate",
+  "barrel",
+  "planter",
+  "signpost",
+  "palm"
+ ],
+ "ground_recolour": {
+  "rule": "greens: saturation x0.86, lightness x0.95, light tones hue toward yellow, dark tones toward blue-green; earth: sat x0.94, light x0.97, slightly warmer; greys: warm when light, plum when dark; whites, snow and flower colours unchanged",
+  "hub_paintGround": {
+   "#72bb60": "#76b05d",
+   "#6ab45a": "#6fa957",
+   "#63ad55": "#619f56",
+   "#86c96d": "#89be69",
+   "#58a04d": "#58924f",
+   "#4f944a": "#4f884b",
+   "#dcbc8c": "#d7b486",
+   "#c9a577": "#c49d73",
+   "#ead3a8": "#e5cba0",
+   "#b8946a": "#b38d67",
+   "#b3a896": "#aea291",
+   "#d4cab8": "#cfc3b2",
+   "#cbc0ad": "#c6b9a7",
+   "#dcd3c2": "#d7ccbb",
+   "#c4b8a4": "#bfb19e",
+   "#a37a4c": "#9c734c",
+   "#8c653c": "#855f3d",
+   "#bf9464": "#ba8c61",
+   "#5fa452": "#5e9653",
+   "#a8844f": "#a07d4f",
+   "#7d5f38": "#775a38",
+   "#8f7445": "#896e45",
+   "#6e5230": "#694d30",
+   "#9a6a3c": "#93643d",
+   "#a8703f": "#a06940",
+   "#b07a48": "#a87349",
+   "#6e4a2e": "#69462e",
+   "#5a3c25": "#563925",
+   "#7a5234": "#744e34"
+  },
+  "regions": {
+   "forest": {
+    "#4f9a4e": "#508d4f",
+    "#478f47": "#488350",
+    "#3f853f": "#417a48",
+    "#5fae58": "#5da257",
+    "#36763a": "#386c42",
+    "#a88a5e": "#a3835b",
+    "#977a50": "#907450",
+    "#b99a6c": "#b49368",
+    "#10261a": "#11231b"
+   },
+   "docks": {
+    "#d8c69a": "#d3be94",
+    "#cfbb8d": "#cab388",
+    "#c6b183": "#c1aa7e",
+    "#e6d7af": "#e1cfa8",
+    "#b49e70": "#af976c",
+    "#a8703f": "#a06940",
+    "#9a6a3c": "#93643d",
+    "#b07a48": "#a87349",
+    "#b9a48a": "#b49d85",
+    "#9c8670": "#97806d"
+   },
+   "academy": {
+    "#86c48a": "#82ba80",
+    "#7ebc82": "#7bb278",
+    "#75b47a": "#72aa70"
+   },
+   "snow": {
+    "#b7c3cd": "#ccbcad",
+    "#aebbc6": "#c5b4a4"
+   },
+   "desert": {
+    "#e7c98f": "#e2c089",
+    "#dfbf84": "#dab67e",
+    "#d6b47a": "#d1ac75",
+    "#f1d9a6": "#edd19e",
+    "#c7a066": "#c29862",
+    "#c99b62": "#c3935f",
+    "#b8894f": "#b2814d",
+    "#d8ad74": "#d3a46f",
+    "#d9b98a": "#d4b184",
+    "#b89466": "#b38d63",
+    "#3a2614": "#372415"
+   },
+   "mountain": {
+    "#8fa38a": "#a4917f",
+    "#869a81": "#9c8976",
+    "#7c9078": "#806d93",
+    "#a6b8a0": "#b8a696",
+    "#6a7d67": "#6f5e7f",
+    "#a9a196": "#aa9a8c",
+    "#958d82": "#877797",
+    "#bbb3a8": "#baac9e",
+    "#1e2526": "#211b27"
+   },
+   "swamp": {
+    "#5d7d45": "#537345",
+    "#56743f": "#4c6b3f",
+    "#4e6b39": "#456239",
+    "#6f8f52": "#6a8452",
+    "#425c31": "#3b5531",
+    "#7d6a4a": "#786549",
+    "#6d5c40": "#68573f",
+    "#8c7856": "#867255",
+    "#141f12": "#121d12"
+   },
+   "city": {
+    "#b9b2a6": "#b9aa9c",
+    "#b1aa9e": "#b1a294",
+    "#a9a296": "#aa9a8c",
+    "#c8c1b5": "#c7b8ab",
+    "#99928a": "#9b8d80",
+    "#8a8580": "#81768c",
+    "#7c7772": "#73697e",
+    "#9a958f": "#9b9085",
+    "#d4cab8": "#cfc3b2",
+    "#b3a896": "#aea291",
+    "#1c1c22": "#1e1a22"
+   },
+   "island": {
+    "#e9d9a8": "#e4d1a1",
+    "#e2d09c": "#ddc895",
+    "#d9c690": "#d4be8a",
+    "#f3e7bf": "#efe0b6",
+    "#c4b07a": "#bfa876"
+   },
+   "meadow": {
+    "#7cc46a": "#80b966",
+    "#73bd62": "#77b25f",
+    "#6ab35a": "#6fa857",
+    "#93d47c": "#95c976",
+    "#5ea24f": "#5d9451",
+    "#dcbc8c": "#d7b486",
+    "#c9a577": "#c49d73",
+    "#ead3a8": "#e5cba0",
+    "#d4cab8": "#cfc3b2",
+    "#b3a896": "#aea291",
+    "#1d3d22": "#1e3825"
+   }
+  }
+ }
+}

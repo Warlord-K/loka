@@ -1,5 +1,11 @@
 import type { Sprite } from "./art";
 import { context, ellipse, makeCanvas, outline, rect, shade } from "./pixels";
+import { rememberThing, thingKey } from "./sprites";
+
+function keyed(key: string, sprite: Sprite): Sprite {
+  rememberThing(sprite, key);
+  return sprite;
+}
 
 const SHADOW = "rgba(20,24,20,0.28)";
 const VEILS = ["#7ee0d2", "#c39bff", "#ffd45a", "#9fdcff", "#ff9ab0", "#9bf08b"];
@@ -27,7 +33,7 @@ export function makeArch(seed: number): Sprite {
   }
   rect(ctx, 29, 3, 6, 5, veil);
   rect(ctx, 31, 4, 2, 3, "#ffffff");
-  return { img: outline(c, [38, 24, 34]), ax: 33, ay: 45 };
+  return keyed("portal_arch", { img: outline(c, [38, 24, 34]), ax: 33, ay: 45 });
 }
 
 export function makeWaySign(): Sprite {
@@ -42,7 +48,7 @@ export function makeWaySign(): Sprite {
   rect(ctx, 4, 13, 18, 6, "#6e4a2e");
   rect(ctx, 5, 14, 16, 4, "#d9c08c");
   rect(ctx, 2, 15, 3, 2, "#6e4a2e");
-  return { img: c, ax: 13, ay: 28 };
+  return keyed("waysign", { img: c, ax: 13, ay: 28 });
 }
 
 export function makeCactus(r: () => number): Sprite {
@@ -61,7 +67,7 @@ export function makeCactus(r: () => number): Sprite {
   rect(ctx, 11, armY - 2, 3, 5, d);
   for (let y = 5; y < 19; y += 3) rect(ctx, 7, y, 1, 1, "#d8e6b8");
   if (r() < 0.4) rect(ctx, 7, 1, 2, 2, "#ff9ab0");
-  return { img: outline(c, [38, 24, 34]), ax: 8, ay: 20 };
+  return keyed("cactus", { img: outline(c, [38, 24, 34]), ax: 8, ay: 20 });
 }
 
 export function makeIceRock(r: () => number): Sprite {
@@ -72,7 +78,7 @@ export function makeIceRock(r: () => number): Sprite {
   rect(ctx, 2, 10 - h, 10, h, "#bfe3f2");
   rect(ctx, 3, 10 - h, 4, 2, "#ffffff");
   rect(ctx, 9, 10 - h + 1, 3, h - 1, "#8fc3dc");
-  return { img: outline(c, [38, 24, 34]), ax: 7, ay: 10 };
+  return keyed("ice_rock", { img: outline(c, [38, 24, 34]), ax: 7, ay: 10 });
 }
 
 export function frost(sprite: Sprite): Sprite {
@@ -95,7 +101,8 @@ export function frost(sprite: Sprite): Sprite {
     }
   }
   ctx.putImageData(data, 0, 0);
-  return { img: c, ax: sprite.ax, ay: sprite.ay };
+  const frosted = { img: c, ax: sprite.ax, ay: sprite.ay };
+  return thingKey(sprite) === "tree_pine" ? keyed("tree_pine_snow", frosted) : frosted;
 }
 
 export function makeLantern(): Sprite {
@@ -107,7 +114,7 @@ export function makeLantern(): Sprite {
   rect(ctx, 2, 3, 6, 5, "#ffd45a");
   rect(ctx, 3, 4, 2, 2, "#fff4c2");
   rect(ctx, 0, 1, 10, 1, "#2f241c");
-  return { img: c, ax: 5, ay: 24 };
+  return keyed("lantern_post", { img: c, ax: 5, ay: 24 });
 }
 
 export function makeCampfire(): Sprite {
@@ -119,7 +126,7 @@ export function makeCampfire(): Sprite {
   rect(ctx, 5, 4, 6, 5, "#f39c34");
   rect(ctx, 6, 2, 4, 4, "#ffd45a");
   rect(ctx, 7, 1, 2, 2, "#fff4c2");
-  return { img: c, ax: 8, ay: 12 };
+  return keyed("campfire", { img: c, ax: 8, ay: 12 });
 }
 
 export function makeBanner(color: string): Sprite {
@@ -131,5 +138,5 @@ export function makeBanner(color: string): Sprite {
   rect(ctx, 4, 14, 3, 3, color);
   rect(ctx, 8, 14, 3, 3, color);
   rect(ctx, 6, 5, 3, 3, "#fbf3e0");
-  return { img: outline(c, [38, 24, 34]), ax: 3, ay: 28 };
+  return keyed("banner", { img: outline(c, [38, 24, 34]), ax: 3, ay: 28 });
 }

@@ -266,6 +266,7 @@ export interface MessageMeta {
   ui?: unknown;
   keys?: string[];
   voice_request?: boolean;
+  partial?: boolean;
   spoken?: boolean;
   choices?: string[];
   drafts?: Draft[];

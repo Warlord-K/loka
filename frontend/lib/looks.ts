@@ -54,19 +54,27 @@ const SPECIES: Species[] = [
   { names: ["peacock"], skin: "#1f8f9c", hair: "#1c3e7a", features: ["beak", "feather"] },
   { names: ["parrot", "bird", "chicken"], skin: "#57b65a", hair: "#d8433a", features: ["beak"] },
   { names: ["mouse", "rat", "hamster"], skin: "#c9b8aa", hair: "#8d7b6e", features: ["ears-round", "whiskers"] },
+  { names: [], declaredOnly: ["unicorn", "pegasus"], skin: "#f7f1fb", hair: "#b98ae8", features: ["horn", "ears-pointed", "snout"] },
+  { names: [], declaredOnly: ["cactus", "cacti", "succulent"], skin: "#5fae5a", hair: "#3e8a45", shirt: "#5fae5a", pants: "#c46a3c", features: ["cactus"] },
+  { names: [], declaredOnly: ["mushroom", "toadstool", "fungus", "fungi"], skin: "#f3e6cf", hair: "#d8433a", shirt: "#efe2c8", pants: "#e3d4b6", features: ["mushroom-cap"] },
 ];
 
 export const SPECIES_OPTIONS: string[] = [
-  "person", "octopus", "bunny", "crab", "dino", "dragon", "frog", "penguin", "duck", "shark", "robot", "ghost",
+  "human", "businessman", "kid", "octopus", "bunny", "crab", "dino", "dragon", "frog", "penguin", "duck", "shark", "robot", "ghost",
   "axolotl", "bee", "fox", "cat", "dog", "panda", "bear", "raccoon", "sloth", "owl", "peacock", "parrot", "mouse",
+  "unicorn", "cactus", "mushroom",
 ];
 
 export const LOOK_ACCESSORIES: Accessory[] = [
   "glasses", "headphones", "crown", "wizard", "beanie", "cap", "hardhat", "mortarboard", "headband", "bun",
-  "beard", "scarf", "cape", "cloak", "apron",
+  "beard", "scarf", "cape", "cloak", "apron", "briefcase",
 ];
 
 export const HATS: Accessory[] = ["beanie", "cap", "mortarboard", "wizard", "hardhat", "crown"];
+
+export function withoutHats(look: LokaLook): LokaLook {
+  return look.accessories?.some((a) => HATS.includes(a)) ? { ...look, accessories: look.accessories.filter((a) => !HATS.includes(a)) } : look;
+}
 
 const ACCESSORY_ALIASES: Record<string, Accessory> = {
   "wizard hat": "wizard",
@@ -98,10 +106,29 @@ export function wordsMatch(names: string[], words: string): boolean {
   return new RegExp(`\\b(?:${names.flatMap(forms).map(escape).join("|")})\\b`).test(words);
 }
 
+const HUMAN_BODIES: { body: string; names: string[] }[] = [
+  { body: "businessman", names: ["businessman", "businesswoman", "business person", "executive"] },
+  { body: "kid", names: ["kid", "child"] },
+];
+
+export function humanBodyFor(declared: string): string {
+  const d = declared.trim().toLowerCase();
+  return (d && HUMAN_BODIES.find((h) => wordsMatch(h.names, d))?.body) || "human";
+}
+
 export function speciesFor(declared: string, words = ""): Species | undefined {
   const d = declared.trim().toLowerCase();
   if (d) return SPECIES.find((s) => wordsMatch([...s.names, ...(s.declaredOnly ?? [])], d));
-  return SPECIES.find((s) => wordsMatch(s.names, words));
+  return SPECIES.find((s) => s.names.length > 0 && wordsMatch(s.names, words));
+}
+
+export function speciesBody(species: Species): string {
+  return species.names[0] ?? species.declaredOnly?.[0] ?? "human";
+}
+
+export function canonicalBody(name: string): string {
+  const species = speciesFor(name);
+  return species ? speciesBody(species) : humanBodyFor(name);
 }
 
 const OLD_BIRD = { skin: "#57b65a", hair: "#d8433a" };
@@ -175,7 +202,8 @@ export function lookFor(agent: Pick<WorldAgent, "slug" | "look" | "persona">): L
   const species = speciesFor(declared, words);
   const colours = paletteFor(species, text(look.palette));
   const chosen = declaredAccessories(look.accessories);
-  const accessories: Accessory[] = species ? [...species.features] : chosen.length ? [] : [pick(HUMAN_ACCESSORIES, seed, 7)];
+  const human = species ? null : humanBodyFor(declared);
+  const accessories: Accessory[] = species ? [...species.features] : chosen.length ? [] : human === "businessman" ? ["briefcase"] : [pick(HUMAN_ACCESSORIES, seed, 7)];
   const firstHat = chosen.find((a) => HATS.includes(a));
   for (const a of chosen) {
     if (HATS.includes(a) && a !== firstHat) continue;
@@ -191,5 +219,6 @@ export function lookFor(agent: Pick<WorldAgent, "slug" | "look" | "persona">): L
     pants: colours?.pants ?? pick(PANTS, seed, 11),
     accent: pick(SHIRTS, seed, 13),
     accessories,
+    body: species ? speciesBody(species) : human ?? "human",
   };
 }

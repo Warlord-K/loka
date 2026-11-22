@@ -25,6 +25,7 @@ export interface Me {
   status_emoji?: string | null;
   status_text?: string | null;
   mention_wakes_main?: boolean;
+  new_art?: boolean;
   onboarding?: boolean;
 }
 

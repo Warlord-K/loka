@@ -5,11 +5,13 @@ import { buildSheet, type Dir } from "./characters";
 import { context, makeCanvas, rect, rgbOf, rng, shade } from "./pixels";
 import { areaName, civicIn, linksOf, type District } from "./districts";
 import { frost, makeCactus, makeIceRock } from "./regions-art";
+import { placeArt, rekey } from "./sprites";
 import type { LokaLook, MapItem } from "./types";
 import {
   BRIDGE,
   GRASS,
   HEARTH,
+  artPoints,
   kitBlock,
   kitFree,
   kitLamp,
@@ -44,7 +46,7 @@ import {
 
 const ICE = 6;
 
-type Prop = "bush" | "flowers" | "rock" | "cactus" | "ice" | "crate" | "barrel" | "reeds";
+type Prop = "bush" | "flowers" | "rock" | "cactus" | "ice" | "crate" | "barrel" | "reeds" | "palm" | "snowman" | "mossy_log" | "sandstone" | "bollard" | "boulder";
 
 interface ThemeLook {
   ground: [string, string, string];
@@ -64,11 +66,11 @@ interface ThemeLook {
 }
 
 const MEADOW: ThemeLook = {
-  ground: ["#7cc46a", "#73bd62", "#6ab35a"],
-  specks: ["#93d47c", "#5ea24f"],
-  path: ["#dcbc8c", "#c9a577", "#ead3a8"],
-  plaza: ["#d4cab8", "#b3a896"],
-  backdrop: "#1d3d22",
+  ground: ["#80b966", "#77b25f", "#6fa857"],
+  specks: ["#95c976", "#5d9451"],
+  path: ["#d7b486", "#c49d73", "#e5cba0"],
+  plaza: ["#cfc3b2", "#aea291"],
+  backdrop: "#1e3825",
   water: "river",
   trees: ["green", "green", "blossom"],
   treeCount: 40,
@@ -84,13 +86,13 @@ const THEMES: Record<RegionTheme, ThemeLook> = {
   meadow: MEADOW,
   forest: {
     ...MEADOW,
-    ground: ["#4f9a4e", "#478f47", "#3f853f"],
-    specks: ["#5fae58", "#36763a"],
-    path: ["#a88a5e", "#977a50", "#b99a6c"],
-    backdrop: "#10261a",
+    ground: ["#508d4f", "#488350", "#417a48"],
+    specks: ["#5da257", "#386c42"],
+    path: ["#a3835b", "#907450", "#b49368"],
+    backdrop: "#11231b",
     trees: ["pine", "pine", "green", "autumn"],
     treeCount: 95,
-    props: ["bush", "bush", "rock"],
+    props: ["bush", "bush", "rock", "mossy_log"],
     lamps: 2,
     weather: "leaves",
     critters: ["fox", "owl", "bear"],
@@ -98,21 +100,21 @@ const THEMES: Record<RegionTheme, ThemeLook> = {
   },
   docks: {
     ...MEADOW,
-    ground: ["#d8c69a", "#cfbb8d", "#c6b183"],
-    specks: ["#e6d7af", "#b49e70"],
-    path: ["#a8703f", "#9a6a3c", "#b07a48"],
-    plaza: ["#b9a48a", "#9c8670"],
+    ground: ["#d3be94", "#cab388", "#c1aa7e"],
+    specks: ["#e1cfa8", "#af976c"],
+    path: ["#a06940", "#93643d", "#a87349"],
+    plaza: ["#b49d85", "#97806d"],
     backdrop: "#132a3a",
     trees: ["green"],
     treeCount: 14,
-    props: ["crate", "barrel", "crate", "rock"],
+    props: ["crate", "barrel", "crate", "rock", "bollard"],
     lamps: 10,
     critters: ["bird", "cat"],
     flowers: false,
   },
   academy: {
     ...MEADOW,
-    ground: ["#86c48a", "#7ebc82", "#75b47a"],
+    ground: ["#82ba80", "#7bb278", "#72aa70"],
     plaza: ["#d8cfe6", "#b9aecb"],
     backdrop: "#1f2140",
     trees: ["blossom", "blossom", "green"],
@@ -124,14 +126,14 @@ const THEMES: Record<RegionTheme, ThemeLook> = {
     ...MEADOW,
     ground: ["#eef4f8", "#e4edf3", "#dbe6ee"],
     specks: ["#ffffff", "#c9d8e3"],
-    path: ["#c9d3dc", "#b7c3cd", "#dde5ec"],
-    plaza: ["#d5dee6", "#aebbc6"],
+    path: ["#c9d3dc", "#ccbcad", "#dde5ec"],
+    plaza: ["#d5dee6", "#c5b4a4"],
     backdrop: "#1c2a3a",
     water: "ice",
     trees: ["pine"],
     treeCount: 55,
     frost: true,
-    props: ["ice", "rock", "ice"],
+    props: ["ice", "rock", "ice", "snowman"],
     lamps: 6,
     weather: "snow",
     critters: ["penguin", "fox"],
@@ -139,15 +141,15 @@ const THEMES: Record<RegionTheme, ThemeLook> = {
   },
   desert: {
     ...MEADOW,
-    ground: ["#e7c98f", "#dfbf84", "#d6b47a"],
-    specks: ["#f1d9a6", "#c7a066"],
-    path: ["#c99b62", "#b8894f", "#d8ad74"],
-    plaza: ["#d9b98a", "#b89466"],
-    backdrop: "#3a2614",
+    ground: ["#e2c089", "#dab67e", "#d1ac75"],
+    specks: ["#edd19e", "#c29862"],
+    path: ["#c3935f", "#b2814d", "#d3a46f"],
+    plaza: ["#d4b184", "#b38d63"],
+    backdrop: "#372415",
     water: "none",
     trees: [],
     treeCount: 0,
-    props: ["cactus", "cactus", "rock"],
+    props: ["cactus", "cactus", "rock", "sandstone"],
     lamps: 3,
     weather: "clear",
     critters: ["rabbit"],
@@ -155,14 +157,14 @@ const THEMES: Record<RegionTheme, ThemeLook> = {
   },
   mountain: {
     ...MEADOW,
-    ground: ["#8fa38a", "#869a81", "#7c9078"],
-    specks: ["#a6b8a0", "#6a7d67"],
-    path: ["#a9a196", "#958d82", "#bbb3a8"],
-    backdrop: "#1e2526",
+    ground: ["#a4917f", "#9c8976", "#806d93"],
+    specks: ["#b8a696", "#6f5e7f"],
+    path: ["#aa9a8c", "#877797", "#baac9e"],
+    backdrop: "#211b27",
     water: "none",
     trees: ["pine"],
     treeCount: 40,
-    props: ["rock", "rock", "rock", "bush"],
+    props: ["rock", "rock", "rock", "bush", "boulder"],
     lamps: 2,
     weather: "fog",
     critters: ["bear", "bird"],
@@ -170,13 +172,13 @@ const THEMES: Record<RegionTheme, ThemeLook> = {
   },
   swamp: {
     ...MEADOW,
-    ground: ["#5d7d45", "#56743f", "#4e6b39"],
-    specks: ["#6f8f52", "#425c31"],
-    path: ["#7d6a4a", "#6d5c40", "#8c7856"],
-    backdrop: "#141f12",
+    ground: ["#537345", "#4c6b3f", "#456239"],
+    specks: ["#6a8452", "#3b5531"],
+    path: ["#786549", "#68573f", "#867255"],
+    backdrop: "#121d12",
     trees: ["green", "autumn"],
     treeCount: 50,
-    props: ["reeds", "reeds", "bush", "rock"],
+    props: ["reeds", "reeds", "bush", "rock", "mossy_log"],
     lamps: 3,
     weather: "fog",
     critters: ["bird", "mouse"],
@@ -184,11 +186,11 @@ const THEMES: Record<RegionTheme, ThemeLook> = {
   },
   city: {
     ...MEADOW,
-    ground: ["#b9b2a6", "#b1aa9e", "#a9a296"],
-    specks: ["#c8c1b5", "#99928a"],
-    path: ["#8a8580", "#7c7772", "#9a958f"],
-    plaza: ["#d4cab8", "#b3a896"],
-    backdrop: "#1c1c22",
+    ground: ["#b9aa9c", "#b1a294", "#aa9a8c"],
+    specks: ["#c7b8ab", "#9b8d80"],
+    path: ["#81768c", "#73697e", "#9b9085"],
+    plaza: ["#cfc3b2", "#aea291"],
+    backdrop: "#1e1a22",
     trees: ["green"],
     treeCount: 16,
     props: ["crate", "barrel", "bush"],
@@ -198,12 +200,12 @@ const THEMES: Record<RegionTheme, ThemeLook> = {
   },
   island: {
     ...MEADOW,
-    ground: ["#e9d9a8", "#e2d09c", "#d9c690"],
-    specks: ["#f3e7bf", "#c4b07a"],
+    ground: ["#e4d1a1", "#ddc895", "#d4be8a"],
+    specks: ["#efe0b6", "#bfa876"],
     backdrop: "#0f3346",
     trees: ["green", "green"],
     treeCount: 22,
-    props: ["rock", "flowers", "bush"],
+    props: ["rock", "flowers", "bush", "palm"],
     lamps: 3,
     weather: "clear",
     critters: ["parrot", "bird"],
@@ -339,7 +341,11 @@ export function buildRegionWorld(region: Region, items: MapItem[], cameFrom: str
       if (!sprite || solid[idx(x, y)]) return;
       kitBlock(k, x, y);
       k.objects.push({ x: x * T + 8, y: y * T + 13, sprite });
-      if (id === "lantern-post" || id === "campfire") k.lights.push({ x: x * T + 8, y: y * T + (id === "campfire" ? 6 : -6), r: 30, color: [255, 190, 110], kind: "lamp", phase: r() * 10 });
+      if (id === "lantern-post" || id === "campfire") {
+        const fallback = { x: x * T + 8, y: y * T + (id === "campfire" ? 6 : -6) };
+        const glow = artPoints(placeArt(sprite, x * T + 8, y * T + 13), id === "campfire" ? "flame" : "light", [fallback])[0] ?? fallback;
+        k.lights.push({ ...glow, r: 30, color: [255, 190, 110], kind: "lamp", phase: r() * 10 });
+      }
     });
   } else if (academy) {
     kitReserve(k, 24, 6, 32, 13);
@@ -404,6 +410,10 @@ export function buildRegionWorld(region: Region, items: MapItem[], cameFrom: str
     const prop = theme.props[Math.floor(r() * theme.props.length)];
     const sprite =
       prop === "cactus" ? makeCactus(r)
+      : prop === "palm" ? rekey(makeTree("green", r), "palm")
+      : prop === "snowman" ? rekey(makeIceRock(r), "snowman")
+      : prop === "bollard" ? rekey(barrel, "bollard")
+      : prop === "mossy_log" || prop === "sandstone" || prop === "boulder" ? rekey(makeRock(r), prop)
       : prop === "ice" ? makeIceRock(r)
       : prop === "rock" ? makeRock(r)
       : prop === "crate" ? crate

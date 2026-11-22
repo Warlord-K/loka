@@ -1,18 +1,21 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ChatCircleDots, Microphone, MicrophoneSlash, PhoneDisconnect } from "@phosphor-icons/react";
+import { createPortal } from "react-dom";
+import { AnimatePresence, motion } from "framer-motion";
+import { Microphone, MicrophoneSlash, PhoneDisconnect, X } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
 import { worldApi, type WorldAgent, type WorldEvent } from "@/lib/world";
 import { listen, micProblem, MODEL_PROBLEM, speech, voiceFor, type Vad } from "./speech";
 import { Shimmer } from "./work-ui";
 import { LiveUnavailable, primeLiveAudio, startLive, type LiveCall } from "./live-voice";
 import { useSpeechStatus } from "./voice-ui";
-import { CHUNKY, PANEL, PIXEL, SEGMENT, SEGMENT_ITEM, SEGMENT_OFF, SEGMENT_ON } from "./styles";
+import { CHUNKY, SEGMENT, SEGMENT_ITEM, SEGMENT_OFF, SEGMENT_ON } from "./styles";
 import { CloseButton } from "./settings-shell";
-import { Keycap } from "./keycap";
 import { SetupHint, useFeature } from "./setup-hint";
-import { escapeTaken } from "@/lib/escape";
+import { callClock } from "@/lib/call-state";
+import { AgentAvatar } from "./channel-ui";
+import { NOTICE_MOTION } from "./motion";
 
 type Phase = "starting" | "connecting" | "listening" | "hearing" | "transcribing" | "thinking" | "speaking" | "error";
 type Engine = "live" | "device";
@@ -26,6 +29,8 @@ export function engineChoice(): Engine {
     return "live";
   }
 }
+
+const PILL_FOCUS = "outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-w-teal";
 
 const LIVE_PHASES = new Set<Phase>(["starting", "connecting", "hearing", "transcribing", "thinking"]);
 
@@ -43,27 +48,35 @@ const LABEL: Record<Phase, string> = {
 export function VoiceMode({
   agent,
   portrait,
-  onClose,
-  onOpenChat,
+  minimised,
+  slot,
+  onMinimise,
+  onRestore,
+  onHangUp,
+  onPill,
 }: {
   agent: WorldAgent;
   portrait: string;
-  onClose: () => void;
-  onOpenChat: () => void;
+  minimised: boolean;
+  slot: HTMLElement | null;
+  onMinimise: () => void;
+  onRestore: () => void;
+  onHangUp: () => void;
+  onPill: (shown: boolean) => void;
 }) {
   const [phase, setPhase] = useState<Phase>("starting");
   const [muted, setMuted] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lines, setLines] = useState<{ id: number; key?: string; who: "you" | "them"; text: string; partial?: boolean }[]>([]);
-  const transcript = useRef<HTMLUListElement>(null);
-  useEffect(() => {
-    const el = transcript.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [lines]);
-  const [level, setLevel] = useState(0);
   const [engine, setEngine] = useState<Engine>(engineChoice);
   const [note, setNote] = useState<string | null>(null);
   const [fellBack, setFellBack] = useState(false);
+  const [settled, setSettled] = useState(false);
+  const [ended, setEnded] = useState(false);
+  useEffect(() => {
+    const id = window.setTimeout(() => setSettled(true), 300);
+    return () => window.clearTimeout(id);
+  }, []);
   const live = useFeature("live_voice");
   const [clock, setClock] = useState({ seconds: 0, usd: 0 });
   const liveRef = useRef<LiveCall | null>(null);
@@ -94,6 +107,7 @@ export function VoiceMode({
     setEngine(next);
     setNote(null);
     setError(null);
+    setEnded(false);
     setLines([]);
     try {
       window.localStorage.setItem(ENGINE_KEY, next);
@@ -108,7 +122,11 @@ export function VoiceMode({
       onPhase: (p) => !cancelled && setPhase(p),
       onCaption: (key, who, text, partial) => !cancelled && caption(key, who, text, partial),
       onError: (message) => !cancelled && setError(message),
-      onEnd: () => undefined,
+      onEnd: () => {
+        if (cancelled) return;
+        liveRef.current = null;
+        setEnded(true);
+      },
     })
       .then((call) => {
         if (cancelled) {
@@ -132,10 +150,9 @@ export function VoiceMode({
     const tick = window.setInterval(() => {
       const call = liveRef.current;
       if (!call) return;
-      setLevel(call.level());
       const seconds = call.elapsed();
       setClock({ seconds, usd: (seconds / 60) * call.usdPerMinute });
-    }, 100);
+    }, 250);
     return () => {
       cancelled = true;
       window.clearInterval(tick);
@@ -183,6 +200,7 @@ export function VoiceMode({
   useEffect(() => {
     if (engine !== "device") return;
     let closed = false;
+    const startedAt = Date.now();
     setPhase("starting");
     speech().unlock();
     speech().warm("stt");
@@ -208,7 +226,7 @@ export function VoiceMode({
         setError(micProblem(e));
         setPhase("error");
       });
-    const tick = window.setInterval(() => setLevel(vadRef.current?.level() ?? 0), 80);
+    const tick = window.setInterval(() => setClock({ seconds: (Date.now() - startedAt) / 1000, usd: 0 }), 250);
     return () => {
       closed = true;
       window.clearInterval(tick);
@@ -238,29 +256,30 @@ export function VoiceMode({
     return () => window.removeEventListener("world-event", onEvent);
   }, [agent, say, engine]);
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        if (!escapeTaken(e)) onClose();
-      } else if (e.key === " ") {
-        e.preventDefault();
-        setMuted((m) => !m);
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
   const loading = engine === "device" ? (status.loading.stt ?? status.loading.tts) : null;
-  const minutes = Math.floor(clock.seconds / 60);
-  const elapsed = `${minutes}:${String(Math.floor(clock.seconds % 60)).padStart(2, "0")}`;
-  const pulse = Math.min(1, level * 18);
-  const active = phase === "hearing" || phase === "speaking";
+  const elapsed = callClock(clock.seconds);
+  const statusText = ended ? (error ? `Call ended. ${error}` : "Call ended") : error ?? note ?? (muted ? "Muted" : loading !== null ? `Setting up on-device voice (${loading}%)` : LABEL[phase]);
+  const statusLive = !ended && !error && !note && !muted && (loading !== null || LIVE_PHASES.has(phase));
+  const latest = lines[lines.length - 1];
+  const docked = !minimised && slot;
+  const showPill = !docked && (minimised || settled);
+  useEffect(() => onPill(showPill), [showPill, onPill]);
+  useEffect(() => () => onPill(false), [onPill]);
 
-  return (
-    <div role="dialog" aria-modal="true" aria-label={`Voice chat with ${agent.name}`} className={cn(PANEL, "pointer-events-auto flex h-full w-full flex-col items-center justify-between gap-4 overflow-hidden p-4 sm:p-6")}>
-      <div className="flex w-full shrink-0 items-center justify-between gap-3">
-        <div role="radiogroup" aria-label="Voice engine" className={SEGMENT}>
+  const bar = (
+    <section aria-label={`Call with ${agent.name}`} className="flex shrink-0 flex-col gap-2 border-b-2 border-w-line bg-w-aqua/40 px-3 py-2.5 sm:px-4">
+      <div className="flex items-center gap-2">
+        <div className="min-w-0 flex-1">
+          <p className="flex items-baseline gap-2 text-w-sm font-semibold text-w-strong">
+            <span className="truncate">{engine === "live" ? "Live call" : "Voice chat"}</span>
+            {!ended && <span className="shrink-0 font-normal tabular-nums text-w-text2">{elapsed}</span>}
+            {engine === "live" && clock.usd > 0 && <span className="hidden shrink-0 text-w-xs font-normal text-w-muted @md:inline">{`about $${clock.usd.toFixed(3)}`}</span>}
+          </p>
+          <p className={cn("truncate text-w-xs", error ? "text-w-danger" : "text-w-text2")} aria-live="polite" title={ended ? statusText : undefined}>
+            {statusLive ? <Shimmer>{statusText}</Shimmer> : statusText}
+          </p>
+        </div>
+        <div role="radiogroup" aria-label="Voice engine" className={cn(SEGMENT, "hidden shrink-0 @lg:inline-flex")}>
           {(live?.state === "unavailable" ? (["device"] as const) : (["live", "device"] as const)).map((e) => (
             <button
               key={e}
@@ -275,85 +294,96 @@ export function VoiceMode({
             </button>
           ))}
         </div>
-        <CloseButton onClose={onClose} label="End voice chat" />
-      </div>
-
-      <div className="flex shrink-0 flex-col items-center gap-5 [@media(max-height:640px)]:gap-2">
-        <div className="relative grid h-[11rem] w-[11rem] place-items-center [@media(max-height:640px)]:hidden">
-          <span
-            aria-hidden
-            className="absolute rounded-full bg-w-teal/15 transition-[width,height] duration-100 motion-reduce:transition-none"
-            style={{ width: `${150 + (active ? pulse * 90 : 0)}px`, height: `${150 + (active ? pulse * 90 : 0)}px` }}
-          />
-          <span aria-hidden className={cn("absolute h-[8.5rem] w-[8.5rem] rounded-full border-[3px] transition-colors duration-300", phase === "speaking" ? "border-w-gold" : active ? "border-w-teal/60" : "border-w-line2")} />
-          <div className="relative rounded-2xl border-[3px] border-w-ink bg-w-aqua p-2 shadow-[0_4px_0_rgb(var(--w-ink))]">
-            {portrait ? <img src={portrait} alt="" className="h-[5.75rem] w-auto [image-rendering:pixelated]" /> : <div className="h-[5.75rem] w-[4.75rem]" />}
-          </div>
-        </div>
-        <div className="max-w-md text-center">
-          <p className={cn(PIXEL, "text-w-xl leading-none text-w-strong")}>{agent.name}</p>
-          <p className="mt-2 text-w-sm text-w-text2" aria-live="polite">
-            {error ?? note ?? (muted ? "Muted. Press Space or the mic to talk again." : loading !== null ? <Shimmer>{`Setting up on-device voice (${loading}%)`}</Shimmer> : LIVE_PHASES.has(phase) ? <Shimmer>{LABEL[phase]}</Shimmer> : LABEL[phase])}
-          </p>
-        </div>
-      </div>
-
-      <div className="flex min-h-0 w-full max-w-2xl flex-1 flex-col justify-end gap-3">
-        {fellBack && live && live.state === "needs_setup" && <SetupHint feature={live} compact onAction={onClose} />}
-        <ul ref={transcript} className="min-h-0 space-y-1.5 overflow-y-auto overscroll-contain text-w-sm">
-          {lines.map((l) => (
-            <li
-              key={l.id}
-              className={cn(
-                "w-fit max-w-[85%] whitespace-pre-wrap rounded-xl px-3 py-2 leading-relaxed [overflow-wrap:anywhere] motion-safe:animate-w-rise",
-                l.who === "you" ? "ml-auto bg-w-aqua text-w-text" : "border-2 border-w-line bg-w-card text-w-text",
-                l.partial && "text-w-text2",
-              )}
+        {ended ? (
+          <CloseButton onClose={onHangUp} label="Close the ended call" />
+        ) : (
+          <>
+            <button
+              type="button"
+              onClick={() => setMuted((m) => !m)}
+              aria-pressed={muted}
+              aria-label={muted ? "Unmute" : "Mute"}
+              title={muted ? "Unmute" : "Mute"}
+              className={cn(CHUNKY, "grid h-10 w-10 shrink-0 place-items-center", muted ? "bg-w-rose text-w-danger" : "bg-w-card text-w-text hover:bg-w-sand")}
             >
-              {l.text}
-              {l.partial && <span aria-hidden>...</span>}
-            </li>
-          ))}
-          {phase === "hearing" && !muted && !(lines.length && lines[lines.length - 1].who === "you" && lines[lines.length - 1].partial) && (
-            <li aria-hidden className="ml-auto w-fit rounded-xl bg-w-aqua/60 px-3 py-2">
-              <Shimmer>Listening</Shimmer>
-            </li>
-          )}
-        </ul>
-        <div className="flex shrink-0 items-end justify-center gap-4 pt-2">
-          <CallButton label={muted ? "Unmute" : "Mute"} pressed={muted} onClick={() => setMuted((m) => !m)} className={muted ? "bg-w-rose text-w-danger" : "bg-w-card text-w-text hover:bg-w-sand"}>
-            {muted ? <MicrophoneSlash size={22} weight="bold" /> : <Microphone size={22} weight="bold" />}
-          </CallButton>
-          <CallButton label="Chat" onClick={onOpenChat} className="bg-w-card text-w-text hover:bg-w-sand">
-            <ChatCircleDots size={22} weight="bold" />
-          </CallButton>
-          <CallButton label="End" onClick={onClose} className="bg-w-coral text-w-ink hover:brightness-105">
-            <PhoneDisconnect size={22} weight="bold" />
-          </CallButton>
-        </div>
-        <p className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-center text-w-xs text-w-muted" aria-live="off">
-          <span>{engine === "live" ? `Live ${elapsed}, about $${clock.usd.toFixed(3)}, saved to the chat` : "Transcribed on this device"}</span>
-          <span className="flex items-center gap-1">
-            <Keycap size="sm">Space</Keycap> mutes
-          </span>
-          <span className="flex items-center gap-1">
-            <Keycap size="sm">Esc</Keycap> ends
-          </span>
-        </p>
+              {muted ? <MicrophoneSlash size={18} weight="bold" /> : <Microphone size={18} weight="bold" />}
+            </button>
+            <button
+              type="button"
+              onClick={onHangUp}
+              aria-label={`Hang up on ${agent.name}`}
+              title="Hang up"
+              className={cn(CHUNKY, "flex h-10 shrink-0 items-center gap-1.5 bg-w-coral px-3 text-w-sm font-semibold text-w-ink hover:brightness-105")}
+            >
+              <PhoneDisconnect size={18} weight="bold" />
+              <span className="hidden @sm:inline">Hang up</span>
+            </button>
+            <CloseButton onClose={onMinimise} label="Minimise the call, it keeps going" />
+          </>
+        )}
       </div>
-    </div>
+      {latest && (
+        <p className={cn("line-clamp-2 text-w-sm leading-snug [overflow-wrap:anywhere]", latest.who === "you" ? "text-w-text2" : "text-w-text")}>
+          <span className="font-semibold text-w-strong">{latest.who === "you" ? "You" : agent.name}: </span>
+          {latest.text}
+          {latest.partial && <span aria-hidden>...</span>}
+        </p>
+      )}
+      {fellBack && live && live.state === "needs_setup" && <SetupHint feature={live} compact onAction={onMinimise} />}
+    </section>
   );
-}
 
-function CallButton({ label, pressed, onClick, className, children }: { label: string; pressed?: boolean; onClick: () => void; className: string; children: React.ReactNode }) {
   return (
-    <span className="flex flex-col items-center gap-1.5">
-      <button type="button" onClick={onClick} aria-pressed={pressed} aria-label={label} className={cn(CHUNKY, "grid h-14 w-14 place-items-center rounded-xl", className)}>
-        {children}
-      </button>
-      <span aria-hidden className="text-w-xs font-medium text-w-text2">
-        {label}
-      </span>
-    </span>
+    <>
+      {docked && createPortal(bar, slot)}
+      <AnimatePresence>
+        {showPill && (
+          <motion.div
+            key="pill"
+            {...NOTICE_MOTION}
+            className="pointer-events-none absolute inset-x-0 top-[max(0.5rem,env(safe-area-inset-top))] z-40 flex justify-center px-3"
+          >
+            <div
+              role="group"
+              aria-label={`Call with ${agent.name}`}
+              className="pointer-events-auto flex h-11 max-w-full items-stretch overflow-hidden rounded-lg border-2 border-w-ink bg-w-paper text-w-sm text-w-text shadow-[0_3px_0_rgb(var(--w-ink))]"
+            >
+              <button
+                type="button"
+                onClick={onRestore}
+                aria-label={`Back to the call with ${agent.name}, ${statusText}, ${elapsed}`}
+                title="Back to the call"
+                className={cn(PILL_FOCUS, "flex min-w-0 items-center gap-2 pl-1.5 pr-3 hover:bg-w-sand")}
+              >
+                <AgentAvatar portrait={portrait} emoji={agent.avatar_emoji} size="2rem" soft rounded="rounded-md" />
+                <span className="min-w-0 max-w-[9rem] truncate font-semibold text-w-strong sm:max-w-[14rem]">{agent.name}</span>
+                <span className={cn("shrink-0", ended ? "text-w-danger" : "tabular-nums text-w-text2")}>{ended ? "Call ended" : elapsed}</span>
+              </button>
+              {!ended && (
+                <button
+                  type="button"
+                  onClick={() => setMuted((m) => !m)}
+                  aria-pressed={muted}
+                  aria-label={muted ? "Unmute" : "Mute"}
+                  title={muted ? "Unmute" : "Mute"}
+                  className={cn(PILL_FOCUS, "grid w-11 shrink-0 place-items-center border-l-2 border-w-ink", muted ? "bg-w-rose text-w-danger" : "hover:bg-w-sand")}
+                >
+                  {muted ? <MicrophoneSlash size={18} weight="bold" /> : <Microphone size={18} weight="bold" />}
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={onHangUp}
+                aria-label={ended ? "Close the ended call" : `Hang up on ${agent.name}`}
+                title={ended ? "Close" : "Hang up"}
+                className={cn(PILL_FOCUS, "grid w-11 shrink-0 place-items-center border-l-2 border-w-ink", ended ? "hover:bg-w-sand" : "bg-w-coral text-w-ink hover:brightness-105")}
+              >
+                {ended ? <X size={18} weight="bold" /> : <PhoneDisconnect size={18} weight="bold" />}
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </>
   );
 }
