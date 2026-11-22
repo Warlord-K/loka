@@ -1,5 +1,6 @@
 pub mod config;
 pub mod environment;
+pub mod move_out;
 pub mod feeds;
 pub mod github;
 pub mod omp_config;

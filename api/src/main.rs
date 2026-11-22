@@ -354,6 +354,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/world/channels/{id}/read", post(routes::world::read_channel))
         .route("/world/me", get(routes::world::get_me).patch(routes::world::set_me))
+        .route("/world/me/move-out", post(routes::move_out::move_out))
         .route("/world/storage", get(routes::cleanup::report))
         .route("/world/storage/cleanup", post(routes::cleanup::cleanup))
         .route("/world/tokens", get(routes::tokens::list).post(routes::tokens::create))

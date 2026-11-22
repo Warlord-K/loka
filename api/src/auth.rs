@@ -138,6 +138,10 @@ fn cookie_value<'a>(req: &'a Request, wanted: &str) -> Option<&'a str> {
         .map(|(_, value)| value.trim())
 }
 
+pub fn app_session_matches(given: &str, secret: &str) -> bool {
+    secret.len() >= APP_SESSION_MIN_LEN && constant_time_eq(given.trim().as_bytes(), secret.as_bytes())
+}
+
 fn app_session_ok(req: &Request, secret: &str) -> bool {
     if secret.len() < APP_SESSION_MIN_LEN {
         return false;

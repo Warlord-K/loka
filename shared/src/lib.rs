@@ -13,6 +13,7 @@ pub mod cli_errors;
 pub mod cron_util;
 pub mod db;
 pub mod environment;
+pub mod portable;
 pub mod key_environments;
 pub mod command_rules;
 pub mod event_scope;
