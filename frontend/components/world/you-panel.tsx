@@ -26,7 +26,7 @@ import { useThemeMode, type ThemeMode } from "./theme";
 import { previewSound, SOUND_KINDS, useSoundPrefs } from "./sounds";
 import { newArtStatus, onNewArtStatus } from "./sprites";
 import { UpdatesPage, useUpdates } from "./updates-ui";
-import { GHOST_ICON_BTN, SettingsCard, SettingsGroup, SettingsRow, SettingsShell, Switch, type SettingsNavItem, EmptyState } from "./settings-shell";
+import { GHOST_ICON_BTN, SEARCH_ROW_FOCUS, SEARCH_ROW_RING, SettingsCard, SettingsGroup, SettingsRow, SettingsShell, Switch, type SettingsNavItem, EmptyState } from "./settings-shell";
 import { runtimeName } from "@/lib/model-names";
 import { escapeTaken } from "@/lib/escape";
 
@@ -218,7 +218,7 @@ function SoundsPage() {
   );
 }
 
-function RuleRow({ rule, editable, onChanged }: { rule: WorldRule; editable: boolean; onChanged: () => void }) {
+function RuleRow({ rule, editable, onChanged, focused }: { rule: WorldRule; editable: boolean; onChanged: () => void; focused: boolean }) {
   const [body, setBody] = useState(rule.body);
   const dirty = body.trim() !== rule.body;
   const save = async (patch: { body?: string; scope?: string; enabled?: boolean }) => {
@@ -226,7 +226,7 @@ function RuleRow({ rule, editable, onChanged }: { rule: WorldRule; editable: boo
     onChanged();
   };
   return (
-    <li className="space-y-3 px-4 py-3.5">
+    <li {...(focused ? SEARCH_ROW_FOCUS : {})} className={cn("space-y-3 px-4 py-3.5", SEARCH_ROW_RING)}>
       <div className={cn(!rule.enabled && "opacity-55")}>
         {editable ? <VoiceField multiline value={body} onChange={setBody} ariaLabel="Rule" /> : <p className="text-w-sm leading-relaxed">{rule.body}</p>}
       </div>
@@ -297,7 +297,7 @@ export function YouPanel({
   onOpenAssistant: () => void;
   onOpenPro: () => void;
   controlPlane: "connecting" | "online" | "offline";
-  focusSection: { id: string; at: number } | null;
+  focusSection: { id: string; at: number; recordId?: string } | null;
   onClose: () => void;
 }) {
   useEffect(() => {
@@ -374,7 +374,7 @@ export function YouPanel({
 
   return (
     <SettingsShell
-      title="You"
+      title="Settings"
       items={items}
       active={active}
       onSelect={select}
@@ -493,7 +493,7 @@ export function YouPanel({
               <SettingsCard rows>
                 <ul className="divide-y-2 divide-w-line">
                   {mine.map((r) => (
-                    <RuleRow key={`${r.id}:${r.body}:${r.scope}:${r.enabled}`} rule={r} editable={canWrite} onChanged={refresh} />
+                    <RuleRow key={`${r.id}:${r.body}:${r.scope}:${r.enabled}`} rule={r} editable={canWrite} onChanged={refresh} focused={focusSection?.id === "world-rules" && focusSection.recordId === r.id} />
                   ))}
                 </ul>
               </SettingsCard>
@@ -504,7 +504,7 @@ export function YouPanel({
               <SettingsCard rows>
                 <ul className="divide-y-2 divide-w-line">
                   {everyone.map((r) => (
-                    <RuleRow key={`${r.id}:${r.body}:${r.scope}:${r.enabled}`} rule={r} editable={admin} onChanged={refresh} />
+                    <RuleRow key={`${r.id}:${r.body}:${r.scope}:${r.enabled}`} rule={r} editable={admin} onChanged={refresh} focused={focusSection?.id === "world-rules" && focusSection.recordId === r.id} />
                   ))}
                 </ul>
               </SettingsCard>
@@ -522,7 +522,7 @@ export function YouPanel({
       {active === "devices" && (
         <SettingsGroup title="Devices" description="Agents use these computers for repositories and coding tools.">
           <SettingsCard>
-            <DevicesPanel controlPlane={controlPlane} embedded />
+            <DevicesPanel controlPlane={controlPlane} focusId={focusSection?.id === "world-devices" ? focusSection.recordId : undefined} embedded />
           </SettingsCard>
         </SettingsGroup>
       )}

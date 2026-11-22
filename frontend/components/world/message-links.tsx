@@ -45,9 +45,11 @@ export function messageUrl(ref: string): string {
   return `${window.location.origin}/world?msg=${ref}`;
 }
 
-export type WorldLinkKind = "quest" | "report" | "todo" | "practice";
-const WORLD_LINK_KINDS: WorldLinkKind[] = ["quest", "report", "todo", "practice"];
+export type WorldLinkKind = "quest" | "report" | "todo" | "practice" | "team" | "list" | "place" | "region";
+const WORLD_LINK_KINDS: WorldLinkKind[] = ["quest", "report", "todo", "practice", "team", "list", "place", "region"];
+const EXACT_WORLD_LINK_KINDS = new Set<WorldLinkKind>(["team", "list", "place", "region"]);
 const WORLD_ID = /^[0-9a-fA-F][0-9a-fA-F-]{5,35}$/;
+const EXACT_WORLD_ID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 const WORLD_ITEM = /^[A-Za-z0-9_-]{1,40}$/;
 
 export function worldUrl(kind: WorldLinkKind, id: string): string {
@@ -61,7 +63,8 @@ export function worldRefFromHref(href?: string | null): { kind: WorldLinkKind; r
     if (url.pathname.replace(/\/$/, "") !== "/world") return null;
     for (const kind of WORLD_LINK_KINDS) {
       const ref = url.searchParams.get(kind);
-      if (!ref || !(kind === "practice" ? ATTEMPT_ID : WORLD_ID).test(ref)) continue;
+      if (!ref || !(kind === "practice" ? ATTEMPT_ID : EXACT_WORLD_LINK_KINDS.has(kind) ? EXACT_WORLD_ID : WORLD_ID).test(ref)) continue;
+      if (EXACT_WORLD_LINK_KINDS.has(kind) && url.origin !== window.location.origin) continue;
       const item = kind === "report" ? url.searchParams.get("item") : null;
       return item && WORLD_ITEM.test(item) ? { kind, ref: ref.toLowerCase(), item } : { kind, ref: ref.toLowerCase() };
     }
@@ -69,6 +72,10 @@ export function worldRefFromHref(href?: string | null): { kind: WorldLinkKind; r
     return null;
   }
   return null;
+}
+
+export function openWorldLink(kind: Extract<WorldLinkKind, "team" | "list" | "place" | "region">, id: string): void {
+  window.dispatchEvent(new CustomEvent("world:open-link", { detail: { kind, id } }));
 }
 
 export function channelRef(id: number): string {
@@ -306,6 +313,29 @@ export function LinkButton({ reference, className }: { reference: string; classN
         copied ? "text-w-ok opacity-100" : "opacity-0",
         className,
       )}
+    >
+      {copied ? <Check size={12} weight="bold" /> : <LinkSimple size={12} weight="bold" />}
+    </button>
+  );
+}
+
+export function WorldLinkButton({ kind, id, label, className }: { kind: WorldLinkKind; id: string; label: string; className?: string }) {
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!copied) return;
+    const timeout = window.setTimeout(() => setCopied(false), 1400);
+    return () => window.clearTimeout(timeout);
+  }, [copied]);
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation();
+        void navigator.clipboard.writeText(worldUrl(kind, id)).then(() => setCopied(true)).catch(() => setCopied(false));
+      }}
+      aria-label={copied ? "Link copied" : `Copy link to ${label}`}
+      title={copied ? "Link copied" : "Copy link"}
+      className={cn("rounded-md p-0.5 text-w-muted hover:bg-w-sand hover:text-w-strong", copied && "text-w-ok", className)}
     >
       {copied ? <Check size={12} weight="bold" /> : <LinkSimple size={12} weight="bold" />}
     </button>

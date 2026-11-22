@@ -58,6 +58,8 @@ pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
     "progress_of",
 ];
 
+const GET_UPLOAD_GUIDE: &str = "Save a file someone attached in chat to your work folder and get its path: audio, video, PDFs, any file the chat showed as an attachment (the upload id is in the message). Use it before you try to open, transcribe or grade a recording. Only task and followup sessions on your owner's own device have it; cloud runners and shared devices have no media folder to save into, and main turns and quick chats cannot open files, so they hand the work to a quest. Read the saved path with your normal file tools.";
+
 const QUEST_CHANNEL_TOOLS: &[(&str, &str)] = &[
     ("read_channel", "Read the latest messages in your team channel or a channel you are in."),
     ("post_to_channel", "Post a short update in your team channel or a channel you are in. Put long detail in a thread (thread: msg:chN)."),
@@ -91,14 +93,18 @@ fn start_task_guide(args: &Value) -> String {
         Value::Object(action)
     )
 }
-const SETUP_TOOLS: &[&str] = &["set_rule", "grant_environment_key", "install_mcp_server", "install_skill", "equip", "set_omp_models", "set_powers", "update_agent", "add_feed", "update_feed"];
+const SETUP_TOOLS: &[&str] = &["set_rule", "grant_environment_key", "install_mcp_server", "install_skill", "equip", "set_omp_models", "set_powers", "update_agent", "add_feed", "update_feed", "approve_plan", "create_challenge", "create_course", "create_adventure"];
 
 fn follows_open_thread(read_only: bool) -> bool {
     !read_only
 }
 
+fn get_upload_reaches(read_only: bool, on_shared_device: bool) -> bool {
+    read_only && !on_shared_device
+}
+
 fn tool_allowed(read_only: bool, name: &str) -> bool {
-    !read_only || matches!(name, "show_media" | "ask_to_use_apps") || QUEST_CHANNEL_TOOLS.iter().chain(QUEST_MESSAGE_TOOLS).any(|(tool, _)| *tool == name) || quest::QUEST_TOOLS.contains(&name) || READ_ONLY_TOOLS.contains(&name) || super::reports_tools::READ_TOOLS.contains(&name) || super::reports_tools::QUEST_WRITE_TOOLS.contains(&name) || super::canvas_tools::CANVAS_TOOLS.contains(&name) || super::practice_tools::READ_TOOLS.contains(&name) || super::teams_tools::READ_TOOLS.contains(&name)
+    !read_only || matches!(name, "show_media" | "get_upload" | "ask_to_use_apps") || QUEST_CHANNEL_TOOLS.iter().chain(QUEST_MESSAGE_TOOLS).any(|(tool, _)| *tool == name) || quest::QUEST_TOOLS.contains(&name) || READ_ONLY_TOOLS.contains(&name) || super::reports_tools::READ_TOOLS.contains(&name) || super::reports_tools::QUEST_WRITE_TOOLS.contains(&name) || super::canvas_tools::CANVAS_TOOLS.contains(&name) || super::practice_tools::READ_TOOLS.contains(&name) || super::teams_tools::READ_TOOLS.contains(&name)
 }
 
 fn docs_path(page: &str) -> Result<String> {
@@ -247,7 +253,7 @@ impl Server {
     }
 
     fn allows(&self, name: &str) -> bool {
-        tool_allowed(self.read_only, name) && !hidden_in_session(self.quick.is_some(), self.aside, name) && (name != "offer_memory" || self.quick.is_some())
+        tool_allowed(self.read_only, name) && !hidden_in_session(self.quick.is_some(), self.aside, name) && (name != "offer_memory" || self.quick.is_some()) && (name != "get_upload" || get_upload_reaches(self.read_only, self.on_shared_device))
     }
 
     fn listed_tools(&self) -> Vec<Value> {
@@ -393,7 +399,7 @@ fn subscribe_description() -> String {
 
 fn with_quest_options(mut properties: Value) -> Value {
     if let Some(map) = properties.as_object_mut() {
-        map.insert("plan_first".into(), json!({ "type": "boolean", "description": "Off unless the person you work for asks or a rule says so. The quest first sends a read-only plan to them to approve or redirect" }));
+        map.insert("plan_first".into(), json!({ "type": "boolean", "description": "Off unless the person you work for asks or a rule says so. The quest first sends a read-only plan to them to approve or redirect. To pass on an approval your person told you in chat, call approve_plan; setting this to false on a quest whose plan is waiting also approves it" }));
         map.insert("attempts".into(), json!({ "type": "integer", "description": "Off (1) unless the person you work for asks. 2 or 3 sessions try the quest in parallel and an independent judge ships the best one; costs that many times more; not with plan_first" }));
         map.insert("ci_feedback".into(), json!({ "type": "boolean", "description": "With a repo and wait for merge: failing checks on the pull request go back to the quest and get fixed without the person, at most 3 rounds. Set it when the repo has checks, unless the person or a rule says not to" }));
         map.insert("context".into(), json!({ "type": "string", "enum": ["lean", "auto", "full"], "description": "How much of your main conversation the quest starts with. Leave it out to use your setting (lean by default). lean: a fresh session with your notes, persona, rules, repo notes, recent quests and this brief, nothing from the chat. auto: carries the chat while it is under half the model window. full: carries the whole chat; only when the work truly depends on it, since big chats make quests fail on their first turn" }));
@@ -435,7 +441,7 @@ impl Server {
         let clis = loka_shared::backends::cli_list_here();
         let mut tools = vec![
             tool("world_agents", "List everyone in the world: name, role, cli and model, the device they run on, what they are doing right now, open task count.", json!({}), &[]),
-            tool("share_link", "Get a full web link to something in Loka for use outside the app: Slack, email, a GitHub PR or issue, docs. Inside Loka chat keep using msg:, quest:, report: and todo: refs, which show as cards. kind is message, quest, report, todo or agent.", json!({ "kind": s("message, quest, report, todo or agent"), "ref": s("The id or first characters (msg:3f2a91c0, msg:ch42, a quest id, report:<id> or its title, report:<id>#<item> for one item on a canvas, a to-do id or text, an agent name or slug)") }), &["kind", "ref"]),
+            tool("share_link", "Get a full web link to something in Loka for use outside the app: Slack, email, a GitHub PR or issue, docs. Inside Loka chat keep using refs, which show as cards. kind is message, quest, report, todo, list, team, region, place or agent.", json!({ "kind": s("message, quest, report, todo, list, team, region, place or agent"), "ref": s("Its canonical ref, id, first characters, exact name or slug: msg:ch42, quest:<id>, report:<id>, todo:<id>, list:<id>, team:<id>, region:<id>, place:<id>, or an agent name") }), &["kind", "ref"]),
             tool("read_docs", "Read Loka's own docs as Markdown. Use it when someone pastes a Loka docs link (any URL with /docs in it) or asks how Loka works: agents, quests, devices, keys, teams, setup. Leave page empty for the list of pages, or pass all for every page at once.", json!({ "page": s("A docs link, a page slug like quests or devices, all, or empty for the list") }), &[]),
             tool("show_ui", loka_shared::ui_cards::GUIDE, json!({ "summary": s("Plain text version of the card: what it shows or asks, one or two sentences"), "spec": { "type": "object", "description": "The json-render spec: root, elements, optional state" } }), &["summary", "spec"]),
             tool("show_media", SHOW_MEDIA_GUIDE, json!({
@@ -446,6 +452,7 @@ impl Server {
                 "collapsed": { "type": "boolean", "description": "true folds it into one line the person can open, for in-between shots from getting there. false (default) shows it open, for the result" },
                 "quest": s("Quest id to file it under, optional; work in a quest files it under that quest on its own")
             }), &[]),
+            tool("get_upload", GET_UPLOAD_GUIDE, json!({ "upload_id": s("The upload id from the attachment, as shown in the message") }), &["upload_id"]),
             tool("agent_activity", "Look at one agent closely: status, open tasks, recent sessions with their summaries, recent events. Use this to give updates on someone's work.", json!({ "agent": s("Agent name or slug") }), &["agent"]),
             tool("message_agent", "Send a message to another agent. They handle it on their next turn and can message you back. Do not wait for the reply.", json!({ "agent": s("Agent name or slug"), "text": s("The message") }), &["agent", "text"]),
             tool("ask_aside", "Pull an agent aside: a fork of their memory answers your question without disturbing their current work. The answer arrives later as an aside.answered event. For a quick, cheap answer pass a smaller model (same CLI keeps their memory); a different cli starts fresh from their notes and recent quests.", json!({ "agent": s("Agent name or slug"), "question": s("What you want to know"), "model": s("Model for this aside, optional, defaults to theirs, e.g. haiku, sonnet, gpt-5.5-mini"), "cli": s(&format!("CLI for this aside, optional: {clis}; needs model when it differs from theirs")) }), &["agent", "question"]),
@@ -547,7 +554,7 @@ impl Server {
             }), &["list"]),
             tool("list_items", "See the buildings, decorations, critters, portals, characters, timers and lists in the home town, or in one region.", json!({ "kind": s("Filter by kind, optional"), "region": s("Region name, slug or id, optional; defaults to the home town") }), &[]),
             tool("remove_item", "Remove a building, decoration group, critter, portal, character, challenge, adventure, timer or list of your person's by name or id.", json!({ "item": s("Name or id") }), &["item"]),
-            tool("edit_item", "Change something already in your person's Loka without rebuilding it. Any item: name. Building: roof, wall, awning, note, opens. Character: persona, greeting, look, dialogue, agent (staff it with one of your person's agents, or none to unstaff). Portal: label, to. Challenge: any create_challenge field (title, prompt, hints, rubric, tests, choices, correct, skill, difficulty, minutes, xp). Adventure: story, challenges (the full new order). Lists use update_list.", json!({
+            tool("edit_item", "Change something already in your person's Loka without rebuilding it. Any item: name. Building: roof, wall, awning, note, opens. Character: persona, greeting, look, dialogue, agent (staff it with one of your person's agents, or none to unstaff). Portal: label, to. Lesson (challenge): any create_challenge field (title, prompt, hints, rubric, tests, choices, correct, skill, difficulty, minutes, xp), reading, coach, course (moves it to the end of that course); a lesson cannot switch to or from canvas. Course (adventure): story, challenges (the full new order), skill, folder, coach. Lists use update_list.", json!({
                 "item": s("Name or id"),
                 "name": s("New name"),
                 "roof": s("Building roof colour, hex"), "wall": s("Building wall colour, hex"), "awning": s("Building awning colour, hex"),
@@ -566,8 +573,12 @@ impl Server {
                 "correct": { "type": "array", "items": { "type": "integer" } },
                 "skill": s("Challenge skill"), "difficulty": s("easy, medium or hard"),
                 "minutes": { "type": "integer" }, "xp": { "type": "integer" },
-                "story": s("Adventure story"),
-                "challenges": { "type": "array", "items": { "type": "string" }, "description": "Adventure challenges in order, names or ids" }
+                "reading": { "type": "array", "items": { "type": "string" }, "description": "Lesson reading: your person's reports or canvases, the full new list" },
+                "coach": s("Lesson or course coach: agent name or slug, or none"),
+                "course": s("Course name or id to move a lesson into"),
+                "folder": s("Course reports folder"),
+                "story": s("Course story"),
+                "challenges": { "type": "array", "items": { "type": "string" }, "description": "Course lessons in order, names or ids" }
             }), &["item"]),
             tool("add_todo", "Add an item to your person's own to-do list (the \"To do\" list in their Lists panel), which they strike off when done. Use this instead of make_list for things they need to do. Set nudge_at when they want a ping to check it (\"ping me tomorrow at 10\"), due_at for a deadline (a ping fires then too). Unfinished nudged items ping again with growing gaps until done. You get a todo.done event when they strike it off.", json!({
                 "text": s("What needs doing, short and concrete"),
@@ -619,7 +630,7 @@ impl Server {
             tool("set_reviewer", "Choose the default CLI and model for the independent reviewer of your quests (or another agent's) (and of request_review). Reviews always run in a fresh session, so any installed CLI works. Leave model empty to go back to reviewing with your own model. This does not turn reviews on; start_task's review flag still decides per quest.", json!({ "cli": s(&format!("{clis}, optional, defaults to the quest's CLI")), "model": s("Model the reviewer uses, e.g. fable, opus, gpt-5.5; empty clears"), "agent": s("Another agent of your person to set it for, optional; needs manage_agents") }), &[]),
             tool("devices", "List the devices (desktop runners) the person you work for has connected, plus the cloud server. Shows which CLIs each one has, whether it is online, which agents live on it, the folders shared from it for start_folder_session, and where you run now.", json!({}), &[]),
             tool("setup_status", "Check which Loka features the person you work for can use right now (devices, terminal, remote workshop, browser for agents, Slack, live voice, keys, phone notifications, OpenCode) and the concrete next step for each one that needs setup. Call it before saying a feature is broken. When they ask for something that is not ready, or a quest was blocked by one, do not send them to settings: say in one line what it unlocks and put setup:<key> alone on its own line (the result names each key). They get a card that turns it on, runs the install on the right Mac, or opens the exact page.", json!({}), &[]),
-            tool("environment_keys", "List environment key names available to you. Values are never returned. The person you work for manages keys and grants in You > Environment.", json!({}), &[]),
+            tool("environment_keys", "List environment key names available to you. Values are never returned. The person you work for manages keys and grants in Settings > Keys.", json!({}), &[]),
             tool("kit", "List installed MCP servers and skills, and which of your owner's agents have each one equipped (global ones reach everyone).", json!({}), &[]),
             tool("rules", "List the rules agents follow: global ones and your owner's own, with ids, scope (talk, work or all) and whether each is on.", json!({}), &[]),
         ];
@@ -690,7 +701,7 @@ impl Server {
                 "config": s("The full models.yml text"),
                 "clear": { "type": "boolean", "description": "Remove the saved config instead" }
             }), &[]));
-            tools.push(tool("install_mcp_server", "Install an MCP server and give it to an agent. definition uses the Claude .mcp.json server shape: {command, args, env} or {type, url, headers}. Use ${secret:KEY} only in env or headers. The key must already exist in You > Environment and be granted to the target agent. Never ask for or accept a secret value in chat.", json!({
+            tools.push(tool("install_mcp_server", "Install an MCP server and give it to an agent. definition uses the Claude .mcp.json server shape: {command, args, env} or {type, url, headers}. Use ${secret:KEY} only in env or headers. The key must already exist in Settings > Keys and be granted to the target agent. Never ask for or accept a secret value in chat.", json!({
                 "agent": s("Agent name or slug, optional"),
                 "name": s("Server name"),
                 "definition": { "type": "object" },
@@ -719,12 +730,19 @@ impl Server {
             tools.extend(super::practice_tools::tools(tool));
             tools.extend(super::teams_tools::tools(tool, self.can(powers::TEAMS)));
             tools.extend(super::loka_tools::look_tools(tool));
+            tools.extend(super::loka_tools::academy_tools(tool));
             if self.can(powers::WORLDBUILD) {
                 tools.extend(super::loka_tools::build_tools(tool));
             }
         }
         if self.can(powers::FEEDS) {
             tools.extend(super::feeds_tools::tools(tool));
+        }
+        if self.caller.owner_user_id.is_some() {
+            tools.push(tool("approve_plan", "Approve the plan a quest is waiting on, exactly like your owner pressing Approve on its plan card: the quest's session starts building it now. Use it only when a verified message from your owner (in any chat, thread or channel) tells you to build that plan. Nothing happens when the plan is already approved, being revised or the quest is closed, and the result says which. A reply that changes the approach or asks a question is not approval: answer it, or send feedback with message_session so the plan is revised. Your own quests always, with no extra power; other agents' quests of the person you work for need the oversee power.", json!({
+                "task": s("Task id or its first 8 characters, from the plans waiting list or list_tasks"),
+                "note": s("A small change your owner added to their yes, passed on to the builder, optional")
+            }), &["task"]));
         }
         if self.can(powers::MANAGE_QUESTS) {
             let quests = || json!({
@@ -834,8 +852,85 @@ impl Server {
                 let todo = self.store.find_todo(owner, &key).await?.ok_or_else(|| anyhow!("no to-do matches {key}; see list_todos"))?;
                 app_links::todo_url(todo.id)
             }
+            "list" => {
+                let owner = owner.ok_or_else(|| anyhow!("you have no person whose lists you can link"))?;
+                let org = self.caller.org_id.ok_or_else(|| anyhow!("you have no organization whose lists you can link"))?;
+                let key = strip("list:");
+                if key.is_empty() {
+                    bail!("list ref is empty; see list_items");
+                }
+                let id = match Uuid::parse_str(&key) {
+                    Ok(id) => Some(id),
+                    Err(_) => match self.store.find_item(Some(owner), Some(org), Some("list"), &key).await? {
+                        Some(item) => Some(item.id),
+                        None => self.store.find_item(Some(owner), Some(org), Some("timer"), &key).await?.map(|item| item.id),
+                    },
+                }
+                .ok_or_else(|| anyhow!("no list matches {key}; see list_items"))?;
+                let item = self
+                    .store
+                    .item_for_viewer(id, owner, org, false)
+                    .await?
+                    .filter(|item| matches!(item.kind.as_str(), "list" | "timer"))
+                    .ok_or_else(|| anyhow!("no list matches {key}; see list_items"))?;
+                app_links::list_url(item.id)
+            }
+            "team" => {
+                let owner = owner.ok_or_else(|| anyhow!("you have no person whose teams you can link"))?;
+                let org = self.caller.org_id.ok_or_else(|| anyhow!("you have no organization whose teams you can link"))?;
+                let key = strip("team:");
+                if key.is_empty() {
+                    bail!("team ref is empty; see list_teams");
+                }
+                let team = self.store.find_visible_team(owner, org, &key).await?.ok_or_else(|| anyhow!("no team matches {key}; see list_teams"))?;
+                app_links::team_url(team.id)
+            }
+            "region" => {
+                let owner = owner.ok_or_else(|| anyhow!("you have no person whose regions you can link"))?;
+                let org = self.caller.org_id.ok_or_else(|| anyhow!("you have no organization whose regions you can link"))?;
+                let key = strip("region:");
+                if key.is_empty() {
+                    bail!("region ref is empty; see list_regions");
+                }
+                let region = match Uuid::parse_str(&key) {
+                    Ok(id) => self.store.region_for(owner, Some(org), false, id).await?.map(|detail| detail.region),
+                    Err(_) => {
+                        let normalized = key.to_ascii_lowercase();
+                        self.store.regions_for(owner, Some(org), false).await?.into_iter().find(|region| {
+                            region.slug == normalized
+                                || region.name.eq_ignore_ascii_case(&key)
+                                || (key.len() >= 6 && region.id.to_string().starts_with(&normalized))
+                        })
+                    }
+                }
+                .ok_or_else(|| anyhow!("no region matches {key}; see list_regions"))?;
+                app_links::region_url(region.id)
+            }
+            "place" => {
+                let owner = owner.ok_or_else(|| anyhow!("you have no person whose places you can link"))?;
+                let org = self.caller.org_id.ok_or_else(|| anyhow!("you have no organization whose places you can link"))?;
+                let key = strip("place:");
+                if key.is_empty() {
+                    bail!("place ref is empty; see list_items");
+                }
+                let id = match Uuid::parse_str(&key) {
+                    Ok(id) => Some(id),
+                    Err(_) => match self.store.find_item(Some(owner), Some(org), Some("building"), &key).await? {
+                        Some(item) => Some(item.id),
+                        None => self.store.find_item(Some(owner), Some(org), Some("npc"), &key).await?.map(|item| item.id),
+                    },
+                }
+                .ok_or_else(|| anyhow!("no place matches {key}; see list_items"))?;
+                let item = self
+                    .store
+                    .item_for_viewer(id, owner, org, false)
+                    .await?
+                    .filter(|item| matches!(item.kind.as_str(), "building" | "npc"))
+                    .ok_or_else(|| anyhow!("no place matches {key}; see list_items"))?;
+                app_links::place_url(item.id)
+            }
             "agent" => app_links::agent_url(&self.agent(raw.trim_start_matches('@')).await?.slug),
-            other => bail!("unknown kind {other}; use message, quest, report, todo or agent"),
+            other => bail!("unknown kind {other}; use message, quest, report, todo, list, team, region, place or agent"),
         };
         Ok(format!("{url}\nOnly people who can see it in Loka can open it."))
     }
@@ -857,7 +952,7 @@ impl Server {
         Ok(if on {
             "\nGitHub events come from your person's GitHub notifications, read on their Mac, so you hear about threads they are part of (authored, review requests, mentions, comments, CI, subscriptions). Bursts are grouped into one turn. To follow one pull request instead of everything, subscribe with pr: owner/repo#123."
         } else {
-            "\nYour person's GitHub feed is off, so no GitHub events arrive yet. Ask them to turn it on in You, under GitHub (it reads their notifications on their Mac with its gh login)."
+            "\nYour person's GitHub feed is off, so no GitHub events arrive yet. Ask them to turn it on in Settings, under GitHub (it reads their notifications on their Mac with its gh login)."
         })
     }
 
@@ -1208,6 +1303,7 @@ impl Server {
                 None => Err(anyhow!("offer_memory only works in a quick chat")),
             },
             "show_media" => self.show_media(args).await,
+            "get_upload" => Err(anyhow!("get_upload only works in a quest running on your owner's own device")),
             "ask_to_use_apps" => match (self.quest, self.session) {
                 (Some(task), Some(session)) => self.store.request_app_control(&self.caller, task, session, arg("reason").unwrap_or("")).await,
                 _ => Err(anyhow!("ask_to_use_apps only works inside a quest running on a Mac")),
@@ -1550,7 +1646,7 @@ impl Server {
                         .map(|w| format!("\n{} wants: {}", w.agent_name, w.keys.join(", ")))
                         .collect::<String>();
                     if entries.is_empty() {
-                        return Ok(format!("No environment keys are configured. Add them in You > Environment, then grant them to an agent.{wanted}"));
+                        return Ok(format!("No environment keys are configured. Add them in Settings > Keys, then grant them to an agent.{wanted}"));
                     }
                     Ok(entries
                         .into_iter()
@@ -1744,7 +1840,7 @@ impl Server {
                 }
                 super::teams_tools::call(&self.store, &self.caller, name, args).await
             }
-            n if super::loka_tools::LOOK_TOOLS.contains(&n) => super::loka_tools::call(&self.store, &self.caller, name, args).await,
+            n if super::loka_tools::LOOK_TOOLS.contains(&n) || super::loka_tools::ACADEMY_TOOLS.contains(&n) => super::loka_tools::call(&self.store, &self.caller, name, args).await,
             n if super::loka_tools::BUILD_TOOLS.contains(&n) => {
                 self.require(powers::WORLDBUILD)?;
                 super::loka_tools::call(&self.store, &self.caller, name, args).await
@@ -2443,6 +2539,19 @@ impl Server {
                 }
                 Ok(done.join(" "))
             }
+            "approve_plan" => {
+                self.require_owner_asked().await?;
+                let task = self.reachable_quest(need("task")?, "approve the plan of").await?;
+                let owner = self.owner()?;
+                let by = self.store.user_display_name(owner).await?.unwrap_or_else(|| "Your owner".into());
+                let label = format!("{} ({})", &task.id.to_string()[..8], short(&task.title, 80));
+                match self.store.approve_plan(task.id, &by, &self.caller.name, arg("note").unwrap_or("")).await? {
+                    loka_shared::quests::PlanApproval::Approved { .. } => Ok(format!(
+                        "Approved the plan for {label}. Its session is building it now and reports back as usual. Tell your owner in one line that it is going."
+                    )),
+                    loka_shared::quests::PlanApproval::NotWaiting(why) => Ok(format!("Nothing to approve for {label}: {why}. Nothing was changed.")),
+                }
+            }
             "set_time_limit" => {
                 let task = self.reachable_quest(need("task")?, "change").await?;
                 let minutes = time_limit_arg(args)?;
@@ -2539,7 +2648,7 @@ impl Server {
                     .await?
                     .into_iter()
                     .find(|e| e.name == key)
-                    .ok_or_else(|| anyhow!("no environment key named {key}; your owner adds keys in You > Environment"))?;
+                    .ok_or_else(|| anyhow!("no environment key named {key}; your owner adds keys in Settings > Keys"))?;
                 let revoke = args.get("revoke").and_then(Value::as_bool).unwrap_or(false);
                 let mut ids: Vec<Uuid> = entry.agent_ids.into_iter().filter(|id| *id != target.id).collect();
                 if !revoke {
@@ -2635,7 +2744,7 @@ impl Server {
                 }
                 let target = match arg("agent") {
                     Some(agent) => Some(self.managed_agent(agent).await?),
-                    None if has_secrets => bail!("choose an agent after granting the environment key in You > Environment"),
+                    None if has_secrets => bail!("choose an agent after granting the environment key in Settings > Keys"),
                     None => None,
                 };
                 if let Some(target) = target.as_ref() {
@@ -2648,7 +2757,7 @@ impl Server {
                             .collect::<Vec<_>>();
                         if !missing.is_empty() {
                             bail!(
-                                "grant {} to {} in You > Environment first",
+                                "grant {} to {} in Settings > Keys first",
                                 missing.join(", "),
                                 target.name
                             );
@@ -3082,17 +3191,30 @@ mod tests {
     }
 
     #[test]
+    fn get_upload_is_for_quest_sessions_on_the_owners_own_device() {
+        assert!(get_upload_reaches(true, false));
+        assert!(!get_upload_reaches(true, true));
+        assert!(!get_upload_reaches(false, false));
+        assert!(!get_upload_reaches(false, true));
+    }
+
+    #[test]
     fn read_only_sessions_get_only_lookup_tools() {
         for name in ["list_tasks", "agent_activity", "world_agents", "list_items", "read_channel", "post_to_channel"] {
             assert!(tool_allowed(true, name), "{name}");
         }
-        for name in ["write_report", "update_report", "get_report", "list_reports", "message_agent"] {
+        for name in ["write_report", "update_report", "get_report", "list_reports", "message_agent", "get_upload"] {
             assert!(tool_allowed(true, name), "{name}");
         }
-        for name in ["delete_report", "read_thread", "find_messages", "recent_events", "list_todos", "kit", "create_task", "environment_keys", "grant_environment_key", "add_todo", "slack_post", "update_my_notes", "list_feeds", "cancel_task"] {
+        for name in ["delete_report", "read_thread", "find_messages", "recent_events", "list_todos", "kit", "create_task", "environment_keys", "grant_environment_key", "add_todo", "slack_post", "update_my_notes", "list_feeds", "cancel_task", "approve_plan"] {
             assert!(!tool_allowed(true, name), "{name}");
             assert!(tool_allowed(false, name), "{name}");
         }
+    }
+
+    #[test]
+    fn approving_a_plan_is_a_setup_change_outside_content_cannot_make() {
+        assert!(SETUP_TOOLS.contains(&"approve_plan"));
     }
 
     #[test]
@@ -3135,9 +3257,36 @@ mod tests {
         let names = |server: &Server| server.listed_tools().iter().filter_map(|t| t["name"].as_str().map(str::to_string)).collect::<Vec<_>>();
         let main = Server::new(store.clone(), db.clone(), caller.clone());
         let aside = Server::new(store, db, caller).in_aside(true);
+        assert!(!names(&main).iter().any(|n| n == "get_upload"));
+        assert!(!names(&aside).iter().any(|n| n == "get_upload"));
         assert!(names(&main).iter().any(|n| n == "start_task"));
         assert!(!names(&aside).iter().any(|n| n == "start_task"));
         assert!(names(&aside).iter().any(|n| n == "create_task"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_coder_without_powers_still_gets_approve_plan() -> Result<()> {
+        let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let db = Database::connect(&url).await?;
+        let store = WorldStore::new(db.pool().clone());
+        let revoked: Vec<&str> = powers::ALL.iter().map(|(name, _)| *name).collect();
+        let caller: WorldAgent = serde_json::from_value(json!({
+            "id": Uuid::new_v4(), "slug": "coder", "name": "Coder", "avatar_emoji": "a", "cli": "claude", "model": "sonnet",
+            "role": "worker", "look": null, "gear": null, "status": "idle", "visibility": "private", "tags": [],
+            "created_at": chrono::Utc::now(), "revoked_powers": revoked, "is_main": false, "jobs": [], "owner_user_id": Uuid::new_v4()
+        }))?;
+        let names = |server: &Server| server.listed_tools().iter().filter_map(|t| t["name"].as_str().map(str::to_string)).collect::<Vec<_>>();
+        let server = Server::new(store.clone(), db.clone(), caller.clone());
+        assert!(!server.can(powers::MANAGE_QUESTS));
+        assert!(names(&server).iter().any(|n| n == "approve_plan"));
+        assert!(!names(&server).iter().any(|n| n == "cancel_task"));
+        let quick = Server::new(store.clone(), db.clone(), caller.clone()).in_quick(Some(Uuid::new_v4()));
+        assert!(names(&quick).iter().any(|n| n == "approve_plan"));
+        let ownerless = Server::new(store, db, WorldAgent { owner_user_id: None, ..caller });
+        assert!(!names(&ownerless).iter().any(|n| n == "approve_plan"));
         Ok(())
     }
 

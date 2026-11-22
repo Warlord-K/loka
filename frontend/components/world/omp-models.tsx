@@ -148,7 +148,7 @@ export function EquipSecretsDialog({
         </ul>
         {!status.environment_configured && <p className="text-w-xs text-w-muted">Secure environment storage is not configured by the operator, so keys cannot be added yet.</p>}
         {secrets.some((s) => !s.in_environment) && status.environment_configured && !blocked && (
-          <p className="text-w-xs text-w-muted">Values are stored in You, Environment and are never shown again. You can also add them there.</p>
+          <p className="text-w-xs text-w-muted">Values are stored in Settings &gt; Keys and are never shown again. You can also add them there.</p>
         )}
         {blocked && <p className="text-w-sm text-w-warn">{blocked}</p>}
         {error && <p role="alert" className="text-w-sm text-w-danger">{error}</p>}

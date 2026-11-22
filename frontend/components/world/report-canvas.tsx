@@ -42,12 +42,13 @@ import {
   PencilSimple,
   Plus,
   Quotes,
-  Sparkle,
+  GraduationCap,
   Trash,
   TreeStructure,
   X,
   type Icon as PhosphorIcon,
 } from "@phosphor-icons/react";
+import { PRACTICE_THIS_HINT, usePracticeThis } from "./practice-this";
 import { AnimatePresence, motion } from "framer-motion";
 import { cn } from "@/lib/utils";
 import { worldApi, type SearchResults, type WorldAgent } from "@/lib/world";
@@ -57,13 +58,14 @@ import { embedFromHref, EmbedView } from "./embeds";
 import { Lightbox } from "./media-view";
 import { UiCard } from "./lazy";
 import { MAIN_TARGET, sendQuote } from "./quote";
-import { RunCommandContext, type RunCommand } from "./run-command";
+import { RunCommandContext, useRunCommand, type RunCommand } from "./run-command";
 import { BTN_PRIMARY, BTN_GHOST, BTN_DANGER_GHOST, BTN_SM, EASE, FOCUS } from "./styles";
 import { POPOVER_MOTION } from "./motion";
 import { useCopy } from "@/lib/copy";
 import { commitMarkDelete, commitMarkDeleteOnExit, hideMarkDeletes, MARK_UNDO_MS, planMarkDelete, pruneMarkDeletes, settleMarkDelete, type MarkDelete, type MarkDeleteApi } from "@/lib/canvas-marks";
 import { takeEscape } from "@/lib/escape";
 import { worldUrl } from "./message-links";
+import { MeaningIcon } from "@/lib/meaning-icons";
 
 const CanvasModel = dynamic(() => import("./canvas-model"), { ssr: false });
 
@@ -142,7 +144,7 @@ function Caption({ item }: { item: CanvasItem }) {
   if (!item.caption && !item.locked) return null;
   return (
     <p className="absolute left-0 right-0 top-full mt-1.5 line-clamp-3 text-w-xs leading-snug text-w-text2">
-      {item.by !== "person" && <Sparkle size={11} weight="fill" className="mr-1 inline text-[rgb(var(--w-chart-3))]" aria-hidden />}
+      {item.by !== "person" && <MeaningIcon.agent size={11} weight="fill" className="mr-1 inline text-[rgb(var(--w-chart-3))]" aria-hidden />}
       {item.caption}
       {item.locked && (
         <span className="ml-1 inline-flex items-center gap-0.5 font-semibold text-w-strong">
@@ -227,7 +229,7 @@ function ItemBody({ item }: { item: CanvasItem }) {
     case "note":
       return (
         <div className="nowheel relative h-full w-full overflow-y-auto rounded-lg border-2 border-w-line2 bg-w-card px-3.5 py-3 text-w-sm leading-relaxed text-w-text shadow-[0_2px_0_rgb(var(--w-line))]">
-          {item.by !== "person" && <Sparkle size={12} weight="fill" className="absolute right-2.5 top-2.5 text-[rgb(var(--w-chart-3))]" aria-label="Written by the agent" />}
+          {item.by !== "person" && <MeaningIcon.agent size={12} weight="fill" className="absolute right-2.5 top-2.5 text-[rgb(var(--w-chart-3))]" aria-label="Written by the agent" />}
           <RichText text={wikify(item.text ?? "", known)} handles={handles} onOpenAgent={onOpenAgent} onWiki={onWiki} />
         </div>
       );
@@ -340,7 +342,7 @@ function MarkView({ data }: NodeProps<MarkNode>) {
                   <p className={cn("whitespace-pre-wrap text-w-sm leading-snug", m.status === "open" ? "text-w-strong" : "text-w-muted line-through")}>{m.body}</p>
                   {m.reply && (
                     <p className="flex gap-1 text-w-xs text-w-text2">
-                      <Sparkle size={11} weight="fill" className="mt-0.5 shrink-0 text-[rgb(var(--w-chart-3))]" aria-hidden />
+                      <MeaningIcon.reply size={11} weight="bold" className="mt-0.5 shrink-0 text-[rgb(var(--w-chart-3))]" aria-hidden />
                       {m.reply}
                     </p>
                   )}
@@ -472,16 +474,12 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
   }, [doc, marks, canEdit]);
 
   const author = report.author_agent_id ? agents.find((a) => a.id === report.author_agent_id) : undefined;
-  const runner: RunCommand | null =
-    author && meId && author.owner_user_id === meId
-      ? {
-          where: author.runner_name ? `on ${author.runner_name}, output goes to ${author.name}'s chat` : `on ${author.name}'s device, output goes to its chat`,
-          who: author.name,
-          run: async (command: string, runOn?: string) => {
-            await worldApi.runCommand(author.id, command, runOn);
-          },
-        }
-      : null;
+  const practice = usePracticeThis(report.id);
+  const ownCanvas = meId !== null && report.owner_user_id === meId;
+  useEffect(() => {
+    if (practice.error) setError(practice.error);
+  }, [practice.error]);
+  const runner = useRunCommand(author, meId, { where: author ? (author.runner_name ? `on ${author.runner_name}, output goes to ${author.name}'s chat` : `on ${author.name}'s device, output goes to its chat`) : undefined });
 
   const change = useCallback(
     async (ops: CanvasOp[]) => {
@@ -990,6 +988,7 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
               }}
             />
             <ClusterButton icon={Quotes} label="Quote this canvas in chat" onClick={quoteCanvas} />
+            {ownCanvas && <ClusterButton icon={GraduationCap} label={practice.busy ? "Making the lesson" : practice.error ?? PRACTICE_THIS_HINT} active={practice.busy} onClick={practice.run} />}
             <ClusterButton icon={ClockCounterClockwise} label="History" onClick={onHistory} />
             <ClusterButton icon={copied ? Check : LinkIcon} label={copied ? "Link copied" : "Copy a link"} onClick={() => copy(worldUrl("report", report.id))} />
           </div>

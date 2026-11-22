@@ -6,7 +6,8 @@ use loka_shared::world::{WorldAgent, WorldStore};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-pub const BUILD_TOOLS: &[&str] = &["create_region", "update_region", "place_portal", "add_npc", "set_ambient", "create_challenge", "create_adventure"];
+pub const BUILD_TOOLS: &[&str] = &["create_region", "update_region", "place_portal", "add_npc", "set_ambient"];
+pub const ACADEMY_TOOLS: &[&str] = &["create_challenge", "create_course", "create_adventure"];
 pub const LOOK_TOOLS: &[&str] = &["list_regions", "list_challenges", "progress_of"];
 
 pub fn look_tools(tool: fn(&str, &str, Value, &[&str]) -> Value) -> Vec<Value> {
@@ -19,8 +20,14 @@ pub fn look_tools(tool: fn(&str, &str, Value, &[&str]) -> Value) -> Vec<Value> {
         ),
         tool(
             "list_challenges",
-            "List the Academy challenges and adventures you or other agents made for your person, with how they did on each (new, pending, passed, failed) and their best score.",
-            json!({ "state": { "type": "string", "description": "Only new, pending, passed or failed, optional" } }),
+            "List your person's Academy courses and their lessons (challenges), with how they did on each (new, pending, passed, failed) and their best score. Give course to list one course in order, challenge to read one lesson in full (prompt, reading, coach, attempts), and for a canvas lesson attempt (practice:<id>) with strokes true for the stroke data of that attempt.",
+            json!({
+                "state": { "type": "string", "description": "Only new, pending, passed or failed, optional" },
+                "course": { "type": "string", "description": "Only the lessons of this course: name or id, optional" },
+                "challenge": { "type": "string", "description": "One lesson to read in full: name or id, optional" },
+                "attempt": { "type": "string", "description": "A canvas attempt to read in full: practice:<id> or its first characters, optional" },
+                "strokes": { "type": "boolean", "description": "With attempt or a canvas challenge: include the full stroke JSON" }
+            }),
             &[],
         ),
         tool("progress_of", "See your person's Academy progress: xp, level, per-skill xp, streak, unlocked rewards and recent graded attempts. Use it to pitch the next challenge at the right level and skill.", json!({}), &[]),
@@ -91,9 +98,16 @@ pub fn build_tools(tool: fn(&str, &str, Value, &[&str]) -> Value) -> Vec<Value> 
             }),
             &["region"],
         ),
+    ]
+}
+
+pub fn academy_tools(tool: fn(&str, &str, Value, &[&str]) -> Value) -> Vec<Value> {
+    let s = |d: &str| json!({ "type": "string", "description": d });
+    let region = s("Region name, slug or id from list_regions; omit for the home town");
+    vec![
         tool(
             "create_challenge",
-            "Create an Academy challenge for your person: a puzzle, dsa (data structures and algorithms), design (system design) or quiz. They answer in the app and it is graded on their keys: quizzes with choices and correct are graded instantly, everything else by a short examiner conversation using your rubric or tests. Passing earns xp in the skill. Keep it doable in the minutes you give. When your person is waiting on a quest, relate it to that quest's subject.",
+            "Create an Academy lesson (challenge) for your person: a puzzle, dsa (data structures and algorithms), design (system design), quiz, or canvas (they write or draw on a practice canvas and press Ready; the coach grades the picture and strokes with grade_attempt). Puzzle, dsa, design and quiz are answered in the app: quizzes with choices and correct are graded instantly, the rest by a short examiner conversation using your rubric or tests. Passing earns xp in the skill. Give course to add it to a course in order, reading for the reports or canvases to read first, coach for who grades it. Keep it doable in the minutes you give. When your person is waiting on a quest, relate it to that quest's subject.",
             json!({
                 "title": s("Short title"),
                 "type": { "type": "string", "enum": academy::TYPES },
@@ -107,21 +121,27 @@ pub fn build_tools(tool: fn(&str, &str, Value, &[&str]) -> Value) -> Vec<Value> 
                 "tests": { "type": "object", "description": "For dsa: {language, harness} with the test cases the examiner traces the answer against", "properties": { "language": { "type": "string" }, "harness": { "type": "string" } } },
                 "choices": { "type": "array", "items": { "type": "string" }, "description": "For a multiple choice quiz" },
                 "correct": { "type": "array", "items": { "type": "integer" }, "description": "1-based positions of the right choices; private" },
+                "course": s("Course name or id to add this lesson to, in order; a canvas lesson without one joins the course of its skill"),
+                "reading": { "type": "array", "items": { "type": "string" }, "description": "Up to 12 of your person's reports or canvases to read first: report:<id>, id, title or slug" },
+                "coach": s("Agent name or slug that grades it; default the course coach, then the last coach for the skill, then the main agent"),
                 "region": region.clone(),
                 "task_id": s("The quest this challenge relates to, optional")
             }),
-            &["title", "type", "prompt", "skill"],
+            &["title", "type", "skill"],
         ),
         tool(
-            "create_adventure",
-            "Group challenges into an adventure: a short story with an ordered path of challenges. Finishing all of them earns a trophy for your person's home town.",
+            "create_course",
+            "Make an Academy course for your person: a topic with an ordered path of lessons (challenges). Add lessons now with challenges, or later with create_challenge course. Finishing every lesson earns a trophy for their home town and wakes the coach to plan what comes next.",
             json!({
-                "title": s("Adventure title"),
-                "story": s("A few sentences of story that ties the challenges together"),
-                "challenges": { "type": "array", "items": { "type": "string" }, "description": "Challenge names or ids, in order" },
+                "title": s("Course title, the topic"),
+                "story": s("A few sentences on what the course covers and why"),
+                "challenges": { "type": "array", "items": { "type": "string" }, "description": "Existing lesson names or ids, in order, optional" },
+                "skill": s("Skill it trains, optional"),
+                "folder": s("Reports folder where its canvases and reading live, optional"),
+                "coach": s("Agent name or slug that coaches the whole course, optional"),
                 "region": region
             }),
-            &["title", "challenges"],
+            &["title"],
         ),
     ]
 }
@@ -171,23 +191,64 @@ pub async fn call(store: &WorldStore, caller: &WorldAgent, name: &str, args: &Va
             }
             Ok(lines.join("\n"))
         }
+        "list_challenges" if arg("attempt").is_some() => {
+            let org = caller.org_id.ok_or_else(|| anyhow!("you are not in an organization"))?;
+            super::practice_tools::read(store, owner, org, None, arg("attempt"), args.get("strokes").and_then(Value::as_bool).unwrap_or(false)).await
+        }
+        "list_challenges" if arg("challenge").is_some() => {
+            let org = caller.org_id.ok_or_else(|| anyhow!("you are not in an organization"))?;
+            let key = arg("challenge").unwrap_or_default();
+            let item = store.find_item(Some(owner), Some(org), Some("challenge"), key).await?.filter(|i| i.owner_user_id == Some(owner)).ok_or_else(|| anyhow!("no lesson called {key}"))?;
+            let d = store.challenge_detail(owner, Some(org), item.id).await?.ok_or_else(|| anyhow!("no lesson called {key}"))?;
+            let c = &d.card;
+            let mut out = format!("{} ({}) {} {} {}, {} xp, ~{} min [{}]
+{}", c.title, short(c.id), c.challenge_type, c.skill, c.difficulty, c.xp, c.minutes, c.state, d.prompt);
+            if !d.reading.is_empty() {
+                out.push_str(&format!("
+Reading: {}", d.reading.iter().map(|r| format!("report:{} \"{}\"", r.id, r.title)).collect::<Vec<_>>().join(", ")));
+            }
+            out.push_str(&format!("
+Coach: {}", d.coach.as_ref().map(|k| format!("{} (@{})", k.name, k.slug)).unwrap_or_else(|| "nobody yet".into())));
+            if let Some(report) = c.report_id {
+                out.push_str(&format!("
+
+{}", super::practice_tools::read(store, owner, org, Some(&report.to_string()), None, args.get("strokes").and_then(Value::as_bool).unwrap_or(false)).await?));
+            } else if !d.attempts.is_empty() {
+                out.push_str("
+Attempts:");
+                for a in &d.attempts {
+                    out.push_str(&format!("
+- {} {}{} {}", short(a.id), a.status, a.score.map(|s| format!(" ({s})")).unwrap_or_default(), a.feedback.as_deref().map(|f| loka_shared::links::excerpt(f, 160)).unwrap_or_default()));
+                }
+            }
+            Ok(out)
+        }
         "list_challenges" => {
             let state = arg("state");
-            let cards = store.challenge_cards(owner).await?;
+            let course = match arg("course") {
+                Some(key) => Some(store.find_course(owner, caller.org_id.ok_or_else(|| anyhow!("you are not in an organization"))?, key).await?),
+                None => None,
+            };
+            let mut cards = store.challenge_cards(owner, caller.org_id).await?;
+            if let Some(c) = &course {
+                cards.retain(|card| card.adventure_id == Some(c.id));
+                cards.sort_by_key(|card| card.adventure_order.unwrap_or(i32::MAX));
+            }
             let lines: Vec<String> = cards
                 .iter()
                 .filter(|c| state.is_none_or(|s| c.state == s))
                 .map(|c| {
                     let best = c.best_score.map(|s| format!(", best {s}")).unwrap_or_default();
-                    format!("- {} ({}) {} {} {}, {} xp, ~{} min [{}{best}]", c.title, short(c.id), c.challenge_type, c.skill, c.difficulty, c.xp, c.minutes, c.state)
+                    format!("- challenge:{} {} {} {} {}, {} xp, ~{} min [{}{best}]", c.id, c.title, c.challenge_type, c.skill, c.difficulty, c.xp, c.minutes, c.state)
                 })
                 .collect();
-            let adventures = store.adventures_for(owner).await?;
-            let mut out = if lines.is_empty() { "No challenges yet.".to_string() } else { lines.join("\n") };
+            let adventures: Vec<_> = store.adventures_for(owner, caller.org_id).await?.into_iter().filter(|a| course.as_ref().is_none_or(|c| c.id == a.id)).collect();
+            let mut out = if lines.is_empty() { "No lessons yet.".to_string() } else { lines.join("\n") };
             if !adventures.is_empty() {
-                out.push_str("\nAdventures:");
+                out.push_str("\nCourses:");
                 for a in adventures {
-                    out.push_str(&format!("\n- {} ({}) {}/{} passed{}", a.title, short(a.id), a.passed, a.total, if a.completed { ", completed" } else { "" }));
+                    let skill = a.skill.as_deref().map(|s| format!(" {s}")).unwrap_or_default();
+                    out.push_str(&format!("\n- course:{} {}{skill} {}/{} passed{}", a.id, a.title, a.passed, a.total, if a.completed { ", completed" } else { "" }));
                 }
             }
             Ok(out)
@@ -298,27 +359,24 @@ pub async fn call(store: &WorldStore, caller: &WorldAgent, name: &str, args: &Va
         }
         "create_challenge" => {
             let region = region_arg(store, owner, caller.org_id, arg("region")).await?;
-            let (item, offer) = store.create_challenge(owner, me, args, region.as_ref().map(|r| r.id)).await?;
+            let org = caller.org_id.ok_or_else(|| anyhow!("you are not in an organization"))?;
+            let (item, offer) = store.create_challenge(owner, org, me, args, region.as_ref().map(|r| r.id)).await?;
             let offered = if offer.is_some() { " It answers their open while-you-wait offer, so they see it now." } else { "" };
             Ok(format!(
-                "Created the {} challenge {} ({}), {} xp, about {} minutes.{offered}",
+                "Created the {} lesson {}, {} xp, about {} minutes.{offered} Put challenge:{} on its own line in chat so your person sees it as a card they open in the Academy.",
                 item.data["type"].as_str().unwrap_or(""),
                 item.name,
-                short(item.id),
                 item.data["xp"],
-                item.data["minutes"]
+                item.data["minutes"],
+                item.id
             ))
         }
-        "create_adventure" => {
-            let title = arg("title").ok_or_else(|| anyhow!("title is required"))?;
-            let keys: Vec<String> = args
-                .get("challenges")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
-                .unwrap_or_default();
+        "create_course" | "create_adventure" => {
+            let org = caller.org_id.ok_or_else(|| anyhow!("you are not in an organization"))?;
             let region = region_arg(store, owner, caller.org_id, arg("region")).await?;
-            let item = store.create_adventure(owner, me, title, arg("story").unwrap_or(""), &keys, region.as_ref().map(|r| r.id)).await?;
-            Ok(format!("Created the adventure {} ({}) with {} challenges.", item.name, short(item.id), keys.len()))
+            let item = store.create_course(owner, org, me, args, region.as_ref().map(|r| r.id)).await?;
+            let lessons = item.data.get("challenges").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
+            Ok(format!("Created the course {} with {lessons} lessons. Add more with create_challenge course \"{}\". Put course:{} on its own line in chat so your person sees it as a card.", item.name, item.name, item.id))
         }
         other => bail!("unknown tool {other}"),
     }

@@ -79,6 +79,9 @@ export function MusicDock({ open, meId, onClose }: { open: boolean; meId: string
             {now ? now.by : music.waiting ? "Starts when you click or press a key" : "Turn music on to start the playlist"}
             {now && music.custom && " · picked by your agent"}
           </p>
+          <p aria-live="polite" className={cn("text-w-xs text-w-muted", !music.note && "sr-only")}>
+            {music.note}
+          </p>
         </div>
         <div className="flex items-center gap-2">
           <button type="button" onClick={toggleMusicPause} aria-label={music.playing ? "Pause" : "Play"} className={cn(CHUNKY, "grid h-8 w-8 place-items-center bg-w-card hover:bg-w-sand")}>

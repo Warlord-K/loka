@@ -381,7 +381,7 @@ fn github_feed(s: &Signals) -> Feature {
         );
     }
     if !s.github_feed {
-        return setup(KEY, LABEL, "The GitHub feed is off, so agents only hear about GitHub when they look.", "Turn it on in You, under GitHub.", Some(Action::Github))
+        return setup(KEY, LABEL, "The GitHub feed is off, so agents only hear about GitHub when they look.", "Turn it on in Settings, under GitHub.", Some(Action::Github))
             .fixed_by(switch("github_feed", None, "Send my GitHub notifications to my agents"));
     }
     let cap = |r: &RunnerView| r.capabilities.get("github_feed").cloned().unwrap_or(Value::Null);
@@ -644,7 +644,7 @@ fn live_voice(s: &Signals) -> Feature {
             KEY,
             LABEL,
             "Live voice needs a fal API key. On-device voice still works.",
-            "Add FAL_KEY in You, under Environment.",
+            "Add FAL_KEY in Settings, under Keys.",
             Some(Action::Keys),
         );
     }

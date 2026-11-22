@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Result};
-use loka_shared::music::{self, Track, MAX_TRACKS};
+use loka_shared::music::{self, MusicError, Track, MAX_TRACKS};
 use loka_shared::world::{WorldAgent, WorldStore};
 use serde_json::{json, Value};
 
@@ -33,13 +33,23 @@ pub async fn call(store: &WorldStore, caller: &WorldAgent, name: &str, args: &Va
             if songs.is_empty() {
                 bail!("give at least one YouTube link or search in songs");
             }
+            let total = songs.len().min(MAX_TRACKS);
             let mut tracks: Vec<Track> = Vec::new();
             let mut missed = Vec::new();
+            let mut cut_off: Option<MusicError> = None;
             for song in songs.into_iter().take(MAX_TRACKS) {
                 match music::resolve(song).await {
                     Ok(t) => tracks.push(t),
+                    Err(e @ MusicError::Unreachable(_)) => {
+                        cut_off = Some(e);
+                        break;
+                    }
                     Err(e) => missed.push(format!("{song}: {e}")),
                 }
+            }
+            let untried = total - tracks.len() - missed.len();
+            if let Some(e) = &cut_off {
+                missed.push(format!("Loka {e}, so {untried} song(s) were not looked up. Try again in a few minutes"));
             }
             if tracks.is_empty() {
                 bail!("nothing played. {}", missed.join("; "));

@@ -6,6 +6,9 @@ use crate::world::{Upload, WorldAgent, WorldStore};
 pub const MAX_IMAGE: usize = 10 * 1024 * 1024;
 pub const MAX_VIDEO: usize = 25 * 1024 * 1024;
 pub const MAX_PER_CALL: usize = 8;
+pub const MAX_ATTACHED_FILE: usize = 10 * 1024 * 1024;
+pub const MAX_ATTACHED_TOTAL: usize = 24 * 1024 * 1024;
+pub const MAX_ATTACHED_FILES: usize = 8;
 
 pub const IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 pub const VIDEO_TYPES: [&str; 3] = ["video/mp4", "video/webm", "video/quicktime"];
@@ -80,6 +83,62 @@ pub fn file_name(raw: &str, mime: &str) -> String {
     };
     let stem = if clean.is_empty() { if is_video(mime) { "recording" } else { "screenshot" } } else { clean };
     format!("{stem}.{ext}")
+}
+
+pub fn attachment_extension(mime: &str) -> &'static str {
+    match mime {
+        "audio/x-m4a" | "audio/m4a" | "audio/mp4" | "audio/x-mp4" => "m4a",
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/wav" | "audio/x-wav" | "audio/wave" => "wav",
+        "audio/ogg" | "audio/opus" => "ogg",
+        "audio/webm" => "webm",
+        "audio/aac" => "aac",
+        "audio/flac" | "audio/x-flac" => "flac",
+        "audio/aiff" | "audio/x-aiff" => "aiff",
+        "video/mp4" => "mp4",
+        "video/quicktime" => "mov",
+        "video/webm" => "webm",
+        "application/pdf" => "pdf",
+        "application/zip" => "zip",
+        _ => "bin",
+    }
+}
+
+pub fn attachment_file_name(id: Uuid, raw: &str, mime: &str) -> String {
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or("");
+    let clean: String = base.chars().filter(|c| c.is_ascii_alphanumeric() || "._- ".contains(*c)).take(64).collect();
+    let clean = clean.trim().trim_start_matches('.').trim_end_matches('.');
+    let named = match clean.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() && ext.len() <= 8 && ext.chars().all(|c| c.is_ascii_alphanumeric()) => clean.to_string(),
+        _ if clean.is_empty() => format!("attachment.{}", attachment_extension(mime)),
+        _ => format!("{clean}.{}", attachment_extension(mime)),
+    };
+    format!("{id}-{named}")
+}
+
+pub fn fits_caps(total: &mut usize, size: usize) -> bool {
+    if size > MAX_ATTACHED_FILE || *total + size > MAX_ATTACHED_TOTAL {
+        return false;
+    }
+    *total += size;
+    true
+}
+
+pub fn attached_files_note(saved: &[(String, String)], skipped: &[String]) -> Option<String> {
+    if saved.is_empty() && skipped.is_empty() {
+        return None;
+    }
+    let mut note = String::new();
+    if !saved.is_empty() {
+        note.push_str("[attached files saved on disk] Your own tools cannot open them. A quest session can: hand the work to a quest and give it the upload id, which is the first 36 characters of each file name below, to fetch with get_upload.");
+        for (path, mime) in saved {
+            note.push_str(&format!("\n- {path} ({mime})"));
+        }
+    }
+    for name in skipped {
+        note.push_str(&format!("\n(attached file {name} was too large to save here, over {} MB)", MAX_ATTACHED_FILE / (1024 * 1024)));
+    }
+    Some(note.trim_start().to_string())
 }
 
 impl WorldStore {
@@ -181,6 +240,53 @@ mod tests {
         assert_eq!(file_name("https://x.test/a/b?sig=1", "image/jpeg"), "b.jpg");
         assert_eq!(file_name("", "video/webm"), "recording.webm");
         assert_eq!(file_name("../../.env", "image/png"), "env.png");
+    }
+
+    #[test]
+    fn attachment_names_keep_the_name_and_stay_inside_their_folder() {
+        let id = Uuid::parse_str("7cee963f-0000-4000-8000-000000000000").unwrap();
+        let prefix = "7cee963f-0000-4000-8000-000000000000-";
+        assert_eq!(attachment_file_name(id, "New Recording.m4a", "audio/x-m4a"), format!("{prefix}New Recording.m4a"));
+        assert_eq!(attachment_file_name(id, "New Recording", "audio/x-m4a"), format!("{prefix}New Recording.m4a"));
+        assert_eq!(attachment_file_name(id, "", "audio/mpeg"), format!("{prefix}attachment.mp3"));
+        assert_eq!(attachment_file_name(id, "", "application/x-unknown"), format!("{prefix}attachment.bin"));
+        assert_eq!(attachment_file_name(id, "../../etc/passwd", "audio/wav"), format!("{prefix}passwd.wav"));
+        assert_eq!(attachment_file_name(id, "..\\..\\evil.sh", "audio/wav"), format!("{prefix}evil.sh"));
+        assert_eq!(attachment_file_name(id, "/abs/olute/clip.mov", "video/quicktime"), format!("{prefix}clip.mov"));
+        assert_eq!(attachment_file_name(id, ".hidden.mp3", "audio/mpeg"), format!("{prefix}hidden.mp3"));
+        assert_eq!(attachment_file_name(id, "a\0b$(x).m4a", "audio/x-m4a"), format!("{prefix}abx.m4a"));
+        assert_eq!(attachment_file_name(id, "weird.toolongextension", "audio/ogg"), format!("{prefix}weird.toolongextension.ogg"));
+        for name in ["..", "../..", "a/../..", "...", "\\", "/"] {
+            let made = attachment_file_name(id, name, "audio/wav");
+            assert!(!made.contains('/') && !made.contains('\\') && made.starts_with(prefix), "{name} gave {made}");
+            assert!(!std::path::Path::new(&made).components().any(|c| matches!(c, std::path::Component::ParentDir)));
+        }
+        assert!(attachment_file_name(id, &"a".repeat(500), "audio/wav").len() <= 120);
+        assert!(attachment_file_name(id, &format!("{}.m4a", "a".repeat(500)), "audio/x-m4a").len() <= 120);
+    }
+
+    #[test]
+    fn caps_count_each_file_and_the_total() {
+        let mut total = 0;
+        assert!(fits_caps(&mut total, MAX_ATTACHED_FILE));
+        assert!(fits_caps(&mut total, MAX_ATTACHED_FILE));
+        assert!(!fits_caps(&mut total, MAX_ATTACHED_FILE + 1));
+        assert!(!fits_caps(&mut total, MAX_ATTACHED_FILE));
+        assert_eq!(total, 2 * MAX_ATTACHED_FILE);
+        let rest = MAX_ATTACHED_TOTAL - total;
+        assert!(fits_caps(&mut total, rest));
+        assert!(!fits_caps(&mut total, 1));
+    }
+
+    #[test]
+    fn the_file_note_lists_paths_and_what_was_left_out() {
+        assert_eq!(attached_files_note(&[], &[]), None);
+        let note = attached_files_note(&[("/w/.uploads/a.m4a".into(), "audio/x-m4a".into())], &["big.mov".into()]).unwrap();
+        assert!(note.starts_with("[attached files saved on disk]"));
+        assert!(note.contains("hand the work to a quest") && note.contains("get_upload"));
+        assert!(note.contains("- /w/.uploads/a.m4a (audio/x-m4a)"));
+        assert!(note.contains("big.mov was too large"));
+        assert!(attached_files_note(&[], &["big.mov".into()]).unwrap().starts_with("(attached file big.mov"));
     }
 
     #[test]

@@ -1,6 +1,22 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { CallTurns, CallUtterances, RESERVATION_MS, ReplyWait, joinSegments } from "./call-turns.ts";
+import {
+  BARGE_CONFIRM_MS,
+  BargeGuard,
+  CallTurns,
+  CallUtterances,
+  ClientTurns,
+  ECHO_LIMIT,
+  PREROLL_CHUNKS,
+  RESERVATION_MS,
+  ReplyWait,
+  TURN_MAX_MS,
+  TURN_SILENCE_MS,
+  joinSegments,
+  serverTurnsApplied,
+  sessionFallback,
+  spokenUpdate,
+} from "./call-turns.ts";
 
 test("each turn is saved once, in order", () => {
   const turns = new CallTurns();
@@ -208,4 +224,167 @@ test("a cut answer never closes the turn even after it finishes playing", () => 
   const wait = new ReplyWait();
   wait.replied(true);
   assert.equal(wait.heard(false, false), false);
+});
+
+test("talking over the agent ducks it at once and the provider confirms the barge-in", () => {
+  const guard = new BargeGuard();
+  assert.equal(guard.local(0), true);
+  assert.equal(guard.ducking(), true);
+  guard.server();
+  assert.equal(guard.ducking(), false);
+  assert.equal(guard.expired(BARGE_CONFIRM_MS * 2), false);
+  assert.deepEqual(guard.stats(), { echoes: 0, confirmed: 1, local_off: false });
+});
+
+test("the agent's own echo only ducks it briefly and stops ducking after repeats", () => {
+  const guard = new BargeGuard();
+  let now = 0;
+  for (let i = 0; i < ECHO_LIMIT; i++) {
+    assert.equal(guard.local(now), true);
+    assert.equal(guard.expired(now + BARGE_CONFIRM_MS - 1), false);
+    now += BARGE_CONFIRM_MS;
+    assert.equal(guard.expired(now), true, "the volume comes back when nobody really spoke");
+    now += 10;
+  }
+  assert.equal(guard.local(now), false, "echo cannot quiet the agent again");
+  assert.deepEqual(guard.stats(), { echoes: ECHO_LIMIT, confirmed: 0, local_off: true });
+  guard.server();
+  assert.equal(guard.local(now), true, "a real interruption turns local ducking back on");
+});
+
+const SESSION = {
+  voice: "liora",
+  turn_detection: { type: "server_vad", silence_duration_ms: 1200 },
+  audio: { input: { format: { type: "audio/pcm" }, transcription: { model: "grok-transcribe" } }, output: { format: { type: "audio/pcm" } } },
+};
+
+test("a refused voice is dropped first and every other setting is kept", () => {
+  const next = sessionFallback(SESSION, "Invalid voice: liora", new Set());
+  assert.equal(next.dropped, "voice");
+  assert.equal("voice" in next.session, false);
+  assert.deepEqual(next.session.turn_detection, SESSION.turn_detection);
+  assert.deepEqual(next.session.audio, SESSION.audio);
+});
+
+test("other refusals drop transcription, then the voice, then give up", () => {
+  const tried = new Set();
+  const first = sessionFallback(SESSION, "bad request", tried);
+  assert.equal(first.dropped, "transcription");
+  assert.equal(first.session.audio.input.transcription, undefined);
+  assert.deepEqual(first.session.audio.input.format, SESSION.audio.input.format);
+  assert.deepEqual(first.session.turn_detection, SESSION.turn_detection);
+  tried.add(first.dropped);
+  const second = sessionFallback(first.session, "bad request", tried);
+  assert.equal(second.dropped, "voice");
+  assert.deepEqual(second.session.turn_detection, SESSION.turn_detection);
+  tried.add(second.dropped);
+  const third = sessionFallback(second.session, "bad request", tried);
+  assert.equal(third.dropped, "turns");
+  assert.equal(third.session.turn_detection, null);
+  tried.add(third.dropped);
+  assert.equal(sessionFallback(third.session, "bad request", tried), null);
+});
+
+test("refused turn settings switch to client turns first and keep the voice and transcription", () => {
+  const next = sessionFallback(SESSION, "Unknown field turn_detection.silence_duration_ms", new Set());
+  assert.equal(next.dropped, "turns");
+  assert.equal(next.session.turn_detection, null);
+  assert.equal(next.session.voice, "liora");
+  assert.deepEqual(next.session.audio, SESSION.audio);
+});
+
+test("server turns count only when the provider confirms at least the asked silence", () => {
+  const sent = { turn_detection: { type: "server_vad", silence_duration_ms: 1200 } };
+  assert.equal(serverTurnsApplied(sent, { turn_detection: { type: "server_vad", silence_duration_ms: 1200 } }), true);
+  assert.equal(serverTurnsApplied(sent, { turn_detection: { type: "server_vad", silence_duration_ms: 1500 } }), true);
+  assert.equal(serverTurnsApplied(sent, { turn_detection: { type: "server_vad", silence_duration_ms: 200 } }), false);
+  assert.equal(serverTurnsApplied(sent, { turn_detection: { type: "server_vad" } }), false);
+  assert.equal(serverTurnsApplied(sent, {}), false);
+  assert.equal(serverTurnsApplied({ turn_detection: null }, sent), false);
+});
+
+test("client turns stay open through short pauses and commit after a real pause", () => {
+  const gate = new ClientTurns();
+  assert.deepEqual(gate.audio("before"), []);
+  const start = gate.tick(0, true);
+  assert.equal(start.opened, true);
+  assert.deepEqual(start.flush, ["before"], "the words just before the turn opened are kept");
+  assert.deepEqual(gate.audio("during"), ["during"]);
+  assert.equal(gate.tick(100, false).commit, false);
+  assert.equal(gate.tick(100 + TURN_SILENCE_MS - 1, false).commit, false, "a pause under the limit keeps the turn open");
+  assert.equal(gate.tick(1400, true).commit, false);
+  assert.equal(gate.tick(1500, false).commit, false, "speaking again restarts the pause");
+  const end = gate.tick(1500 + TURN_SILENCE_MS, false);
+  assert.equal(end.commit, true);
+  assert.equal(end.respond, true);
+  assert.equal(gate.isOpen(), false);
+  assert.equal(gate.tick(9000, false).commit, false, "nothing to commit while quiet");
+});
+
+test("client turns keep only the latest audio before speech and cap a turn's length", () => {
+  const gate = new ClientTurns();
+  for (let i = 0; i < PREROLL_CHUNKS + 3; i++) gate.audio(i);
+  const start = gate.tick(0, true);
+  assert.equal(start.flush.length, PREROLL_CHUNKS);
+  assert.equal(start.flush[PREROLL_CHUNKS - 1], PREROLL_CHUNKS + 2);
+  assert.equal(gate.tick(TURN_MAX_MS - 1, true).commit, false);
+  const long = gate.tick(TURN_MAX_MS, true);
+  assert.equal(long.commit, true, "a long turn sends what it has");
+  assert.equal(long.respond, false, "but the agent waits for the pause");
+  assert.equal(gate.isOpen(), true);
+  assert.equal(gate.tick(TURN_MAX_MS + 40, true).commit, false, "nothing new to send yet");
+  gate.audio("more");
+  const quiet = TURN_MAX_MS + 80;
+  assert.equal(gate.tick(quiet, false).commit, false, "the pause timer starts at the first quiet moment");
+  const done = gate.tick(quiet + TURN_SILENCE_MS, false);
+  assert.deepEqual([done.commit, done.respond], [true, true]);
+  gate.close();
+  assert.equal(gate.isOpen(), false);
+  assert.deepEqual(gate.tick(TURN_MAX_MS * 3, true).flush, []);
+});
+
+test("a turn with no audio sent never asks the agent to answer", () => {
+  const gate = new ClientTurns();
+  assert.equal(gate.tick(0, true).opened, true);
+  gate.tick(10, false);
+  const end = gate.tick(10 + TURN_SILENCE_MS, false);
+  assert.deepEqual([end.commit, end.respond], [false, false]);
+  assert.equal(gate.isOpen(), false);
+});
+
+test("a long turn that ends right after a mid-turn send still gets an answer", () => {
+  const gate = new ClientTurns();
+  gate.audio("a");
+  gate.tick(0, true);
+  assert.equal(gate.tick(TURN_MAX_MS, true).commit, true);
+  gate.tick(TURN_MAX_MS + 10, false);
+  const end = gate.tick(TURN_MAX_MS + 10 + TURN_SILENCE_MS, false);
+  assert.deepEqual([end.commit, end.respond], [false, true]);
+});
+
+test("muting while ducked drops the duck without counting it as echo", () => {
+  const guard = new BargeGuard();
+  guard.local(0);
+  guard.cancel();
+  assert.equal(guard.ducking(), false);
+  assert.equal(guard.expired(BARGE_CONFIRM_MS * 2), false);
+  assert.deepEqual(guard.stats(), { echoes: 0, confirmed: 0, local_off: false });
+});
+
+const reply = (payload, agent = "a") => ({ type: "message.created", agent_id: agent, payload: { author_kind: "agent", body: " Done. ", ...payload } });
+
+test("a main chat call speaks the agent's own replies and never a quick chat's", () => {
+  assert.equal(spokenUpdate(reply({}), "a", null), "Done.");
+  assert.equal(spokenUpdate(reply({ quick_session_id: "q1", quiet: true }), "a", null), null);
+  assert.equal(spokenUpdate(reply({ author_agent_id: "b" }), "a", null), null);
+  assert.equal(spokenUpdate(reply({}, "b"), "a", null), null);
+  assert.equal(spokenUpdate(reply({ author_kind: "user" }), "a", null), null);
+  assert.equal(spokenUpdate(reply({ body: "  " }), "a", null), null);
+});
+
+test("a quick chat call speaks only that quick chat's replies, quiet or not", () => {
+  assert.equal(spokenUpdate(reply({ quick_session_id: "q1", quiet: true }), "a", "q1"), "Done.");
+  assert.equal(spokenUpdate(reply({ quick_session_id: "q2", quiet: true }), "a", "q1"), null);
+  assert.equal(spokenUpdate(reply({}), "a", "q1"), null);
+  assert.equal(spokenUpdate({ type: "run.finished", agent_id: "a", payload: { quick_session_id: "q1" } }, "a", "q1"), null);
 });

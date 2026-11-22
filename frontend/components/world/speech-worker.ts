@@ -43,9 +43,32 @@ function progress(what: "stt" | "tts") {
 type Transcriber = (audio: Float32Array) => Promise<{ text?: string } | { text?: string }[]>;
 const pipeline = loadPipeline as unknown as (task: string, model: string, options: Record<string, unknown>) => Promise<Transcriber>;
 
-let sttPromise: Promise<Transcriber> | null = null;
-function stt() {
-  sttPromise ??= device().then(async (d) => {
+const DISK_FULL = "This device is out of disk space, so the on-device voice model could not be loaded. Free some space and try again.";
+const DOWNLOAD_FAILED = "The on-device voice model could not be downloaded. Check your connection and try again.";
+
+function explain(err: unknown): string {
+  const name = err instanceof DOMException || err instanceof Error ? err.name : "";
+  const text = err instanceof Error ? err.message : String(err);
+  if (name === "QuotaExceededError" || /quota|no space|disk (is )?full|ENOSPC/i.test(text)) return DISK_FULL;
+  if (/failed to fetch|network|load failed/i.test(text)) return DOWNLOAD_FAILED;
+  return text;
+}
+
+function retryable<T>(load: () => Promise<T>): () => Promise<T> {
+  let current: Promise<T> | null = null;
+  return () => {
+    if (current) return current;
+    const attempt = load();
+    current = attempt;
+    attempt.catch(() => {
+      if (current === attempt) current = null;
+    });
+    return attempt;
+  };
+}
+
+const stt = retryable(() =>
+  device().then(async (d) => {
     const asr = await pipeline("automatic-speech-recognition", STT_MODEL, {
       device: "wasm",
       dtype: "q8",
@@ -53,13 +76,11 @@ function stt() {
     });
     ctx.postMessage({ type: "ready", what: "stt", device: d === "webgpu" ? "webgpu available, wasm in use" : "wasm" });
     return asr;
-  });
-  return sttPromise;
-}
+  }),
+);
 
-let ttsPromise: Promise<KokoroTTS> | null = null;
-function tts() {
-  ttsPromise ??= device().then(async (d) => {
+const tts = retryable(() =>
+  device().then(async (d) => {
     const model = await KokoroTTS.from_pretrained(TTS_MODEL, {
       device: "wasm",
       dtype: "q8",
@@ -67,9 +88,8 @@ function tts() {
     });
     ctx.postMessage({ type: "ready", what: "tts", device: d === "webgpu" ? "webgpu + wasm" : "wasm" });
     return model;
-  });
-  return ttsPromise;
-}
+  }),
+);
 
 ctx.onmessage = async (e) => {
   const msg = e.data;
@@ -92,6 +112,6 @@ ctx.onmessage = async (e) => {
       ctx.postMessage({ type: "audio", id: msg.id, audio, sampling_rate: raw.sampling_rate }, [audio.buffer]);
     }
   } catch (err) {
-    ctx.postMessage({ type: "error", id: "id" in msg ? msg.id : -1, error: err instanceof Error ? err.message : String(err) });
+    ctx.postMessage({ type: "error", id: "id" in msg ? msg.id : -1, error: explain(err) });
   }
 };

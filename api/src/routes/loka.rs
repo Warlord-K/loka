@@ -97,7 +97,8 @@ pub async fn list_challenges(
     State(state): State<AppState>,
     Extension(user): Extension<UserId>,
 ) -> Result<Json<Vec<ChallengeCard>>, StatusCode> {
-    Ok(Json(state.world.challenge_cards(user.0).await.map_err(internal)?))
+    let org = crate::access::viewer_for(&state, user.0).await?.org;
+    Ok(Json(state.world.challenge_cards(user.0, org).await.map_err(internal)?))
 }
 
 pub async fn get_challenge(
@@ -105,14 +106,16 @@ pub async fn get_challenge(
     Extension(user): Extension<UserId>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ChallengeDetail>, StatusCode> {
-    state.world.challenge_detail(user.0, id).await.map_err(internal)?.map(Json).ok_or(StatusCode::NOT_FOUND)
+    let org = crate::access::viewer_for(&state, user.0).await?.org;
+    state.world.challenge_detail(user.0, org, id).await.map_err(internal)?.map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
 pub async fn list_adventures(
     State(state): State<AppState>,
     Extension(user): Extension<UserId>,
 ) -> Result<Json<Vec<AdventureCard>>, StatusCode> {
-    Ok(Json(state.world.adventures_for(user.0).await.map_err(internal)?))
+    let org = crate::access::viewer_for(&state, user.0).await?.org;
+    Ok(Json(state.world.adventures_for(user.0, org).await.map_err(internal)?))
 }
 
 #[derive(Deserialize)]

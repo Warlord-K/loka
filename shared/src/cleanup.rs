@@ -52,7 +52,7 @@ impl CleanupKind {
             Self::Chats => "chat messages with your agents",
             Self::Quests => "finished, failed and cancelled quests with their sessions, runs and logs (lifetime cost stays)",
             Self::Activity => "activity feed events, including cleared bell items",
-            Self::Workspaces => "workspaces and temp folders of closed quests on your devices (worktrees, build output, test databases and scratch files; branches, commits and pull requests stay)",
+            Self::Workspaces => "workspaces and temp folders of closed quests on your devices (worktrees, build output, test databases and scratch files), plus the node_modules, .next and cargo target folders of idle open quests (branches, commits and pull requests stay)",
         }
     }
 }
@@ -99,6 +99,8 @@ pub struct WorkspaceUse {
     pub reclaimable_tasks: i64,
     pub temp_bytes: i64,
     pub reclaimable_temp_bytes: i64,
+    pub build_bytes: i64,
+    pub reclaimable_build_bytes: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -194,18 +196,23 @@ impl WorldStore {
         let store = RunnerStore::new(self.pool().clone());
         let mut found = Vec::new();
         for (runner_id, name, status, view) in runners {
-            let largest: Vec<(Uuid, i64, i64)> = view["largest"]
+            let largest: Vec<(Uuid, i64, i64, i64)> = view["largest"]
                 .as_array()
                 .map(|list| {
                     list.iter()
-                        .filter_map(|row| Some((row["id"].as_str()?.parse().ok()?, row["bytes"].as_i64()?, row["temp_bytes"].as_i64().unwrap_or(0))))
+                        .filter_map(|row| {
+                            Some((row["id"].as_str()?.parse().ok()?, row["bytes"].as_i64()?, row["temp_bytes"].as_i64().unwrap_or(0), row["build_bytes"].as_i64().unwrap_or(0)))
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
-            let ids: Vec<Uuid> = largest.iter().map(|(id, _, _)| *id).collect();
+            let ids: Vec<Uuid> = largest.iter().map(|(id, _, _, _)| *id).collect();
             let closed: Vec<Uuid> = store.closed_tasks(runner_id, &ids, true).await?.into_iter().map(|task| task.id).collect();
-            let reclaimed: Vec<&(Uuid, i64, i64)> = largest.iter().filter(|(id, _, _)| closed.contains(id)).collect();
-            let reclaimable: Vec<i64> = reclaimed.iter().map(|(_, bytes, _)| *bytes).collect();
+            let idle: Vec<Uuid> = store.idle_tasks(runner_id, &ids).await?;
+            let idle_build: i64 = largest.iter().filter(|(id, _, _, _)| idle.contains(id) && !closed.contains(id)).map(|(_, _, _, build)| *build).sum();
+            let build_bytes = view["build_bytes"].as_i64().unwrap_or(0);
+            let reclaimed: Vec<&(Uuid, i64, i64, i64)> = largest.iter().filter(|(id, _, _, _)| closed.contains(id)).collect();
+            let reclaimable: Vec<i64> = reclaimed.iter().map(|(_, bytes, _, _)| *bytes).collect();
             found.push(WorkspaceUse {
                 runner_id,
                 name,
@@ -218,7 +225,9 @@ impl WorldStore {
                 reclaimable_bytes: reclaimable.iter().sum(),
                 reclaimable_tasks: reclaimable.len() as i64,
                 temp_bytes: view["temp_bytes"].as_i64().unwrap_or(0),
-                reclaimable_temp_bytes: reclaimed.iter().map(|(_, _, temp)| *temp).sum(),
+                reclaimable_temp_bytes: reclaimed.iter().map(|(_, _, temp, _)| *temp).sum(),
+                build_bytes,
+                reclaimable_build_bytes: idle_build,
             });
         }
         Ok(found)
@@ -230,9 +239,9 @@ impl WorldStore {
         }
         let usage = self.workspace_use(request.owner).await?;
         let rows: i64 = usage.iter().map(|u| u.reclaimable_tasks).sum();
-        let bytes: i64 = usage.iter().map(|u| u.reclaimable_bytes).sum();
-        let runners: Vec<Uuid> = usage.iter().filter(|u| u.reclaimable_tasks > 0).map(|u| u.runner_id).collect();
-        let applied = apply && rows > 0;
+        let bytes: i64 = usage.iter().map(|u| u.reclaimable_bytes + u.reclaimable_build_bytes).sum();
+        let runners: Vec<Uuid> = usage.iter().filter(|u| u.reclaimable_tasks > 0 || u.reclaimable_build_bytes > 0).map(|u| u.runner_id).collect();
+        let applied = apply && !runners.is_empty();
         if applied {
             let mut tx = self.pool().begin().await?;
             sqlx::query("UPDATE world_runners SET clean_workspaces_at = NOW() WHERE id = ANY($1)")

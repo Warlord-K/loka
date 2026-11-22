@@ -249,7 +249,7 @@ export function FolderWorkshop({
             {runners === null ? (
               <Shimmer className="text-w-sm">Loading your agents</Shimmer>
             ) : macs.length === 0 ? (
-              <EmptyState icon={Desktop} title="No Mac paired yet" description="Folder sessions run on this Mac. Connect it under You, Devices." />
+              <EmptyState icon={Desktop} title="No Mac paired yet" description="Folder sessions run on this Mac. Connect it in Settings, under Devices." />
             ) : mine.length === 0 ? (
               <EmptyState icon={UsersThree} title="You have no agents yet" description="Make one from the quest board first." />
             ) : (

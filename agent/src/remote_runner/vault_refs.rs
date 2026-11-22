@@ -11,7 +11,7 @@ const TRUSTED_DIRS: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];
 
 const MISSING: &str = "the 1Password CLI (op) is not installed on this Mac. Install it with brew install 1password-cli, then turn on Integrate with 1Password CLI in the 1Password app (Settings > Developer).";
 const LOCKED: &str = "1Password is locked or op is not signed in. Unlock the 1Password app on this Mac and turn on Integrate with 1Password CLI (Settings > Developer).";
-const NOT_FOUND: &str = "1Password has no vault, item or field at that reference. Check the reference in You > Environment.";
+const NOT_FOUND: &str = "1Password has no vault, item or field at that reference. Check the reference in Settings > Keys.";
 const TIMED_OUT: &str = "op did not answer within 2 minutes. Unlock 1Password on this Mac and approve the request when it asks.";
 const EMPTY: &str = "1Password returned an empty value for it.";
 const INVALID: &str = "it is not a valid op://vault/item/field reference.";

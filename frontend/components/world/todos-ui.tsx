@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alarm, BellRinging, CalendarBlank, CheckSquare, Clock, Copy, LinkSimple, Plus, Quotes, Sparkle, Square, X, Check } from "@phosphor-icons/react";
+import { Alarm, BellRinging, CalendarBlank, CheckSquare, Clock, Copy, LinkSimple, Plus, Quotes, Square, X, Check } from "@phosphor-icons/react";
 import { MAIN_TARGET, sendQuote } from "./quote";
 import { AnimatePresence, motion } from "framer-motion";
 import { MODAL_MOTION, scrimMotion } from "./motion";
@@ -11,9 +11,12 @@ import { ProposalPanel, ProposalStrip } from "./todo-actions";
 import { matchesQuery, worldApi, type Todo, type WorldAgent } from "@/lib/world";
 import { BTN_PRIMARY_SM, BTN_SECONDARY_SM, CHUNKY, ITEM_CARD, MODAL, PILL_INFO, BTN_DANGER_GHOST, BTN_SECONDARY, PIXEL } from "./styles";
 import { BoardColumn } from "./board-kit";
+import { MOVE_FAILED, moveFailureNote, placeOpenTodo } from "@/lib/todo-board";
+import { applyLatest, latestOnly } from "@/lib/latest";
 import { AgentFace } from "./channel-ui";
 import { Shimmer } from "./work-ui";
 import { CLOSE_BTN } from "./settings-shell";
+import { MeaningIcon } from "@/lib/meaning-icons";
 
 const PRIORITY = [
   { label: "Urgent", dot: "bg-w-danger", tone: "text-w-danger", bars: 3 },
@@ -33,6 +36,10 @@ function PriorityMark({ level }: { level: number }) {
   );
 }
 const UNDO_MS = 4000;
+const FAILED_MS = 6000;
+type MoveStep = "up" | "down" | "left" | "right";
+const MOVE_KEYS: Record<string, MoveStep> = { ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right" };
+const SAVE_FAILED = "Could not save that change, so it is back as it was.";
 const todoCache: { list: Todo[] | null } = { list: null };
 const COLUMN_DOT: Record<string, string> = { todo: "bg-w-muted", progress: "bg-w-teal", done: "bg-w-ok", cancelled: "bg-w-faint" };
 
@@ -175,6 +182,7 @@ function TodoCard({
   onDragEnd,
   onDragOverCard,
   onDropCard,
+  onMoveKey,
   onStrike,
   onPriority,
   agents,
@@ -193,6 +201,7 @@ function TodoCard({
   onDragEnd: () => void;
   onDragOverCard: () => void;
   onDropCard: () => void;
+  onMoveKey: (step: MoveStep) => void;
   onStrike: () => void;
   onPriority: () => void;
 }) {
@@ -200,13 +209,25 @@ function TodoCard({
   const overdue = todo.status === "open" && todo.due_at ? new Date(todo.due_at).getTime() <= now : false;
   const p = PRIORITY[Math.min(3, Math.max(0, todo.priority))];
   const closed = todo.status !== "open";
+  const acceptDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    onDragOverCard();
+  };
   return (
     <li
       draggable
       tabIndex={0}
+      data-todo-id={todo.id}
+      aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown Alt+ArrowLeft Alt+ArrowRight"
       onClick={onOpen}
       onKeyDown={(e) => {
-        if (e.key === "Enter" && e.target === e.currentTarget) onOpen();
+        if (e.target !== e.currentTarget) return;
+        const step = e.altKey && !e.metaKey && !e.ctrlKey ? MOVE_KEYS[e.key] : undefined;
+        if (step) {
+          e.preventDefault();
+          onMoveKey(step);
+        } else if (e.key === "Enter") onOpen();
       }}
       onDragStart={(e) => {
         e.dataTransfer.effectAllowed = "move";
@@ -214,11 +235,8 @@ function TodoCard({
         onDragStart();
       }}
       onDragEnd={onDragEnd}
-      onDragOver={(e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        onDragOverCard();
-      }}
+      onDragEnter={acceptDrop}
+      onDragOver={acceptDrop}
       onDrop={(e) => {
         e.preventDefault();
         e.stopPropagation();
@@ -278,7 +296,7 @@ function TodoCard({
           <span className="ml-auto flex min-w-0 items-center gap-1.5">
             {todo.source?.suggested && (
               <span className={cn(PILL_INFO, "py-[3px]")} title="Suggested. Nothing starts until you approve.">
-                <Sparkle size={10} weight="fill" />
+                <MeaningIcon.suggestion size={10} weight="fill" />
                 Suggested
               </span>
             )}
@@ -625,6 +643,11 @@ export function TodoBoard({ agents, filter = "" }: { agents: WorldAgent[]; filte
   const [dragging, setDragging] = useState<string | null>(null);
   const [over, setOver] = useState<{ column: Column; before: string | null } | null>(null);
   const [opened, setOpened] = useState<string | null>(null);
+  const [outsideBoard, setOutsideBoard] = useState<Todo | null>(null);
+  const todoSelection = useRef(latestOnly()).current;
+  const [failed, setFailed] = useState<string | null>(null);
+  const [refocus, setRefocus] = useState<string | null>(null);
+  const boardRef = useRef<HTMLElement>(null);
   const [now, setNow] = useState(() => Date.now());
   const pendingRef = useRef(pending);
   pendingRef.current = pending;
@@ -641,14 +664,25 @@ export function TodoBoard({ agents, filter = "" }: { agents: WorldAgent[]; filte
 
   useEffect(() => {
     const take = () => {
-      if (!pendingTodo || !todos.some((t) => t.id === pendingTodo)) return;
-      setOpened(pendingTodo);
+      const id = pendingTodo;
+      if (!id) return;
       pendingTodo = null;
+      const current = todoSelection.begin();
+      const local = todos.find((t) => t.id === id);
+      void applyLatest(() => local ?? worldApi.todo(id), current, (todo) => {
+        setOutsideBoard(local ? null : todo);
+        setOpened(todo.id);
+      }).catch(() => {});
     };
     take();
     window.addEventListener("world:todo-focus", take);
     return () => window.removeEventListener("world:todo-focus", take);
-  }, [todos]);
+  }, [todos, todoSelection]);
+  const openCard = (id: string | null) => {
+    todoSelection.begin();
+    setOutsideBoard(null);
+    setOpened(id);
+  };
 
   useEffect(() => {
     load();
@@ -659,6 +693,12 @@ export function TodoBoard({ agents, filter = "" }: { agents: WorldAgent[]; filte
       window.clearInterval(tick);
     };
   }, [load]);
+
+  useEffect(() => {
+    if (!failed) return;
+    const timer = window.setTimeout(() => setFailed(null), FAILED_MS);
+    return () => window.clearTimeout(timer);
+  }, [failed]);
 
   const commit = useCallback(
     (id: string) => {
@@ -689,9 +729,18 @@ export function TodoBoard({ agents, filter = "" }: { agents: WorldAgent[]; filte
     setPending((p) => ({ ...p, [id]: timer }));
   };
 
-  const patch = (id: string, change: Partial<Todo>, send: Parameters<typeof worldApi.updateTodo>[1]) => {
+  const settle = (work: Promise<unknown>, message: string) => {
+    void work.then(load, () => {
+      setFailed(message);
+      load();
+    });
+  };
+
+  const patch = (id: string, change: Partial<Todo>, send: Parameters<typeof worldApi.updateTodo>[1], message = SAVE_FAILED) => {
     setTodos((prev) => prev.map((t) => (t.id === id ? { ...t, ...change } : t)));
-    void worldApi.updateTodo(id, send).then(load, load);
+    settle(worldApi.updateTodo(id, send).then((saved) => {
+      setOutsideBoard((current) => current?.id === saved.id ? saved : current);
+    }), message);
   };
 
   const byColumn = useMemo(() => {
@@ -708,26 +757,23 @@ export function TodoBoard({ agents, filter = "" }: { agents: WorldAgent[]; filte
 
   const move = (id: string, column: Column, before: string | null) => {
     const moved = todos.find((t) => t.id === id);
-    if (!moved) return;
+    if (!moved) {
+      if (outsideBoard?.id === id && columnOf(outsideBoard) !== column) patch(id, columnChange(column, outsideBoard), columnPatch(column), MOVE_FAILED);
+      return;
+    }
     const from = columnOf(moved);
     if (pending[id]) {
       window.clearTimeout(pending[id]);
       setPending(({ [id]: _, ...rest }) => rest);
     }
     if (column === "done" || column === "cancelled") {
-      if (from !== column) patch(id, columnChange(column, moved), columnPatch(column));
+      if (from !== column) patch(id, columnChange(column, moved), columnPatch(column), MOVE_FAILED);
       return;
     }
     if (before === id) return;
     const placed = { ...moved, ...columnChange(column, moved) };
-    const target = byColumn[column].filter((t) => t.id !== id);
-    let at = before ? target.findIndex((t) => t.id === before) : -1;
-    if (at < 0) at = target.length;
-    const priority = before ? (target[at]?.priority ?? placed.priority) : placed.priority;
-    const ordered = [...target.slice(0, at), { ...placed, priority }, ...target.slice(at)];
-    const others = column === "todo" ? byColumn.progress : byColumn.todo;
-    const open = [...(column === "todo" ? ordered : others.filter((t) => t.id !== id)), ...(column === "todo" ? others.filter((t) => t.id !== id) : ordered)];
-    const positioned = new Map(open.map((t, i) => [t.id, i + 1]));
+    const { priority, order } = placeOpenTodo({ todo: byColumn.todo, progress: byColumn.progress }, moved, column, before);
+    const positioned = new Map(order.map((todoId, i) => [todoId, i + 1]));
     setTodos((prev) =>
       prev.map((t) => {
         const next = t.id === id ? { ...placed, priority } : t;
@@ -735,12 +781,23 @@ export function TodoBoard({ agents, filter = "" }: { agents: WorldAgent[]; filte
         return position ? { ...next, position } : next;
       }),
     );
+    const saved = { column: false, priority: false };
+    const label = COLUMNS.find((c) => c.id === column)?.label ?? column;
     const save = async () => {
-      if (from !== column) await worldApi.updateTodo(id, columnPatch(column));
-      if (priority !== moved.priority) await worldApi.updateTodo(id, { priority });
-      await worldApi.reorderTodos(open.map((t) => t.id));
+      if (from !== column) {
+        await worldApi.updateTodo(id, columnPatch(column));
+        saved.column = true;
+      }
+      if (priority !== moved.priority) {
+        await worldApi.updateTodo(id, { priority });
+        saved.priority = true;
+      }
+      await worldApi.reorderTodos(order);
     };
-    void save().then(load, load);
+    void save().then(load, () => {
+      setFailed(moveFailureNote(saved, label));
+      load();
+    });
   };
 
   const add = async (input: string, column: Column) => {
@@ -757,27 +814,54 @@ export function TodoBoard({ agents, filter = "" }: { agents: WorldAgent[]; filte
     if (id) move(id, column, before);
   };
 
+  const moveByKey = (id: string, column: Column, items: Todo[], step: MoveStep) => {
+    const closed = column === "done" || column === "cancelled";
+    if (step === "left" || step === "right") {
+      const next = COLUMNS[COLUMNS.findIndex((c) => c.id === column) + (step === "left" ? -1 : 1)];
+      if (!next) return;
+      setRefocus(id);
+      move(id, next.id, null);
+      return;
+    }
+    const at = items.findIndex((t) => t.id === id);
+    if (closed || at < 0) return;
+    const before = step === "up" ? (at > 0 ? items[at - 1].id : undefined) : at < items.length - 1 ? (items[at + 2]?.id ?? null) : undefined;
+    if (before === undefined) return;
+    setRefocus(id);
+    move(id, column, before);
+  };
+
+  useEffect(() => {
+    if (!refocus) return;
+    boardRef.current?.querySelector<HTMLElement>(`[data-todo-id="${refocus}"]`)?.focus();
+    setRefocus(null);
+  }, [refocus, todos]);
+
   const struck = Object.keys(pending).length;
   const openCount = byColumn.todo.length + byColumn.progress.length - struck;
-  const detail = opened ? todos.find((t) => t.id === opened) : undefined;
-  const dragProps = (column: Column) => ({
-    onDragOver: (e: React.DragEvent) => {
+  const detail = opened ? todos.find((t) => t.id === opened) ?? (outsideBoard?.id === opened ? outsideBoard : undefined) : undefined;
+  const dragProps = (column: Column) => {
+    const accept = (e: React.DragEvent) => {
       if (!dragging) return;
       e.preventDefault();
       e.dataTransfer.dropEffect = "move";
       if (over?.column !== column || over.before !== null) setOver({ column, before: null });
-    },
-    onDragLeave: (e: React.DragEvent) => {
-      if (!e.currentTarget.contains(e.relatedTarget as Node)) setOver((o) => (o?.column === column ? null : o));
-    },
-    onDrop: (e: React.DragEvent) => {
-      e.preventDefault();
-      drop(column, null);
-    },
-  });
+    };
+    return {
+      onDragEnter: accept,
+      onDragOver: accept,
+      onDragLeave: (e: React.DragEvent) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node)) setOver((o) => (o?.column === column ? null : o));
+      },
+      onDrop: (e: React.DragEvent) => {
+        e.preventDefault();
+        drop(column, null);
+      },
+    };
+  };
 
   return (
-    <section className="relative flex min-h-0 flex-1 flex-col">
+    <section ref={boardRef} className="relative flex min-h-0 flex-1 flex-col">
       <div className="flex min-h-0 flex-1 snap-x snap-mandatory gap-3 overflow-x-auto pb-1 sm:snap-none">
         {COLUMNS.map((col) => {
           const items = filter ? byColumn[col.id].filter((t) => matchesQuery(filter, t.text, t.source?.label, by(t.added_by_agent)?.name)) : byColumn[col.id];
@@ -803,7 +887,7 @@ export function TodoBoard({ agents, filter = "" }: { agents: WorldAgent[]; filte
                     now={now}
                     dragging={dragging === t.id}
                     over={over?.before === t.id}
-                    onOpen={() => setOpened(t.id)}
+                    onOpen={() => openCard(t.id)}
                     onDragStart={() => setDragging(t.id)}
                     onDragEnd={() => {
                       setDragging(null);
@@ -813,6 +897,7 @@ export function TodoBoard({ agents, filter = "" }: { agents: WorldAgent[]; filte
                       if (dragging && over?.before !== t.id) setOver({ column: col.id, before: closed ? null : t.id });
                     }}
                     onDropCard={() => drop(col.id, closed ? null : t.id)}
+                    onMoveKey={(step) => moveByKey(t.id, col.id, items, step)}
                     onStrike={() => strike(t.id)}
                     agents={agents}
                     onDecided={load}
@@ -831,7 +916,12 @@ export function TodoBoard({ agents, filter = "" }: { agents: WorldAgent[]; filte
           );
         })}
       </div>
-      <p className="mt-2 hidden text-w-2xs text-w-muted sm:block">{loaded ? `${openCount} open` : <Shimmer>Loading</Shimmer>} · Click a card to read or edit it, drag to move it</p>
+      <p className="mt-2 hidden text-w-2xs text-w-muted sm:block">{loaded ? `${openCount} open` : <Shimmer>Loading</Shimmer>} · Click a card to read or edit it, drag it or press Alt (Option) with an arrow key to move it</p>
+      {failed && (
+        <p role="alert" className="mt-2 rounded-lg bg-w-rose px-3 py-1.5 text-w-sm text-w-danger animate-[fade-in-up_180ms_ease-out_both] motion-reduce:animate-none">
+          {failed}
+        </p>
+      )}
       {struck > 0 && (
         <div role="status" className="mt-2 flex items-center justify-between gap-2 rounded-lg bg-w-invert px-3 py-1.5 text-w-sm text-w-oninvert animate-[fade-in-up_180ms_ease-out_both] motion-reduce:animate-none">
           <span>{struck === 1 ? "Struck off" : `${struck} struck off`}</span>
@@ -854,7 +944,7 @@ export function TodoBoard({ agents, filter = "" }: { agents: WorldAgent[]; filte
           todo={detail}
           agent={by(detail.added_by_agent)}
           now={now}
-          onClose={() => setOpened(null)}
+          onClose={() => openCard(null)}
           onMove={(column) => move(detail.id, column, null)}
           onPatch={(change, send) => patch(detail.id, change, send)}
           agents={agents}

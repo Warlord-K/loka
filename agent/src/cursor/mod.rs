@@ -71,6 +71,7 @@ pub(crate) async fn acp_setup(opts: &CliOptions<'_>) -> Result<crate::acp::Setup
     if sandbox_mode != crate::claude::sandbox::Mode::Off {
         let temp = sandbox::run_temp().context("Failed to create the Cursor run temp dir")?;
         command.env("TMPDIR", &temp.0);
+        crate::cli::drop_default_quest_target(&mut command);
         if let Some(policy) = sandbox::policy(crate::claude::sandbox::mode(), opts.working_dir, &opts.readable_files, Some(&temp.0)) {
             keep.push(Box::new(install_sandbox_policy(opts.working_dir, &policy).await?));
         }
@@ -506,6 +507,7 @@ async fn run_inner(opts: &CliOptions<'_>, plugin_dir: Option<&Path>) -> Result<C
     let run_temp = if sandboxed { Some(sandbox::run_temp().context("Failed to create the Cursor run temp dir")?) } else { None };
     if let Some(temp) = &run_temp {
         cmd.env("TMPDIR", &temp.0);
+        crate::cli::drop_default_quest_target(&mut cmd);
     }
     let policy = sandbox::policy(sandbox_mode, opts.working_dir, &readable, run_temp.as_ref().map(|t| t.0.as_path()));
     let _policy_file = match &policy {

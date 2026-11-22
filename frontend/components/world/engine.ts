@@ -651,6 +651,12 @@ export class LokaEngine {
     if (this.navigate(goals)) this.pending = target;
   }
 
+  cancelWalk(): void {
+    this.path = [];
+    this.pending = null;
+    this.marker = null;
+  }
+
   interact(target: Target): void {
     const p = this.pointOf(target);
     if (p) this.face(p);

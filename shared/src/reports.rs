@@ -15,11 +15,12 @@ const MAX_FOLDER_DEPTH: usize = 6;
 const KEEP_REVISIONS: i64 = 100;
 const MERGE_SECS: i64 = 300;
 const QUIET_CHARS: usize = 600;
+pub const STALE_REPORT: &str = "Someone saved a newer version of this report while you were editing.";
 const VISIBLE: &str = "(r.org_id = $9 AND (r.owner_user_id = $1 OR r.visibility = 'public'))";
 pub(crate) const BRIEF_COLUMNS: &str = "r.id, r.owner_user_id, r.author_agent_id, r.author_user_id, r.title, r.slug, r.tags, r.folder, r.pinned,
   r.visibility, r.revision, r.task_id, r.created_at, r.updated_at, left(r.body, 280) AS excerpt, octet_length(r.body) AS size, r.kind,
   (SELECT COUNT(*) FROM world_canvas_marks m WHERE m.report_id = r.id AND m.status = 'open') AS open_marks,
-  CASE WHEN r.kind = 'canvas' AND jsonb_typeof(r.canvas->'items') = 'array' THEN jsonb_array_length(r.canvas->'items') ELSE 0 END AS item_count, r.practice";
+  CASE WHEN r.kind = 'canvas' AND jsonb_typeof(r.canvas->'items') = 'array' THEN jsonb_array_length(r.canvas->'items') ELSE 0 END AS item_count, r.practice, r.challenge_id";
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct Report {
@@ -47,6 +48,9 @@ pub struct Report {
     pub canvas: Option<serde_json::Value>,
     #[sqlx(default)]
     pub practice: Option<serde_json::Value>,
+    #[sqlx(default)]
+    #[serde(default)]
+    pub challenge_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize)]
@@ -71,6 +75,8 @@ pub struct ReportBrief {
     pub open_marks: i64,
     pub item_count: i32,
     pub practice: Option<serde_json::Value>,
+    #[sqlx(default)]
+    pub challenge_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize)]
@@ -143,9 +149,21 @@ pub struct ReportPatch {
     pub tags: Option<Vec<String>>,
     pub pinned: Option<bool>,
     pub visibility: Option<String>,
+    pub base_updated_at: Option<DateTime<Utc>>,
     #[serde(skip)]
     pub canvas: Option<serde_json::Value>,
 }
+
+#[derive(Debug)]
+pub struct StaleReport(pub Box<Report>);
+
+impl std::fmt::Display for StaleReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(STALE_REPORT)
+    }
+}
+
+impl std::error::Error for StaleReport {}
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ReportFilter {
@@ -220,6 +238,7 @@ pub const REPO_NOTES_TAG: &str = "repo-notes";
 const REPO_NOTES_MAX: usize = 12 * 1024;
 const REPO_NOTE_MAX: usize = 400;
 const REPO_NOTES_PER_TASK: usize = 12;
+const REPO_NOTES_TRIES: u32 = 3;
 
 pub fn repo_notes_title(repo: &str) -> String {
     format!("Repo notes: {}", repo.trim().trim_end_matches(".git"))
@@ -362,7 +381,7 @@ fn changed_chars(a: &str, b: &str) -> usize {
 }
 
 impl WorldStore {
-    async fn unused_report_slug(&self, owner: Uuid, title: &str, except: Option<Uuid>) -> Result<String> {
+    async fn unused_report_slug(&self, db: impl sqlx::PgExecutor<'_>, owner: Uuid, title: &str, except: Option<Uuid>) -> Result<String> {
         let base = slug_base(title);
         let taken: Vec<String> = sqlx::query_scalar(
             "SELECT slug FROM world_reports WHERE owner_user_id = $1 AND (slug = $2 OR slug LIKE $2 || '-%') AND id IS DISTINCT FROM $3",
@@ -370,7 +389,7 @@ impl WorldStore {
         .bind(owner)
         .bind(&base)
         .bind(except)
-        .fetch_all(self.pool())
+        .fetch_all(db)
         .await?;
         if !taken.contains(&base) {
             return Ok(base);
@@ -378,7 +397,7 @@ impl WorldStore {
         Ok((2..).map(|n| format!("{base}-{n}")).find(|s| !taken.contains(s)).unwrap_or(base))
     }
 
-    pub(crate) async fn resolve_report_links(&self, owner: Uuid, org: Option<Uuid>, body: &str, me: Option<Uuid>) -> Result<Vec<Uuid>> {
+    pub(crate) async fn resolve_report_links(&self, db: impl sqlx::PgExecutor<'_>, owner: Uuid, org: Option<Uuid>, body: &str, me: Option<Uuid>) -> Result<Vec<Uuid>> {
         let titles: Vec<String> = wiki_links(body).iter().map(|t| t.to_lowercase()).collect();
         let refs: Vec<String> = report_refs(body).iter().map(|r| format!("{r}%")).collect();
         if titles.is_empty() && refs.is_empty() {
@@ -394,7 +413,7 @@ impl WorldStore {
         .bind(&refs)
         .bind(me)
         .bind(org)
-        .fetch_all(self.pool())
+        .fetch_all(db)
         .await?)
     }
 
@@ -411,7 +430,7 @@ impl WorldStore {
         .fetch_all(self.pool())
         .await?;
         for (id, owner, body) in pending {
-            let links = self.resolve_report_links(owner, org, &body, Some(id)).await?;
+            let links = self.resolve_report_links(self.pool(), owner, org, &body, Some(id)).await?;
             sqlx::query("UPDATE world_reports SET links = $2 WHERE id = $1").bind(id).bind(&links).execute(self.pool()).await?;
         }
         Ok(())
@@ -431,7 +450,7 @@ impl WorldStore {
             Some(v @ ("private" | "public")) => v.to_string(),
             Some(_) => bail!("visibility is private or public"),
         };
-        let slug = self.unused_report_slug(new.owner_user_id, &title, None).await?;
+        let slug = self.unused_report_slug(self.pool(), new.owner_user_id, &title, None).await?;
         let org: Option<Uuid> = sqlx::query_scalar(
             "SELECT COALESCE((SELECT org_id FROM agent_profiles WHERE id = $2), (SELECT org_id FROM agent_tasks WHERE id = $3),
                              world_active_org($1), world_only_org(), world_default_org())",
@@ -445,7 +464,7 @@ impl WorldStore {
             self.check_canvas_uploads(new.owner_user_id, org, c, &crate::canvas::Canvas::default()).await?;
         }
         let canvas = canvas.map(crate::canvas::Canvas::to_value);
-        let links = self.resolve_report_links(new.owner_user_id, org, &new.body, None).await?;
+        let links = self.resolve_report_links(self.pool(), new.owner_user_id, org, &new.body, None).await?;
         let mut tx = self.pool().begin().await?;
         let report = sqlx::query_as::<_, Report>(
             "INSERT INTO world_reports (owner_user_id, author_agent_id, author_user_id, title, slug, body, tags, folder, pinned, visibility, links, task_id, org_id, kind, canvas, practice)
@@ -505,10 +524,17 @@ impl WorldStore {
         }
         let org: Option<Uuid> = sqlx::query_scalar("SELECT org_id FROM agent_profiles WHERE id = $1").bind(agent).fetch_optional(self.pool()).await?;
         match self.repo_notes(owner, org, repo).await? {
-            Some(current) => {
-                let Some(body) = merge_repo_notes(&current.body, notes) else { return Ok(None) };
-                let patch = ReportPatch { body: Some(body), ..Default::default() };
-                self.update_report(current.id, ReportActor::Agent(agent), &patch).await
+            Some(mut current) => {
+                let mut tries = 0;
+                loop {
+                    tries += 1;
+                    let Some(body) = merge_repo_notes(&current.body, notes) else { return Ok(None) };
+                    let patch = ReportPatch { body: Some(body), base_updated_at: Some(current.updated_at), ..Default::default() };
+                    match self.update_report(current.id, ReportActor::Agent(agent), &patch).await {
+                        Err(e) if tries < REPO_NOTES_TRIES && e.is::<StaleReport>() => current = *e.downcast::<StaleReport>()?.0,
+                        done => return done,
+                    }
+                }
             }
             None => {
                 let Some(body) = merge_repo_notes("", notes) else { return Ok(None) };
@@ -640,7 +666,13 @@ impl WorldStore {
     }
 
     pub async fn update_report(&self, id: Uuid, by: ReportActor, patch: &ReportPatch) -> Result<Option<Report>> {
-        let Some(current) = self.get_report(id).await? else { return Ok(None) };
+        let mut tx = self.pool().begin().await?;
+        let Some(current) = sqlx::query_as::<_, Report>("SELECT * FROM world_reports WHERE id = $1 FOR UPDATE").bind(id).fetch_optional(&mut *tx).await? else {
+            return Ok(None);
+        };
+        if patch.base_updated_at.is_some_and(|base| base != current.updated_at) {
+            return Err(StaleReport(Box::new(current)).into());
+        }
         let title = match patch.title.as_deref() {
             Some(t) => clean_title(t)?,
             None => current.title.clone(),
@@ -683,12 +715,12 @@ impl WorldStore {
         let pinned = patch.pinned.unwrap_or(current.pinned);
         let content_changed = canvas_changed || title != current.title || body != current.body || folder != current.folder || tags != current.tags;
         if !content_changed && visibility == current.visibility && pinned == current.pinned {
+            tx.rollback().await?;
             return Ok(Some(current));
         }
         let renamed = title != current.title;
-        let slug = if renamed { self.unused_report_slug(current.owner_user_id, &title, Some(id)).await? } else { current.slug.clone() };
-        let links = if body != current.body { self.resolve_report_links(current.owner_user_id, current.org_id, &body, Some(id)).await? } else { current.links.clone() };
-        let mut tx = self.pool().begin().await?;
+        let slug = if renamed { self.unused_report_slug(&mut *tx, current.owner_user_id, &title, Some(id)).await? } else { current.slug.clone() };
+        let links = if body != current.body { self.resolve_report_links(&mut *tx, current.owner_user_id, current.org_id, &body, Some(id)).await? } else { current.links.clone() };
         let (revision, merged) = if content_changed {
             self.record_revision(&mut tx, &current, by, (&title, &body, &folder, &tags), canvas.as_ref()).await?
         } else {
@@ -716,6 +748,9 @@ impl WorldStore {
         tx.commit().await?;
         if renamed {
             self.relink_mentions(report.owner_user_id, report.org_id, report.id, &report.title).await?;
+            if let Some(lesson) = report.challenge_id {
+                self.rename_lesson_only(lesson, &report.title).await?;
+            }
         }
         let quiet = merged || !content_changed || (!renamed && changed_chars(&current.body, &report.body) < QUIET_CHARS);
         self.report_event("report.updated", &report, by, quiet).await?;
@@ -797,11 +832,19 @@ impl WorldStore {
 
     pub async fn delete_report(&self, id: Uuid, by: ReportActor) -> Result<Option<Report>> {
         let mut tx = self.pool().begin().await?;
+        let lesson: Option<Uuid> = sqlx::query_scalar("SELECT challenge_id FROM world_reports WHERE id = $1").bind(id).fetch_optional(&mut *tx).await?.flatten();
+        if let Some(lesson) = lesson {
+            sqlx::query("SELECT id FROM world_items WHERE id = $1 FOR UPDATE").bind(lesson).execute(&mut *tx).await?;
+            sqlx::query("UPDATE world_items SET status = 'archived', updated_at = NOW() WHERE id = $1 AND kind = 'challenge'").bind(lesson).execute(&mut *tx).await?;
+        }
         let report = sqlx::query_as::<_, Report>("DELETE FROM world_reports WHERE id = $1 RETURNING *").bind(id).fetch_optional(&mut *tx).await?;
         if report.is_some() {
             sqlx::query("UPDATE world_reports SET links = array_remove(links, $1) WHERE links @> ARRAY[$1]").bind(id).execute(&mut *tx).await?;
         }
         tx.commit().await?;
+        if let Some(late) = report.as_ref().and_then(|r| r.challenge_id).filter(|c| Some(*c) != lesson) {
+            sqlx::query("UPDATE world_items SET status = 'archived', updated_at = NOW() WHERE id = $1 AND kind = 'challenge'").bind(late).execute(self.pool()).await?;
+        }
         if let Some(r) = &report {
             self.report_event("report.deleted", r, by, true).await?;
         }

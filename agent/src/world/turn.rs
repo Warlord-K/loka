@@ -259,6 +259,12 @@ async fn take_turn(ctx: &Ctx, agent: &WorldAgent, items: &[InboxItem]) -> Result
     let rules_hash = prompts::rules_hash(&format!("{system}\n{rules_text}"));
     let fresh = main.cli_session_id.is_none();
     let mut prompt = prompts::turn(items, &tasks);
+    if loka_shared::quests::owner_spoke(items) {
+        let note = loka_shared::quests::waiting_plans_note(&ctx.store.waiting_plans(agent.id).await.unwrap_or_default());
+        if !note.is_empty() {
+            prompt = format!("{prompt}\n\n{note}");
+        }
+    }
     if !fresh {
         let last = prompts::last_replies(&ctx.store.last_turn_replies(agent.id, main.id).await.unwrap_or_default());
         if !last.is_empty() {
@@ -279,7 +285,10 @@ async fn take_turn(ctx: &Ctx, agent: &WorldAgent, items: &[InboxItem]) -> Result
     }
     let home = super::agent_home(ctx, &agent.slug);
     tokio::fs::create_dir_all(&home).await?;
-    let image_paths = materialize_uploads(ctx, &home, items).await;
+    let (image_paths, files_note) = materialize_uploads(ctx, &home, items).await;
+    if let Some(note) = files_note {
+        prompt = format!("{prompt}\n\n{note}");
+    }
     let mut options = TurnOptions::from_items(items);
     if main.backend == "claude" && !options.fast {
         options.fast = ctx.store.any_urgent(&loka_shared::quests::inbox_task_ids(items)).await.unwrap_or(false);
@@ -824,25 +833,18 @@ impl TurnOptions {
     }
 }
 
-async fn materialize_uploads(ctx: &Ctx, home: &std::path::Path, items: &[InboxItem]) -> Vec<std::path::PathBuf> {
-    let ids: Vec<Uuid> = items
-        .iter()
-        .filter_map(|i| i.payload.get("attachments").and_then(Value::as_array))
-        .flatten()
-        .filter(|a| a.get("mime").and_then(Value::as_str).is_none_or(prompts::is_image))
-        .filter_map(|a| a.get("id").and_then(Value::as_str).and_then(|s| s.parse().ok()))
-        .take(8)
-        .collect();
-    if ids.is_empty() {
-        return Vec::new();
+async fn materialize_uploads(ctx: &Ctx, home: &std::path::Path, items: &[InboxItem]) -> (Vec<std::path::PathBuf>, Option<String>) {
+    let attached = prompts::attached_ids(items.iter().map(|i| &i.payload));
+    if attached.images.is_empty() && attached.files.is_empty() {
+        return (Vec::new(), None);
     }
     let dir = home.join(".uploads");
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         warn!(error = %e, "Could not create uploads dir");
-        return Vec::new();
+        return (Vec::new(), None);
     }
     let mut paths = Vec::new();
-    for id in ids {
+    for id in attached.images {
         match ctx.store.get_upload(id, None).await {
             Ok(Some((mime, bytes))) => {
                 let ext = match mime.as_str() {
@@ -861,7 +863,30 @@ async fn materialize_uploads(ctx: &Ctx, home: &std::path::Path, items: &[InboxIt
             Err(e) => warn!(error = %e, "Could not read upload"),
         }
     }
-    paths
+    let mut saved = Vec::new();
+    let mut skipped = Vec::new();
+    let mut total = 0usize;
+    for (id, name) in attached.files {
+        match ctx.store.get_upload(id, None).await {
+            Ok(Some((mime, bytes))) => {
+                let file_name = loka_shared::media::attachment_file_name(id, &name, &mime);
+                if !loka_shared::media::fits_caps(&mut total, bytes.len()) {
+                    skipped.push(file_name);
+                    continue;
+                }
+                let path = dir.join(&file_name);
+                match tokio::fs::write(&path, &bytes).await {
+                    Ok(()) => {
+                        saved.push((path.display().to_string(), mime));
+                    }
+                    Err(e) => warn!(error = %e, "Could not write upload"),
+                }
+            }
+            Ok(None) => warn!(upload = %id, "Upload missing"),
+            Err(e) => warn!(error = %e, "Could not read upload"),
+        }
+    }
+    (paths, loka_shared::media::attached_files_note(&saved, &skipped))
 }
 
 async fn system_note(ctx: &Ctx, agent: &WorldAgent, text: &str) -> Result<()> {

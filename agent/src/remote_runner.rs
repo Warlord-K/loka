@@ -36,6 +36,7 @@ use outbox::{Batch, Deliver, EventSink, Outbox, Sent};
 use storage::RunnerStorage;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const BROWSER_CLOSE_LIMIT: Duration = Duration::from_secs(30);
 const UPDATE_DRAIN: Duration = Duration::from_secs(20);
 const IDLE_WAIT: Duration = Duration::from_secs(45);
 const STREAM_SILENCE: Duration = Duration::from_secs(45);
@@ -103,6 +104,8 @@ struct ClosedTasks {
     closed: Vec<Uuid>,
     #[serde(default)]
     entries: Vec<loka_shared::runners::ClosedTask>,
+    #[serde(default)]
+    idle: Vec<Uuid>,
 }
 
 #[derive(Debug)]
@@ -273,6 +276,14 @@ impl RunnerApi {
             .into_iter()
             .map(|id| loka_shared::runners::ClosedTask { id, status: "closed".into(), idle_since: None })
             .collect())
+    }
+
+    async fn idle_tasks(&self, tasks: &[Uuid]) -> Result<Vec<Uuid>> {
+        let response = send_json(|| self.authorized(self.client.post(self.runner_url("/workspaces"))), &json!({ "tasks": tasks, "idle": true }))
+            .await
+            .context("runner idle quests request failed")?;
+        ensure_success(response.status(), "runner idle quests")?;
+        Ok(response.json::<ClosedTasks>().await?.idle)
     }
 
     async fn disk_low(&self, notice: &loka_shared::runners::DiskNotice) -> Result<()> {
@@ -575,6 +586,7 @@ pub async fn run() -> Result<()> {
         protect_user_settings()?;
     }
     prepare_root(&root).await?;
+    close_leftover_browser_tabs(&root).await;
     let storage = RunnerStorage::from_env(&root, runner_id).await?;
     for name in [
         "WORLD_RUNNER_TOKEN",
@@ -1349,6 +1361,7 @@ async fn execute_job(
         }
     };
     drop(execution);
+    close_run_browser_tabs(root, &job).await;
     crate::apps::set_granted(root, job.lease_id, false);
     if storage.is_some()
         && state_may_change.load(Ordering::Acquire)
@@ -1415,6 +1428,25 @@ async fn execute_job(
             work_summary: None,
         },
     })
+}
+
+async fn close_leftover_browser_tabs(root: &Path) {
+    let root = root.to_path_buf();
+    let sweep = tokio::task::spawn_blocking(move || crate::browser::sweep(&root));
+    if tokio::time::timeout(BROWSER_CLOSE_LIMIT, sweep).await.is_err() {
+        warn!("Closing browser tabs left open by earlier runs took too long, so it was skipped");
+    }
+}
+
+async fn close_run_browser_tabs(root: &Path, job: &RunnerJob) {
+    if !crate::browser::wanted(&job.kind) {
+        return;
+    }
+    let (root, agent_id, run_id) = (root.to_path_buf(), job.agent_id, job.run_id);
+    let close = tokio::task::spawn_blocking(move || crate::browser::close_run(&root, agent_id, run_id));
+    if tokio::time::timeout(BROWSER_CLOSE_LIMIT, close).await.is_err() {
+        warn!(run_id = %job.run_id, "Closing this run's browser tabs took too long, they close at the next start");
+    }
 }
 
 fn start_fresh_if_transcript_missing(mut job: RunnerJob, storage: Option<&RunnerStorage>) -> RunnerJob {
@@ -1522,7 +1554,12 @@ async fn execute_job_inner(
         skills.push(path);
     }
     let images = materialize_images(&work_root, job).await?;
+    let files_note = materialize_files(&work_root, job).await?;
     let prompt = prompt_with_skills(&job.prompt, &skills, storage);
+    let prompt = match files_note {
+        Some(note) => format!("{prompt}\n\n{note}"),
+        None => prompt,
+    };
     let prompt = match &job.setup_scan {
         Some(request) => {
             if job.kind != "aside" || storage.is_some() {
@@ -1734,11 +1771,17 @@ async fn execute_job_inner(
         _ => None,
     }
     .map(|summary| redact(&summary, &secrets));
+    let publish_pr_state = match job.kind.as_str() {
+        "followup" if job.workspace.repo.is_some() && crate::world::prompts::parse_report(&result.output).is_some() => {
+            crate::git::github::pr_sync(&workspace, claimed_at).await.report().map(str::to_string)
+        }
+        _ => None,
+    };
     Ok(ExecutionOutcome {
         result,
         pr_url: None,
         pr_number: None,
-        publish_pr_state: None,
+        publish_pr_state,
         work_summary,
     })
 }
@@ -1760,7 +1803,7 @@ async fn publish_job(root: &Path, job: &RunnerJob) -> Result<ExecutionOutcome> {
         .as_deref()
         .filter(|name| !name.trim().is_empty())
         .unwrap_or(&publish.branch);
-    crate::git::workspace::commit_signed(&workspace, &publish.commit_message).await?;
+    let committed = crate::git::workspace::commit_for_publish(&workspace, repo, &publish.commit_message).await?;
     let ahead = crate::git::workspace::ahead_of_fresh_base(&workspace, &publish.base_branch).await?;
     if publish.pr_number.is_none() && !ahead {
         return Ok(ExecutionOutcome {
@@ -1816,17 +1859,31 @@ async fn publish_job(root: &Path, job: &RunnerJob) -> Result<ExecutionOutcome> {
         });
     }
     let mut publish_pr_state = None;
+    let target = crate::git::workspace::PublishTarget {
+        repo,
+        base: &publish.base_branch,
+        onto: &publish.base_branch,
+        quest_branch,
+    };
     let pr = match crate::git::github::open_pr_containing_head(
         &workspace,
         repo,
         &publish.base_branch,
         quest_branch,
+        publish.stack_onto_pr,
     )
     .await?
     {
+        crate::git::github::HeadPr::Extends(pr, head_ref)
+            if ahead && crate::git::github::extends_recorded_pr(publish.pr_number, pr.number) =>
+        {
+            info!(pr = %pr.url, "Work extends an open pull request, pushing to its branch instead of opening another");
+            let extending = crate::git::workspace::PublishTarget { quest_branch: &head_ref, ..target };
+            crate::git::workspace::publish_commits(&workspace, &committed, &extending, &head_ref).await?;
+            Some(pr)
+        }
         crate::git::github::HeadPr::Own(pr, head) if ahead => {
-            crate::git::workspace::ensure_signed_commits(&workspace, &publish.base_branch).await?;
-            crate::git::workspace::push_quest_branch(&workspace, &head, quest_branch).await?;
+            crate::git::workspace::publish_commits(&workspace, &committed, &target, &head).await?;
             Some(pr)
         }
         crate::git::github::HeadPr::Elsewhere(pr) => {
@@ -1834,7 +1891,7 @@ async fn publish_job(root: &Path, job: &RunnerJob) -> Result<ExecutionOutcome> {
             publish_pr_state = Some(loka_shared::runners::PUBLISH_ELSEWHERE.to_string());
             None
         }
-        crate::git::github::HeadPr::Missing if ahead => 'missing: {
+        crate::git::github::HeadPr::Missing | crate::git::github::HeadPr::Extends(..) if ahead => 'missing: {
             if !crate::git::workspace::ahead_of_fresh_base(&workspace, &publish.base_branch).await? {
                 info!("The base branch caught up with this work while publishing, not opening a pull request");
                 break 'missing None;
@@ -1844,9 +1901,9 @@ async fn publish_job(root: &Path, job: &RunnerJob) -> Result<ExecutionOutcome> {
             if branch == publish.base_branch {
                 bail!("publish workspace is on the base branch");
             }
-            crate::git::workspace::ensure_signed_commits(&workspace, &publish.base_branch).await?;
-            crate::git::workspace::push_quest_branch(&workspace, &branch, quest_branch).await?;
             let into = crate::git::github::stack_base(&workspace, repo, &publish.base_branch, quest_branch, publish.stack_onto_pr).await;
+            let target = crate::git::workspace::PublishTarget { onto: &into, ..target };
+            crate::git::workspace::publish_commits(&workspace, &committed, &target, &branch).await?;
             crate::git::github::create_pr(
                 &workspace,
                 repo,
@@ -2065,6 +2122,14 @@ async fn relay_mcp(api: &RunnerApi, stream: tokio::net::UnixStream) -> Result<()
         bail!("runner MCP request is larger than {MAX_MCP_REQUEST_BYTES} bytes");
     }
     let mut request: Value = serde_json::from_str(&line)?;
+    if media::wants_upload(&request) {
+        let reply = match media::save_upload(api, lease_id, &token, &roots, &request).await {
+            Ok(text) => media::answer(&request, text),
+            Err(message) => media::refusal(&request, &message),
+        };
+        writer.write_all(&serde_json::to_vec(&reply)?).await?;
+        return Ok(());
+    }
     if media::wants_files(&request) {
         if let Err(message) = media::upload_files(api, lease_id, &token, &roots, &mut request).await {
             writer.write_all(&serde_json::to_vec(&media::refusal(&request, &message))?).await?;
@@ -2355,7 +2420,9 @@ async fn prepare_workspace(root: &Path, workspace: &RunnerWorkspace) -> Result<P
         )
         .await?;
     }
-    canonical_contained(&workspaces, &target).await
+    let workspace_path = canonical_contained(&workspaces, &target).await?;
+    crate::git::workspace::pin_signing(&workspace_path).await;
+    Ok(workspace_path)
 }
 
 async fn repository_path(root: &Path, repo: &str) -> Result<PathBuf> {
@@ -2460,7 +2527,7 @@ async fn materialize_browser(root: &Path, job: &RunnerJob) -> Result<PathBuf> {
     secure_create_dir(&profiles, Path::new(&job.agent_id.to_string()), false).await?;
     let dir = secure_create_dir(&root.join("skills"), Path::new(&job.session_id.to_string()), false).await?;
     let path = dir.join("browser.md");
-    let launcher = crate::browser::launcher(job.agent_id, &job.kind).ok_or_else(|| anyhow::anyhow!("the browser launcher path is not usable"))?;
+    let launcher = crate::browser::launcher(job.agent_id, job.run_id, &job.kind).ok_or_else(|| anyhow::anyhow!("the browser launcher path is not usable"))?;
     tokio::fs::write(&path, crate::browser::skill(&launcher)).await?;
     Ok(path)
 }
@@ -2491,6 +2558,28 @@ async fn materialize_images(root: &Path, job: &RunnerJob) -> Result<Vec<PathBuf>
         paths.push(path);
     }
     Ok(paths)
+}
+
+async fn materialize_files(root: &Path, job: &RunnerJob) -> Result<Option<String>> {
+    if job.files.is_empty() {
+        return Ok(None);
+    }
+    let uploads_root = secure_create_dir(root, Path::new("uploads"), false).await?;
+    let dir = secure_create_dir(&uploads_root, Path::new(&job.run_id.to_string()), false).await?;
+    let mut saved = Vec::new();
+    let mut total = 0usize;
+    for file in &job.files {
+        let name = validated_file_name(&file.name)?;
+        let bytes = STANDARD.decode(&file.data_base64).context("invalid file data")?;
+        total += bytes.len();
+        if bytes.len() > loka_shared::media::MAX_ATTACHED_FILE || total > loka_shared::media::MAX_ATTACHED_TOTAL {
+            bail!("runner attachments exceed the size limit");
+        }
+        let path = dir.join(name);
+        tokio::fs::write(&path, bytes).await?;
+        saved.push((path.display().to_string(), file.mime_type.clone()));
+    }
+    Ok(loka_shared::media::attached_files_note(&saved, &[]))
 }
 
 fn prompt_with_skills(prompt: &str, skills: &[PathBuf], storage: Option<&RunnerStorage>) -> String {
@@ -2537,7 +2626,7 @@ fn add_gate_environment(
         environment.insert(crate::browser::ROOT_ENV.to_string(), root.display().to_string());
     }
     if browser {
-        for (name, value) in crate::browser::environment(root, job.agent_id, &job.kind) {
+        for (name, value) in crate::browser::environment(root, job.agent_id, job.run_id, &job.kind) {
             environment.insert(name, value);
         }
     }
@@ -3077,6 +3166,39 @@ mod tests {
             "timeout_secs": 60, "effort": null, "fast": false, "mcp_token": "t", "publish": null, "omp_models": null,
         }))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn attached_files_land_on_disk_and_are_listed_in_the_prompt_note() {
+        let root = std::env::temp_dir().join(format!("loka-files-test-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut job = quest_job("turn");
+        let id = Uuid::new_v4();
+        let name = loka_shared::media::attachment_file_name(id, "New Recording.m4a", "audio/x-m4a");
+        let audio = b"\0\0\0\x20ftypM4A fake audio bytes";
+        job.files = vec![loka_shared::runners::RunnerFile {
+            id,
+            name: name.clone(),
+            mime_type: "audio/x-m4a".into(),
+            data_base64: STANDARD.encode(audio),
+        }];
+        let note = materialize_files(&root, &job).await.unwrap().unwrap();
+        let path = std::fs::canonicalize(&root).unwrap().join("uploads").join(job.run_id.to_string()).join(&name);
+        assert_eq!(std::fs::read(&path).unwrap(), audio);
+        assert!(note.contains(&format!("- {} (audio/x-m4a)", path.display())), "{note}");
+        assert!(note.contains("New Recording.m4a"));
+
+        job.files[0].name = "../escape.m4a".into();
+        assert!(materialize_files(&root, &job).await.is_err());
+        assert!(!root.join("escape.m4a").exists() && !root.join("uploads").join("escape.m4a").exists());
+
+        job.files[0].name = name;
+        job.files[0].data_base64 = STANDARD.encode(vec![0u8; loka_shared::media::MAX_ATTACHED_FILE + 1]);
+        assert!(materialize_files(&root, &job).await.is_err());
+
+        job.files.clear();
+        assert_eq!(materialize_files(&root, &job).await.unwrap(), None);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

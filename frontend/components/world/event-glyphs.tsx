@@ -19,7 +19,6 @@ import {
   Medal,
   PushPinSimple,
   Signpost,
-  Sparkle,
   Student,
   Timer,
   TreasureChest,
@@ -28,6 +27,7 @@ import {
 import type { WorldAgent } from "@/lib/world";
 import { cn } from "@/lib/utils";
 import { AgentFace } from "./channel-ui";
+import { MeaningIcon } from "@/lib/meaning-icons";
 
 export type GlyphTone = "ok" | "warn" | "danger" | "info" | "quiet" | "gold";
 
@@ -82,7 +82,7 @@ export function eventGlyph(type: string, error = false): EventGlyph {
     case "aside.answered":
       return { icon: ChatTeardropDots, tone: "info", label: "Message" };
     case "changelog":
-      return { icon: Sparkle, tone: "gold", label: "What's new" };
+      return { icon: MeaningIcon.whatsNew, tone: "gold", label: "What's new" };
     case "download":
       return { icon: DownloadSimple, tone: "ok", label: "Downloaded" };
     case "travel":

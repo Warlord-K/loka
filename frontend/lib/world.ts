@@ -124,7 +124,7 @@ export function tradeFor(agent: Pick<WorldAgent, "slug" | "look" | "tags" | "per
 
 export const SUBSCRIPTION_EVENTS: { id: string; label: string; detail: string }[] = [
   { id: "slack.notification", label: "Slack notifications", detail: "DMs, mentions, highlights and thread replies, grouped into one turn per burst" },
-  { id: "github.", label: "GitHub notifications", detail: "Review requests, mentions, comments and CI from your GitHub, needs the GitHub feed in You" },
+  { id: "github.", label: "GitHub notifications", detail: "Review requests, mentions, comments and CI from your GitHub, needs the GitHub feed in Settings" },
   { id: "task.finished", label: "Quest finished", detail: "Any of your agents finished a quest" },
   { id: "run.failed", label: "Run failed", detail: "A task, review or follow-up run failed" },
   { id: "run.timed_out", label: "Run timed out", detail: "A run hit its time limit" },
@@ -572,6 +572,7 @@ export interface WorldItem {
   created_at: string;
   updated_at: string;
   done_count?: number;
+  region_id?: string | null;
 }
 
 export interface WorldRule {
@@ -1080,7 +1081,7 @@ export interface SearchResults {
   feeds?: { id: string; agent_id: string; name: string; kind: string; paused: boolean }[];
   teams?: { id: string; name: string; purpose: string; lead_agent_id: string | null }[];
   regions?: { id: string; name: string; theme: string; visibility: string; mine: boolean }[];
-  places?: { id: string; kind: "building" | "npc"; name: string; region_id: string | null; region_name: string | null; data: Record<string, unknown> }[];
+  places?: { id: string; kind: "building" | "npc" | "challenge" | "adventure"; name: string; region_id: string | null; region_name: string | null; data: Record<string, unknown> }[];
   rules?: { id: string; scope: string; excerpt: string; enabled: boolean; global: boolean }[];
   kit?: { id: string; kind: "skill" | "mcp"; name: string; description: string; agent_id: string }[];
   devices?: { id: string; name: string; platform: string; status: string }[];
@@ -1179,7 +1180,7 @@ export const worldApi = {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ body, attachments, options, answers, spoken, task_id: taskId, reply_to: replyTo, quote: quote ?? undefined }),
     }).then((r) => sendJson<AgentMessage>(r)),
-  quickStart: (agentId: string, body: { text: string; attachments?: string[]; spoken?: boolean; cli?: string; model?: string }) =>
+  quickStart: (agentId: string, body: { text: string; attachments?: string[]; spoken?: boolean; cli?: string; model?: string; quote?: { text: string; label?: string; source?: string; context?: string } | null }) =>
     fetch(`/api/world/agents/${agentId}/quick`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -1192,7 +1193,7 @@ export const worldApi = {
     return fetch(`/api/world/quick?${q.toString()}`, { cache: "no-store" }).then((r) => quickJson<QuickBrief[]>(r));
   },
   quickRead: (id: string) => fetch(`/api/world/quick/${id}`, { cache: "no-store" }).then((r) => quickJson<QuickChat>(r)),
-  quickSend: (id: string, body: { text: string; attachments?: string[]; spoken?: boolean; answers?: string }) =>
+  quickSend: (id: string, body: { text: string; attachments?: string[]; spoken?: boolean; answers?: string; quote?: { text: string; label?: string; source?: string; context?: string } | null }) =>
     fetch(`/api/world/quick/${id}/messages`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -1631,6 +1632,13 @@ export const worldApi = {
       if (!r.ok) throw new Error(String(r.status));
     }),
   items: () => fetch("/api/world/items", { cache: "no-store" }).then((r) => json<WorldItem[]>(r)),
+  item: (id: string) => fetch(`/api/world/items/${id}`, { cache: "no-store" }).then((r) => json<WorldItem>(r)),
+  createList: (title: string, items: string[]) =>
+    fetch("/api/world/items", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title, items }),
+    }).then((r) => json<WorldItem>(r)),
   updateItem: (id: string, patch: { name?: string; data?: Record<string, unknown>; status?: string; group?: boolean }) =>
     fetch(`/api/world/items/${id}`, {
       method: "PATCH",
@@ -1638,6 +1646,7 @@ export const worldApi = {
       body: JSON.stringify(patch),
     }).then((r) => json<WorldItem>(r)),
   todos: () => fetch("/api/world/todos", { cache: "no-store" }).then((r) => json<Todo[]>(r)),
+  todo: (id: string) => fetch(`/api/world/todos/${id}`, { cache: "no-store" }).then((r) => json<Todo>(r)),
   addTodo: (body: { text: string; priority?: number; due_at?: string; nudge_at?: string; repeat_nudge?: boolean }) =>
     fetch("/api/world/todos", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }).then((r) => json<Todo>(r)),
   updateTodo: (id: string, patch: TodoPatch) =>

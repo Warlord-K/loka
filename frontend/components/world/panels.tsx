@@ -1125,6 +1125,12 @@ export function QuestBoard({
   );
   const order = useMemo(() => columns.flatMap((c) => c.items.map((t) => t.id)), [columns]);
   const q = useQuestControls({ tasks, setTasks, agents, viewer, order });
+  const acceptDrop = (e: React.DragEvent, column: string) => {
+    if (!dragging) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    if (over !== column) setOver(column);
+  };
   return (
     <div className="relative flex min-h-0 flex-1 flex-col">
       <div className="flex items-center gap-3 px-4 pt-4 sm:px-5">
@@ -1142,12 +1148,8 @@ export function QuestBoard({
             over={over === col.id}
             compact={(col.id === "cancelled" || col.id === "failed") && !col.items.length && over !== col.id}
             empty={COLUMN_EMPTY[col.id]}
-            onDragOver={(e) => {
-              if (!dragging) return;
-              e.preventDefault();
-              e.dataTransfer.dropEffect = "move";
-              if (over !== col.id) setOver(col.id);
-            }}
+            onDragEnter={(e) => acceptDrop(e, col.id)}
+            onDragOver={(e) => acceptDrop(e, col.id)}
             onDragLeave={(e) => {
               if (!e.currentTarget.contains(e.relatedTarget as Node)) setOver((o) => (o === col.id ? null : o));
             }}
@@ -1363,7 +1365,7 @@ export function describeNotification(e: WorldEvent, names: Map<string, string>):
       return `${p.overdue ? "Overdue" : "Still open"}: ${str("text")}${str("age") ? ` (${str("age")} old${str("added_by") ? `, from ${str("added_by")}` : ""})` : ""}`;
     case "agent.transferred": {
       const keys = Array.isArray(p.wanted_keys) ? (p.wanted_keys as string[]) : [];
-      return `${str("by") || "Someone"} handed ${who} over to you.${keys.length ? ` Add ${keys.join(", ")} in You > Environment.` : ""}`;
+      return `${str("by") || "Someone"} handed ${who} over to you.${keys.length ? ` Add ${keys.join(", ")} in Settings > Keys.` : ""}`;
     }
     case "attention.requested":
       return `${who} needs your decision: ${str("text")}`;

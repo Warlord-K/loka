@@ -42,6 +42,14 @@ pub fn org_visible(event_type: &str) -> bool {
         .any(|allowed| if allowed.ends_with('.') { event_type.starts_with(allowed) } else { event_type == *allowed })
 }
 
+pub fn addressed_to(event: &WorldEvent, viewer: Uuid) -> bool {
+    event
+        .payload
+        .get("audience")
+        .and_then(Value::as_array)
+        .is_some_and(|people| people.iter().any(|p| p.as_str().and_then(|id| id.parse::<Uuid>().ok()) == Some(viewer)))
+}
+
 pub fn private_from(event: &WorldEvent, viewer: Uuid, owned: &HashSet<Uuid>) -> bool {
     if let Some(outside) = crate::guests::outside_thread(event, viewer, owned) {
         return outside;
@@ -50,11 +58,7 @@ pub fn private_from(event: &WorldEvent, viewer: Uuid, owned: &HashSet<Uuid>) -> 
         return false;
     }
     let owner = event.payload.get("owner_user_id").and_then(Value::as_str).and_then(|id| id.parse::<Uuid>().ok());
-    let addressed = event
-        .payload
-        .get("audience")
-        .and_then(Value::as_array)
-        .is_some_and(|people| people.iter().any(|p| p.as_str().and_then(|id| id.parse::<Uuid>().ok()) == Some(viewer)));
+    let addressed = addressed_to(event, viewer);
     let mine = event.actor_user_id == Some(viewer) || owner == Some(viewer) || addressed || event.agent_id.is_some_and(|agent| owned.contains(&agent));
     !mine
 }

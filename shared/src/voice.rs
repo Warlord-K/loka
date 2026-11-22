@@ -32,6 +32,7 @@ pub struct CallTurn<'a> {
     pub body: &'a str,
     pub partial: bool,
     pub thread: Option<Uuid>,
+    pub session: Option<Uuid>,
 }
 
 impl WorldStore {
@@ -42,6 +43,7 @@ impl WorldStore {
              WHERE agent_id = $1 AND author_kind = $2 AND meta->>'kind' = 'voice' AND meta->>'call_id' = $3 AND meta->>'turn' = $4
                AND author_user_id IS NOT DISTINCT FROM $5
                AND meta->>'thread_user_id' IS NOT DISTINCT FROM $6
+               AND session_id IS NOT DISTINCT FROM $7
                AND created_at > NOW() - INTERVAL '1 day'
              ORDER BY created_at DESC LIMIT 1",
         )
@@ -51,6 +53,7 @@ impl WorldStore {
         .bind(t.turn)
         .bind(t.from_user)
         .bind(t.thread.map(|u| u.to_string()))
+        .bind(t.session)
         .fetch_optional(self.pool())
         .await?;
         if let Some((id, body, partial)) = found {
@@ -70,13 +73,16 @@ impl WorldStore {
         if t.partial {
             meta["partial"] = json!(true);
         }
+        if let Some(session) = t.session {
+            meta["quick"] = json!(session);
+        }
         self.insert_message(NewMessage {
             agent_id: t.agent_id,
             author_kind,
             author_user_id: t.from_user,
             author_agent_id: None,
             body: t.body,
-            session_id: None,
+            session_id: t.session,
             run_id: None,
             meta: crate::guests::in_thread(meta, t.thread),
         })
@@ -116,7 +122,7 @@ mod tests {
             .bind(owner)
             .fetch_one(&pool)
             .await?;
-        let turn = |turn: &'static str, from_user: Option<Uuid>, body: &'static str, partial: bool| CallTurn { agent_id: agent, call_id: "call-1", turn, from_user, body, partial, thread: None };
+        let turn = |turn: &'static str, from_user: Option<Uuid>, body: &'static str, partial: bool| CallTurn { agent_id: agent, call_id: "call-1", turn, from_user, body, partial, thread: None, session: None };
 
         assert!(store.save_call_turn(turn("u-1", Some(owner), "Can you check the build?", false)).await?);
         assert!(store.save_call_turn(turn("a-1", None, "Sure, I am", true)).await?);
@@ -155,6 +161,71 @@ mod tests {
 
         let page = store.list_messages_page(agent, owner, 50, None, None).await?;
         assert_eq!(page.iter().filter(|m| m.meta["kind"] == json!("voice")).count(), 2, "the owner's chat shows both sides of the call");
+
+        sqlx::query("DELETE FROM agent_profiles WHERE id = $1").bind(agent).execute(&pool).await?;
+        sqlx::query("DELETE FROM users WHERE id = ANY($1)").bind(vec![owner, other]).execute(&pool).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_quick_chat_call_stays_in_that_chat_and_only_its_owner_reaches_it() -> Result<()> {
+        let Ok(url) = std::env::var("VOICE_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new().max_connections(2).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email, name, world_role) VALUES ($1, 'Sam', 'write') RETURNING id")
+            .bind(format!("qcall-{tag}@test.dev"))
+            .fetch_one(&pool)
+            .await?;
+        let other: Uuid = sqlx::query_scalar("INSERT INTO users (email, name, world_role) VALUES ($1, 'Eve', 'write') RETURNING id")
+            .bind(format!("qcall-other-{tag}@test.dev"))
+            .fetch_one(&pool)
+            .await?;
+        crate::orgs::join_default_for_tests(&pool, owner, None).await?;
+        crate::orgs::join_default_for_tests(&pool, other, None).await?;
+        let agent: Uuid = sqlx::query_scalar("INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id) VALUES ($1, 'Callie', 'claude', 'haiku', $2) RETURNING id")
+            .bind(format!("qcallie-{tag}"))
+            .bind(owner)
+            .fetch_one(&pool)
+            .await?;
+        sqlx::query("INSERT INTO agent_sessions (agent_id, role, backend, model, cli_session_id, status) VALUES ($1, 'main', 'claude', 'haiku', 'main-cli', 'active')")
+            .bind(agent)
+            .execute(&pool)
+            .await?;
+        let org: Uuid = sqlx::query_scalar("SELECT org_id FROM agent_profiles WHERE id = $1").bind(agent).fetch_one(&pool).await?;
+        let choice = crate::world::AsideChoice::default();
+        let session = store
+            .open_quick(crate::quick::Opening { agent_id: agent, user_id: owner, asker: "Sam", text: "Plan my week", choice: &choice, thread_root: None })
+            .await?;
+
+        let turn = |session: Option<Uuid>, turn: &'static str, from_user: Option<Uuid>, body: &'static str| CallTurn {
+            agent_id: agent,
+            call_id: "call-q",
+            turn,
+            from_user,
+            body,
+            partial: false,
+            thread: Some(owner),
+            session,
+        };
+        assert!(store.save_call_turn(turn(Some(session.id), "u-1", Some(owner), "What is on Monday?")).await?);
+        assert!(store.save_call_turn(turn(Some(session.id), "a-1", None, "Standup at ten.")).await?);
+        assert!(!store.save_call_turn(turn(Some(session.id), "a-1", None, "Standup at ten.")).await?, "an unchanged turn is not written again");
+        assert!(store.save_call_turn(turn(None, "a-1", None, "Main chat line with the same keys")).await?, "the main chat is a different place");
+
+        let quick = store.quick_messages(session.id, 50).await?;
+        let bodies: Vec<&str> = quick.iter().map(|m| m.body.as_str()).collect();
+        assert_eq!(bodies, vec!["What is on Monday?", "Standup at ten."], "both sides of the call are in the quick chat");
+        assert!(quick.iter().all(|m| m.session_id == Some(session.id) && m.meta["quick"] == json!(session.id) && m.meta["kind"] == json!("voice")));
+
+        let main = store.list_messages_page(agent, owner, 50, None, None).await?;
+        let main_bodies: Vec<&str> = main.iter().map(|m| m.body.as_str()).collect();
+        assert_eq!(main_bodies, vec!["Main chat line with the same keys"], "the quick call never shows in the main chat");
+
+        assert!(store.quick_session_for(owner, org, session.id).await?.is_some());
+        assert!(store.quick_session_for(other, org, session.id).await?.is_none(), "another person cannot reach the owner's quick chat");
 
         sqlx::query("DELETE FROM agent_profiles WHERE id = $1").bind(agent).execute(&pool).await?;
         sqlx::query("DELETE FROM users WHERE id = ANY($1)").bind(vec![owner, other]).execute(&pool).await?;

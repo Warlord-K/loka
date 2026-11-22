@@ -1,7 +1,7 @@
 "use client";
 
 import { bindTerminalKeys } from "@/lib/terminal-keys";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type MutableRefObject } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
@@ -10,8 +10,14 @@ import { CaretDown, Plus, SquareSplitHorizontal, TerminalWindow, Trash } from "@
 import { cn } from "@/lib/utils";
 import { PIXEL } from "../styles";
 import { wb, type WbTerm } from "./bridge";
+import { QuoteButton, type MessageQuote } from "../quote";
+import { TERMINAL_THEME, readTerminal, selectionSpot, typeCommand } from "../terminal-surface";
+import type { TerminalReader } from "../terminal";
+
+const PLACE = "the Workshop terminal";
 
 interface Live {
+  since: number;
   info: WbTerm;
   term: Terminal;
   fit: FitAddon;
@@ -20,31 +26,23 @@ interface Live {
   exited: boolean;
 }
 
-const THEME = {
-  background: "#120c15",
-  foreground: "#e9dcc6",
-  cursor: "#e8b64a",
-  cursorAccent: "#120c15",
-  selectionBackground: "#3d2f4a",
-  black: "#1d1422",
-  red: "#e07a5f",
-  green: "#7be06b",
-  yellow: "#e8b64a",
-  blue: "#6bc7e8",
-  magenta: "#c39bff",
-  cyan: "#19b8b8",
-  white: "#e9dcc6",
-  brightBlack: "#5f4f60",
-  brightRed: "#ff8fa8",
-  brightGreen: "#9bf08b",
-  brightYellow: "#f2c66a",
-  brightBlue: "#9fdcff",
-  brightMagenta: "#d9bfff",
-  brightCyan: "#6be0e0",
-  brightWhite: "#fff8ea",
-};
-
-export function TerminalPane({ sessionKey, onHide, onError }: { sessionKey: string; onHide: () => void; onError: (message: string) => void }) {
+export function TerminalPane({
+  sessionKey,
+  onHide,
+  onError,
+  readerRef,
+  request = null,
+  onRequestTaken,
+  onQuote,
+}: {
+  sessionKey: string;
+  onHide: () => void;
+  onError: (message: string) => void;
+  readerRef?: MutableRefObject<TerminalReader | null>;
+  request?: { id: number; command: string } | null;
+  onRequestTaken?: (id: number) => void;
+  onQuote?: (quote: MessageQuote) => void;
+}) {
   const live = useRef(new Map<string, Live>());
   const [list, setList] = useState<WbTerm[]>([]);
   const [active, setActive] = useState<string | null>(null);
@@ -53,6 +51,10 @@ export function TerminalPane({ sessionKey, onHide, onError }: { sessionKey: stri
   const slotA = useRef<HTMLDivElement>(null);
   const slotB = useRef<HTMLDivElement>(null);
   const wantFocus = useRef(false);
+  const activeRef = useRef<string | null>(null);
+  activeRef.current = active;
+  const [quoteSpot, setQuoteSpot] = useState<{ x: number; y: number } | null>(null);
+  const handled = useRef<number | null>(null);
   const pick = (id: string) => {
     wantFocus.current = true;
     setActive(id);
@@ -69,7 +71,7 @@ export function TerminalPane({ sessionKey, onHide, onError }: { sessionKey: stri
         cursorBlink: true,
         scrollback: 8000,
         allowProposedApi: true,
-        theme: THEME,
+        theme: TERMINAL_THEME,
         macOptionIsMeta: true,
       });
       const fit = new FitAddon();
@@ -96,6 +98,8 @@ export function TerminalPane({ sessionKey, onHide, onError }: { sessionKey: stri
           } else {
             term.write("\r\n\x1b[2m[process exited]\x1b[0m\r\n");
             const known = id;
+            const item = known ? live.current.get(known) : undefined;
+            if (item) item.exited = true;
             if (known) setExited((prev) => new Set(prev).add(known));
           }
         });
@@ -111,7 +115,14 @@ export function TerminalPane({ sessionKey, onHide, onError }: { sessionKey: stri
           }
         });
         observer.observe(host);
-        live.current.set(id, { info, term, fit, host, observer, exited: info.exited });
+        term.onSelectionChange(() => {
+          if (activeRef.current !== id) return;
+          setQuoteSpot(term.hasSelection() && term.getSelection().trim() ? selectionSpot(term, host.querySelector(".xterm-screen")) : null);
+        });
+        term.onScroll(() => {
+          if (activeRef.current === id) setQuoteSpot(null);
+        });
+        live.current.set(id, { since: Date.now(), info, term, fit, host, observer, exited: info.exited });
         if (info.exited) setExited((prev) => new Set(prev).add(id));
         parking.remove();
         return info;
@@ -198,6 +209,47 @@ export function TerminalPane({ sessionKey, onHide, onError }: { sessionKey: stri
     }
   }, [active, second, list]);
 
+  useEffect(() => {
+    setQuoteSpot(null);
+  }, [active]);
+
+  useEffect(() => {
+    if (!readerRef) return;
+    readerRef.current = () => {
+      const item = activeRef.current ? live.current.get(activeRef.current) : undefined;
+      return item ? readTerminal(item.term, false, PLACE) : null;
+    };
+    return () => {
+      readerRef.current = null;
+    };
+  }, [readerRef]);
+
+  useEffect(() => {
+    if (!request || handled.current === request.id || !active) return;
+    const item = live.current.get(active);
+    if (!item) return;
+    handled.current = request.id;
+    onRequestTaken?.(request.id);
+    const id = active;
+    void typeCommand(item.term, (data) => void wb.termWrite(id, data).catch(() => {}), request.command, {
+      liveSince: item.since,
+      alive: () => live.current.get(id) === item && !item.exited,
+    }).then((result) => {
+      if (result === "copied") onError("This shell does not take pasted lines, so the command was copied instead. Paste it at the prompt.");
+      else if (result === "not_copied") onError("This shell does not take pasted lines. Copy the command from the chat and paste it at the prompt.");
+    });
+  }, [request, active, list, onError, onRequestTaken]);
+
+  const quoteSelection = () => {
+    const item = active ? live.current.get(active) : undefined;
+    setQuoteSpot(null);
+    if (!item || !onQuote) return;
+    const quote = readTerminal(item.term, true, PLACE);
+    if (!quote) return;
+    item.term.clearSelection();
+    onQuote(quote);
+  };
+
   const close = async (id: string) => {
     await wb.termClose(id).catch(() => {});
     const item = live.current.get(id);
@@ -245,6 +297,7 @@ export function TerminalPane({ sessionKey, onHide, onError }: { sessionKey: stri
       <div className="flex min-h-0 flex-1">
         <div className="flex min-w-0 flex-1">
           <div ref={slotA} className="min-w-0 flex-1 px-1.5 pt-1" />
+          <QuoteButton spot={onQuote ? quoteSpot : null} onQuote={quoteSelection} />
           <div ref={slotB} className={cn("min-w-0 flex-1 border-l border-[#3a2a3d] px-1.5 pt-1", !(second && second !== active) && "hidden")} />
         </div>
         <ul className="w-36 shrink-0 overflow-y-auto border-l border-[#3a2a3d] bg-[#17101b] py-1 text-w-xs">

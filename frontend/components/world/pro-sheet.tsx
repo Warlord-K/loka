@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect } from "react";
-import { ArrowSquareOut, Sparkle } from "@phosphor-icons/react";
+import { ArrowSquareOut, Crown } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
 import { WindowHeader } from "./settings-shell";
 import { BTN_PRIMARY, MODAL } from "./styles";
@@ -23,7 +23,7 @@ export function ProSheet({ onClose }: { onClose: () => void }) {
   }, [onClose]);
   return (
     <div role="dialog" aria-modal="true" aria-label="Loka Pro" className={cn(MODAL, "w-full max-w-md")}>
-      <WindowHeader title="Loka Pro" subtitle="Coming soon" icon={Sparkle} onClose={onClose} />
+      <WindowHeader title="Loka Pro" subtitle="Coming soon" icon={Crown} onClose={onClose} />
       <div className="space-y-4 px-4 py-4 sm:px-5">
         <p className="text-w-base leading-relaxed text-w-text">
           Loka Pro, coming soon. {PRO_PITCH}

@@ -522,6 +522,7 @@ pub fn urgent_inbox_sql(alias: &str) -> String {
 pub enum TaskResume {
     Fresh,
     Busy(Uuid),
+    AwaitingPlan(Uuid),
     Resumed { session_id: Uuid, run_id: Uuid },
 }
 
@@ -606,6 +607,30 @@ impl From<sqlx::Error> for RetryRunError {
 impl From<anyhow::Error> for RetryRunError {
     fn from(error: anyhow::Error) -> Self {
         Self::Internal(error)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ReplayGap {
+    pub head: i64,
+    pub missed: i64,
+}
+
+pub const REPLAY_MAX_EVENTS: i64 = 2000;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Resume {
+    Replay(i64),
+    Resync(i64),
+}
+
+impl ReplayGap {
+    pub fn resume_from(&self, after_seq: i64) -> Resume {
+        if after_seq < 0 || after_seq > self.head || self.missed > REPLAY_MAX_EVENTS {
+            Resume::Resync(self.head)
+        } else {
+            Resume::Replay(after_seq)
+        }
     }
 }
 
@@ -2693,6 +2718,34 @@ impl WorldStore {
         if current.2 == "archived" {
             anyhow::bail!("archived sessions cannot receive follow-ups");
         }
+        let publishing = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+               SELECT 1 FROM session_runs
+               WHERE kind = 'publish' AND status IN ('queued', 'running')
+                 AND (session_id = $1 OR task_id = $2)
+             )",
+        )
+        .bind(session.id)
+        .bind(current.3)
+        .fetch_one(&mut *tx)
+        .await?;
+        if publishing {
+            anyhow::bail!("that quest's work is being published; wait for the publish to finish, then message it again");
+        }
+        let waiting_on_siblings = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+               SELECT 1 FROM agent_sessions s
+               JOIN agent_sessions o ON o.task_id = s.task_id AND o.id <> s.id
+                 AND o.attempt IS NOT NULL AND o.attempt_state = 'running'
+               WHERE s.id = $1 AND s.attempt_state = 'finished'
+             )",
+        )
+        .bind(session.id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if waiting_on_siblings {
+            anyhow::bail!("that attempt already finished and the other attempts are still running; wait for the best one to be picked, then message it again");
+        }
         let running = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (
                SELECT 1 FROM session_runs
@@ -2712,24 +2765,62 @@ impl WorldStore {
             .await?,
             None => false,
         };
+        let review_active = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+               SELECT 1 FROM session_runs r
+               WHERE r.kind = 'review' AND r.status IN ('queued', 'running')
+                 AND (r.task_id = $2 OR r.session_id IN (SELECT id FROM agent_sessions WHERE parent_session_id = $1))
+             )",
+        )
+        .bind(session.id)
+        .bind(current.3)
+        .fetch_one(&mut *tx)
+        .await?;
         let ready = if current.0 == "review" {
             (current.4 == Some(true) || task_finished) && (running || current.1.is_some())
         } else {
-            running || current.1.is_some() && (current.2 == "active" || task_finished)
+            running || current.1.is_some() && (current.2 == "active" || task_finished || !review_active)
         };
         if !ready {
             if current.1.is_some() || current.0 == "review" && running {
-                anyhow::bail!("that session is being reviewed; wait for the review to finish");
+                anyhow::bail!("that session is being reviewed; wait for the review to finish or stop the review run, then message it again");
             }
             anyhow::bail!("that session has not started yet");
         }
-        let replan = sqlx::query("UPDATE agent_sessions SET plan_state = 'planning' WHERE id = $1 AND plan_state = 'awaiting'")
-            .bind(session.id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected()
-            > 0;
-        let ask = if replan { crate::quests::PLAN_AGAIN } else { FOLLOWUP_ASK };
+        let (plan_state, plan_first) = sqlx::query_as::<_, (Option<String>, bool)>(
+            "SELECT s.plan_state, COALESCE(t.plan_first, FALSE)
+             FROM agent_sessions s LEFT JOIN agent_tasks t ON t.id = s.task_id WHERE s.id = $1",
+        )
+        .bind(session.id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let plan_run_active = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM session_runs WHERE session_id = $1 AND kind IN ('task', 'followup') AND status IN ('queued', 'running'))",
+        )
+        .bind(session.id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let plan_skipped = !plan_first && !plan_run_active && matches!(plan_state.as_deref(), Some("awaiting" | "planning"));
+        let replan = !plan_skipped
+            && sqlx::query("UPDATE agent_sessions SET plan_state = 'planning' WHERE id = $1 AND plan_state = 'awaiting'")
+                .bind(session.id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected()
+                > 0;
+        if plan_skipped {
+            sqlx::query("UPDATE agent_sessions SET plan_state = 'approved' WHERE id = $1")
+                .bind(session.id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let ask = if plan_skipped {
+            crate::quests::PLAN_SKIPPED
+        } else if replan {
+            crate::quests::PLAN_AGAIN
+        } else {
+            FOLLOWUP_ASK
+        };
         let prompt = format!("[follow-up from {from}]\n{text}\n\n{ask}");
         let run = sqlx::query_as::<_, SessionRun>(
             "INSERT INTO session_runs
@@ -2747,6 +2838,12 @@ impl WorldStore {
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
+        if plan_skipped {
+            self.announce_plan_skipped(session.agent_id, session.id, run.id, session.task_id).await?;
+        } else if replan {
+            self.settle_plan_cards(session.agent_id, session.id, crate::quests::PLAN_REVISING_NOTE).await?;
+            self.clear_plan_waiting(session.agent_id).await?;
+        }
         Ok(run)
     }
 
@@ -3111,19 +3208,31 @@ impl WorldStore {
         if let Some(session_id) = busy {
             return Ok(TaskResume::Busy(session_id));
         }
-        let session = sqlx::query_scalar::<_, Uuid>(
-            "SELECT id FROM agent_sessions
-             WHERE agent_id = $1 AND task_id = $2 AND role = 'task' AND status <> 'archived'
-               AND cli_session_id IS NOT NULL
-             ORDER BY created_at DESC LIMIT 1 FOR UPDATE",
+        let session = sqlx::query_as::<_, (Uuid, Option<String>, bool)>(
+            "SELECT s.id, s.plan_state, COALESCE(t.plan_first, FALSE)
+             FROM agent_sessions s JOIN agent_tasks t ON t.id = s.task_id
+             WHERE s.agent_id = $1 AND s.task_id = $2 AND s.role = 'task' AND s.status <> 'archived'
+               AND s.cli_session_id IS NOT NULL
+             ORDER BY s.created_at DESC LIMIT 1 FOR UPDATE OF s",
         )
         .bind(agent_id)
         .bind(task_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some(session_id) = session else {
+        let Some((session_id, plan_state, plan_first)) = session else {
             return Ok(TaskResume::Fresh);
         };
+        if plan_first && plan_state.as_deref() == Some("awaiting") {
+            return Ok(TaskResume::AwaitingPlan(session_id));
+        }
+        let plan_skipped = !plan_first && matches!(plan_state.as_deref(), Some("awaiting" | "planning"));
+        if plan_skipped {
+            sqlx::query("UPDATE agent_sessions SET plan_state = 'approved' WHERE id = $1")
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let prompt = if plan_skipped { format!("{}\n\n{prompt}", crate::quests::PLAN_SKIPPED) } else { prompt.to_string() };
         sqlx::query("UPDATE agent_sessions SET status = 'active', review_rounds = 0, updated_at = NOW() WHERE id = $1")
             .bind(session_id)
             .execute(&mut *tx)
@@ -3140,6 +3249,9 @@ impl WorldStore {
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
+        if plan_skipped {
+            self.announce_plan_skipped(agent_id, session_id, run_id, Some(task_id)).await?;
+        }
         Ok(TaskResume::Resumed { session_id, run_id })
     }
 
@@ -3306,6 +3418,175 @@ impl WorldStore {
         }
         tx.commit().await?;
         Ok(stopped)
+    }
+
+    pub async fn settle_merged_quests(&self) -> Result<Vec<Uuid>> {
+        Ok(sqlx::query_scalar::<_, Uuid>(
+            "WITH moved AS (
+               UPDATE agent_tasks t SET status = 'done'
+               WHERE t.pr_url IS NOT NULL AND t.status IN ('review', 'in_progress')
+                 AND EXISTS (SELECT 1 FROM task_milestones m WHERE m.task_id = t.id AND m.kind = 'merge' AND m.status = 'done')
+                 AND NOT EXISTS (
+                   SELECT 1 FROM session_runs o
+                   WHERE o.kind IN ('task', 'followup', 'review', 'publish') AND o.status IN ('queued', 'running')
+                     AND (o.task_id = t.id OR o.session_id IN (SELECT id FROM agent_sessions WHERE task_id = t.id))
+                 )
+               RETURNING t.id
+             ), closed AS (
+               UPDATE task_milestones SET status = 'done', done_at = NOW(), next_check_at = NULL, updated_at = NOW()
+               WHERE task_id IN (SELECT id FROM moved) AND kind = 'work' AND status IN ('pending', 'active')
+             )
+             SELECT id FROM moved",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn settle_cancelled_reviews(&self) -> Result<Vec<Uuid>> {
+        let stuck = sqlx::query_as::<_, (Uuid, Uuid, Uuid, Uuid, Uuid, Option<String>)>(
+            "SELECT DISTINCT ON (t.id) t.id, r.agent_id, r.id, s.id, p.id, r.error
+             FROM session_runs r
+             JOIN agent_sessions s ON s.id = r.session_id AND s.role = 'review'
+             JOIN agent_sessions p ON p.id = s.parent_session_id AND p.status <> 'archived'
+             JOIN agent_tasks t ON t.id = p.task_id AND t.status = 'in_progress'
+             WHERE r.kind = 'review' AND r.status = 'cancelled'
+               AND s.asked_by->>'manual' IS DISTINCT FROM 'true'
+               AND s.asked_by->'compare' IS NULL
+               AND NOT EXISTS (SELECT 1 FROM task_milestones m WHERE m.task_id = t.id AND m.kind = 'merge' AND m.status = 'done')
+               AND NOT EXISTS (
+                 SELECT 1 FROM session_runs o
+                 WHERE o.kind IN ('task', 'followup', 'review', 'publish')
+                   AND (o.task_id = t.id OR o.session_id IN (SELECT id FROM agent_sessions WHERE task_id = t.id))
+                   AND (o.status IN ('queued', 'running') OR o.created_at > r.created_at)
+               )
+             ORDER BY t.id, r.created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut settled = Vec::with_capacity(stuck.len());
+        for (task_id, agent_id, run_id, session_id, task_session_id, error) in stuck {
+            let mut tx = self.pool.begin().await?;
+            let moved = sqlx::query("UPDATE agent_tasks SET status = 'review' WHERE id = $1 AND status = 'in_progress'")
+                .bind(task_id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected()
+                > 0;
+            if !moved {
+                continue;
+            }
+            let summary = error.unwrap_or_else(|| "The review run was cancelled".to_string());
+            emit_in(
+                &mut tx,
+                &NewEvent::new("review.finished")
+                    .agent(agent_id)
+                    .session(session_id)
+                    .run(run_id)
+                    .task(Some(task_id))
+                    .payload(serde_json::json!({
+                        "task_id": task_id,
+                        "task_session_id": task_session_id,
+                        "cancelled": true,
+                        "review": { "verdict": "review cancelled", "summary": summary },
+                    })),
+                Some((agent_id, "review.finished")),
+            )
+            .await?;
+            tx.commit().await?;
+            settled.push(task_id);
+        }
+        Ok(settled)
+    }
+
+    pub async fn quest_merged_pr(&self, task_id: Uuid) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT t.pr_url FROM agent_tasks t
+             WHERE t.id = $1 AND t.pr_url IS NOT NULL AND t.status <> 'cancelled'
+               AND (t.status = 'done' OR EXISTS (
+                 SELECT 1 FROM task_milestones m WHERE m.task_id = t.id AND m.kind = 'merge' AND m.status = 'done'))",
+        )
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    pub async fn settle_cancelled_work(&self) -> Result<Vec<Uuid>> {
+        let stuck = sqlx::query_as::<_, (Uuid, Uuid, Uuid, Uuid, String, bool, Option<String>)>(
+            "SELECT t.id, r.agent_id, r.id, r.session_id, r.kind, r.started_at IS NOT NULL, r.error
+             FROM (
+               SELECT DISTINCT ON (t.id) t.id, t.assigned_agent_id, r.id AS run_id
+               FROM agent_tasks t
+               JOIN session_runs r ON r.kind IN ('task', 'followup', 'review', 'publish')
+                 AND (r.task_id = t.id OR r.session_id IN (SELECT id FROM agent_sessions WHERE task_id = t.id))
+               WHERE t.status = 'in_progress'
+               ORDER BY t.id, r.created_at DESC
+             ) t
+             JOIN session_runs r ON r.id = t.run_id AND r.status = 'cancelled' AND r.agent_id = t.assigned_agent_id
+             JOIN agent_sessions s ON s.id = r.session_id AND s.status <> 'archived'
+             WHERE NOT (r.kind = 'review' AND s.asked_by->'compare' IS NULL)
+               AND NOT EXISTS (
+                 SELECT 1 FROM session_runs o
+                 WHERE o.kind IN ('task', 'followup', 'review', 'publish') AND o.status IN ('queued', 'running')
+                   AND (o.task_id = t.id OR o.session_id IN (SELECT id FROM agent_sessions WHERE task_id = t.id))
+               )",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut settled = Vec::with_capacity(stuck.len());
+        for (task_id, agent_id, run_id, session_id, kind, started, why) in stuck {
+            let mut tx = self.pool.begin().await?;
+            let locked = sqlx::query_scalar::<_, Uuid>("SELECT id FROM agent_tasks WHERE id = $1 AND status = 'in_progress' FOR UPDATE")
+                .bind(task_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+            if locked.is_none() {
+                continue;
+            }
+            let superseded = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (
+                   SELECT 1 FROM session_runs o, session_runs r
+                   WHERE r.id = $2 AND o.kind IN ('task', 'followup', 'review', 'publish')
+                     AND (o.task_id = $1 OR o.session_id IN (SELECT id FROM agent_sessions WHERE task_id = $1))
+                     AND (o.status IN ('queued', 'running') OR o.created_at > r.created_at)
+                 )",
+            )
+            .bind(task_id)
+            .bind(run_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if superseded {
+                continue;
+            }
+            let reason = match why.as_deref().map(str::trim).filter(|why| !why.is_empty()) {
+                Some(why) => format!("It was cancelled: {why}"),
+                None => "It was cancelled before it finished".to_string(),
+            };
+            let error = format!("The {kind} run was cancelled, so the quest stopped. {reason}");
+            sqlx::query("UPDATE agent_tasks SET status = 'failed', error_message = $2 WHERE id = $1")
+                .bind(task_id)
+                .bind(&error)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE session_runs SET cause = COALESCE(cause, 'cancelled') WHERE id = $1")
+                .bind(run_id)
+                .execute(&mut *tx)
+                .await?;
+            let mut payload = crate::cli_errors::failure_payload(Some(task_id), &error, session_id, &kind);
+            if let Some(fields) = payload.as_object_mut() {
+                fields.insert("cause".into(), json!("cancelled"));
+                fields.insert("stage".into(), json!(if started { "run" } else { "queue" }));
+                fields.insert("reason".into(), json!(reason));
+            }
+            emit_in(
+                &mut tx,
+                &NewEvent::new("run.failed").agent(agent_id).session(session_id).run(run_id).task(Some(task_id)).payload(payload),
+                Some((agent_id, "run.failed")),
+            )
+            .await?;
+            tx.commit().await?;
+            settled.push(task_id);
+        }
+        Ok(settled)
     }
 
     pub async fn find_tasks_by_prefix(&self, prefix: &str) -> Result<Vec<TaskRef>> {
@@ -4102,7 +4383,7 @@ impl WorldStore {
             return Ok(false);
         }
         let text = format!(
-            "Its model key was rejected ({key}), so it is paused with its schedules and heartbeat instead of retrying. Update or re-equip the key in You > Environment and it resumes on its own, or resume it by hand once the CLI login on its device is fixed."
+            "Its model key was rejected ({key}), so it is paused with its schedules and heartbeat instead of retrying. Update or re-equip the key in Settings > Keys and it resumes on its own, or resume it by hand once the CLI login on its device is fixed."
         );
         self.emit(
             NewEvent::new("agent.paused").agent(agent.id).payload(serde_json::json!({ "name": agent.name, "reason": reason })),
@@ -4918,6 +5199,14 @@ impl WorldStore {
             .await?)
     }
 
+    pub async fn upload_infos(&self, ids: &[Uuid]) -> Result<Vec<(Uuid, String, i32)>> {
+        Ok(sqlx::query_as::<_, (Uuid, String, i32)>("SELECT id, mime, size FROM world_uploads WHERE id = ANY($1)").bind(ids).fetch_all(&self.pool).await?)
+    }
+
+    pub async fn upload_name(&self, id: Uuid) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>("SELECT name FROM world_uploads WHERE id = $1").bind(id).fetch_optional(&self.pool).await?)
+    }
+
     pub async fn own_uploads(&self, ids: &[Uuid], user: Uuid, org: Option<Uuid>) -> Result<Vec<Upload>> {
         Ok(sqlx::query_as::<_, Upload>(
             "SELECT id, mime, name, size FROM world_uploads
@@ -5366,6 +5655,19 @@ impl WorldStore {
         .bind(org)
         .fetch_all(&self.pool)
         .await?)
+    }
+
+    pub async fn replay_gap(&self, org: Uuid, after_seq: i64, cap: i64) -> Result<ReplayGap> {
+        let (head, missed): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COALESCE(MAX(seq), 0) FROM world_events WHERE org_id = $2),
+                    (SELECT COUNT(*) FROM (SELECT 1 FROM world_events WHERE seq > $1 AND org_id = $2 LIMIT $3) gap)",
+        )
+        .bind(after_seq)
+        .bind(org)
+        .bind(cap + 1)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(ReplayGap { head, missed })
     }
 
     pub async fn recent_events(&self, agent_id: Option<Uuid>, limit: i64) -> Result<Vec<WorldEvent>> {
@@ -5915,7 +6217,7 @@ mod tests {
 
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
-    use super::{parse_skill_markdown, raw_skill_url, resume_prompt, AgentUpdate, RetryRunError, TaskResume, WorldStore, VERDICT_NUDGE};
+    use super::{parse_skill_markdown, raw_skill_url, resume_prompt, AgentUpdate, ReplayGap, Resume, RetryRunError, TaskResume, WorldStore, REPLAY_MAX_EVENTS, VERDICT_NUDGE};
     use chrono::{DateTime, Utc};
     use serde_json::Value;
     use uuid::Uuid;
@@ -7735,6 +8037,60 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn a_reconnect_replays_a_small_gap_and_resyncs_a_stale_one() {
+        let gap = |head, missed| ReplayGap { head, missed };
+        assert_eq!(gap(100, 3).resume_from(97), Resume::Replay(97));
+        assert_eq!(gap(100, 0).resume_from(100), Resume::Replay(100));
+        assert_eq!(gap(100, REPLAY_MAX_EVENTS).resume_from(1), Resume::Replay(1));
+        assert_eq!(gap(100_000, REPLAY_MAX_EVENTS + 1).resume_from(1), Resume::Resync(100_000));
+        assert_eq!(gap(100, 0).resume_from(500), Resume::Resync(100), "an id from the future means the log was reset");
+        assert_eq!(gap(100, 0).resume_from(-1), Resume::Resync(100));
+    }
+
+    #[tokio::test]
+    async fn replay_gap_counts_only_the_orgs_own_missed_events() -> anyhow::Result<()> {
+        let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let _db = steer_db().read().await;
+        let pool = PgPoolOptions::new().max_connections(2).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let mut orgs = Vec::new();
+        for name in ["a", "b"] {
+            orgs.push(
+                sqlx::query_scalar::<_, Uuid>("INSERT INTO orgs (slug, name) VALUES ($1, 'Replay') RETURNING id")
+                    .bind(format!("replay-{name}-{}", &tag[..16]))
+                    .fetch_one(&pool)
+                    .await?,
+            );
+        }
+        let mut seqs = Vec::new();
+        for (i, org) in [orgs[0], orgs[1], orgs[0], orgs[0]].into_iter().enumerate() {
+            seqs.push(
+                sqlx::query_scalar::<_, i64>("INSERT INTO world_events (type, payload, org_id) VALUES ('test.replay', $1, $2) RETURNING seq")
+                    .bind(serde_json::json!({ "i": i }))
+                    .bind(org)
+                    .fetch_one(&pool)
+                    .await?,
+            );
+        }
+        let gap = store.replay_gap(orgs[0], seqs[0], 10).await?;
+        assert_eq!(gap.missed, 2);
+        assert_eq!(gap.head, seqs[3]);
+        assert_eq!(store.replay_gap(orgs[1], 0, 10).await?.head, seqs[1], "the head never reaches past the org's own events");
+        assert_eq!(gap.resume_from(seqs[0]), Resume::Replay(seqs[0]));
+        let events = store.events_since_in(orgs[0], seqs[0], 10).await?;
+        assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![seqs[2], seqs[3]], "replay never includes another org's events");
+        assert_eq!(store.replay_gap(orgs[0], seqs[0], 1).await?.missed, 2, "the count stops one past the cap");
+        assert_eq!(store.replay_gap(orgs[0], seqs[0], 1).await?.resume_from(seqs[0]), Resume::Replay(seqs[0]));
+        assert_eq!(store.replay_gap(orgs[0], gap.head + 1000, 10).await?.resume_from(gap.head + 1000), Resume::Resync(gap.head));
+        sqlx::query("DELETE FROM world_events WHERE seq = ANY($1)").bind(&seqs).execute(&pool).await?;
+        sqlx::query("DELETE FROM orgs WHERE id = ANY($1)").bind(&orgs).execute(&pool).await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn budgets_count_live_spend_and_stop_running_work() -> anyhow::Result<()> {
         let Ok(url) = std::env::var("LIMITS_TEST_DATABASE_URL") else {
@@ -8309,6 +8665,475 @@ mod tests {
         assert_eq!(queued["body"], "fixed");
         sqlx::query("UPDATE agent_inbox SET status = 'processing' WHERE agent_id = $1").bind(agent).execute(&pool).await?;
         assert!(store.replace_pending_message(agent, message, user, "again", &meta, &payload).await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn followups_are_refused_only_while_a_review_is_really_running() -> anyhow::Result<()> {
+        let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let _db = steer_db().read().await;
+        let pool = PgPoolOptions::new().max_connections(2).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let user: Uuid = sqlx::query_scalar("INSERT INTO users (email, name, world_role) VALUES ($1, 'Ana', 'write') RETURNING id")
+            .bind(format!("ana-{tag}@test.dev"))
+            .fetch_one(&pool)
+            .await?;
+        let agent: Uuid = sqlx::query_scalar("INSERT INTO agent_profiles (slug, name, cli, model) VALUES ($1, 'Rev', 'codex', 'gpt') RETURNING id")
+            .bind(format!("rev-{tag}"))
+            .fetch_one(&pool)
+            .await?;
+        for (review_status, refused) in [
+            ("queued", true),
+            ("running", true),
+            ("completed", false),
+            ("failed", false),
+            ("timed_out", false),
+            ("cancelled", false),
+        ] {
+            let task: Uuid = sqlx::query_scalar(
+                "INSERT INTO agent_tasks (user_id, title, status, assigned_agent_id) VALUES ($1, 'fix bmc', 'in_progress', $2) RETURNING id",
+            )
+            .bind(user)
+            .bind(agent)
+            .fetch_one(&pool)
+            .await?;
+            let parent = Uuid::new_v4();
+            insert_session(&pool, parent, agent, "task", "completed", Some(task), None, Some("cli-task"), None, None).await?;
+            let review = Uuid::new_v4();
+            insert_session(&pool, review, agent, "review", "active", Some(task), Some(parent), Some("cli-review"), None, None).await?;
+            insert_run(&pool, review, agent, Some(task), "review", review_status, None).await?;
+            let session = store.get_session(parent).await?.expect("task session");
+            let sent = store.start_followup(&session, "one more thing", "Ana", false).await;
+            if refused {
+                let error = sent.expect_err(review_status).to_string();
+                assert!(error.contains("being reviewed") && error.contains("stop the review run"), "{review_status}: {error}");
+            } else {
+                let run = sent.map_err(|e| anyhow::anyhow!("{review_status}: {e}"))?;
+                assert_eq!(run.kind, "followup", "{review_status}");
+                assert_eq!(run.status, "queued", "{review_status}");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn followups_wait_for_a_publish_and_for_racing_attempts() -> anyhow::Result<()> {
+        let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let _db = steer_db().read().await;
+        let pool = PgPoolOptions::new().max_connections(2).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let user: Uuid = sqlx::query_scalar("INSERT INTO users (email, name, world_role) VALUES ($1, 'Ana', 'write') RETURNING id")
+            .bind(format!("ana-{tag}@test.dev"))
+            .fetch_one(&pool)
+            .await?;
+        let agent: Uuid = sqlx::query_scalar("INSERT INTO agent_profiles (slug, name, cli, model) VALUES ($1, 'Pub', 'codex', 'gpt') RETURNING id")
+            .bind(format!("pub-{tag}"))
+            .fetch_one(&pool)
+            .await?;
+        for (publish_status, refused) in [("queued", true), ("running", true), ("completed", false), ("failed", false)] {
+            let task: Uuid = sqlx::query_scalar(
+                "INSERT INTO agent_tasks (user_id, title, status, assigned_agent_id) VALUES ($1, 'ship it', 'in_progress', $2) RETURNING id",
+            )
+            .bind(user)
+            .bind(agent)
+            .fetch_one(&pool)
+            .await?;
+            let parent = Uuid::new_v4();
+            insert_session(&pool, parent, agent, "task", "active", Some(task), None, Some("cli-task"), None, None).await?;
+            insert_run(&pool, parent, agent, Some(task), "publish", publish_status, None).await?;
+            let session = store.get_session(parent).await?.expect("task session");
+            let sent = store.start_followup(&session, "one more thing", "Ana", false).await;
+            if refused {
+                let error = sent.expect_err(publish_status).to_string();
+                assert!(error.contains("being published"), "{publish_status}: {error}");
+            } else {
+                sent.map_err(|e| anyhow::anyhow!("{publish_status}: {e}"))?;
+            }
+        }
+        for (sibling_state, refused) in [("running", true), ("won", false), ("lost", false), ("failed", false)] {
+            let task: Uuid = sqlx::query_scalar(
+                "INSERT INTO agent_tasks (user_id, title, status, assigned_agent_id) VALUES ($1, 'race', 'in_progress', $2) RETURNING id",
+            )
+            .bind(user)
+            .bind(agent)
+            .fetch_one(&pool)
+            .await?;
+            let finished = Uuid::new_v4();
+            let sibling = Uuid::new_v4();
+            insert_session(&pool, finished, agent, "task", "active", Some(task), None, Some("cli-a"), None, None).await?;
+            insert_session(&pool, sibling, agent, "task", "active", Some(task), None, Some("cli-b"), None, None).await?;
+            sqlx::query("UPDATE agent_sessions SET attempt = 1, attempt_state = 'finished' WHERE id = $1").bind(finished).execute(&pool).await?;
+            sqlx::query("UPDATE agent_sessions SET attempt = 2, attempt_state = $2 WHERE id = $1").bind(sibling).bind(sibling_state).execute(&pool).await?;
+            let session = store.get_session(finished).await?.expect("attempt session");
+            let sent = store.start_followup(&session, "one more thing", "Ana", false).await;
+            if refused {
+                let error = sent.expect_err(sibling_state).to_string();
+                assert!(error.contains("other attempts are still running"), "{sibling_state}: {error}");
+            } else {
+                sent.map_err(|e| anyhow::anyhow!("{sibling_state}: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_review_puts_its_quest_back_in_review() -> anyhow::Result<()> {
+        let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let _db = steer_db().write().await;
+        let pool = PgPoolOptions::new().max_connections(2).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let user: Uuid = sqlx::query_scalar("INSERT INTO users (email, name, world_role) VALUES ($1, 'Ana', 'write') RETURNING id")
+            .bind(format!("ana-{tag}@test.dev"))
+            .fetch_one(&pool)
+            .await?;
+        let agent: Uuid = sqlx::query_scalar("INSERT INTO agent_profiles (slug, name, cli, model) VALUES ($1, 'Cut', 'codex', 'gpt') RETURNING id")
+            .bind(format!("cut-{tag}"))
+            .fetch_one(&pool)
+            .await?;
+        let quest = |status: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Uuid>(
+                    "INSERT INTO agent_tasks (user_id, title, status, assigned_agent_id) VALUES ($1, 'review me', $3, $2) RETURNING id",
+                )
+                .bind(user)
+                .bind(agent)
+                .bind(status)
+                .fetch_one(&pool)
+                .await
+            }
+        };
+        let cases: [(&str, Option<serde_json::Value>, &str, bool); 7] = [
+            ("cancelled", None, "in_progress", true),
+            ("cancelled", Some(serde_json::json!({ "manual": true })), "in_progress", false),
+            ("cancelled", Some(serde_json::json!({ "compare": [Uuid::new_v4()] })), "in_progress", false),
+            ("failed", None, "in_progress", false),
+            ("timed_out", None, "in_progress", false),
+            ("cancelled", None, "done", false),
+            ("cancelled", None, "cancelled", false),
+        ];
+        let mut expected = Vec::new();
+        for (run_status, asked_by, quest_status, moves) in cases {
+            let task = quest(quest_status).await?;
+            let parent = Uuid::new_v4();
+            let review = Uuid::new_v4();
+            insert_session(&pool, parent, agent, "task", "active", Some(task), None, Some("cli-task"), None, None).await?;
+            insert_session(&pool, review, agent, "review", "active", Some(task), Some(parent), Some("cli-review"), None, asked_by).await?;
+            let run = insert_run(&pool, review, agent, Some(task), "review", run_status, None).await?;
+            sqlx::query("UPDATE session_runs SET error = 'Organization suspended' WHERE id = $1").bind(run).execute(&pool).await?;
+            expected.push((task, quest_status, moves));
+        }
+        let merged = quest("in_progress").await?;
+        sqlx::query("INSERT INTO task_milestones (task_id, title, kind, status) VALUES ($1, 'merge', 'merge', 'done')").bind(merged).execute(&pool).await?;
+        let merged_parent = Uuid::new_v4();
+        let merged_review = Uuid::new_v4();
+        insert_session(&pool, merged_parent, agent, "task", "active", Some(merged), None, Some("cli-task"), None, None).await?;
+        insert_session(&pool, merged_review, agent, "review", "active", Some(merged), Some(merged_parent), Some("cli-review"), None, None).await?;
+        insert_run(&pool, merged_review, agent, Some(merged), "review", "cancelled", None).await?;
+        expected.push((merged, "in_progress", false));
+        let busy = quest("in_progress").await?;
+        let busy_parent = Uuid::new_v4();
+        let busy_review = Uuid::new_v4();
+        insert_session(&pool, busy_parent, agent, "task", "active", Some(busy), None, Some("cli-task"), None, None).await?;
+        insert_session(&pool, busy_review, agent, "review", "active", Some(busy), Some(busy_parent), Some("cli-review"), None, None).await?;
+        insert_run(&pool, busy_review, agent, Some(busy), "review", "cancelled", None).await?;
+        insert_run(&pool, busy_parent, agent, Some(busy), "followup", "queued", None).await?;
+        expected.push((busy, "in_progress", false));
+
+        let settled = store.settle_cancelled_reviews().await?;
+        for (task, before, moves) in expected {
+            let status: String = sqlx::query_scalar("SELECT status FROM agent_tasks WHERE id = $1").bind(task).fetch_one(&pool).await?;
+            assert_eq!(status, if moves { "review" } else { before }, "{before}");
+            assert_eq!(settled.contains(&task), moves, "{before}");
+            let events: Vec<serde_json::Value> = sqlx::query_scalar("SELECT payload FROM world_events WHERE task_id = $1 AND type = 'review.finished'")
+                .bind(task)
+                .fetch_all(&pool)
+                .await?;
+            assert_eq!(events.len(), usize::from(moves), "{before}");
+            if moves {
+                assert_eq!(events[0]["cancelled"], true);
+                assert_eq!(events[0]["review"]["verdict"], "review cancelled");
+                assert_eq!(events[0]["review"]["summary"], "Organization suspended");
+                let woken: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_inbox WHERE agent_id = $1 AND kind = 'review.finished' AND payload->>'task_id' = $2")
+                    .bind(agent)
+                    .bind(task.to_string())
+                    .fetch_one(&pool)
+                    .await?;
+                assert_eq!(woken, 1);
+            }
+        }
+        assert!(store.settle_cancelled_reviews().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn quests_with_a_merged_pr_settle_as_done_unless_work_is_running() -> anyhow::Result<()> {
+        let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let _db = steer_db().write().await;
+        let pool = PgPoolOptions::new().max_connections(2).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let user: Uuid = sqlx::query_scalar("INSERT INTO users (email, name, world_role) VALUES ($1, 'Ana', 'write') RETURNING id")
+            .bind(format!("merged-{tag}@test.dev"))
+            .fetch_one(&pool)
+            .await?;
+        let agent: Uuid = sqlx::query_scalar("INSERT INTO agent_profiles (slug, name, cli, model) VALUES ($1, 'Mer', 'codex', 'gpt') RETURNING id")
+            .bind(format!("mer-{tag}"))
+            .fetch_one(&pool)
+            .await?;
+        let cases = [
+            ("review", Some("https://github.com/o/r/pull/1"), "done", None, "done"),
+            ("in_progress", Some("https://github.com/o/r/pull/2"), "done", None, "done"),
+            ("review", Some("https://github.com/o/r/pull/3"), "active", None, "review"),
+            ("review", None, "done", None, "review"),
+            ("failed", Some("https://github.com/o/r/pull/5"), "done", None, "failed"),
+            ("cancelled", Some("https://github.com/o/r/pull/6"), "done", None, "cancelled"),
+            ("in_progress", Some("https://github.com/o/r/pull/7"), "done", Some("running"), "in_progress"),
+            ("review", Some("https://github.com/o/r/pull/8"), "done", Some("completed"), "done"),
+        ];
+        let mut tasks = Vec::new();
+        for (status, pr, merge, run, expected) in cases {
+            let task: Uuid = sqlx::query_scalar(
+                "INSERT INTO agent_tasks (user_id, title, status, assigned_agent_id, pr_url) VALUES ($1, 'ship it', $2, $3, $4) RETURNING id",
+            )
+            .bind(user)
+            .bind(status)
+            .bind(agent)
+            .bind(pr)
+            .fetch_one(&pool)
+            .await?;
+            sqlx::query("DELETE FROM task_milestones WHERE task_id = $1").bind(task).execute(&pool).await?;
+            sqlx::query("INSERT INTO task_milestones (task_id, title, kind, status) VALUES ($1, 'merge', 'merge', $2)").bind(task).bind(merge).execute(&pool).await?;
+            sqlx::query("INSERT INTO task_milestones (task_id, title, kind, status) VALUES ($1, 'tests', 'work', 'pending')").bind(task).execute(&pool).await?;
+            if let Some(run) = run {
+                let session = Uuid::new_v4();
+                insert_session(&pool, session, agent, "task", "active", Some(task), None, Some("cli-task"), None, None).await?;
+                insert_run(&pool, session, agent, Some(task), "followup", run, None).await?;
+            }
+            tasks.push((task, expected));
+        }
+        let settled = store.settle_merged_quests().await?;
+        for (task, expected) in tasks {
+            let status: String = sqlx::query_scalar("SELECT status FROM agent_tasks WHERE id = $1").bind(task).fetch_one(&pool).await?;
+            assert_eq!(status, expected);
+            assert_eq!(settled.contains(&task), expected == "done");
+            let open_work: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_milestones WHERE task_id = $1 AND kind = 'work' AND status = 'pending'")
+                .bind(task)
+                .fetch_one(&pool)
+                .await?;
+            assert_eq!(open_work, i64::from(!settled.contains(&task)));
+        }
+        assert!(store.settle_merged_quests().await?.iter().all(|id| !settled.contains(id)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_work_runs_fail_their_quest_so_it_can_be_resumed() -> anyhow::Result<()> {
+        let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let _db = steer_db().write().await;
+        let pool = PgPoolOptions::new().max_connections(2).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let user: Uuid = sqlx::query_scalar("INSERT INTO users (email, name, world_role) VALUES ($1, 'Ana', 'write') RETURNING id")
+            .bind(format!("ana-{tag}@test.dev"))
+            .fetch_one(&pool)
+            .await?;
+        let new_agent = |name: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Uuid>("INSERT INTO agent_profiles (slug, name, cli, model) VALUES ($1, 'Cut', 'codex', 'gpt') RETURNING id")
+                    .bind(name)
+                    .fetch_one(&pool)
+                    .await
+            }
+        };
+        let agent = new_agent(format!("cut-{tag}")).await?;
+        let other = new_agent(format!("old-{tag}")).await?;
+        let quest = |status: &'static str, assignee: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Uuid>(
+                    "INSERT INTO agent_tasks (user_id, title, status, assigned_agent_id) VALUES ($1, 'stuck', $3, $2) RETURNING id",
+                )
+                .bind(user)
+                .bind(assignee)
+                .bind(status)
+                .fetch_one(&pool)
+                .await
+            }
+        };
+        struct Case {
+            name: &'static str,
+            kind: &'static str,
+            asked_by: Option<serde_json::Value>,
+            quest_status: &'static str,
+            run_status: &'static str,
+            handed_off: bool,
+            session_status: &'static str,
+            later: Option<&'static str>,
+            moves: bool,
+        }
+        let compare = Some(serde_json::json!({ "compare": [Uuid::new_v4()] }));
+        let case = |name, kind| Case {
+            name,
+            kind,
+            asked_by: None,
+            quest_status: "in_progress",
+            run_status: "cancelled",
+            handed_off: false,
+            session_status: "active",
+            later: None,
+            moves: true,
+        };
+        let cases = [
+            case("task", "task"),
+            case("followup", "followup"),
+            case("publish", "publish"),
+            Case { asked_by: compare, ..case("compare review", "review") },
+            Case { moves: false, ..case("automatic review", "review") },
+            Case { asked_by: Some(serde_json::json!({ "manual": true })), moves: false, ..case("manual review", "review") },
+            Case { run_status: "failed", moves: false, ..case("failed run", "task") },
+            Case { run_status: "timed_out", moves: false, ..case("timed out run", "followup") },
+            Case { quest_status: "done", moves: false, ..case("done quest", "task") },
+            Case { quest_status: "cancelled", moves: false, ..case("cancelled quest", "task") },
+            Case { later: Some("queued"), moves: false, ..case("newer queued run", "task") },
+            Case { later: Some("running"), moves: false, ..case("newer running run", "task") },
+            Case { later: Some("completed"), moves: false, ..case("newer finished run", "task") },
+            Case { handed_off: true, moves: false, ..case("handed off", "task") },
+            Case { session_status: "archived", moves: false, ..case("archived session", "task") },
+        ];
+        let mut expected = Vec::new();
+        for (index, case) in cases.into_iter().enumerate() {
+            let agent = new_agent(format!("case-{index}-{tag}")).await?;
+            let task = quest(case.quest_status, agent).await?;
+            let session = Uuid::new_v4();
+            let parent = Uuid::new_v4();
+            let is_review = case.kind == "review";
+            insert_session(&pool, parent, agent, "task", "active", Some(task), None, Some("cli-task"), None, None).await?;
+            insert_session(
+                &pool,
+                session,
+                agent,
+                if is_review { "review" } else { "task" },
+                case.session_status,
+                Some(task),
+                is_review.then_some(parent),
+                Some("cli-run"),
+                None,
+                case.asked_by.clone(),
+            )
+            .await?;
+            let run = insert_run(&pool, session, if case.handed_off { other } else { agent }, Some(task), case.kind, case.run_status, None).await?;
+            sqlx::query("UPDATE session_runs SET error = 'Organization suspended', created_at = NOW() - INTERVAL '1 minute' WHERE id = $1")
+                .bind(run)
+                .execute(&pool)
+                .await?;
+            if let Some(later) = case.later {
+                insert_run(&pool, parent, agent, Some(task), "followup", later, None).await?;
+            }
+            expected.push((task, agent, case.name, case.quest_status, case.moves, run));
+        }
+        let racing_other = quest("in_progress", agent).await?;
+        let racing_session = Uuid::new_v4();
+        let racing_sibling = Uuid::new_v4();
+        insert_session(&pool, racing_session, agent, "task", "active", Some(racing_other), None, Some("cli-a"), None, None).await?;
+        insert_session(&pool, racing_sibling, agent, "task", "active", Some(racing_other), None, Some("cli-b"), None, None).await?;
+        insert_run(&pool, racing_session, agent, Some(racing_other), "task", "cancelled", None).await?;
+        insert_run(&pool, racing_sibling, agent, Some(racing_other), "task", "running", None).await?;
+        expected.push((racing_other, agent, "sibling attempt still running", "in_progress", false, Uuid::nil()));
+
+        let settled = store.settle_cancelled_work().await?;
+        for (task, agent, name, before, moves, run) in expected.clone() {
+            let (status, error): (String, Option<String>) = sqlx::query_as("SELECT status, error_message FROM agent_tasks WHERE id = $1")
+                .bind(task)
+                .fetch_one(&pool)
+                .await?;
+            assert_eq!(status, if moves { "failed" } else { before }, "{name}");
+            assert_eq!(settled.contains(&task), moves, "{name}");
+            let events: Vec<serde_json::Value> = sqlx::query_scalar("SELECT payload FROM world_events WHERE task_id = $1 AND type = 'run.failed'")
+                .bind(task)
+                .fetch_all(&pool)
+                .await?;
+            assert_eq!(events.len(), usize::from(moves), "{name}");
+            if moves {
+                assert!(error.as_deref().is_some_and(|e| e.contains("was cancelled") && e.contains("Organization suspended")), "{name}");
+                assert_eq!(events[0]["cause"], "cancelled", "{name}");
+                assert_eq!(events[0]["task_id"], task.to_string(), "{name}");
+                let cause: Option<String> = sqlx::query_scalar("SELECT cause FROM session_runs WHERE id = $1").bind(run).fetch_one(&pool).await?;
+                assert_eq!(cause.as_deref(), Some("cancelled"), "{name}");
+                let woken: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_inbox WHERE agent_id = $1 AND kind = 'run.failed' AND payload->>'task_id' = $2")
+                    .bind(agent)
+                    .bind(task.to_string())
+                    .fetch_one(&pool)
+                    .await?;
+                assert_eq!(woken, 1, "{name}");
+            }
+        }
+        let again = store.settle_cancelled_work().await?;
+        assert!(again.is_empty(), "{again:?}");
+        let (resume_task, resume_agent) = expected.iter().find(|row| row.4).map(|row| (row.0, row.1)).expect("a quest moved");
+        let resumed = store.resume_task_session(resume_agent, resume_task, "pick it back up").await?;
+        assert!(matches!(resumed, TaskResume::Resumed { .. } | TaskResume::Fresh));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_quest_counts_as_merged_only_with_a_pr_and_a_done_merge() -> anyhow::Result<()> {
+        let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let _db = steer_db().write().await;
+        let pool = PgPoolOptions::new().max_connections(2).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let user: Uuid = sqlx::query_scalar("INSERT INTO users (email, name, world_role) VALUES ($1, 'Ana', 'write') RETURNING id")
+            .bind(format!("ana-{tag}@test.dev"))
+            .fetch_one(&pool)
+            .await?;
+        let pr = "https://github.com/acme/app/pull/7";
+        let cases = [
+            ("pr and done quest", "done", Some(pr), None, true),
+            ("pr and merged milestone", "review", Some(pr), Some("done"), true),
+            ("pr and active milestone", "review", Some(pr), Some("active"), false),
+            ("pr and failed milestone", "review", Some(pr), Some("failed"), false),
+            ("pr and no milestone", "in_progress", Some(pr), None, false),
+            ("done without a pr", "done", None, None, false),
+            ("merged milestone without a pr", "review", None, Some("done"), false),
+            ("cancelled quest", "cancelled", Some(pr), Some("done"), false),
+        ];
+        for (name, status, pr_url, milestone, merged) in cases {
+            let task: Uuid = sqlx::query_scalar("INSERT INTO agent_tasks (user_id, title, status, pr_url) VALUES ($1, 'quest', $2, $3) RETURNING id")
+                .bind(user)
+                .bind(status)
+                .bind(pr_url)
+                .fetch_one(&pool)
+                .await?;
+            if let Some(milestone) = milestone {
+                sqlx::query("INSERT INTO task_milestones (task_id, title, kind, status) VALUES ($1, 'merge', 'merge', $2)")
+                    .bind(task)
+                    .bind(milestone)
+                    .execute(&pool)
+                    .await?;
+            }
+            let found = store.quest_merged_pr(task).await?;
+            assert_eq!(found.is_some(), merged, "{name}");
+            if merged {
+                assert_eq!(found.as_deref(), Some(pr), "{name}");
+            }
+        }
         Ok(())
     }
 

@@ -1,7 +1,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use loka_shared::milestones::{CI_ROUNDS_MAX, DueMerge, MilestoneStore};
-use loka_shared::world::{NewEvent, NewMessage};
+use loka_shared::db::Database;
+use loka_shared::world::{AgentSession, NewEvent, NewMessage, WorldStore};
 use serde_json::{json, Value};
 use tokio::process::Command;
 use tracing::{info, warn};
@@ -284,20 +285,52 @@ async fn merged(ctx: &Ctx, store: &MilestoneStore, due: &DueMerge, url: &str) ->
     if open == 0 {
         ctx.db.update_status(due.task_id, "done").await?;
     }
-    announce(ctx, due, url, "done", None, "task.merged").await?;
+    announce(&ctx.store, due, url, "done", None, "task.merged").await?;
     info!(task = %due.task_id, "PR merged, quest done");
     Ok(())
+}
+
+pub(super) async fn settle_merged(store: &WorldStore, db: &Database, session: &AgentSession, pr_url: &str) -> Result<()> {
+    let Some(task_id) = session.task_id else {
+        return Ok(());
+    };
+    let Some(task) = db.get_task(task_id).await? else {
+        return Ok(());
+    };
+    let milestones = MilestoneStore::new(store.pool().clone());
+    milestones.settle_merge(task_id, true).await?;
+    if milestones.open_count(task_id).await? == 0 {
+        db.update_status(task_id, "done").await?;
+    }
+    store.set_session_status(session.id, "completed", None).await?;
+    let announced = sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM world_events WHERE task_id = $1 AND type = 'task.merged')")
+        .bind(task_id)
+        .fetch_one(store.pool())
+        .await?;
+    if announced {
+        return Ok(());
+    }
+    let due = DueMerge {
+        id: Uuid::nil(),
+        task_id,
+        data: json!({}),
+        pr_url: Some(pr_url.to_string()),
+        repo: task.repo.clone(),
+        title: task.title.clone(),
+        agent_id: task.assigned_agent_id,
+    };
+    announce(store, &due, pr_url, "done", None, "task.merged").await
 }
 
 async fn closed(ctx: &Ctx, store: &MilestoneStore, due: &DueMerge, url: &str) -> Result<()> {
     store.note(due.id, "failed", "Closed without merging", json!({})).await?;
     let error = "The pull request was closed without merging";
     ctx.db.set_error(due.task_id, error).await?;
-    announce(ctx, due, url, "failed", Some(error), "task.pr_closed").await?;
+    announce(&ctx.store, due, url, "failed", Some(error), "task.pr_closed").await?;
     Ok(())
 }
 
-async fn announce(ctx: &Ctx, due: &DueMerge, url: &str, status: &str, error: Option<&str>, event: &str) -> Result<()> {
+async fn announce(store: &WorldStore, due: &DueMerge, url: &str, status: &str, error: Option<&str>, event: &str) -> Result<()> {
     let Some(agent_id) = due.agent_id else {
         return Ok(());
     };
@@ -305,14 +338,14 @@ async fn announce(ctx: &Ctx, due: &DueMerge, url: &str, status: &str, error: Opt
         "SELECT id FROM agent_sessions WHERE task_id = $1 AND role = 'task' ORDER BY created_at DESC LIMIT 1",
     )
     .bind(due.task_id)
-    .fetch_optional(ctx.store.pool())
+    .fetch_optional(store.pool())
     .await?;
-    let main = ctx.store.main_session(agent_id).await?;
+    let main = store.main_session(agent_id).await?;
     let body = match status {
         "done" => "The pull request was merged.",
         _ => "The pull request was closed without merging.",
     };
-    ctx.store
+    store
         .insert_message(NewMessage {
             agent_id,
             author_kind: "system",
@@ -333,7 +366,7 @@ async fn announce(ctx: &Ctx, due: &DueMerge, url: &str, status: &str, error: Opt
             }),
         })
         .await?;
-    ctx.store
+    store
         .emit(
             NewEvent::new(event)
                 .agent(agent_id)
@@ -443,6 +476,76 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_merged_pr_settles_its_quest_as_done_once() -> Result<()> {
+        let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let db = Database::connect(&url).await?;
+        let pool = db.pool().clone();
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email) VALUES ($1) RETURNING id")
+            .bind(format!("settled-{tag}@example.test"))
+            .fetch_one(&pool)
+            .await?;
+        let agent: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id) VALUES ($1, 'Bun', 'claude', 'sonnet', $2) RETURNING id",
+        )
+        .bind(format!("settled-{tag}"))
+        .bind(owner)
+        .fetch_one(&pool)
+        .await?;
+        let pr = "https://github.com/acme/app/pull/4";
+        for (open_work, status) in [(false, "done"), (true, "in_progress")] {
+            let task: Uuid = sqlx::query_scalar(
+                "INSERT INTO agent_tasks (user_id, title, status, assigned_agent_id, pr_url) VALUES ($1, 'ship it', 'in_progress', $2, $3) RETURNING id",
+            )
+            .bind(owner)
+            .bind(agent)
+            .bind(pr)
+            .fetch_one(&pool)
+            .await?;
+            sqlx::query("DELETE FROM task_milestones WHERE task_id = $1").bind(task).execute(&pool).await?;
+            sqlx::query("INSERT INTO task_milestones (task_id, title, kind, status) VALUES ($1, 'merge', 'merge', 'active')")
+                .bind(task)
+                .execute(&pool)
+                .await?;
+            if open_work {
+                sqlx::query("INSERT INTO task_milestones (task_id, title, kind, status) VALUES ($1, 'tests', 'work', 'pending')")
+                    .bind(task)
+                    .execute(&pool)
+                    .await?;
+            }
+            let session: Uuid = sqlx::query_scalar(
+                "INSERT INTO agent_sessions (agent_id, role, backend, model, task_id, status) VALUES ($1, 'task', 'claude', 'sonnet', $2, 'active') RETURNING id",
+            )
+            .bind(agent)
+            .bind(task)
+            .fetch_one(&pool)
+            .await?;
+            let session = store.get_session(session).await?.expect("session");
+            settle_merged(&store, &db, &session, pr).await?;
+            settle_merged(&store, &db, &session, pr).await?;
+            let now: String = sqlx::query_scalar("SELECT status FROM agent_tasks WHERE id = $1").bind(task).fetch_one(&pool).await?;
+            assert_eq!(now, status);
+            let merge: String = sqlx::query_scalar("SELECT status FROM task_milestones WHERE task_id = $1 AND kind = 'merge'")
+                .bind(task)
+                .fetch_one(&pool)
+                .await?;
+            assert_eq!(merge, "done");
+            let session_status: String = sqlx::query_scalar("SELECT status FROM agent_sessions WHERE id = $1").bind(session.id).fetch_one(&pool).await?;
+            assert_eq!(session_status, "completed");
+            let announced: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_events WHERE task_id = $1 AND type = 'task.merged'")
+                .bind(task)
+                .fetch_one(&pool)
+                .await?;
+            assert_eq!(announced, 1);
+            assert_eq!(store.quest_merged_pr(task).await?.as_deref(), Some(pr));
+        }
+        Ok(())
+    }
 
     #[test]
     fn reads_failing_checks() {

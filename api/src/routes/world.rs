@@ -635,8 +635,8 @@ async fn inline_files(state: &AppState, org: Option<Uuid>, attachments: &Value) 
             continue;
         }
         let name = attachment.get("name").and_then(Value::as_str).unwrap_or("file");
-        let mut file = json!({ "name": name, "mime": mime });
         let id = attachment.get("id").and_then(Value::as_str).and_then(|id| id.parse::<Uuid>().ok());
+        let mut file = json!({ "name": name, "mime": mime, "id": id });
         if let (true, Some(id)) = (readable_as_text(mime, name) && budget > 0, id) {
             if let Some((_, bytes)) = state.world.get_upload(id, org).await.map_err(internal)? {
                 if let Ok(text) = String::from_utf8(bytes) {
@@ -848,9 +848,15 @@ pub async fn post_message(
         None => None,
     };
     let attachments = attachment_meta(&state, &viewer, &body.attachments).await?;
+    let mut quote = state.world.clean_quote(&viewer, body.quote.as_ref()).await.map_err(internal)?;
+    if let (Some(q), Some(org)) = (quote.as_mut(), viewer.org) {
+        state.world.expand_canvas_quote(user.0, org, q, loka_shared::canvas::QuoteCards::Resolved).await.map_err(internal)?;
+        state.world.expand_practice_quote(user.0, viewer.role, org, q).await.map_err(internal)?;
+    }
     if let (Some(root), None, None) = (reply_to, body.answers, body.task_id) {
         let agent = load(&state, id).await?;
-        if let Some(msg) = crate::routes::quick::reply_in_thread(&state, &viewer, &agent, root, text, &attachments, body.spoken).await? {
+        let said = crate::routes::quick::Said { text, attachments: &attachments, spoken: body.spoken, quote: quote.as_ref() };
+        if let Some(msg) = crate::routes::quick::reply_in_thread(&state, &viewer, &agent, root, &said).await? {
             return Ok((StatusCode::CREATED, Json(msg)));
         }
     }
@@ -877,11 +883,6 @@ pub async fn post_message(
         .await
         .map_err(internal)?
         .unwrap_or_else(|| "someone".to_string());
-    let mut quote = loka_shared::quotes::clean(body.quote.as_ref());
-    if let (Some(q), Some(org)) = (quote.as_mut(), viewer.org) {
-        state.world.expand_canvas_quote(user.0, org, q, loka_shared::canvas::QuoteCards::Resolved).await.map_err(internal)?;
-        state.world.expand_practice_quote(user.0, viewer.role, org, q).await.map_err(internal)?;
-    }
     let setup_card = match text.is_empty() {
         true => None,
         false => crate::routes::setup_scan::card_kind(&state, id, body.answers).await?,
@@ -895,6 +896,7 @@ pub async fn post_message(
         _ => None,
     };
     let plan_answered = matches!(plan, Some(PlanAnswer::Approved { .. } | PlanAnswer::Redirected { .. }));
+    let plan_undecided = matches!(plan, Some(PlanAnswer::Undecided));
     let msg = state
         .world
         .insert_reply(NewMessage {
@@ -907,7 +909,7 @@ pub async fn post_message(
             run_id: None,
             meta: {
                 let mut meta = json!({ "attachments": attachments, "options": options });
-                if let Some(ask) = body.answers {
+                if let Some(ask) = body.answers.filter(|_| !plan_undecided) {
                     meta["answers"] = json!(ask);
                 }
                 if body.spoken {
@@ -1315,16 +1317,32 @@ pub async fn list_events(
     ))
 }
 
+fn last_seen(after: Option<i64>, headers: &axum::http::HeaderMap) -> Option<i64> {
+    let header: Option<i64> = headers.get("last-event-id").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse().ok());
+    match (after, header) {
+        (Some(query), Some(header)) => Some(query.max(header)),
+        (query, header) => query.or(header),
+    }
+}
+
 pub async fn stream(
     State(state): State<AppState>,
     Extension(user): Extension<UserId>,
     Extension(scope): Extension<Viewer>,
     Query(q): Query<EventsQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, StatusCode> {
     let viewer = user.0;
     let org = scope.org();
-    let mut cursor = match q.after {
-        Some(after) => after,
+    let mut resync = None;
+    let mut cursor = match last_seen(q.after, &headers) {
+        Some(after) => match state.world.replay_gap(org, after, loka_shared::world::REPLAY_MAX_EVENTS).await.map_err(internal)?.resume_from(after) {
+            loka_shared::world::Resume::Replay(from) => from,
+            loka_shared::world::Resume::Resync(head) => {
+                resync = Some(head);
+                head
+            }
+        },
         None => state
             .world
             .recent_events(None, 1)
@@ -1338,6 +1356,9 @@ pub async fn stream(
     let store = state.world.clone();
     let stream = async_stream::stream! {
         let _open = crate::metrics::Open::new("world");
+        if let Some(head) = resync {
+            yield Ok::<Event, Infallible>(Event::default().event("resync").data(json!({ "head": head }).to_string()));
+        }
         loop {
             match store.events_since_in(org, cursor, 500).await {
                 Ok(events) if events.is_empty() => {}
@@ -2429,7 +2450,7 @@ pub async fn post_channel(
                 if body.spoken {
                     meta["spoken"] = json!(true);
                 }
-                if let Some(mut quote) = loka_shared::quotes::clean(body.quote.as_ref()) {
+                if let Some(mut quote) = state.world.clean_quote(&viewer, body.quote.as_ref()).await.map_err(internal)? {
                     if let Some(org) = viewer.org {
                         state.world.expand_canvas_quote(user.0, org, &mut quote, loka_shared::canvas::QuoteCards::RefsOnly).await.map_err(internal)?;
                         state.world.expand_practice_quote(user.0, loka_shared::access::Role::Write, org, &mut quote).await.map_err(internal)?;
@@ -2902,6 +2923,53 @@ pub async fn list_items(
 }
 
 #[derive(Deserialize)]
+pub struct NewListBody {
+    title: String,
+    #[serde(default)]
+    items: Vec<String>,
+}
+
+pub async fn create_list(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserId>,
+    Extension(viewer): Extension<Viewer>,
+    Json(body): Json<NewListBody>,
+) -> Result<(StatusCode, Json<loka_shared::items::WorldItem>), StatusCode> {
+    if body.title.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let item = state
+        .world
+        .create_list(loka_shared::items::NewList {
+            owner: user.0,
+            creator: None,
+            org: viewer.org(),
+            title: &body.title,
+            items: body.items,
+            note: None,
+            region: None,
+        })
+        .await
+        .map_err(internal)?;
+    Ok((StatusCode::CREATED, Json(item)))
+}
+
+pub async fn get_item(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserId>,
+    Extension(viewer): Extension<Viewer>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<loka_shared::items::WorldItem>, StatusCode> {
+    state
+        .world
+        .item_for_viewer(id, user.0, viewer.org(), viewer.role == Role::Admin)
+        .await
+        .map_err(internal)?
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+#[derive(Deserialize)]
 pub struct ItemPatch {
     name: Option<String>,
     data: Option<Value>,
@@ -3042,5 +3110,29 @@ mod disk_full_tests {
         assert_eq!(internal(anyhow::anyhow!("pool timed out while waiting for an open connection")), StatusCode::INTERNAL_SERVER_ERROR);
         let io = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
         assert_eq!(internal(anyhow::Error::new(io)), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}
+
+#[cfg(test)]
+mod stream_resume_tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn the_newest_of_the_query_and_the_last_event_id_header_wins() {
+        let mut headers = HeaderMap::new();
+        headers.insert("last-event-id", HeaderValue::from_static("41"));
+        assert_eq!(last_seen(Some(7), &headers), Some(41));
+        assert_eq!(last_seen(Some(90), &headers), Some(90));
+        assert_eq!(last_seen(None, &headers), Some(41));
+        assert_eq!(last_seen(Some(7), &HeaderMap::new()), Some(7));
+    }
+
+    #[test]
+    fn a_missing_or_unreadable_last_event_id_starts_live() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(last_seen(None, &headers), None);
+        headers.insert("last-event-id", HeaderValue::from_static("abc"));
+        assert_eq!(last_seen(None, &headers), None);
     }
 }

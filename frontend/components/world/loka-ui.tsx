@@ -1,6 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import dynamic from "next/dynamic";
+import { AnimatePresence } from "framer-motion";
 import {
   ArrowRight,
   Books,
@@ -12,7 +14,6 @@ import {
   LockSimple,
   MapTrifold,
   PaperPlaneRight,
-  Sparkle,
   Star,
   Trophy,
   X,
@@ -21,9 +22,11 @@ import {
   Clock,
   Lamp,
   TShirt,
+  BookOpen,
+  Student,
 } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
-import type { AdventureCard, Attempt, ChallengeCard, ChallengeDetail, DialogueLine, NpcLine, Progress, Region, Unlock } from "@/lib/loka";
+import type { AcademyTarget, AdventureCard, Attempt, ChallengeCard, ChallengeDetail, DialogueLine, NpcLine, Progress, Region, Unlock } from "@/lib/loka";
 import type { WorldAgent, WorldEvent } from "@/lib/world";
 import { portraitUrl } from "./characters";
 import { AgentAvatar } from "./channel-ui";
@@ -36,11 +39,21 @@ import { lookOfNpc, staffOf } from "./regions";
 import { BTN_PRIMARY, BTN_SECONDARY, CHUNKY, INPUT, ITEM_CARD, PILL_NEUTRAL, SEGMENT, SEGMENT_ITEM, SEGMENT_OFF, SEGMENT_ON } from "./styles";
 import { SettingsCard, SettingsGroup, SettingsRow, Switch } from "./settings-shell";
 import { Shimmer } from "./work-ui";
+import { quoteProps } from "./quote";
+import { ATTEMPT_ITEM, keepInReports } from "@/lib/practice";
+import { openReport, reportsApi, type ReportDetail } from "@/lib/reports";
+
+const PracticeView = dynamic(() => import("./practice-view").then((m) => m.PracticeView), {
+  ssr: false,
+  loading: () => <Shimmer>Opening the canvas</Shimmer>,
+});
+const NewPracticeDialog = dynamic(() => import("./practice-view").then((m) => m.NewPracticeDialog), { ssr: false });
 import { EmptyState } from "./settings-shell";
+import { MeaningIcon } from "@/lib/meaning-icons";
 
 export type LokaSheet =
   | { kind: "npc"; id: string; name: string; data: Record<string, unknown> }
-  | { kind: "academy"; challengeId?: string | null; tab?: "challenges" | "progress" }
+  | ({ kind: "academy"; tab?: "courses" | "progress" } & AcademyTarget)
   | { kind: "travel" };
 
 interface Refusal {
@@ -239,7 +252,7 @@ function Md({ text, className }: { text: string; className?: string }) {
 }
 
 const DIFFICULTY_TONE: Record<string, string> = { easy: "bg-w-ok/20", medium: "bg-w-warn/25", hard: "bg-w-danger/20" };
-const TYPE_LABEL: Record<string, string> = { dsa: "DSA", design: "System design", quiz: "Quiz", puzzle: "Puzzle" };
+const TYPE_LABEL: Record<string, string> = { dsa: "DSA", design: "System design", quiz: "Quiz", puzzle: "Puzzle", canvas: "Canvas", reading: "Reading" };
 
 function title(skill: string): string {
   return skill.split(/[-_ ]/).filter(Boolean).map((w) => w[0].toUpperCase() + w.slice(1)).join(" ") || "General";
@@ -272,21 +285,29 @@ function CardRow({ card, onOpen }: { card: ChallengeCard; onOpen: () => void }) 
 
 export function AcademySheet({
   meId,
-  initial,
-  initialTab = "challenges",
+  target,
+  initialTab = "courses",
   waitingOn,
+  agents,
+  onOpenAgent,
   onClose,
   onFix,
 }: {
   meId: string | null;
-  initial: string | null;
-  initialTab?: "challenges" | "progress";
+  target: AcademyTarget;
+  initialTab?: "courses" | "progress";
   waitingOn: string | null;
+  agents: WorldAgent[];
+  onOpenAgent: (id: string) => void;
   onClose: () => void;
   onFix: (fix: "budget" | "keys") => void;
 }) {
-  const [tab, setTab] = useState<"challenges" | "progress">(initialTab);
-  const [open, setOpen] = useState<string | null>(initial);
+  const [tab, setTab] = useState<"courses" | "progress">(initialTab);
+  const [open, setOpen] = useState<string | null>(target.challengeId ?? null);
+  const [attempt, setAttempt] = useState<string | null>(target.attemptId ?? null);
+  const [resolving, setResolving] = useState<string | null>(target.reportId ?? null);
+  const [creating, setCreating] = useState(Boolean(target.newPractice));
+  const [course, setCourse] = useState<string | null>(target.courseId ?? null);
   const [cards, setCards] = useState<ChallengeCard[] | null>(null);
   const [adventures, setAdventures] = useState<AdventureCard[]>([]);
   const [progress, setProgressState] = useState<Progress | null>(null);
@@ -307,17 +328,83 @@ export function AcademySheet({
   }, [setProgress]);
   useEffect(load, [load]);
   useEffect(() => setTab(initialTab), [initialTab]);
-  useEffect(() => setOpen(initial), [initial]);
+  useEffect(() => {
+    setOpen(target.challengeId ?? null);
+    setAttempt(target.attemptId ?? null);
+    setResolving(target.reportId ?? null);
+    setCreating(Boolean(target.newPractice));
+    setCourse(target.courseId ?? null);
+    if (target.challengeId || target.reportId || target.courseId) setTab("courses");
+  }, [target]);
+  useEffect(() => {
+    if (!resolving || cards === null) return;
+    const reportId = resolving;
+    const hit = cards.find((c) => c.report_id === reportId);
+    if (hit) {
+      setOpen(hit.id);
+      setResolving(null);
+      return;
+    }
+    let live = true;
+    lokaApi
+      .practiceThis(reportId)
+      .then((made) => {
+        if (!live) return;
+        setOpen(made.challenge_id);
+        setResolving(null);
+        load();
+      })
+      .catch(() => {
+        if (!live) return;
+        setResolving(null);
+        keepInReports(reportId);
+        openReport(reportId, attempt ? `${ATTEMPT_ITEM}${attempt}` : null);
+      });
+    return () => {
+      live = false;
+    };
+  }, [resolving, cards, attempt, load]);
   useWorldEvent(
     useCallback(
       (ev: WorldEvent) => {
         if (ev.payload.owner_user_id && ev.payload.owner_user_id !== meId) return;
-        if (["challenge.created", "challenge.graded", "adventure.created", "adventure.completed", "academy.unlocked"].includes(ev.type)) load();
+        if (["challenge.created", "challenge.graded", "adventure.created", "adventure.completed", "academy.unlocked", "practice.ready", "practice.updated", "report.updated", "item.updated"].includes(ev.type)) load();
       },
       [load, meId],
     ),
   );
-  if (open) return <ChallengeView id={open} meId={meId} waitingOn={waitingOn} onBack={() => { setOpen(null); load(); }} onClose={onClose} onFix={onFix} onProgress={setProgress} />;
+  const openCard = (card: ChallengeCard) => {
+    setAttempt(null);
+    setOpen(card.id);
+  };
+  if (resolving) {
+    return (
+      <Shell eyebrow="University" title="Academy" onClose={onClose}>
+        <Shimmer>Opening the lesson</Shimmer>
+      </Shell>
+    );
+  }
+  if (open)
+    return (
+      <ChallengeView
+        key={open}
+        id={open}
+        meId={meId}
+        attempt={attempt}
+        agents={agents}
+        onOpenAgent={onOpenAgent}
+        waitingOn={waitingOn}
+        onBack={() => {
+          setOpen(null);
+          setAttempt(null);
+          load();
+        }}
+        onClose={onClose}
+        onFix={onFix}
+        onProgress={setProgress}
+      />
+    );
+  const ordered = course ? [...adventures].sort((a, b) => Number(b.id === course) - Number(a.id === course)) : adventures;
   const inAdventure = new Set(adventures.flatMap((a) => a.challenges));
   const loose = (cards ?? []).filter((c) => !inAdventure.has(c.id));
   const bySkill = new Map<string, ChallengeCard[]>();
@@ -327,9 +414,9 @@ export function AcademySheet({
     <Shell eyebrow="University" title="Academy" onClose={onClose}>
       <div className="mb-6 flex items-center gap-3">
         <div role="tablist" aria-label="Academy" className={SEGMENT}>
-          {(["challenges", "progress"] as const).map((t) => (
+          {(["courses", "progress"] as const).map((t) => (
             <button key={t} type="button" role="tab" aria-selected={tab === t} onClick={() => setTab(t)} className={cn(SEGMENT_ITEM, "px-3.5 py-1.5 text-w-sm", tab === t ? SEGMENT_ON : SEGMENT_OFF)}>
-              {t === "challenges" ? "Challenges" : "Progress"}
+              {t === "courses" ? "Courses" : "Progress"}
             </button>
           ))}
         </div>
@@ -339,27 +426,45 @@ export function AcademySheet({
             Level {progress.level} · {progress.xp} xp
           </span>
         )}
+        <button type="button" onClick={() => setCreating(true)} className={cn(BTN_SECONDARY, !progress && "ml-auto")} title="Write or draw on a canvas and a coach agent checks each attempt">
+          <Student size={14} weight="bold" />
+          <span className="hidden @md:inline">New practice</span>
+        </button>
       </div>
       {error && <p className="mb-3 text-w-base text-w-danger">{error}</p>}
+      <AnimatePresence>
+        {creating && (
+          <NewPracticeDialog
+            key="new-practice"
+            agents={agents}
+            onClose={() => setCreating(false)}
+            onCreated={(reportId) => {
+              setCreating(false);
+              setResolving(reportId);
+              load();
+            }}
+          />
+        )}
+      </AnimatePresence>
       {tab === "progress" ? (
         progress ? <ProgressView progress={progress} meId={meId} onChange={setProgress} /> : <Shimmer>Opening your record</Shimmer>
       ) : cards === null ? (
-        <Shimmer>Gathering challenges</Shimmer>
-      ) : cards.length === 0 ? (
+        <Shimmer>Gathering courses</Shimmer>
+      ) : cards.length === 0 && adventures.length === 0 ? (
         <EmptyState
           icon={GraduationCap}
-          title="No challenges yet"
-          description={`Ask your main agent for a puzzle, a coding problem, a system design prompt or a quiz.${progress?.academy_on === false ? " Challenges while you wait are off; turn them on under Progress." : " A mentor may also stop by while a quest runs."}`}
+          title="No courses yet"
+          description={`Ask your main agent for a course on anything you want to learn, a practice canvas to write or draw on, a coding problem, a system design prompt or a quiz.${progress?.academy_on === false ? " Challenges while you wait are off; turn them on under Progress." : " A mentor may also stop by while a quest runs."}`}
         />
       ) : (
         <div className="space-y-5">
-          {adventures.map((a) => (
-            <section key={a.id} aria-label={a.title}>
+          {ordered.map((a) => (
+            <section key={a.id} aria-label={a.title} className={cn(a.id === course && "rounded-lg ring-2 ring-w-teal ring-offset-4 ring-offset-w-paper")}>
               <div className="mb-2 flex items-center gap-2">
                 <Compass size={16} weight="bold" className="text-w-warn" />
                 <h3 className="text-w-md font-semibold text-w-strong">{a.title}</h3>
                 <span className="text-w-xs text-w-muted">
-                  {a.passed} of {a.total}
+                  Course · {a.passed} of {a.total} passed
                   {a.completed ? " · complete" : ""}
                 </span>
               </div>
@@ -367,8 +472,9 @@ export function AcademySheet({
               <div className="space-y-2">
                 {a.challenges.map((id) => {
                   const c = cardOf.get(id);
-                  return c ? <CardRow key={id} card={c} onOpen={() => setOpen(id)} /> : null;
+                  return c ? <CardRow key={id} card={c} onOpen={() => openCard(c)} /> : null;
                 })}
+                {a.total === 0 && <p className="text-w-sm text-w-muted">No lessons yet. Ask an agent to add one.</p>}
               </div>
             </section>
           ))}
@@ -381,7 +487,7 @@ export function AcademySheet({
               </div>
               <div className="space-y-2">
                 {list.map((c) => (
-                  <CardRow key={c.id} card={c} onOpen={() => setOpen(c.id)} />
+                  <CardRow key={c.id} card={c} onOpen={() => openCard(c)} />
                 ))}
               </div>
             </section>
@@ -399,9 +505,60 @@ function parseChoices(answer: string): number[] {
     .filter((n) => Number.isInteger(n) && n > 0);
 }
 
+function LessonCanvas({
+  reportId,
+  attempt,
+  agents,
+  meId,
+  onOpenAgent,
+  onLessonChanged,
+}: {
+  reportId: string;
+  attempt: string | null;
+  agents: WorldAgent[];
+  meId: string | null;
+  onOpenAgent: (id: string) => void;
+  onLessonChanged: () => void;
+}) {
+  const [detail, setDetail] = useState<ReportDetail | null>(null);
+  const [gone, setGone] = useState(false);
+  const load = useCallback(() => {
+    reportsApi
+      .get(reportId)
+      .then((d) => {
+        setDetail(d);
+        setGone(false);
+      })
+      .catch(() => setGone(true));
+  }, [reportId]);
+  useEffect(load, [load]);
+  useWorldEvent(
+    useCallback(
+      (ev: WorldEvent) => {
+        if (ev.type === "report.updated" && String(ev.payload.report_id ?? ev.payload.id ?? "") === reportId) load();
+      },
+      [load, reportId],
+    ),
+  );
+  if (!detail) return gone ? <p className="text-w-sm text-w-muted">This lesson's canvas is gone.</p> : <Shimmer>Opening the canvas</Shimmer>;
+  return (
+    <div className="h-[min(46rem,78vh)] min-h-[28rem] overflow-hidden rounded-xl border-2 border-w-ink bg-w-card">
+      <PracticeView embedded detail={detail} agents={agents} meId={meId} focusItem={attempt ? `${ATTEMPT_ITEM}${attempt}` : null} onOpenAgent={onOpenAgent}
+        onChanged={() => {
+          load();
+          onLessonChanged();
+        }}
+      />
+    </div>
+  );
+}
+
 function ChallengeView({
   id,
   meId,
+  attempt,
+  agents,
+  onOpenAgent,
   waitingOn,
   onBack,
   onClose,
@@ -410,6 +567,9 @@ function ChallengeView({
 }: {
   id: string;
   meId: string | null;
+  attempt: string | null;
+  agents: WorldAgent[];
+  onOpenAgent: (id: string) => void;
   waitingOn: string | null;
   onBack: () => void;
   onClose: () => void;
@@ -417,6 +577,8 @@ function ChallengeView({
   onProgress: (p: Progress) => void;
 }) {
   const [detail, setDetail] = useState<ChallengeDetail | null>(null);
+  const reportRef = useRef<string | null>(null);
+  reportRef.current = detail?.card.report_id ?? null;
   const [hints, setHints] = useState(0);
   const [answer, setAnswer] = useDraft(`academy:${id}`);
   const [pending, setPending] = useState<Attempt | null>(null);
@@ -447,6 +609,11 @@ function ChallengeView({
   useWorldEvent(
     useCallback(
       (ev: WorldEvent) => {
+        if (ev.type === "report.updated" || ev.type === "item.updated") {
+          const ref = String(ev.payload.report_id ?? ev.payload.item_id ?? ev.payload.id ?? "");
+          if (ref && (ref === id || ref === reportRef.current)) load();
+          return;
+        }
         if (ev.type !== "challenge.graded" || ev.payload.challenge_id !== id) return;
         if (ev.payload.owner_user_id && ev.payload.owner_user_id !== meId) return;
         const attemptId = String(ev.payload.attempt_id ?? "");
@@ -455,7 +622,7 @@ function ChallengeView({
           .then((a) => finish(a, { levelUp: Boolean(ev.payload.level_up), level: Number(ev.payload.level) || null, unlocks: (ev.payload.unlocks as Unlock[]) ?? [] }))
           .catch(() => {});
       },
-      [id, meId, finish],
+      [id, meId, finish, load],
     ),
   );
   useEffect(() => {
@@ -511,7 +678,23 @@ function ChallengeView({
           {card.state === "passed" && <span className="text-w-ok">passed before, practice earns no new xp</span>}
         </p>
         {waitingOn && <p className="rounded-lg border-2 border-dashed border-w-line2 px-3 py-2 text-w-sm text-w-muted">Your agent keeps working on {waitingOn}. You will get a note here when it is done, and your answer stays saved.</p>}
-        <Md text={detail.prompt} className="rounded-lg border-2 border-w-ink bg-w-card p-3 text-w-md leading-relaxed" />
+        <div {...quoteProps(`challenge:${card.id}`, card.title)}>
+          <Md text={detail.prompt || (card.type === "canvas" ? "Draw it on the canvas and press Ready. Your coach checks the picture and every stroke." : "Read it, then tell your coach in your own words what it says.")} className="rounded-lg border-2 border-w-ink bg-w-card p-3 text-w-md leading-relaxed" />
+        </div>
+        {detail.reading.length > 0 && (
+          <div>
+            <p className="mb-1.5 text-w-sm text-w-muted">Read first</p>
+            <div className="flex flex-wrap gap-2">
+              {detail.reading.map((r) => (
+                <button key={r.id} type="button" onClick={() => openReport(r.id)} className={cn(BTN_SECONDARY, "max-w-full")}>
+                  <BookOpen size={14} weight="bold" className="shrink-0" />
+                  <span className="truncate">{r.title}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        {detail.coach && <p className="text-w-sm text-w-muted">Coach: {detail.coach.name}</p>}
         {detail.hints.length > 0 && (
           <div className="space-y-2">
             {detail.hints.slice(0, hints).map((h, i) => (
@@ -527,7 +710,13 @@ function ChallengeView({
             )}
           </div>
         )}
-        {card.type === "quiz" && detail.choices.length > 0 ? (
+        {card.type === "canvas" ? (
+          card.report_id ? (
+            <LessonCanvas reportId={card.report_id} attempt={attempt} agents={agents} meId={meId} onOpenAgent={onOpenAgent} onLessonChanged={load} />
+          ) : (
+            <p className="text-w-sm text-w-muted">This lesson's canvas is gone.</p>
+          )
+        ) : card.type === "quiz" && detail.choices.length > 0 ? (
           <fieldset className="space-y-2">
             <legend className="mb-1 text-w-sm text-w-muted">Pick every answer that fits</legend>
             {detail.choices.map((c, i) => (
@@ -539,13 +728,13 @@ function ChallengeView({
           </fieldset>
         ) : (
           <label className="block">
-            <span className="mb-1 block text-w-sm text-w-muted">{card.type === "dsa" ? `Your solution in ${lang}` : card.type === "design" ? "Your design" : "Your answer"}</span>
+            <span className="mb-1 block text-w-sm text-w-muted">{card.type === "dsa" ? `Your solution in ${lang}` : card.type === "design" ? "Your design" : card.type === "reading" ? "What did you take from it?" : "Your answer"}</span>
             <textarea
               value={answer}
               onChange={(e) => setAnswer(e.target.value)}
               spellCheck={card.type !== "dsa"}
               rows={card.type === "dsa" ? 12 : 8}
-              placeholder={card.type === "dsa" ? "Write your code here" : card.type === "design" ? "Components, data flow, trade-offs" : "Type your answer"}
+              placeholder={card.type === "dsa" ? "Write your code here" : card.type === "design" ? "Components, data flow, trade-offs" : card.type === "reading" ? "What it says, in your own words" : "Type your answer"}
               className={cn(INPUT, "w-full resize-y leading-relaxed", card.type === "dsa" && "font-mono text-w-base")}
               onKeyDown={(e) => {
                 if (card.type === "dsa" && e.key === "Tab" && !e.shiftKey) {
@@ -560,7 +749,7 @@ function ChallengeView({
           </label>
         )}
         {refusal && <RefusalNote refusal={refusal} onFix={onFix} />}
-        {pending ? (
+        {card.type === "canvas" ? null : pending ? (
           <p className="rounded-lg border-2 border-w-ink bg-w-card px-3 py-2 text-w-base">
             <Shimmer>Your answer is being graded</Shimmer>
           </p>
@@ -600,7 +789,7 @@ function GradeCard({ result }: { result: { attempt: Attempt; levelUp: boolean; l
   return (
     <div role="status" className={cn("space-y-2 rounded-xl border-2 p-4", passed ? "border-w-ok/40 bg-w-ok/10" : a.status === "error" ? "border-w-danger/40 bg-w-danger/10" : "border-w-warn/40 bg-w-warn/10")}>
       <p className="flex items-center gap-2 text-w-lg font-semibold text-w-strong">
-        {passed ? <Trophy size={18} weight="fill" className="text-w-warn" /> : <Sparkle size={18} weight="bold" />}
+        {passed ? <Trophy size={18} weight="fill" className="text-w-warn" /> : <MeaningIcon.tryAgain size={18} weight="bold" />}
         {passed ? "Passed" : a.status === "error" ? "Could not grade this one" : "Not quite yet"}
         {a.score !== null && <span className="text-w-muted">· {a.score} / 100</span>}
       </p>

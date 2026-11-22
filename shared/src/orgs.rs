@@ -78,6 +78,11 @@ pub struct Org {
     pub created_at: DateTime<Utc>,
 }
 
+pub(crate) async fn lock_org(tx: &mut Transaction<'_, Postgres>, org: Uuid) -> Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('world_org_members:' || $1::text))").bind(org).execute(&mut **tx).await?;
+    Ok(())
+}
+
 pub(crate) async fn audit_in(tx: &mut Transaction<'_, Postgres>, org: Uuid, actor: Option<Uuid>, action: &str, target: Option<String>, detail: Value) -> Result<()> {
     sqlx::query("INSERT INTO org_audit (org_id, actor_user_id, action, target, detail) VALUES ($1, $2, $3, $4, $5)")
         .bind(org)

@@ -68,8 +68,12 @@ export function useAgentContext(agentId: string, enabled: boolean, refreshKey: s
       if (next) client.setQueryData(qk.agent.context(agentId), next);
     };
     window.addEventListener("world-event", onEvent);
-    return () => window.removeEventListener("world-event", onEvent);
-  }, [agentId, enabled, client]);
+    window.addEventListener("world-reconnected", refresh);
+    return () => {
+      window.removeEventListener("world-event", onEvent);
+      window.removeEventListener("world-reconnected", refresh);
+    };
+  }, [agentId, enabled, client, refresh]);
   const data = query.data;
   const context = enabled && data && data !== CONTEXT_MISSING ? data : null;
   return { context, refresh };

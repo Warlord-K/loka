@@ -299,6 +299,7 @@ pub(crate) fn wrap(
         Kind::Bubblewrap => rebuild(&cmd, BWRAP, bwrap_args(&paths, on_disk).into_iter().chain([OsString::from("--")]).collect()),
     };
     wrapped.env("TMPDIR", &temp.0);
+    crate::cli::drop_default_quest_target(&mut wrapped);
     Ok((wrapped, Some(temp)))
 }
 
@@ -327,6 +328,34 @@ mod tests {
         assert!(!owner.contains("loka-outbox"));
         let guest = seatbelt_profile(&Paths { hidden: vec![temp], ..sample() });
         assert!(!guest.contains("TemporaryDirectory"));
+    }
+
+    #[test]
+    fn owner_temp_rules_reach_inside_the_named_entries_and_nowhere_else() {
+        let temp = PathBuf::from("/private/var/folders/ab/cd/T");
+        let owner = seatbelt_profile(&Paths { owner_temp: vec![temp.clone()], hidden: vec![temp], ..sample() });
+        let rules: Vec<regex_lite::Regex> = owner
+            .lines()
+            .filter_map(|line| line.strip_prefix("(allow file-read* file-write* (regex #\"")?.strip_suffix("\"))"))
+            .map(|pattern| regex_lite::Regex::new(pattern).unwrap())
+            .collect();
+        let allowed = |path: &str| rules.iter().any(|rule| rule.is_match(path));
+        for root in ["/private/var/folders/ab/cd/T", "/var/folders/ab/cd/T"] {
+            for inside in [
+                "TemporaryDirectory.Ab12",
+                "TemporaryDirectory.Ab12/a",
+                "TemporaryDirectory.Ab12/SourcePackages/checkouts/x/Package.resolved",
+                "swift-build-1/x/y",
+                "com.apple.dt.XCBuild/a/b",
+                "xcrun_db-abc",
+            ] {
+                assert!(allowed(&format!("{root}/{inside}")), "{root}/{inside} refused");
+            }
+            for outside in ["", "/x", "/loka-outbox/a", "/TemporaryDirectoryAb/a", "/other/TemporaryDirectory.a/b"] {
+                assert!(!allowed(&format!("{root}{outside}")), "{root}{outside} allowed");
+            }
+        }
+        assert!(!allowed("/private/var/folders/zz/yy/T/TemporaryDirectory.a/b"));
     }
 
     #[test]

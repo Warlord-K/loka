@@ -22,7 +22,7 @@ impl Server {
             return Vec::new();
         }
         vec![
-            tool("key_environments", "List your person's keys that have more than one value (environments such as staging or a second account) and which environment each of their agents uses. Shows names only, never values; values are added by your person under You > Keys.", json!({}), &[]),
+            tool("key_environments", "List your person's keys that have more than one value (environments such as staging or a second account) and which environment each of their agents uses. Shows names only, never values; values are added by your person under Settings > Keys.", json!({}), &[]),
             tool("use_key_environment", &format!("Switch one of your person's agents, or you, to the value of a key from another environment (for example the CLAUDE_CODE_OAUTH_TOKEN from staging), or back to default. Leave key empty to switch every key that has that environment. hours makes it temporary; it goes back to default by itself after that. It only picks between values your person already saved and never grants a key the agent does not have. Takes effect on the agent's next run. Use it {OWNER_ONLY}.")
                 , json!({
                     "agent": s("Agent name or slug, optional, defaults to you"),
@@ -56,7 +56,7 @@ impl Server {
             "key_environments" => {
                 let variants = self.store.list_environment_variants(owner).await?;
                 if variants.is_empty() {
-                    return Ok("Your person has no key with more than one value. They can add one under You > Keys: open a key and add a value for another environment.".into());
+                    return Ok("Your person has no key with more than one value. They can add one under Settings > Keys: open a key and add a value for another environment.".into());
                 }
                 let mut by_key: BTreeMap<String, Vec<String>> = BTreeMap::new();
                 for variant in variants {
@@ -115,7 +115,7 @@ impl Server {
                             format!("{} now uses {} from {target}{when}. It applies from their next run.", agent.name, names.join(", "))
                         })
                     }
-                    Err(ChoiceError::NoSuchEnvironment) => bail!("your person has not saved a value for that key in that environment; they add it under You > Keys"),
+                    Err(ChoiceError::NoSuchEnvironment) => bail!("your person has not saved a value for that key in that environment; they add it under Settings > Keys"),
                     Err(error) => bail!("{error}"),
                 }
             }

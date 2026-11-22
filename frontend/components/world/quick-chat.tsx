@@ -1,22 +1,25 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { BookmarkSimple, Lightning, Plus, User, X } from "@phosphor-icons/react";
+import { BookmarkSimple, Lightning, Phone, Plus, User, X } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
 import { QUICK_KEEP, QUICK_SKIP, WorldApiError, worldApi, type AgentMessage, type QuickBrief, type QuickChat, type WorldAgent, type WorldEvent } from "@/lib/world";
 import { runtimeName } from "@/lib/model-names";
+import { latestOnly, startRechecks } from "@/lib/latest";
 import { AgentFace, PersonAvatar } from "./channel-ui";
-import { AskChoices, AttachButton, AttachmentGrid, NewMessagesPill, PendingStrip, RichText, useAgentHandles, useAttachments, useFollowBottom } from "./chat-kit";
+import { AskChoices, AttachButton, AttachmentGrid, NewMessagesPill, PendingStrip, RichText, useAgentHandles, useAttachments, useFollowBottom, useRefetchOnResume } from "./chat-kit";
 import { useDraft } from "./drafts";
 import { MessageAuthor, MessageRow } from "./message-row";
 import { PaneResizer, usePaneWidth } from "./pane-resizer";
 import { useEscape } from "./panels";
+import { QuotedBlock, QuotePreview, quoteProps, useQuote } from "./quote";
 import { RelativeTime } from "./relative-time";
 import { EmptyState, InfoNote, WindowHeader } from "./settings-shell";
 import { BTN_SECONDARY, CHUNKY, NAV_OFF, NAV_ON, PANEL, SIDEBAR } from "./styles";
 import { SpokenMark, VoiceField } from "./voice-ui";
 import { AgentStatus, Shimmer } from "./work-ui";
 import { LocalPathContext } from "./local-path";
+import { RunCommandContext, useRunCommand, type RunCommand } from "./run-command";
 
 const CHATS = new Map<string, QuickChat>();
 let LIST: QuickBrief[] | null = null;
@@ -35,6 +38,10 @@ export function QuickChatWindow({
   initialSessionId,
   onOpenAgent,
   onClose,
+  call,
+  onCall,
+  onHangUp,
+  onCallSlot,
 }: {
   agents: WorldAgent[];
   mainAgentId: string | null;
@@ -43,6 +50,10 @@ export function QuickChatWindow({
   initialSessionId?: string | null;
   onOpenAgent: (id: string) => void;
   onClose: () => void;
+  call: { quickId: string | null; minimised: boolean };
+  onCall: (agentId: string, sessionId: string) => void;
+  onHangUp: () => void;
+  onCallSlot: (el: HTMLElement, on: boolean) => void;
 }) {
   useEscape(onClose);
   const [agentId, setAgentId] = useState(() => initialAgentId ?? mainAgentId ?? agents[0]?.id ?? "");
@@ -52,6 +63,7 @@ export function QuickChatWindow({
   const [loadFailed, setLoadFailed] = useState(false);
   const sessionRef = useRef(sessionId);
   sessionRef.current = sessionId;
+  const reads = useRef(latestOnly());
   const pane = usePaneWidth("quick.list", 17, 13, 30);
   const handles = useAgentHandles(agents);
 
@@ -66,9 +78,11 @@ export function QuickChatWindow({
   }, []);
 
   const loadChat = useCallback((id: string) => {
+    const latest = reads.current.begin();
     void worldApi
       .quickRead(id)
       .then((next) => {
+        if (!latest()) return;
         CHATS.set(id, next);
         if (sessionRef.current === id) {
           setChat(next);
@@ -76,7 +90,7 @@ export function QuickChatWindow({
         }
       })
       .catch(() => {
-        if (sessionRef.current === id) setLoadFailed(true);
+        if (latest() && sessionRef.current === id) setLoadFailed(true);
       });
   }, []);
 
@@ -104,15 +118,37 @@ export function QuickChatWindow({
     return () => window.removeEventListener("world-event", onEvent);
   }, [loadList, loadChat]);
 
+  useRefetchOnResume(() => {
+    loadList();
+    if (sessionRef.current) loadChat(sessionRef.current);
+  });
+
+  const waiting = !!chat && (chat.busy || chat.messages[chat.messages.length - 1]?.author_kind === "user");
+  useEffect(() => {
+    if (!sessionId || !waiting) return;
+    return startRechecks(() => loadChat(sessionId));
+  }, [sessionId, waiting, loadChat]);
+
   const chatAgent = agents.find((a) => a.id === (chat?.agent_id ?? agentId)) ?? null;
   const names = useMemo(() => new Map(agents.map((a) => [a.id, a])), [agents]);
 
+  const leaveCallFor = (next: string | null) => {
+    if (call.quickId && call.quickId !== next && !call.minimised) onHangUp();
+  };
+
+  const pickChat = (id: string) => {
+    leaveCallFor(id);
+    setSessionId(id);
+  };
+
   const startNew = (id?: string) => {
+    leaveCallFor(null);
     setSessionId(null);
     if (id) setAgentId(id);
   };
 
   const close = async (id: string) => {
+    if (call.quickId === id) onHangUp();
     try {
       await worldApi.quickClose(id);
     } catch {
@@ -122,6 +158,10 @@ export function QuickChatWindow({
     if (sessionRef.current === id) setSessionId(null);
     loadList();
   };
+
+  useEffect(() => {
+    if (chat?.status === "archived" && call.quickId === chat.id) onHangUp();
+  }, [chat?.status, chat?.id, call.quickId, onHangUp]);
 
   return (
     <div role="dialog" aria-modal="true" aria-label="Quick chat" className={cn(PANEL, "pointer-events-auto flex h-full w-full flex-col overflow-hidden")}>
@@ -166,7 +206,7 @@ export function QuickChatWindow({
                 <li key={q.id} className="group relative">
                   <button
                     type="button"
-                    onClick={() => setSessionId(q.id)}
+                    onClick={() => pickChat(q.id)}
                     className={cn("w-full rounded-lg px-2.5 py-2 pr-8 text-left text-w-sm transition-colors", sessionId === q.id ? NAV_ON : NAV_OFF)}
                   >
                     <span className="block truncate font-semibold text-w-strong">{q.title || "Quick chat"}</span>
@@ -203,6 +243,9 @@ export function QuickChatWindow({
           meId={meId}
           handles={handles}
           onOpenAgent={onOpenAgent}
+          calling={call.quickId !== null && call.quickId === sessionId ? (call.minimised ? "away" : "here") : null}
+          onCall={() => sessionId && chatAgent && onCall(chatAgent.id, sessionId)}
+          onCallSlot={onCallSlot}
           onStarted={(id, first) => {
             setSessionId(id);
             CHATS.delete(id);
@@ -227,6 +270,9 @@ function Conversation({
   meId,
   handles,
   onOpenAgent,
+  calling,
+  onCall,
+  onCallSlot,
   onStarted,
   onRefresh,
 }: {
@@ -240,20 +286,39 @@ function Conversation({
   meId: string | null;
   handles: Map<string, WorldAgent>;
   onOpenAgent: (id: string) => void;
+  calling: "here" | "away" | null;
+  onCall: () => void;
+  onCallSlot: (el: HTMLElement, on: boolean) => void;
   onStarted: (id: string, first: AgentMessage | null) => void;
   onRefresh: () => void;
 }) {
   const [draft, setDraft] = useDraft(`quick:${sessionId ?? `new:${agentId}`}`);
   const [sending, setSending] = useState(false);
   const [dictated, setDictated] = useState(false);
+  const [quote, setQuote] = useQuote(sessionId ? `quick:${sessionId}` : null);
   const [error, setError] = useState<string | null>(null);
   const [answering, setAnswering] = useState<Set<string>>(new Set());
   const inputRef = useRef<HTMLTextAreaElement | HTMLInputElement | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
   const files = useAttachments();
-  const messages = useMemo(() => (chat?.messages ?? []).filter((m) => !(m.author_kind === "user" && m.meta?.answers)), [chat]);
+  const messages = useMemo(() => (chat?.messages ?? []).filter((m) => !(m.author_kind === "user" && (m.meta?.answers || m.meta?.voice_request))), [chat]);
+  const slotEl = useRef<HTMLElement | null>(null);
+  const callSlotRef = useCallback(
+    (el: HTMLDivElement | null) => {
+      if (el) {
+        slotEl.current = el;
+        onCallSlot(el, true);
+      } else if (slotEl.current) {
+        onCallSlot(slotEl.current, false);
+        slotEl.current = null;
+      }
+    },
+    [onCallSlot],
+  );
+  const canCall = !!sessionId && !!chat && chat.status !== "archived" && !chat.thread_root && !!agent && calling !== "here";
   const last = messages[messages.length - 1];
   const follow = useFollowBottom(endRef, last?.id, sessionId);
+  const runner = useRunCommand(agent, meId, { where: agent ? (agent.runner_name ? `on ${agent.runner_name}, output goes to ${agent.name}'s main chat` : `on ${agent.name}'s device, output goes to its main chat`) : undefined });
   const thinking = !!chat && (chat.busy || last?.author_kind === "user");
 
   useEffect(() => {
@@ -272,7 +337,7 @@ function Conversation({
     follow.stick();
     try {
       if (sessionId) {
-        await worldApi.quickSend(sessionId, { text, attachments: files.ready, spoken: dictated || undefined });
+        await worldApi.quickSend(sessionId, { text, attachments: files.ready, spoken: dictated || undefined, quote });
         onRefresh();
       } else {
         const started = await worldApi.quickStart(agentId, { text, attachments: files.ready, spoken: dictated || undefined });
@@ -280,6 +345,7 @@ function Conversation({
       }
       files.clear();
       setDictated(false);
+      setQuote(null);
     } catch (err) {
       setDraft(text);
       setError(err instanceof WorldApiError ? err.message : "Not sent. Your message is back in the box, try again.");
@@ -323,6 +389,17 @@ function Conversation({
                 <span className="shrink-0">{runtimeName(chat?.backend ?? agent.cli, chat?.model ?? agent.model)}</span>
               </p>
             </div>
+            {canCall && (
+              <button
+                type="button"
+                onClick={onCall}
+                aria-label={calling === "away" ? `Back to the call with ${name}` : `Call ${name} from this chat`}
+                title={calling === "away" ? "Back to the call" : "Call from this chat"}
+                className={cn(CHUNKY, "grid h-10 w-10 shrink-0 place-items-center bg-w-teal text-w-strong hover:bg-w-teal2")}
+              >
+                <Phone size={17} weight="bold" />
+              </button>
+            )}
           </div>
         )}
         {!sessionId && agents.length > 1 && (
@@ -350,6 +427,7 @@ function Conversation({
           </div>
         )}
       </div>
+      {calling === "here" && <div ref={callSlotRef} className="shrink-0" />}
       <div className="relative min-h-0 flex-1 overflow-y-auto pb-2 pt-3">
         <InfoNote className="mx-4 mb-3">
           {`Starts from ${name}'s memory. ${name} keeps working on everything else, and nothing here is remembered unless you tap Remember.`}
@@ -361,7 +439,7 @@ function Conversation({
           <p className="px-4 text-w-sm text-w-muted">{loadFailed ? "Could not load this chat." : <Shimmer>Loading the chat</Shimmer>}</p>
         )}
         {messages.map((m) => (
-          <QuickRow key={m.id} message={m} agent={agent} meId={meId} handles={handles} onOpenAgent={onOpenAgent} busy={answering.has(m.id)} onAnswer={(choice) => void answer(m, choice)} />
+          <QuickRow key={m.id} message={m} sessionId={sessionId} agent={agent} meId={meId} runner={m.author_kind === "agent" ? runner : null} handles={handles} onOpenAgent={onOpenAgent} busy={answering.has(m.id)} onAnswer={(choice) => void answer(m, choice)} />
         ))}
         {thinking && (
           <p className="px-4 py-2 pl-[4.25rem] text-w-sm">
@@ -377,6 +455,7 @@ function Conversation({
       ) : (
         <div className="shrink-0 px-3 pb-3 pt-1" {...files.dropProps}>
           <div className="relative rounded-xl border-2 border-w-line2 bg-w-card transition-colors focus-within:border-w-teal focus-within:ring-2 focus-within:ring-w-teal/25">
+            {quote && <QuotePreview quote={quote} onClear={() => setQuote(null)} />}
             <PendingStrip pending={files.pending} onRemove={files.remove} />
             <form onSubmit={submit} className="flex items-end gap-2 p-2">
               <AttachButton onFiles={files.add} />
@@ -410,16 +489,20 @@ function Conversation({
 
 function QuickRow({
   message: m,
+  sessionId,
   agent,
   meId,
+  runner,
   handles,
   onOpenAgent,
   busy,
   onAnswer,
 }: {
   message: AgentMessage;
+  sessionId: string | null;
   agent: WorldAgent | null;
   meId: string | null;
+  runner: RunCommand | null;
   handles: Map<string, WorldAgent>;
   onOpenAgent: (id: string) => void;
   busy: boolean;
@@ -452,7 +535,7 @@ function QuickRow({
       avatar={avatar}
       header={
         <MessageAuthor name={label} agent={!you} createdAt={m.created_at} onOpen={!you && agent ? () => onOpenAgent(agent.id) : undefined}>
-          {m.meta?.spoken && <SpokenMark />}
+          {(m.meta?.spoken || m.meta?.kind === "voice") && <SpokenMark />}
         </MessageAuthor>
       }
       actions={{ copy: m.body }}
@@ -460,9 +543,16 @@ function QuickRow({
       {memory ? (
         <MemoryOffer line={memory.line} answered={m.meta?.memory_answered ?? null} busy={busy} onAnswer={onAnswer} />
       ) : (
-        <LocalPathContext.Provider value={agent}>
-          <RichText text={m.body} handles={handles} onOpenAgent={onOpenAgent} className={cn("select-text", m.meta?.failed ? "text-w-danger" : "text-w-text")} />
-        </LocalPathContext.Provider>
+        <>
+          {m.meta?.quote && <QuotedBlock quote={m.meta.quote} />}
+          <div {...(sessionId ? quoteProps(`msg:${m.id}`, you ? "Your message" : `${label}'s message`, `quick:${sessionId}`) : {})}>
+            <LocalPathContext.Provider value={agent}>
+              <RunCommandContext.Provider value={runner}>
+                <RichText text={m.body} handles={handles} onOpenAgent={onOpenAgent} className={cn("select-text", m.meta?.failed ? "text-w-danger" : "text-w-text")} />
+              </RunCommandContext.Provider>
+            </LocalPathContext.Provider>
+          </div>
+        </>
       )}
       <AttachmentGrid items={m.meta?.attachments ?? []} />
     </MessageRow>

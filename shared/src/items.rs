@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use sqlx::FromRow;
 use uuid::Uuid;
 
-use crate::world::{NewEvent, WorldStore};
+use crate::world::{emit_in, NewEvent, WorldStore};
 
 pub const KINDS: &[&str] = &["building", "decoration", "critter", "timer", "list", "portal", "npc", "challenge", "adventure"];
 pub const PUBLIC_KINDS: &[&str] = &["building", "decoration", "critter", "portal", "npc"];
@@ -57,20 +57,51 @@ pub struct NewItem<'a> {
     pub region_id: Option<Uuid>,
 }
 
+pub struct NewList<'a> {
+    pub owner: Uuid,
+    pub creator: Option<Uuid>,
+    pub org: Uuid,
+    pub title: &'a str,
+    pub items: Vec<String>,
+    pub note: Option<Value>,
+    pub region: Option<Uuid>,
+}
+
+pub fn list_data(items: Vec<String>, note: Option<Value>) -> Value {
+    let mut data = json!({
+        "items": items
+            .into_iter()
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+            .map(|text| json!({ "text": text, "done": false }))
+            .collect::<Vec<_>>()
+    });
+    if note.as_ref().is_some_and(|value| value.as_object().is_some_and(|object| !object.is_empty())) {
+        data["note"] = note.unwrap_or_default();
+    }
+    data
+}
+
+fn item_name(name: &str) -> Result<&str> {
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("items need a name");
+    }
+    Ok(name)
+}
+
 impl WorldStore {
     pub async fn create_item(&self, new: NewItem<'_>) -> Result<WorldItem> {
         if !KINDS.contains(&new.kind) {
             bail!("unknown item kind {}", new.kind);
         }
-        if new.name.trim().is_empty() {
-            bail!("items need a name");
-        }
+        let name = item_name(new.name)?;
         let item = sqlx::query_as::<_, WorldItem>(
             "INSERT INTO world_items (kind, name, owner_user_id, created_by_agent, data, fires_at, region_id)
              VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *",
         )
         .bind(new.kind)
-        .bind(new.name.trim())
+        .bind(name)
         .bind(new.owner_user_id)
         .bind(new.created_by_agent)
         .bind(&new.data)
@@ -82,11 +113,63 @@ impl WorldStore {
         Ok(item)
     }
 
+    pub async fn create_list(&self, new: NewList<'_>) -> Result<WorldItem> {
+        let title = item_name(new.title)?;
+        let mut tx = self.pool().begin().await?;
+        let item = sqlx::query_as::<_, WorldItem>(
+            "INSERT INTO world_items (kind, name, owner_user_id, created_by_agent, data, region_id, org_id)
+             VALUES ('list', $1, $2, $3, $4, $5, $6) RETURNING *",
+        )
+        .bind(title)
+        .bind(new.owner)
+        .bind(new.creator)
+        .bind(list_data(new.items, new.note))
+        .bind(new.region)
+        .bind(new.org)
+        .fetch_one(&mut *tx)
+        .await?;
+        let mut event = NewEvent::new("item.created").payload(json!({
+            "item_id": item.id,
+            "org_id": item.org_id,
+            "kind": item.kind,
+            "name": item.name,
+            "owner_user_id": item.owner_user_id,
+            "region_id": item.region_id,
+            "private": true,
+        }));
+        if let Some(agent) = item.created_by_agent {
+            event = event.agent(agent);
+        }
+        emit_in(&mut tx, &event, None).await?;
+        tx.commit().await?;
+        Ok(item)
+    }
+
     pub async fn get_item(&self, id: Uuid) -> Result<Option<WorldItem>> {
         Ok(sqlx::query_as::<_, WorldItem>("SELECT * FROM world_items WHERE id = $1")
             .bind(id)
             .fetch_optional(self.pool())
             .await?)
+    }
+
+    pub async fn item_for_viewer(&self, id: Uuid, viewer: Uuid, org: Uuid, admin: bool) -> Result<Option<WorldItem>> {
+        Ok(sqlx::query_as::<_, WorldItem>(
+            "SELECT i.* FROM world_items i
+             LEFT JOIN world_regions r ON r.id = i.region_id
+             WHERE i.id = $1 AND i.status <> 'archived' AND i.org_id = $3
+               AND ((i.kind IN ('list', 'timer') AND i.owner_user_id = $2
+                     AND (i.region_id IS NULL OR (r.status = 'active' AND r.org_id = $3
+                          AND (r.owner_user_id = $2 OR r.visibility = 'public' OR $4))))
+                    OR (i.kind IN ('building', 'npc')
+                        AND (i.region_id IS NULL OR (r.status = 'active' AND r.org_id = $3
+                             AND (r.owner_user_id = $2 OR r.visibility = 'public' OR $4)))))",
+        )
+        .bind(id)
+        .bind(viewer)
+        .bind(org)
+        .bind(admin)
+        .fetch_optional(self.pool())
+        .await?)
     }
 
     pub async fn find_item(&self, owner: Option<Uuid>, org: Option<Uuid>, kind: Option<&str>, key: &str) -> Result<Option<WorldItem>> {
@@ -262,7 +345,7 @@ impl WorldStore {
             .unwrap_or(true))
     }
 
-    async fn item_event(&self, kind: &str, item: &WorldItem) -> Result<()> {
+    pub(crate) async fn item_event(&self, kind: &str, item: &WorldItem) -> Result<()> {
         let mut event = NewEvent::new(kind).payload(json!({
             "item_id": item.id,
             "org_id": item.org_id,
@@ -277,6 +360,19 @@ impl WorldStore {
         }
         self.emit(event, None).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_data_cleans_entries_and_keeps_style() {
+        let data = list_data(vec![" milk ".into(), "".into(), "bread".into()], Some(json!({ "color": "mint" })));
+        assert_eq!(data["items"], json!([{ "text": "milk", "done": false }, { "text": "bread", "done": false }]));
+        assert_eq!(data["note"], json!({ "color": "mint" }));
+        assert_eq!(list_data(vec![], Some(json!({}))), json!({ "items": [] }));
     }
 }
 

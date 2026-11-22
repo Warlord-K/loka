@@ -1,10 +1,16 @@
 "use client";
 
 import { useMemo, useState, type FormEvent } from "react";
-import { Check, Coins, Hash, PencilSimple, Plus, Star, Sword, Trash, UsersFour } from "@phosphor-icons/react";
+import { useQuery } from "@tanstack/react-query";
+import { ArrowLeft, Check, Coins, Hash, PencilSimple, Plus, Star, Sword, Trash, UsersFour } from "@phosphor-icons/react";
+import { SOLO } from "@/lib/edition";
+import { qk } from "@/lib/query-keys";
 import { cn } from "@/lib/utils";
-import type { WorldAgent } from "@/lib/world";
+import { worldApi, type Person, type WorldAgent } from "@/lib/world";
 import { teamsApi, type Team, type TeamDraft, type TeamQuest } from "@/lib/teams";
+import { WSelect } from "./controls";
+import { WorldLinkButton } from "./message-links";
+import { quoteProps } from "./quote";
 import { BTN_DANGER, BTN_PRIMARY, BTN_SECONDARY, INPUT, ITEM_CARD, PILL_NEUTRAL, SURFACE } from "./styles";
 import { Shimmer } from "./work-ui";
 import { AgentFace, PersonAvatar } from "./channel-ui";
@@ -28,15 +34,21 @@ function openQuest(taskId: string, agentId: string | null) {
 }
 
 function emptyDraft(): TeamDraft {
-  return { name: "", purpose: "", rules: "", lead_agent_id: null, agent_ids: [], channel: "" };
+  return { name: "", purpose: "", rules: "", lead_agent_id: null, agent_ids: [], user_ids: [], channel: "" };
+}
+
+function personName(person: { name: string | null; email?: string | null }): string {
+  return person.name || person.email?.split("@")[0] || "Someone";
 }
 
 function TeamEditor({
   agents,
+  meId,
   team,
   onDone,
 }: {
   agents: WorldAgent[];
+  meId: string | null;
   portraits: Record<string, string>;
   team: Team | null;
   onDone: () => void;
@@ -49,11 +61,22 @@ function TeamEditor({
           rules: team.rules,
           lead_agent_id: team.lead_agent_id,
           agent_ids: team.members.filter((m) => m.member_kind === "agent").map((m) => m.member_id),
+          user_ids: team.members.filter((m) => m.member_kind === "user").map((m) => m.member_id),
         }
       : emptyDraft(),
   );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [person, setPerson] = useState("");
+  const people: Person[] = useQuery({ queryKey: qk.people(), queryFn: () => worldApi.people(), enabled: !SOLO }).data ?? [];
+  const selectedPeople = draft.user_ids.map((id) => {
+    const found = people.find((entry) => entry.id === id);
+    const member = team?.members.find((entry) => entry.member_kind === "user" && entry.member_id === id);
+    return { id, name: found ? personName(found) : member?.name ?? "Someone" };
+  });
+  const personOptions = people
+    .filter((entry) => entry.id !== meId && !draft.user_ids.includes(entry.id))
+    .map((entry) => ({ value: entry.id, label: personName(entry), hint: entry.email ?? undefined }));
   const toggle = (id: string) =>
     setDraft((d) => {
       const on = d.agent_ids.includes(id);
@@ -93,7 +116,7 @@ function TeamEditor({
       <textarea className={cn(INPUT, "block min-h-[4rem] w-full")} placeholder="What the team is for" value={draft.purpose} onChange={(e) => setDraft({ ...draft, purpose: e.target.value })} aria-label="Team purpose" />
       <textarea className={cn(INPUT, "block min-h-[3.5rem] w-full")} placeholder="Team rules, one per line (optional)" value={draft.rules} onChange={(e) => setDraft({ ...draft, rules: e.target.value })} aria-label="Team rules" />
       <div>
-        <p className="mb-2 text-w-xs font-medium text-w-muted">Members. Tap the star to pick the lead.</p>
+        <p className="mb-2 text-w-xs font-medium text-w-muted">Agents. Tap the star to pick the lead.</p>
         {agents.length === 0 ? (
           <p className="text-w-sm text-w-muted">You have no agents to put on a team yet.</p>
         ) : (
@@ -127,6 +150,42 @@ function TeamEditor({
           </ul>
         )}
       </div>
+      {!SOLO && (
+        <div>
+          <p className="mb-2 text-w-xs font-medium text-w-muted">People</p>
+          {selectedPeople.length > 0 && (
+            <ul className="mb-2 flex flex-wrap gap-1.5">
+              {selectedPeople.map((entry) => (
+                <li key={entry.id} className={cn(PILL_NEUTRAL, "gap-1.5 py-1 pl-1 pr-1 text-w-xs font-medium")}>
+                  <PersonAvatar id={entry.id} name={entry.name} size={18} soft />
+                  <span>{entry.name}</span>
+                  <button
+                    type="button"
+                    onClick={() => setDraft((current) => ({ ...current, user_ids: current.user_ids.filter((id) => id !== entry.id) }))}
+                    aria-label={`Remove ${entry.name} from the team`}
+                    className="rounded p-0.5 text-w-muted hover:bg-w-rose hover:text-w-danger"
+                  >
+                    <Trash size={12} weight="bold" />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          {personOptions.length > 0 && (
+            <WSelect
+              value={person}
+              onChange={(id) => {
+                setDraft((current) => ({ ...current, user_ids: [...current.user_ids, id] }));
+                setPerson("");
+              }}
+              options={personOptions}
+              placeholder="Add a person"
+              ariaLabel="Person to add to the team"
+              className="w-full sm:w-72"
+            />
+          )}
+        </div>
+      )}
       {error && <p role="alert" className="rounded-lg bg-w-rose px-3 py-2 text-w-sm text-w-danger">{error}</p>}
       <div className="flex justify-end gap-2">
         <button type="button" onClick={onDone} className={BTN_SECONDARY}>
@@ -212,7 +271,7 @@ function TeamCard({
   );
   const busy = team.members.filter((m) => m.member_kind === "agent" && (byId.get(m.member_id)?.jobs?.length ?? 0) > 0).length;
   return (
-    <li className={cn(ITEM_CARD, "flex flex-col p-4")}>
+    <li {...quoteProps(`team:${team.id}`, team.name)} className={cn(ITEM_CARD, "flex flex-col p-4 select-text")}>
       <div className="flex items-start gap-3">
         <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-w-aqua text-w-link">
           <UsersFour size={20} weight="duotone" />
@@ -221,6 +280,7 @@ function TeamCard({
           <p className="truncate text-w-md font-semibold text-w-strong">{team.name}</p>
           {team.purpose && <p className="mt-0.5 line-clamp-2 text-w-sm leading-relaxed text-w-muted">{team.purpose}</p>}
         </div>
+        <WorldLinkButton kind="team" id={team.id} label={team.name} className={cn(GHOST_ICON_BTN, "shrink-0")} />
         {canEdit && (
           <div className="flex shrink-0 items-center gap-0.5">
             <button type="button" onClick={onEdit} aria-label={`Edit ${team.name}`} title="Edit" className={GHOST_ICON_BTN}>
@@ -303,20 +363,31 @@ export function TeamsView({
   meId,
   portraits,
   canWrite,
+  focusId,
+  onFocusChange,
 }: {
   teams: Team[];
   agents: WorldAgent[];
   meId: string | null;
   portraits: Record<string, string>;
   canWrite: boolean;
+  focusId?: string | null;
+  onFocusChange?: (id: string | null) => void;
 }) {
   const [editing, setEditing] = useState<Team | "new" | null>(null);
   const byId = useMemo(() => new Map(agents.map((a) => [a.id, a])), [agents]);
   const mine = useMemo(() => agents.filter((a) => a.owner_user_id === meId), [agents, meId]);
+  const shownTeams = focusId ? teams.filter((team) => team.id === focusId) : teams;
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
       <div className="w-full space-y-5 px-4 py-5 sm:px-5 xl:px-8">
         <div className="flex flex-wrap items-start justify-between gap-3">
+          {focusId && (
+            <button type="button" onClick={() => onFocusChange?.(null)} className={BTN_SECONDARY}>
+              <ArrowLeft size={14} weight="bold" />
+              All teams
+            </button>
+          )}
           <InfoNote className="max-w-3xl">
             Teams work together in their own channel. A quest given to a team goes to its lead, who splits it into parts and keeps everyone posted there, and it closes by itself once every part is done. You can also ask your main agent, for example: make a research team with Ada and Rook.
           </InfoNote>
@@ -328,15 +399,15 @@ export function TeamsView({
           )}
         </div>
         {canWrite && editing === null && teams.length === 0 && <StarterTeamCard agentCount={agents.length} />}
-        {editing === "new" && <TeamEditor agents={mine} portraits={portraits} team={null} onDone={() => setEditing(null)} />}
+        {editing === "new" && <TeamEditor agents={mine} meId={meId} portraits={portraits} team={null} onDone={() => setEditing(null)} />}
         {teams.length === 0 && editing === null ? (
           <EmptyState icon={UsersFour} title="No teams yet" description="Group agents into a team with a lead, a purpose and its own channel." />
         ) : (
           <ul className="grid items-start gap-3 @4xl:grid-cols-2">
-            {teams.map((t) =>
+            {shownTeams.map((t) =>
               editing !== null && editing !== "new" && editing.id === t.id ? (
                 <li key={t.id} className="@4xl:col-span-2">
-                  <TeamEditor agents={mine} portraits={portraits} team={t} onDone={() => setEditing(null)} />
+                  <TeamEditor agents={mine} meId={meId} portraits={portraits} team={editing} onDone={() => setEditing(null)} />
                 </li>
               ) : (
                 <TeamCard key={t.id} team={t} byId={byId} portraits={portraits} canEdit={canWrite && t.owner_user_id === meId} onEdit={() => setEditing(t)} />

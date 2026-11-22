@@ -6,7 +6,7 @@ import { cn } from "@/lib/utils";
 import type { Attachment, Person, ReplyAuthor, WorldAgent, WorldEvent } from "@/lib/world";
 import { AgentFace, PersonAvatar } from "./channel-ui";
 import { RelativeTime } from "./relative-time";
-import { AttachButton, AttachmentGrid, MessageEditor, NewMessagesPill, PendingStrip, RichText, useAttachments, useFollowBottom } from "./chat-kit";
+import { AttachButton, AttachmentGrid, MessageEditor, NewMessagesPill, PendingStrip, RichText, useAttachments, useFollowBottom, useRefetchOnResume } from "./chat-kit";
 import { MessageAuthor, MessageRow } from "./message-row";
 export { ReplyButton } from "./message-row";
 import { useDraft } from "./drafts";
@@ -16,7 +16,9 @@ import { CHUNKY } from "./styles";
 import { SpokenMark, VoiceField } from "./voice-ui";
 import { Shimmer } from "./work-ui";
 import { MemoryOffer } from "./quick-chat";
+import { QuotedBlock, QuotePreview, quoteProps, useQuote, type MessageQuote } from "./quote";
 import { takeEscape } from "@/lib/escape";
+import { RunCommandContext, type RunCommand } from "./run-command";
 import { notSent, sendFailure } from "@/lib/send-failure";
 
 export interface ThreadItem {
@@ -30,6 +32,9 @@ export interface ThreadItem {
   agent?: boolean;
   spoken?: boolean;
   call?: boolean;
+  quote?: MessageQuote;
+  quoteSource?: string;
+  runner?: RunCommand | null;
   onEdit?: (body: string) => Promise<void>;
   onDelete?: () => Promise<void>;
   memory?: { line: string; answered: string | null; onAnswer: (choice: string) => Promise<void> };
@@ -92,6 +97,7 @@ export function ThreadPanel({
   load,
   refreshOn,
   send,
+  quoteTarget,
   canPost,
   handles,
   people,
@@ -113,7 +119,8 @@ export function ThreadPanel({
   draftKey: string;
   load: () => Promise<ThreadItem[]>;
   refreshOn: (ev: WorldEvent) => boolean;
-  send: (text: string, spoken: boolean, attachments: string[]) => Promise<void>;
+  send: (text: string, spoken: boolean, attachments: string[], quote: MessageQuote | null) => Promise<void>;
+  quoteTarget?: string;
   canPost: boolean;
   handles: Map<string, WorldAgent>;
   people?: Map<string, Person>;
@@ -129,6 +136,7 @@ export function ThreadPanel({
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [draft, setDraft] = useDraft(draftKey);
+  const [quote, setQuote] = useQuote(quoteTarget ?? null);
   const inputRef = useRef<HTMLTextAreaElement | HTMLInputElement | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
   const loadRef = useRef(load);
@@ -158,6 +166,7 @@ export function ThreadPanel({
     window.addEventListener("world-event", onEvent);
     return () => window.removeEventListener("world-event", onEvent);
   }, [refresh]);
+  useRefetchOnResume(refresh);
 
   const follow = useFollowBottom(endRef, items?.[items.length - 1]?.key, draftKey);
 
@@ -211,9 +220,10 @@ export function ThreadPanel({
     setDraft("");
     follow.stick();
     try {
-      await send(text, dictated, attachments);
+      await send(text, dictated, attachments, quote);
       files.clear();
       setDictated(false);
+      setQuote(null);
       refresh();
       follow.stick();
     } catch (err) {
@@ -255,14 +265,14 @@ export function ThreadPanel({
           <p className="px-4 text-w-sm text-w-muted">This message is gone.</p>
         ) : (
           <>
-            <Row item={root} handles={handles} people={people} onOpenAgent={onOpenAgent} onOpenPerson={onOpenPerson} onSaved={refresh} />
+            <Row item={root} quoteTarget={quoteTarget} handles={handles} people={people} onOpenAgent={onOpenAgent} onOpenPerson={onOpenPerson} onSaved={refresh} />
             <div className="my-2 flex items-center gap-2 px-4 text-w-xs text-w-muted">
               <span>{replies.length === 0 ? "No replies yet" : replies.length === 1 ? "1 reply" : `${replies.length} replies`}</span>
               <span className="h-0 flex-1 border-t border-dashed border-w-line2" />
             </div>
             {replies.map((item) => (
               <Fragment key={item.key}>
-                <Row item={item} handles={handles} people={people} onOpenAgent={onOpenAgent} onOpenPerson={onOpenPerson} onRemove={item.onDelete ? () => remove(item) : undefined} onSaved={refresh} />
+                <Row item={item} quoteTarget={quoteTarget} handles={handles} people={people} onOpenAgent={onOpenAgent} onOpenPerson={onOpenPerson} onRemove={item.onDelete ? () => remove(item) : undefined} onSaved={refresh} />
               </Fragment>
             ))}
             {thinking && (
@@ -290,6 +300,7 @@ export function ThreadPanel({
           {typing}
           <div className="relative rounded-xl border-2 border-w-line2 bg-w-card transition-colors focus-within:border-w-teal focus-within:ring-2 focus-within:ring-w-teal/25">
             {picker.popover}
+            {quote && <QuotePreview quote={quote} onClear={() => setQuote(null)} />}
             <PendingStrip pending={files.pending} onRemove={files.remove} />
             <form onSubmit={submit} className="flex items-end gap-2 p-2">
               <AttachButton onFiles={files.add} />
@@ -324,6 +335,7 @@ export function ThreadPanel({
 
 function Row({
   item,
+  quoteTarget,
   handles,
   people,
   onOpenAgent,
@@ -332,6 +344,7 @@ function Row({
   onSaved,
 }: {
   item: ThreadItem;
+  quoteTarget?: string;
   handles: Map<string, WorldAgent>;
   people?: Map<string, Person>;
   onOpenAgent: (id: string) => void;
@@ -379,7 +392,14 @@ function Row({
           }}
         />
       ) : (
-        <RichText text={item.body} handles={handles} people={people} onOpenAgent={onOpenAgent} onOpenPerson={onOpenPerson} className="select-text text-w-text" />
+        <>
+          {item.quote && <QuotedBlock quote={item.quote} />}
+          <div {...(quoteTarget && item.quoteSource ? quoteProps(item.quoteSource, `${item.name}'s message`, quoteTarget) : {})}>
+            <RunCommandContext.Provider value={item.runner ?? null}>
+              <RichText text={item.body} handles={handles} people={people} onOpenAgent={onOpenAgent} onOpenPerson={onOpenPerson} className="select-text text-w-text" />
+            </RunCommandContext.Provider>
+          </div>
+        </>
       )}
       <AttachmentGrid items={item.attachments ?? []} />
     </MessageRow>

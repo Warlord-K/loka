@@ -30,7 +30,7 @@ pub fn min_role(method: &Method, path: &str) -> Role {
         ["world", "github", ..] => Role::Write,
         ["world", "agents"] if get => Role::View,
         ["world", "stream"] | ["world", "events"] => Role::View,
-        ["world", "items"] if get => Role::View,
+        ["world", "items", ..] if get => Role::View,
         ["world", "regions", ..] | ["world", "loka", ..] if get => Role::View,
         ["world", "progress"] | ["world", "challenges", ..] | ["world", "attempts", ..] | ["world", "adventures"] if get => Role::View,
         ["world", "npcs", _, "talk"] if get => Role::View,
@@ -258,6 +258,7 @@ mod tests {
         assert_eq!(min_role(&Method::GET, "/world/agents/abc/feeds"), Role::Write);
         assert_eq!(min_role(&Method::DELETE, "/world/agents/abc/feeds/def"), Role::Write);
         assert_eq!(min_role(&Method::GET, "/world/regions/abc"), Role::View);
+        assert_eq!(min_role(&Method::GET, "/world/items/abc"), Role::View);
         assert_eq!(min_role(&Method::GET, "/world/challenges/abc"), Role::View);
         assert_eq!(min_role(&Method::POST, "/world/challenges/abc/attempts"), Role::Write);
         assert_eq!(min_role(&Method::POST, "/world/npcs/abc/talk"), Role::Write);

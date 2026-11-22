@@ -151,7 +151,7 @@ export interface NpcVia {
   region: string | null;
 }
 
-export type ChallengeType = "puzzle" | "dsa" | "design" | "quiz";
+export type ChallengeType = "puzzle" | "dsa" | "design" | "quiz" | "reading" | "canvas";
 export type Difficulty = "easy" | "medium" | "hard";
 export type ChallengeState = "new" | "pending" | "passed" | "failed";
 export type AttemptStatus = "pending" | "passed" | "failed" | "error";
@@ -168,6 +168,8 @@ export interface ChallengeCard {
   adventure_id: string | null;
   adventure_order: number | null;
   task_id: string | null;
+  report_id: string | null;
+  coach_agent_id: string | null;
   created_by_agent: string | null;
   created_at: string;
   state: ChallengeState;
@@ -201,6 +203,8 @@ export interface ChallengeDetail {
   hints: string[];
   tests: ChallengeTests | null;
   choices: string[];
+  reading: { id: string; title: string; kind: string }[];
+  coach: { id: string; name: string; slug: string } | null;
   attempts: Attempt[];
 }
 
@@ -209,6 +213,9 @@ export interface AdventureCard {
   title: string;
   story: string;
   region_id: string | null;
+  folder: string | null;
+  skill: string | null;
+  coach_agent_id: string | null;
   challenges: string[];
   passed: number;
   total: number;
@@ -371,4 +378,22 @@ export const LOKA_ROUTES = {
   progress: "/api/world/progress",
   offer: "/api/world/academy/offer",
   academy: "/api/world/academy",
+  practiceThis: (reportId: string) => `/api/world/reports/${reportId}/practice`,
 } as const;
+
+export const OPEN_ACADEMY = "world:open-academy";
+
+export type AcademyTarget = {
+  challengeId?: string | null;
+  reportId?: string | null;
+  attemptId?: string | null;
+  courseId?: string | null;
+  newPractice?: boolean;
+};
+
+export function openAcademy(target: AcademyTarget | string | null = null) {
+  const detail: AcademyTarget = typeof target === "string" ? { challengeId: target } : (target ?? {});
+  window.dispatchEvent(new CustomEvent<AcademyTarget>(OPEN_ACADEMY, { detail }));
+}
+
+export type Practiced = { challenge_id: string; report_id: string | null; created: boolean };

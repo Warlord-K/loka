@@ -1,3 +1,4 @@
+import type { AcademyTarget } from "./loka";
 import type { Report, ReportBrief } from "./reports";
 
 export type InkTool = "pen" | "pencil" | "marker" | "eraser";
@@ -49,6 +50,9 @@ export interface Attempt {
   created_at: string;
   checked_at: string | null;
   stroke_count: number;
+  grade_status?: "pending" | "passed" | "failed" | "error" | null;
+  grade_score?: number | null;
+  xp_awarded?: number | null;
 }
 
 export interface AttemptCard {
@@ -132,26 +136,28 @@ export function coachLate(createdAt: string, since: number | null, now: number):
   return now - start >= COACH_WAIT_MS;
 }
 
-export const PRACTICE_OPEN = "world:new-practice";
-
 export const PRACTICE_VOICE = "world:practice-voice";
 
-export function openPractice(reportId: string, attemptId?: string | null) {
-  window.dispatchEvent(new CustomEvent("world:open-report", { detail: { id: reportId, item: attemptId ? `${ATTEMPT_ITEM}${attemptId}` : null } }));
+const keptInReports = new Set<string>();
+
+export function keepInReports(reportId: string) {
+  keptInReports.add(reportId);
 }
 
-let practiceWanted = false;
+export function keptInReport(reportId: string): boolean {
+  return keptInReports.has(reportId);
+}
+
+function toAcademy(detail: AcademyTarget) {
+  window.dispatchEvent(new CustomEvent<AcademyTarget>("world:open-academy", { detail }));
+}
+
+export function openPractice(reportId: string, attemptId?: string | null) {
+  toAcademy({ reportId, attemptId: attemptId ?? null });
+}
 
 export function startPractice() {
-  practiceWanted = true;
-  window.dispatchEvent(new CustomEvent("world:open-report", { detail: { id: null, item: null } }));
-  window.dispatchEvent(new Event(PRACTICE_OPEN));
-}
-
-export function takePracticeWanted(): boolean {
-  const wanted = practiceWanted;
-  practiceWanted = false;
-  return wanted;
+  toAcademy({ newPractice: true });
 }
 
 export const ATTEMPT_ITEM = "attempt-";

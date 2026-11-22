@@ -1,17 +1,19 @@
 "use client";
 
-import { useEffect, useState, type ReactNode } from "react";
-import { Alarm, ArrowsOutLineHorizontal, CaretDown, Check, CheckSquare, CheckSquareOffset, Copy, DotsSixVertical, Notepad, PaintBucket, Robot, Square, Trash } from "@phosphor-icons/react";
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { Alarm, ArrowLeft, ArrowsOutLineHorizontal, CaretDown, Check, CheckSquare, CheckSquareOffset, Copy, DotsSixVertical, LinkSimple, Notepad, PaintBucket, Plus, Robot, Square, Trash } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
 import { useNow } from "@/lib/clock";
 import { checklistMarkdown, useCopy } from "@/lib/copy";
 import { matchesQuery, worldApi, type WorldAgent, type WorldItem } from "@/lib/world";
-import { CHUNKY, PANEL, TAB, TABS, TAB_COUNT, TAB_OFF, TAB_ON, TAG_X } from "./styles";
+import { BTN_PRIMARY, BTN_SECONDARY, CHUNKY, INPUT, PANEL, TAB, TABS, TAB_COUNT, TAB_OFF, TAB_ON, TAG_X } from "./styles";
 import { FilterField } from "./filter-field";
 import { TodoBoard } from "./todos-ui";
 import { ownsItem, ScopeToggle, useEveryone } from "./scope";
 import { EmptyState, WindowHeader } from "./settings-shell";
 import { escapeTaken } from "@/lib/escape";
+import { WorldLinkButton, worldUrl } from "./message-links";
+import { quoteProps } from "./quote";
 
 function left(ms: number): string {
   const s = Math.max(0, Math.round(ms / 1000));
@@ -64,7 +66,7 @@ function groupTimers(timers: WorldItem[]): TimerGroup[] {
   return [...groups.values()].sort((a, b) => Number(b.active) - Number(a.active) || (a.firesAt ?? 0) - (b.firesAt ?? 0));
 }
 
-function ReminderStack({ groups, now, by, onArchive }: { groups: TimerGroup[]; now: number; by: (id: string | null) => WorldAgent | undefined; onArchive: (...ids: string[]) => void }) {
+function ReminderStack({ groups, now, by, canWrite, onArchive }: { groups: TimerGroup[]; now: number; by: (id: string | null) => WorldAgent | undefined; canWrite: boolean; onArchive: (...ids: string[]) => void }) {
   const [open, setOpen] = useState(false);
   const [showDone, setShowDone] = useState(false);
   const active = groups.filter((g) => g.active);
@@ -115,9 +117,11 @@ function ReminderStack({ groups, now, by, onArchive }: { groups: TimerGroup[]; n
                 </span>
                 {g.count > 1 && <span className={TAG_X}>x{g.count}</span>}
                 <span className="text-w-sm font-semibold tabular-nums text-w-strong">{g.active && g.firesAt !== null ? left(g.firesAt - now) : "done"}</span>
-                <button type="button" onClick={() => onArchive(...g.ids)} aria-label={`Remove ${g.name}`} className="rounded-md p-1 text-w-muted hover:bg-w-sand hover:text-w-danger">
-                  <Trash size={12} weight="bold" />
-                </button>
+                {canWrite && (
+                  <button type="button" onClick={() => onArchive(...g.ids)} aria-label={`Remove ${g.name}`} className="rounded-md p-1 text-w-muted hover:bg-w-sand hover:text-w-danger">
+                    <Trash size={12} weight="bold" />
+                  </button>
+                )}
               </li>
             ))}
           </ul>
@@ -173,6 +177,8 @@ function StickyNote({
   list,
   index,
   maker,
+  meId,
+  canWrite,
   dragging,
   onDragStart,
   onDragEnd,
@@ -184,6 +190,8 @@ function StickyNote({
   list: WorldItem;
   index: number;
   maker?: string;
+  meId: string | null;
+  canWrite: boolean;
   dragging: string | null;
   onDragStart: () => void;
   onDragEnd: () => void;
@@ -194,25 +202,23 @@ function StickyNote({
 }) {
   const [over, setOver] = useState(false);
   const [copied, copy] = useCopy();
+  const canReference = meId !== null && list.owner_user_id === meId;
   const note = noteOf(list);
   const color = note.color && NOTE_COLORS[note.color] ? note.color : NOTE_COLOR_NAMES[index % 4];
   const size = note.size && NOTE_SIZES.includes(note.size) ? note.size : "medium";
   const entries = (list.data.items as Entry[] | undefined) ?? [];
   const done = entries.filter((e) => e.done).length;
   const next = <T,>(all: readonly T[], current: T) => all[(all.indexOf(current) + 1) % all.length];
+  const acceptDrop = (e: React.DragEvent) => {
+    if (!dragging || dragging === list.id) return;
+    e.preventDefault();
+    setOver(true);
+  };
   return (
     <div
-      draggable
-      onDragStart={(e) => {
-        e.dataTransfer.effectAllowed = "move";
-        onDragStart();
-      }}
-      onDragEnd={onDragEnd}
-      onDragOver={(e) => {
-        if (!dragging || dragging === list.id) return;
-        e.preventDefault();
-        setOver(true);
-      }}
+      {...(canReference ? quoteProps(`list:${list.id}`, `List "${list.name}"`) : {})}
+      onDragEnter={acceptDrop}
+      onDragOver={acceptDrop}
       onDragLeave={() => setOver(false)}
       onDrop={(e) => {
         e.preventDefault();
@@ -220,7 +226,7 @@ function StickyNote({
         onDrop();
       }}
       className={cn(
-        "group flex flex-col rounded-md border-2 border-w-ink p-3 shadow-[0_3px_0_rgb(var(--w-ink))]",
+        "group flex select-text flex-col rounded-md border-2 border-w-ink p-3 shadow-[0_3px_0_rgb(var(--w-ink))]",
         NOTE_COLORS[color],
         size === "large" && "sm:col-span-2",
         index % 3 === 0 ? "-rotate-[0.6deg]" : index % 3 === 1 ? "rotate-[0.5deg]" : "",
@@ -229,7 +235,21 @@ function StickyNote({
       )}
     >
       <div className="mb-2 flex items-start gap-1.5">
-        <DotsSixVertical size={16} weight="bold" className="mt-0.5 shrink-0 cursor-grab text-w-muted" aria-hidden />
+        {canWrite && (
+          <span
+            draggable
+            onDragStart={(e) => {
+              e.dataTransfer.effectAllowed = "move";
+              e.dataTransfer.setData("text/plain", list.id);
+              onDragStart();
+            }}
+            onDragEnd={onDragEnd}
+            className="mt-0.5 shrink-0 cursor-grab text-w-muted"
+            aria-hidden
+          >
+            <DotsSixVertical size={16} weight="bold" />
+          </span>
+        )}
         <div className="min-w-0 flex-1">
           <p className="text-w-md font-semibold leading-snug [overflow-wrap:anywhere]">{list.name}</p>
           <p className="text-w-xs text-w-muted">
@@ -238,12 +258,17 @@ function StickyNote({
           </p>
         </div>
         <div className="flex shrink-0 items-center opacity-60 group-hover:opacity-100 group-focus-within:opacity-100">
-          <button type="button" onClick={() => onRestyle({ color: next(NOTE_COLOR_NAMES, color) })} aria-label={`Change colour of ${list.name}`} title="Change colour" className="rounded-md p-1 text-w-muted hover:bg-w-field/60 hover:text-w-text">
-            <PaintBucket size={14} weight="bold" />
-          </button>
-          <button type="button" onClick={() => onRestyle({ size: next(NOTE_SIZES, size) })} aria-label={`Change size of ${list.name}, now ${size}`} title={`Size: ${size}`} className="rounded-md p-1 text-w-muted hover:bg-w-field/60 hover:text-w-text">
-            <ArrowsOutLineHorizontal size={14} weight="bold" />
-          </button>
+          {canReference && <WorldLinkButton kind="list" id={list.id} label={list.name} className="p-1" />}
+          {canWrite && (
+            <>
+              <button type="button" onClick={() => onRestyle({ color: next(NOTE_COLOR_NAMES, color) })} aria-label={`Change colour of ${list.name}`} title="Change colour" className="rounded-md p-1 text-w-muted hover:bg-w-field/60 hover:text-w-text">
+                <PaintBucket size={14} weight="bold" />
+              </button>
+              <button type="button" onClick={() => onRestyle({ size: next(NOTE_SIZES, size) })} aria-label={`Change size of ${list.name}, now ${size}`} title={`Size: ${size}`} className="rounded-md p-1 text-w-muted hover:bg-w-field/60 hover:text-w-text">
+                <ArrowsOutLineHorizontal size={14} weight="bold" />
+              </button>
+            </>
+          )}
           <button
             type="button"
             onClick={() => void copy(checklistMarkdown(list.name, entries))}
@@ -253,18 +278,27 @@ function StickyNote({
           >
             {copied ? <Check size={14} weight="bold" /> : <Copy size={14} weight="bold" />}
           </button>
-          <button type="button" onClick={onArchive} aria-label={`Remove ${list.name}`} className="rounded-md p-1 text-w-muted hover:bg-w-field/60 hover:text-w-danger">
-            <Trash size={14} weight="bold" />
-          </button>
+          {canWrite && (
+            <button type="button" onClick={onArchive} aria-label={`Remove ${list.name}`} className="rounded-md p-1 text-w-muted hover:bg-w-field/60 hover:text-w-danger">
+              <Trash size={14} weight="bold" />
+            </button>
+          )}
         </div>
       </div>
       <ul className={cn("space-y-1", size === "small" && "max-h-56 overflow-y-auto pr-1", size === "large" && "sm:columns-2 sm:gap-4")}>
         {entries.map((e, i) => (
           <li key={i} className="break-inside-avoid">
-            <button type="button" onClick={() => onToggle(i)} className="flex w-full items-start gap-2 rounded-md px-1 py-0.5 text-left text-w-base hover:bg-w-field/50">
-              {e.done ? <CheckSquare size={17} weight="fill" className="mt-0.5 shrink-0 text-w-ok" /> : <Square size={17} weight="bold" className="mt-0.5 shrink-0 text-w-muted" />}
-              <span className={cn("min-w-0 [overflow-wrap:anywhere]", e.done && "text-w-muted line-through")}>{e.text}</span>
-            </button>
+            {canWrite ? (
+              <button type="button" onClick={() => onToggle(i)} className="flex w-full items-start gap-2 rounded-md px-1 py-0.5 text-left text-w-base hover:bg-w-field/50">
+                {e.done ? <CheckSquare size={17} weight="fill" className="mt-0.5 shrink-0 text-w-ok" /> : <Square size={17} weight="bold" className="mt-0.5 shrink-0 text-w-muted" />}
+                <span className={cn("min-w-0 [overflow-wrap:anywhere]", e.done && "text-w-muted line-through")}>{e.text}</span>
+              </button>
+            ) : (
+              <div className="flex w-full items-start gap-2 px-1 py-0.5 text-w-base">
+                {e.done ? <CheckSquare size={17} weight="fill" className="mt-0.5 shrink-0 text-w-ok" /> : <Square size={17} weight="bold" className="mt-0.5 shrink-0 text-w-muted" />}
+                <span className={cn("min-w-0 [overflow-wrap:anywhere]", e.done && "text-w-muted line-through")}>{e.text}</span>
+              </div>
+            )}
           </li>
         ))}
       </ul>
@@ -272,18 +306,67 @@ function StickyNote({
   );
 }
 
+function NewListForm({ onCancel, onCreated }: { onCancel: () => void; onCreated: (item: WorldItem) => void }) {
+  const [title, setTitle] = useState("");
+  const [items, setItems] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const live = useRef(true);
+  useEffect(() => {
+    live.current = true;
+    return () => {
+      live.current = false;
+    };
+  }, []);
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!title.trim() || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const item = await worldApi.createList(title, items.split("\n"));
+      if (live.current) onCreated(item);
+    } catch {
+      if (!live.current) return;
+      setError("Could not make the list.");
+      setBusy(false);
+    }
+  };
+  return (
+    <form onSubmit={submit} className="mx-auto w-full max-w-xl space-y-3 rounded-xl border-2 border-w-line bg-w-card p-4">
+      <div>
+        <h2 className="text-w-md font-semibold text-w-strong">New list</h2>
+        <p className="text-w-xs text-w-muted">Add one item per line.</p>
+      </div>
+      <input autoFocus className={cn(INPUT, "w-full")} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="List name" aria-label="List name" />
+      <textarea className={cn(INPUT, "min-h-[8rem] w-full")} value={items} onChange={(event) => setItems(event.target.value)} placeholder={"Milk\nBread\nCoffee"} aria-label="List items, one per line" />
+      {error && <p role="alert" className="text-w-sm text-w-danger">{error}</p>}
+      <div className="flex justify-end gap-2">
+        <button type="button" onClick={onCancel} className={BTN_SECONDARY}>Cancel</button>
+        <button type="submit" disabled={busy || !title.trim()} className={BTN_PRIMARY}>{busy ? "Making" : "Make list"}</button>
+      </div>
+    </form>
+  );
+}
+
 export function ListsPanel({
   items: allItems,
   agents,
   meId,
+  canWrite,
   sideToggle,
+  focusId,
+  onFocusChange,
   onClose,
   onChanged,
 }: {
   items: WorldItem[];
   agents: WorldAgent[];
   meId: string | null;
+  canWrite: boolean;
   sideToggle?: ReactNode;
+  focusId?: string | null;
+  onFocusChange?: (id: string | null) => void;
   onClose: () => void;
   onChanged: () => void;
 }) {
@@ -293,6 +376,24 @@ export function ListsPanel({
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
   const [filter, setFilter] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [focused, setFocused] = useState<WorldItem | null | undefined>(undefined);
+  const focusIdRef = useRef(focusId);
+  focusIdRef.current = focusId;
+  const [linkCopied, copyLink] = useCopy();
+  useEffect(() => {
+    if (!focusId) {
+      setFocused(undefined);
+      return;
+    }
+    const local = allItems.find((item) => item.id === focusId);
+    setFocused(local);
+    let live = true;
+    void worldApi.item(focusId).then((item) => live && setFocused(item)).catch(() => live && setFocused(null));
+    return () => {
+      live = false;
+    };
+  }, [focusId, allItems]);
   const everyone = useEveryone();
   const mineOnly = allItems.filter((i) => ownsItem(i, meId));
   const items = everyone ? allItems : mineOnly;
@@ -303,22 +404,32 @@ export function ListsPanel({
     .filter((l) => matchesQuery(filter, l.name, ...((l.data.items as Entry[] | undefined) ?? []).map((e) => e.text)))
     .sort((a, b) => (noteOf(a).order ?? 1000) - (noteOf(b).order ?? 1000) || a.created_at.localeCompare(b.created_at));
   const timers = items.filter((i) => i.kind === "timer" && i.status !== "archived" && matchesQuery(filter, i.name));
-  const now = useNow(1000, timers.some((t) => t.status === "active"));
+  const focusedTimerActive = focused?.kind === "timer" && focused.id === focusId && focused.status === "active";
+  const now = useNow(1000, focusedTimerActive || timers.some((t) => t.status === "active"));
   const by = (id: string | null) => agents.find((a) => a.id === id);
   const yours = groupTimers(timers.filter((t) => !isAgentTimer(t)));
   const reminders = groupTimers(timers.filter(isAgentTimer));
   const [timersOpen, setTimersOpen] = useState(true);
   const [view, setView] = useState<"todos" | "lists">("todos");
-  const hasLists = lists.length > 0 || yours.length > 0 || items.some((i) => i.kind === "list" && i.status !== "archived");
-  const shown = hasLists ? view : "todos";
+  useEffect(() => {
+    const showTodos = () => {
+      setView("todos");
+      setCreating(false);
+    };
+    window.addEventListener("world:todo-focus", showTodos);
+    return () => window.removeEventListener("world:todo-focus", showTodos);
+  }, []);
+  const shown = creating || focusId ? "lists" : view;
 
   const toggle = async (list: WorldItem, index: number) => {
     const entries = ((list.data.items as Entry[] | undefined) ?? []).map((e, i) => (i === index ? { ...e, done: !e.done } : e));
-    await worldApi.updateItem(list.id, { data: { ...list.data, items: entries } }).catch(() => {});
+    const updated = await worldApi.updateItem(list.id, { data: { ...list.data, items: entries } }).catch(() => null);
+    if (updated) setFocused((current) => (current?.id === updated.id ? updated : current));
     onChanged();
   };
   const restyle = async (list: WorldItem, change: Partial<NoteStyle>) => {
-    await worldApi.updateItem(list.id, { data: { ...list.data, note: { ...noteOf(list), ...change } } }).catch(() => {});
+    const updated = await worldApi.updateItem(list.id, { data: { ...list.data, note: { ...noteOf(list), ...change } } }).catch(() => null);
+    if (updated) setFocused((current) => (current?.id === updated.id ? updated : current));
     onChanged();
   };
   const moveBefore = async (id: string, target: string) => {
@@ -335,6 +446,7 @@ export function ListsPanel({
   };
   const archive = async (...ids: string[]) => {
     await Promise.all(ids.map((id) => worldApi.updateItem(id, { status: "archived", group: true }).catch(() => {})));
+    if (focusIdRef.current && ids.includes(focusIdRef.current)) onFocusChange?.(null);
     onChanged();
   };
   const timerList = (groups: TimerGroup[], empty: string, showAgent: boolean) => (
@@ -353,9 +465,11 @@ export function ListsPanel({
           </span>
           {g.count > 1 && <span className={TAG_X}>x{g.count}</span>}
           <span className="text-w-base font-semibold tabular-nums text-w-strong">{g.active && g.firesAt !== null ? left(g.firesAt - now) : "done"}</span>
-          <button type="button" onClick={() => void archive(...g.ids)} aria-label={`Remove ${g.name}`} className="rounded-md p-1 text-w-muted hover:bg-w-sand hover:text-w-danger">
-            <Trash size={14} weight="bold" />
-          </button>
+          {canWrite && (
+            <button type="button" onClick={() => void archive(...g.ids)} aria-label={`Remove ${g.name}`} className="rounded-md p-1 text-w-muted hover:bg-w-sand hover:text-w-danger">
+              <Trash size={14} weight="bold" />
+            </button>
+          )}
         </li>
       ))}
     </ul>
@@ -364,19 +478,44 @@ export function ListsPanel({
   return (
     <div role="dialog" aria-modal="true" aria-label="Your lists" className={cn(PANEL, "pointer-events-auto flex h-full w-full flex-col overflow-hidden @container")}>
       <WindowHeader
-        title="Lists"
-        subtitle='To-dos and timers. Type "stretch 20m" to add one with a timer.'
+        title={focused?.name ?? "Lists"}
+        subtitle={focusId ? "A checklist from your Lists board." : 'To-dos and timers. Type "stretch 20m" to add one with a timer.'}
         onClose={onClose}
         actions={
           <>
+            {focusId && (
+              <button type="button" onClick={() => { setView("lists"); onFocusChange?.(null); }} className={BTN_SECONDARY}>
+                <ArrowLeft size={14} weight="bold" />
+                All lists
+              </button>
+            )}
+            {focusId && focused?.kind === "timer" && (
+              <button type="button" onClick={() => void copyLink(worldUrl("list", focused.id))} className={BTN_SECONDARY} aria-label={linkCopied ? "Link copied" : `Copy link to ${focused.name}`}>
+                {linkCopied ? <Check size={14} weight="bold" /> : <LinkSimple size={14} weight="bold" />}
+                {linkCopied ? "Copied" : "Copy link"}
+              </button>
+            )}
+            {!focusId && canWrite && (
+              <button
+                type="button"
+                onClick={() => {
+                  setCreating(true);
+                  setView("lists");
+                }}
+                className={BTN_PRIMARY}
+              >
+                <Plus size={14} weight="bold" />
+                New list
+              </button>
+            )}
             <ScopeToggle others={othersCount} className="hidden @xl:inline-flex" />
             <FilterField value={filter} onChange={setFilter} placeholder="Filter lists" className="hidden w-56 @xl:flex" />
-            <ReminderStack groups={reminders} now={now} by={by} onArchive={(...ids) => void archive(...ids)} />
+            <ReminderStack groups={reminders} now={now} by={by} canWrite={canWrite} onArchive={(...ids) => void archive(...ids)} />
             {sideToggle}
           </>
         }
       />
-      {hasLists && (
+      {!focusId && (
         <div className={TABS} role="tablist">
           {(
             [
@@ -389,7 +528,10 @@ export function ListsPanel({
               type="button"
               role="tab"
               aria-selected={shown === id}
-              onClick={() => setView(id)}
+              onClick={() => {
+                setCreating(false);
+                setView(id);
+              }}
               className={cn(
                 TAB,
                 shown === id ? TAB_ON : TAB_OFF,
@@ -403,11 +545,57 @@ export function ListsPanel({
         </div>
       )}
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto p-4 @xl:p-5 @4xl:overflow-hidden">
-        <div className="mb-2 flex items-center gap-2 @xl:hidden">
+        {!focusId && !creating && <div className="mb-2 flex items-center gap-2 @xl:hidden">
           <FilterField value={filter} onChange={setFilter} placeholder="Filter your lists" className="flex-1" />
           <ScopeToggle others={othersCount} />
-        </div>
-        {shown === "todos" ? (
+        </div>}
+        {creating && !focusId ? (
+          <NewListForm
+            onCancel={() => setCreating(false)}
+            onCreated={(item) => {
+              setCreating(false);
+              setFocused(item);
+              onChanged();
+              onFocusChange?.(item.id);
+            }}
+          />
+        ) : focusId ? (
+          focused === undefined ? (
+            <p className="text-w-sm text-w-muted">Opening list...</p>
+          ) : focused === null || (focused.kind !== "list" && focused.kind !== "timer") ? (
+            <EmptyState icon={Notepad} title="List unavailable" description="It may have been removed or shared with someone else." />
+          ) : focused.kind === "list" ? (
+            <div className="mx-auto w-full max-w-2xl">
+              <StickyNote
+                list={focused}
+                index={0}
+                maker={by(focused.created_by_agent)?.name}
+                meId={meId}
+                canWrite={canWrite}
+                dragging={dragging}
+                onDragStart={() => setDragging(focused.id)}
+                onDragEnd={() => setDragging(null)}
+                onDrop={() => setDragging(null)}
+                onToggle={(index) => void toggle(focused, index)}
+                onRestyle={(change) => void restyle(focused, change)}
+                onArchive={() => void archive(focused.id)}
+              />
+            </div>
+          ) : (
+            <div {...quoteProps(`list:${focused.id}`, `Timer "${focused.name}"`)} className="mx-auto flex w-full max-w-xl items-center gap-3 rounded-xl border-2 border-w-line bg-w-card p-4 select-text">
+              <Alarm size={20} weight="bold" className={focused.status === "active" ? "text-w-alert" : "text-w-muted"} />
+              <div className="min-w-0 flex-1">
+                <p className="font-semibold text-w-strong">{focused.name}</p>
+                <p className="text-w-sm text-w-muted">{focused.status === "active" && focused.fires_at ? left(new Date(focused.fires_at).getTime() - now) : "Finished"}</p>
+              </div>
+              {canWrite && (
+                <button type="button" onClick={() => void archive(focused.id)} aria-label={`Remove ${focused.name}`} className="rounded-md p-1 text-w-muted hover:bg-w-sand hover:text-w-danger">
+                  <Trash size={16} weight="bold" />
+                </button>
+              )}
+            </div>
+          )
+        ) : shown === "todos" ? (
           <div className="flex min-h-[24rem] min-w-0 flex-1 flex-col @4xl:min-h-0">
             <TodoBoard agents={agents} filter={filter} />
           </div>
@@ -420,6 +608,8 @@ export function ListsPanel({
                   list={l}
                   index={n}
                   maker={by(l.created_by_agent)?.name}
+                  meId={meId}
+                  canWrite={canWrite}
                   dragging={dragging}
                   onDragStart={() => setDragging(l.id)}
                   onDragEnd={() => setDragging(null)}

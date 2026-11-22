@@ -10,6 +10,20 @@ import { EASE_SMOOTH } from "./motion";
 import { Keycap } from "./keycap";
 import { scrollWithin } from "@/lib/scroll";
 
+export const SEARCH_ROW_FOCUS = {
+  "aria-current": true as const,
+  tabIndex: -1,
+  ref(node: HTMLElement | null) {
+    if (!node) return;
+    const frame = window.requestAnimationFrame(() => {
+      node.focus({ preventScroll: true });
+      scrollWithin(node, { block: "center" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  },
+};
+export const SEARCH_ROW_RING = "aria-[current=true]:ring-2 aria-[current=true]:ring-inset aria-[current=true]:ring-w-teal";
+
 export interface SettingsNavItem {
   id: string;
   label: string;

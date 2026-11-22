@@ -5,70 +5,32 @@ use loka_shared::world::{WorldAgent, WorldStore};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-pub const PRACTICE_TOOLS: &[&str] = &["create_practice", "read_practice", "update_practice", "list_practice", "practice_check"];
-pub const READ_TOOLS: &[&str] = &["read_practice", "list_practice"];
+pub const PRACTICE_TOOLS: &[&str] = &["grade_attempt", "practice_check", "create_practice", "read_practice", "update_practice", "list_practice"];
+pub const READ_TOOLS: &[&str] = &["read_practice", "list_practice", "list_challenges"];
 const STROKES_CHARS: usize = 60_000;
 
 pub fn tools(tool: fn(&str, &str, Value, &[&str]) -> Value) -> Vec<Value> {
     let s = |d: &str| json!({ "type": "string", "description": d });
-    let canvas = s("The practice canvas: report:<id>, its id or first characters, its title or slug");
-    vec![
-        tool(
-            "create_practice",
-            "Make a practice canvas for your person: a board in Reports where they write or draw (Japanese, drawing, anything) and press Ready, which wakes the coach with the picture and the strokes. Use it when they want to practise something with an agent's feedback.",
-            json!({
-                "subject": s("What they practise, like japanese or drawing"),
-                "title": s("Optional title, default \"<Subject> practice\""),
-                "coach": s("Agent name or slug that checks attempts; default the last coach they used for this subject, else you")
-            }),
-            &["subject"],
-        ),
-        tool(
-            "read_practice",
-            "Read a practice canvas: subject, coach and every attempt with its check, newest first. Give attempt (practice:<id> or its first characters) to see one attempt in full, with strokes true for its stroke data as JSON (points x, y, pressure p, time t in ms, in drawing order).",
-            json!({
-                "canvas": canvas.clone(),
-                "attempt": s("Optional: practice:<attempt id> or its first characters"),
-                "strokes": { "type": "boolean", "description": "Include the full stroke JSON of the attempt (or the latest one)" }
-            }),
-            &[],
-        ),
-        tool(
-            "update_practice",
-            "Change a practice canvas: who coaches it, its subject or title. The coach also becomes the default for that subject.",
-            json!({
-                "canvas": canvas,
-                "coach": s("Agent name or slug of the new coach"),
-                "subject": s("New subject"),
-                "title": s("New title")
-            }),
-            &["canvas"],
-        ),
-        tool(
-            "list_practice",
-            "List your person's practice canvases with their subject, coach and number of attempts.",
-            json!({ "subject": s("Only this subject, optional"), "query": s("Words to look for in titles, optional") }),
-            &[],
-        ),
-        tool(
-            "practice_check",
-            "Answer a practice.ready attempt you were sent as coach. Look at the image and the stroke order first and compare with earlier attempts. It saves the check, posts it in your person's chat with you (with a practice:<id> card) and notifies them, so do not also reply with the same text. Each attempt gets one check.",
-            json!({
-                "attempt": s("The attempt id from practice.ready (practice:<id> or its first characters)"),
-                "right": s("What is right in this attempt, specific: name strokes, shapes or proportions"),
-                "fix": s("The one or two most important things to fix and how"),
-                "next": s("The next exercise to do"),
-                "score": { "type": "number", "description": "Optional score from 0 to 100" }
-            }),
-            &["attempt", "right", "fix", "next"],
-        ),
-    ]
+    vec![tool(
+        "grade_attempt",
+        "Grade a canvas lesson attempt you were sent as coach (practice.ready). Look at the image and the stroke order first and compare with earlier attempts. It saves your check, grades the attempt in the Academy (a pass earns xp in the skill the first time, keeps the streak and counts toward the course), posts it in your person's chat with you (with a practice:<id> card) and notifies them, so do not also reply with the same text. Each attempt gets one grade.",
+        json!({
+            "attempt": s("The attempt id from practice.ready (practice:<id> or its first characters)"),
+            "right": s("What is right in this attempt, specific: name strokes, shapes or proportions"),
+            "fix": s("The one or two most important things to fix and how"),
+            "next": s("The next exercise to do"),
+            "score": { "type": "number", "description": "Optional score from 0 to 100; 60 or more passes unless passed says otherwise" },
+            "passed": { "type": "boolean", "description": "Optional: whether this attempt passes the lesson; default from the score, or a pass with no score" }
+        }),
+        &["attempt", "right", "fix", "next"],
+    )]
 }
 
 #[derive(Debug)]
 pub struct CheckArgs {
     pub attempt: String,
     pub check: Check,
+    pub passed: Option<bool>,
 }
 
 pub fn check_args(args: &Value) -> Result<CheckArgs> {
@@ -85,6 +47,7 @@ pub fn check_args(args: &Value) -> Result<CheckArgs> {
         Some(_) => bail!("score is a number from 0 to 100"),
     };
     Ok(CheckArgs {
+        passed: args.get("passed").and_then(Value::as_bool),
         attempt: attempt.to_string(),
         check: Check::new(&super::prompts::plain_dashes(text("right")), &super::prompts::plain_dashes(text("fix")), &super::prompts::plain_dashes(text("next")), score)?,
     })
@@ -109,11 +72,19 @@ async fn coach_name(store: &WorldStore, id: Option<Uuid>) -> String {
 
 fn attempt_line(a: &Attempt) -> String {
     let note = a.note.as_deref().map(|n| format!(" note: {}", loka_shared::links::excerpt(n, 160))).unwrap_or_default();
-    format!("- practice:{} {} ({}){note}", a.id, practice::history_line(a), a.created_at.format("%Y-%m-%d %H:%M UTC"))
+    format!("- practice:{} {}{} ({}){note}", a.id, practice::history_line(a), grade_note(a), a.created_at.format("%Y-%m-%d %H:%M UTC"))
+}
+
+fn grade_note(a: &Attempt) -> String {
+    match (a.grade_status.as_deref(), a.xp_awarded) {
+        (Some(status), Some(xp)) if xp > 0 => format!(", {status} +{xp} xp"),
+        (Some(status), _) => format!(", {status}"),
+        _ => String::new(),
+    }
 }
 
 fn attempt_detail(a: &Attempt, strokes: bool) -> String {
-    let mut out = format!("Attempt {} practice:{} ({}, {} strokes, image upload {})", a.n, a.id, a.status, a.stroke_count, a.image_upload_id.map(|i| i.to_string()).unwrap_or_else(|| "gone".into()));
+    let mut out = format!("Attempt {} practice:{} ({}{}, {} strokes, image upload {})", a.n, a.id, a.status, grade_note(a), a.stroke_count, a.image_upload_id.map(|i| i.to_string()).unwrap_or_else(|| "gone".into()));
     if let Some(note) = &a.note {
         out.push_str(&format!("\nNote from your person: {note}"));
     }
@@ -133,6 +104,44 @@ fn attempt_detail(a: &Attempt, strokes: bool) -> String {
         }
     }
     out
+}
+
+pub fn grade_line(status: Option<&str>, xp: i32) -> String {
+    match status {
+        Some("passed") if xp > 0 => format!(" It passed and earned {xp} xp."),
+        Some("passed") => " It passed; this lesson was already passed, so no new xp.".to_string(),
+        Some("failed") => " It did not pass yet, so it earns no xp.".to_string(),
+        _ => " A newer attempt replaced it, so it earns no xp.".to_string(),
+    }
+}
+
+pub async fn read(store: &WorldStore, owner: Uuid, org: Uuid, canvas: Option<&str>, attempt: Option<&str>, strokes: bool) -> Result<String> {
+    if let Some(key) = attempt {
+        let attempt = store.find_practice_attempt(owner, org, key).await?.ok_or_else(|| anyhow!("no attempt matches {key}"))?;
+        let report = store.get_report(attempt.report_id).await?.ok_or_else(|| anyhow!("that practice canvas is gone"))?;
+        return Ok(format!("Practice canvas report:{} \"{}\" ({})\n{}", report.id, report.title, attempt.subject, attempt_detail(&attempt, strokes)));
+    }
+    let (report, practice) = find(store, owner, org, canvas).await?;
+    let attempts = store.practice_attempts(report.id, 30, false).await?;
+    let mut out = format!(
+        "Practice canvas report:{} \"{}\": subject {}, coach {}, {} attempts shown.",
+        report.id,
+        report.title,
+        practice.subject,
+        coach_name(store, practice.coach_agent_id).await,
+        attempts.len()
+    );
+    if !attempts.is_empty() {
+        out.push('\n');
+        out.push_str(&attempts.iter().map(attempt_line).collect::<Vec<_>>().join("\n"));
+    }
+    if strokes {
+        if let Some(latest) = attempts.first() {
+            let full = store.practice_attempt(latest.id).await?.ok_or_else(|| anyhow!("that attempt is gone"))?;
+            out.push_str(&format!("\n\nLatest attempt:\n{}", attempt_detail(&full, true)));
+        }
+    }
+    Ok(out)
 }
 
 pub async fn call(store: &WorldStore, caller: &WorldAgent, quest: Option<Uuid>, name: &str, args: &Value) -> Result<String> {
@@ -156,34 +165,7 @@ pub async fn call(store: &WorldStore, caller: &WorldAgent, quest: Option<Uuid>, 
                 report.id
             ))
         }
-        "read_practice" => {
-            if let Some(key) = arg("attempt") {
-                let attempt = store.find_practice_attempt(owner, org, key).await?.ok_or_else(|| anyhow!("no attempt matches {key}"))?;
-                let report = store.get_report(attempt.report_id).await?.ok_or_else(|| anyhow!("that practice canvas is gone"))?;
-                return Ok(format!("Practice canvas report:{} \"{}\" ({})\n{}", report.id, report.title, attempt.subject, attempt_detail(&attempt, args.get("strokes").and_then(Value::as_bool).unwrap_or(false))));
-            }
-            let (report, practice) = find(store, owner, org, arg("canvas")).await?;
-            let attempts = store.practice_attempts(report.id, 30, false).await?;
-            let mut out = format!(
-                "Practice canvas report:{} \"{}\": subject {}, coach {}, {} attempts shown.",
-                report.id,
-                report.title,
-                practice.subject,
-                coach_name(store, practice.coach_agent_id).await,
-                attempts.len()
-            );
-            if !attempts.is_empty() {
-                out.push('\n');
-                out.push_str(&attempts.iter().map(attempt_line).collect::<Vec<_>>().join("\n"));
-            }
-            if args.get("strokes").and_then(Value::as_bool).unwrap_or(false) {
-                if let Some(latest) = attempts.first() {
-                    let full = store.practice_attempt(latest.id).await?.ok_or_else(|| anyhow!("that attempt is gone"))?;
-                    out.push_str(&format!("\n\nLatest attempt:\n{}", attempt_detail(&full, true)));
-                }
-            }
-            Ok(out)
-        }
+        "read_practice" => read(store, owner, org, arg("canvas"), arg("attempt"), args.get("strokes").and_then(Value::as_bool).unwrap_or(false)).await,
         "update_practice" => {
             let (report, _) = find(store, owner, org, arg("canvas")).await?;
             let coach = match arg("coach") {
@@ -216,12 +198,13 @@ pub async fn call(store: &WorldStore, caller: &WorldAgent, quest: Option<Uuid>, 
             }
             Ok(lines.join("\n"))
         }
-        "practice_check" => {
+        "grade_attempt" | "practice_check" => {
             let parsed = check_args(args)?;
             let attempt = store.find_practice_attempt(owner, org, &parsed.attempt).await?.ok_or_else(|| anyhow!("no attempt matches {}", parsed.attempt))?;
-            let saved = store.practice_check(caller, attempt.id, parsed.check).await?;
+            let saved = store.practice_check(caller, attempt.id, parsed.check, parsed.passed).await?;
+            let grade = grade_line(saved.grade_status.as_deref(), saved.xp_awarded.unwrap_or(0));
             Ok(format!(
-                "Checked attempt {} and posted it in your person's chat as msg:{}. End your turn without repeating it.",
+                "Graded attempt {} and posted it in your person's chat as msg:{}.{grade} End your turn without repeating it.",
                 saved.n,
                 saved.coach_message_id.map(|m| m.to_string()[..8].to_string()).unwrap_or_default()
             ))
@@ -244,6 +227,17 @@ mod tests {
     }
 
     #[test]
+    fn grade_replies_name_the_outcome() {
+        assert_eq!(grade_line(Some("passed"), 40), " It passed and earned 40 xp.");
+        assert!(grade_line(Some("passed"), 0).contains("already passed"));
+        assert!(grade_line(Some("failed"), 0).contains("did not pass"));
+        for status in [Some("error"), Some("pending"), None] {
+            let line = grade_line(status, 0);
+            assert!(line.contains("newer attempt") && !line.contains("It error"), "{line}");
+        }
+    }
+
+    #[test]
     fn check_args_refuse_missing_parts() {
         assert!(check_args(&json!({ "right": "r", "fix": "f", "next": "n" })).unwrap_err().to_string().contains("attempt"));
         assert!(check_args(&json!({ "attempt": "a", "right": "r", "next": "n" })).unwrap_err().to_string().contains("fix"));
@@ -252,13 +246,13 @@ mod tests {
     }
 
     #[test]
-    fn every_practice_tool_is_listed() {
+    fn only_grade_attempt_is_listed_and_the_old_names_still_dispatch() {
         fn tool(name: &str, _: &str, _: Value, _: &[&str]) -> Value {
             json!(name)
         }
         let listed: Vec<Value> = tools(tool);
-        assert_eq!(listed.len(), PRACTICE_TOOLS.len());
-        assert!(PRACTICE_TOOLS.iter().all(|n| listed.contains(&json!(n))));
-        assert!(READ_TOOLS.iter().all(|n| PRACTICE_TOOLS.contains(n)));
+        assert_eq!(listed, vec![json!("grade_attempt")]);
+        assert!(PRACTICE_TOOLS.contains(&"grade_attempt"));
+        assert!(!listed.contains(&json!("create_practice")) && !listed.contains(&json!("practice_check")), "the old practice tools stay as hidden aliases");
     }
 }

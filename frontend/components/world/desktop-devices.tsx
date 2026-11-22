@@ -10,7 +10,7 @@ import { BTN_PRIMARY, BTN_SECONDARY, CHUNKY, HUD_CHIP, INPUT } from "./styles";
 import { refreshReadiness } from "./setup-hint";
 import { VoiceField } from "./voice-ui";
 import { pollWhileVisible } from "@/lib/visible-poll";
-import { EmptyState } from "./settings-shell";
+import { EmptyState, SEARCH_ROW_FOCUS, SEARCH_ROW_RING } from "./settings-shell";
 import { ConnectionMark, deviceConnection, planeConnection } from "./connection-mark";
 
 function age(value: string | null): string {
@@ -81,7 +81,7 @@ export function DesktopStatusButton({ controlPlane, onOpen }: { controlPlane: "c
   );
 }
 
-export function DevicesPanel({ controlPlane, embedded = false }: { controlPlane: "connecting" | "online" | "offline"; embedded?: boolean }) {
+export function DevicesPanel({ controlPlane, embedded = false, focusId }: { controlPlane: "connecting" | "online" | "offline"; embedded?: boolean; focusId?: string }) {
   const [runners, setRunners] = useState<RunnerView[]>([]);
   const [agents, setAgents] = useState<WorldAgent[]>([]);
   const [native, setNative] = useState<DesktopStatus | null>(null);
@@ -181,7 +181,7 @@ export function DevicesPanel({ controlPlane, embedded = false }: { controlPlane:
             </li>
           )}
           {runners.map((runner) => (
-            <li key={runner.id} className="flex flex-wrap items-center gap-3 rounded-lg border-2 border-w-line bg-w-card p-3">
+            <li key={runner.id} {...(focusId === runner.id ? SEARCH_ROW_FOCUS : {})} className={cn("flex flex-wrap items-center gap-3 rounded-lg border-2 border-w-line bg-w-card p-3", SEARCH_ROW_RING)}>
               <ComputerTower size={20} weight="bold" className="text-w-link" />
               <span className="min-w-0 flex-1">
                 <span className="block truncate text-w-base font-semibold">{runner.name}</span>
@@ -414,7 +414,7 @@ export function AgentRunnerSelector({ agentId, cli: initialCli, model: initialMo
         <WSelect disabled={busy} ariaLabel="Execution device" className="w-56" value={current?.id ?? ""} onChange={(value) => void assign(value)} options={[{ value: "", label: "Not assigned" }, ...choices.map((runner) => ({ value: runner.id, label: label(runner), hint: runner.status }))]} />
       </div>
       <p className="text-w-xs text-w-text2">{current ? <>Runs on <span className="font-semibold">{label(current)}</span> ({current.status})</> : "Not on any device yet. It moves to an online device when work arrives."}</p>
-      {!busy && choices.length === 0 && <p className="text-w-xs text-w-muted">Connect this Mac from You to assign this agent.</p>}
+      {!busy && choices.length === 0 && <p className="text-w-xs text-w-muted">Connect this Mac in Settings to assign this agent.</p>}
       {handoffRunner && (
         <form onSubmit={handoff} className="space-y-2 border-t-2 border-dashed border-w-line2 pt-3">
           <p className="text-w-sm font-semibold text-w-strong">Hand off to {handoffRunner.name}</p>

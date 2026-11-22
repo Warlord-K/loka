@@ -53,6 +53,15 @@ pub async fn list(
     Ok(Json(out))
 }
 
+pub async fn get(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserId>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<TeamDetail>, (StatusCode, String)> {
+    let team = state.world.team_visible_to(user.0, id).await.map_err(internal)?.ok_or(status(StatusCode::NOT_FOUND))?;
+    Ok(Json(state.world.team_detail(team).await.map_err(internal)?))
+}
+
 #[derive(Deserialize)]
 pub struct CreateBody {
     name: String,

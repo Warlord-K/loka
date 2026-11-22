@@ -38,6 +38,7 @@ fn runner_away() -> String {
 pub const WORKSPACE_SETTLE_SECONDS: f64 = 3600.0;
 pub const WORKSPACE_DONE_GRACE_SECONDS: f64 = 3.0 * 86400.0;
 pub const WORKSPACE_FAILED_GRACE_SECONDS: f64 = 7.0 * 86400.0;
+pub const WORKSPACE_IDLE_BUILD_SECONDS: f64 = 2.0 * 3600.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct ClosedTask {
@@ -60,15 +61,18 @@ pub struct DiskNotice {
     pub still_low: bool,
     #[serde(default)]
     pub folders: Vec<DiskFolder>,
+    #[serde(default)]
+    pub caches_bytes: u64,
 }
 
 impl DiskNotice {
     pub fn message(&self, device: &str) -> String {
         let gb = |bytes: u64| format!("{:.1} GB", bytes as f64 / 1e9);
+        let caches = if self.caches_bytes > 0 { format!(" Loka cleared build caches ({}).", gb(self.caches_bytes)) } else { String::new() };
         let freed = if self.removed > 0 {
-            format!(" Loka removed {} closed quest workspace{} ({}).", self.removed, if self.removed == 1 { "" } else { "s" }, gb(self.freed_bytes))
+            format!("{caches} Loka removed {} closed quest workspace{} ({}).", self.removed, if self.removed == 1 { "" } else { "s" }, gb(self.freed_bytes.saturating_sub(self.caches_bytes)))
         } else {
-            String::new()
+            caches
         };
         let biggest = if self.folders.is_empty() {
             String::new()
@@ -77,7 +81,7 @@ impl DiskNotice {
             format!(" Biggest folders: {}.", names.join(", "))
         };
         if self.still_low {
-            format!("{device} has only {} of disk space left.{freed}{biggest} New quest runs are paused there until space is free: delete what is listed, or clean up closed quests under You > Storage.", gb(self.free_bytes))
+            format!("{device} has only {} of disk space left.{freed}{biggest} New quest runs are paused there until space is free: delete what is listed, or clean up closed quests under Settings > Storage.", gb(self.free_bytes))
         } else {
             format!("{device} was running low on disk space ({} free now).{freed}", gb(self.free_bytes))
         }
@@ -276,6 +280,14 @@ pub struct RunnerImage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunnerFile {
+    pub id: Uuid,
+    pub name: String,
+    pub mime_type: String,
+    pub data_base64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunnerPublish {
     pub repo: String,
     pub branch: String,
@@ -406,6 +418,8 @@ pub struct RunnerJob {
     pub provider_keys: BTreeMap<String, String>,
     #[serde(default)]
     pub images: Vec<RunnerImage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<RunnerFile>,
     pub publish: Option<RunnerPublish>,
     #[serde(default)]
     pub rewind_to: Option<String>,
@@ -480,6 +494,45 @@ pub struct LeaseSteers {
 }
 
 pub const USAGE_EVENT: &str = "usage";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrSync {
+    Merged,
+    Unchanged,
+    Changed,
+}
+
+impl PrSync {
+    pub fn report(self) -> Option<&'static str> {
+        match self {
+            Self::Merged => Some("merged"),
+            Self::Unchanged => Some("unchanged"),
+            Self::Changed => None,
+        }
+    }
+
+    pub fn from_report(state: Option<&str>) -> Self {
+        match state {
+            Some("merged") => Self::Merged,
+            Some("unchanged") => Self::Unchanged,
+            _ => Self::Changed,
+        }
+    }
+
+    pub fn needs_review(self) -> bool {
+        self == Self::Changed
+    }
+}
+
+pub fn pr_sync_from(state: Option<&str>, dirty: bool, new_commits: bool) -> PrSync {
+    if state == Some("MERGED") {
+        PrSync::Merged
+    } else if dirty || new_commits {
+        PrSync::Changed
+    } else {
+        PrSync::Unchanged
+    }
+}
+
 pub const PUBLISH_ELSEWHERE: &str = "elsewhere";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1260,6 +1313,27 @@ impl RunnerStore {
         .bind(WORKSPACE_SETTLE_SECONDS)
         .bind(WORKSPACE_DONE_GRACE_SECONDS)
         .bind(WORKSPACE_FAILED_GRACE_SECONDS)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn idle_tasks(&self, runner_id: Uuid, task_ids: &[Uuid]) -> Result<Vec<Uuid>> {
+        Ok(sqlx::query_scalar::<_, Uuid>(
+            "WITH me AS (SELECT id, owner_user_id FROM world_runners WHERE id = $2)
+             SELECT t.id
+               FROM agent_tasks t
+               LEFT JOIN agent_profiles a ON a.id = t.assigned_agent_id
+               JOIN me ON a.owner_user_id = me.owner_user_id OR a.runner_id = me.id
+                       OR (t.assigned_agent_id IS NULL AND t.user_id = me.owner_user_id)
+              WHERE t.id = ANY($1::uuid[])
+                AND t.status NOT IN ('cancelled', 'done', 'failed')
+                AND NOT EXISTS (SELECT 1 FROM session_runs r WHERE r.task_id = t.id AND r.status IN ('queued', 'running'))
+                AND GREATEST(t.updated_at, (SELECT MAX(COALESCE(r.finished_at, r.created_at)) FROM session_runs r WHERE r.task_id = t.id))
+                      < NOW() - make_interval(secs => $3::double precision)",
+        )
+        .bind(task_ids)
+        .bind(runner_id)
+        .bind(WORKSPACE_IDLE_BUILD_SECONDS)
         .fetch_all(&self.pool)
         .await?)
     }
@@ -2374,6 +2448,22 @@ mod tests {
 
     fn usage(input: u64, cached: u64, output: u64) -> RunnerUsage {
         RunnerUsage { input_tokens: input, cached_input_tokens: cached, output_tokens: output, context_tokens: 0 }
+    }
+
+    #[test]
+    fn a_followup_needs_a_review_only_when_it_changed_the_pull_request() {
+        assert_eq!(pr_sync_from(Some("MERGED"), true, true), PrSync::Merged);
+        assert_eq!(pr_sync_from(Some("OPEN"), false, false), PrSync::Unchanged);
+        assert_eq!(pr_sync_from(Some("OPEN"), true, false), PrSync::Changed);
+        assert_eq!(pr_sync_from(Some("OPEN"), false, true), PrSync::Changed);
+        assert_eq!(pr_sync_from(Some("CLOSED"), false, false), PrSync::Unchanged);
+        assert_eq!(pr_sync_from(None, false, false), PrSync::Unchanged);
+        assert_eq!(pr_sync_from(None, false, true), PrSync::Changed);
+        for sync in [PrSync::Merged, PrSync::Unchanged, PrSync::Changed] {
+            assert_eq!(PrSync::from_report(sync.report()), sync);
+        }
+        assert_eq!(PrSync::from_report(Some(PUBLISH_ELSEWHERE)), PrSync::Changed);
+        assert!(PrSync::Changed.needs_review() && !PrSync::Merged.needs_review() && !PrSync::Unchanged.needs_review());
     }
 
     #[test]
@@ -3531,6 +3621,22 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        let open_fresh = task(mine, "in_progress", 300).await;
+        let open_busy = task(mine, "in_progress", 30 * day).await;
+        let foreign_open = task(theirs, "in_progress", 30 * day).await;
+        sqlx::query("INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, prompt) VALUES ($1, $2, $3, 'followup', 'queued', 'go')")
+            .bind(session)
+            .bind(mine)
+            .bind(open_busy)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut idle = store.idle_tasks(runner, &[open, in_review, open_fresh, open_busy, foreign_open, done_old, cancelled, Uuid::new_v4()]).await.unwrap();
+        idle.sort();
+        let mut expected_idle = vec![open, in_review];
+        expected_idle.sort();
+        assert_eq!(idle, expected_idle, "open quests idle for hours qualify; fresh, running, queued, someone else's, closed and unknown ones do not");
+
         let all = [open, in_review, done_fresh, done_old, failed_mid, failed_old, cancelled, cancelled_fresh, busy, foreign, deleted];
 
         let got_ids = |tasks: &[ClosedTask]| tasks.iter().map(|task| task.id).collect::<Vec<Uuid>>();
@@ -3557,7 +3663,7 @@ mod tests {
         assert!(store.take_workspace_cleanup(runner).await.unwrap());
         assert!(!store.take_workspace_cleanup(runner).await.unwrap(), "a request is delivered once");
 
-        let notice = DiskNotice { free_bytes: 3_000_000_000, freed_bytes: 40_000_000_000, removed: 12, still_low: false, folders: Vec::new() };
+        let notice = DiskNotice { free_bytes: 3_000_000_000, freed_bytes: 40_000_000_000, removed: 12, still_low: false, folders: Vec::new(), caches_bytes: 0 };
         assert!(store.warn_disk_low(runner, &notice).await.unwrap());
         assert!(!store.warn_disk_low(runner, &notice).await.unwrap(), "one notice per hour");
         let bell: (String, String) = sqlx::query_as(
@@ -3572,7 +3678,7 @@ mod tests {
         assert!(bell.1.contains("removed 12 closed quest workspaces (40.0 GB)"), "{}", bell.1);
 
         let report = crate::world::WorldStore::new(pool.clone());
-        sqlx::query("UPDATE world_runners SET capabilities = jsonb_build_object('workspaces', jsonb_build_object('bytes', 9000000000, 'tasks', 3, 'free_gb', 2, 'total_gb', 460, 'low', true, 'largest', jsonb_build_array(jsonb_build_object('id', $2::text, 'bytes', 5000000000, 'temp_bytes', 4000000000), jsonb_build_object('id', $3::text, 'bytes', 3000000000, 'temp_bytes', 2000000000)), 'temp_bytes', 6000000000)) WHERE id = $1")
+        sqlx::query("UPDATE world_runners SET capabilities = jsonb_build_object('workspaces', jsonb_build_object('bytes', 9000000000, 'tasks', 3, 'free_gb', 2, 'total_gb', 460, 'low', true, 'largest', jsonb_build_array(jsonb_build_object('id', $2::text, 'bytes', 5000000000, 'temp_bytes', 4000000000), jsonb_build_object('id', $3::text, 'bytes', 3000000000, 'temp_bytes', 2000000000, 'build_bytes', 1000000000)), 'temp_bytes', 6000000000, 'build_bytes', 4000000000)) WHERE id = $1")
             .bind(runner)
             .bind(done_old.to_string())
             .bind(open.to_string())
@@ -3585,7 +3691,8 @@ mod tests {
         assert_eq!((usage[0].temp_bytes, usage[0].reclaimable_temp_bytes), (6_000_000_000, 4_000_000_000), "only the closed quest's temp counts as reclaimable");
         let request = crate::cleanup::CleanupRequest { owner, org: None, agent: None, kind: crate::cleanup::CleanupKind::Workspaces, older_than_days: 0, by_agent: None };
         let preview = report.clean_up(request, false).await.unwrap();
-        assert_eq!((preview.rows, preview.bytes, preview.applied), (1, 5_000_000_000, false));
+        assert_eq!((preview.rows, preview.bytes, preview.applied), (1, 6_000_000_000, false), "closed workspaces plus the idle quest's build folders");
+        assert_eq!((usage[0].build_bytes, usage[0].reclaimable_build_bytes), (4_000_000_000, 1_000_000_000), "only the idle quest's build folders are reclaimable");
         assert!(!store.take_workspace_cleanup(runner).await.unwrap(), "a preview asks nothing of the device");
         assert!(report.clean_up(request, true).await.unwrap().applied);
         assert!(store.take_workspace_cleanup(runner).await.unwrap());

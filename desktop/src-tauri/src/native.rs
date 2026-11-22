@@ -413,6 +413,7 @@ fn build_window(app: &mut tauri::App) -> tauri::Result<()> {
         .inner_size(1280.0, 820.0)
         .min_inner_size(820.0, 600.0)
         .center()
+        .disable_drag_drop_handler()
         .initialization_script(
             "document.addEventListener('keydown', function (event) { if (event.key === 'Escape') event.preventDefault(); });",
         )

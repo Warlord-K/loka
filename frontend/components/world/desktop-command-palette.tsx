@@ -6,7 +6,7 @@ import { AgentFace } from "./channel-ui";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Command } from "cmdk";
 import Glide from "./glide";
-import { AppleLogo, ArrowsClockwise, Crown, Lightning, ArrowCounterClockwise, Bell, BookOpenText, Buildings, CalendarDots, ChatCircleDots, CheckSquare, CircleHalf, ClockCounterClockwise, Code, Coins, Compass, Star, Student, Desktop, DeviceMobile, DownloadSimple, FileText, FlowArrow, Gavel, GraduationCap, Hash, Hammer, House, IdentificationBadge, IdentificationCard, Key, Keyboard, ListChecks, MagnifyingGlass, MapTrifold, Microphone, Monitor, Moon, MusicNotes, Pause, PaperPlaneRight, Play, Plugs, Plus, PuzzlePiece, Rss, Scroll, ShareNetwork, SignOut, SkipForward, SlackLogo, Smiley, Sparkle, SpeakerHigh, SpeakerSlash, Square, Sun, Sword, TerminalWindow, TextAa, Timer, Trophy, UploadSimple, User, UserCircle, UserSwitch, UsersThree, X } from "@phosphor-icons/react";
+import { AppleLogo, ArrowsClockwise, Crown, Lightning, ArrowCounterClockwise, Bell, BookOpenText, Buildings, CalendarDots, ChatCircleDots, CheckSquare, CircleHalf, ClockCounterClockwise, Code, Coins, Compass, Star, Student, Desktop, DeviceMobile, DownloadSimple, FileText, FlowArrow, Gavel, GearSix, GraduationCap, Hash, Hammer, House, IdentificationBadge, IdentificationCard, Key, Keyboard, ListChecks, MagnifyingGlass, MapTrifold, Microphone, Monitor, Moon, MusicNotes, Pause, PaperPlaneRight, Play, Plugs, Plus, PuzzlePiece, Rss, Scroll, ShareNetwork, SignOut, SkipForward, SlackLogo, Smiley, SpeakerHigh, SpeakerSlash, Square, Sun, Sword, TerminalWindow, TextAa, Timer, Trophy, UploadSimple, User, UserCircle, UserSwitch, UsersThree, X } from "@phosphor-icons/react";
 import { openQuickChat } from "./quick-chat";
 import { cn } from "@/lib/utils";
 import { worldApi, type SearchResults, type WorldAgent } from "@/lib/world";
@@ -23,6 +23,7 @@ import { Keys, hintKeys, isMac } from "./keycap";
 import { useThemeMode } from "./theme";
 import { useSoundPrefs } from "./sounds";
 import { setMusicOn, skipMusic, toggleMusicPause, useMusic } from "./music";
+import { MeaningIcon } from "@/lib/meaning-icons";
 
 function words(text: string): string[] {
   return text.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
@@ -37,15 +38,17 @@ function subsequence(hay: string, needle: string): boolean {
 export const TELL = "tell:main";
 
 export type PaletteJump =
-  | { kind: "schedules" | "feeds" | "kit"; agentId: string }
+  | { kind: "schedules" | "feeds"; agentId: string; id: string }
+  | { kind: "kit"; agentId: string; id: string; itemKind: "skill" | "mcp" }
   | { kind: "surface"; surface: "usage" | "schedules" | "feeds" }
   | { kind: "you"; page: string; focus?: string }
-  | { kind: "academy"; tab?: "progress" }
+  | { kind: "academy"; tab?: "progress"; challengeId?: string | null; courseId?: string | null }
   | { kind: "map" | "travel" | "notifications" | "music" | "new-agent" }
-  | { kind: "teams" }
-  | { kind: "rules" }
+  | { kind: "teams"; id?: string }
+  | { kind: "list"; id: string }
+  | { kind: "rules" | "device" | "person"; id: string }
   | { kind: "region"; id: string; name: string }
-  | { kind: "place"; place: NonNullable<SearchResults["places"]>[number] };
+  | { kind: "place"; id: string };
 
 const TALK = /^(talk( to)?|chat( with)?|message|dm|open)\s+/;
 
@@ -238,6 +241,7 @@ export function DesktopCommandPalette({
   canWorkshop,
   onOpenWorkshop,
   onOpenChange,
+  canOpenRecord,
   onOpenAgent,
   onOpenQuests,
   onOpenChat,
@@ -249,6 +253,7 @@ export function DesktopCommandPalette({
   onOpenPro,
   onOpenLists,
   onOpenTerminal,
+  onTerminalChat,
   canTerminal,
   onOpenShortcuts,
   mainAgent,
@@ -266,6 +271,7 @@ export function DesktopCommandPalette({
   canWorkshop: boolean;
   onOpenWorkshop: () => void;
   onOpenChange: (open: boolean) => void;
+  canOpenRecord: () => boolean;
   onOpenAgent: (id: string) => void;
   onOpenQuests: () => void;
   onOpenChat: () => void;
@@ -277,6 +283,7 @@ export function DesktopCommandPalette({
   onOpenPro: () => void;
   onOpenLists: () => void;
   onOpenTerminal: () => void;
+  onTerminalChat: () => void;
   canTerminal: boolean;
   onOpenShortcuts: () => void;
 }) {
@@ -351,6 +358,7 @@ export function DesktopCommandPalette({
     { id: "history", label: "Open session history", hint: "H", icon: ClockCounterClockwise, available: canWrite, run: onOpenHistory, keywords: "sessions runs rewind library", core: true },
     { id: "folder-workshop", label: "Work in a folder with an agent", hint: "O", icon: Hammer, available: canWrite, run: onOpenFolderWorkshop, keywords: "workshop mac directory", core: true },
     { id: "terminal", label: "Open terminal", hint: "T", icon: TerminalWindow, available: canTerminal, run: onOpenTerminal, keywords: "shell forge console", core: true },
+    { id: "terminal-chat", label: "Ask an agent about the terminal", hint: "", icon: ChatCircleDots, available: canTerminal && canWrite, run: onTerminalChat, keywords: "terminal shell output error side chat quote explain" },
     { id: "workshop", label: "Open workshop", hint: "", icon: Hammer, available: canWorkshop, run: onOpenWorkshop, keywords: "workbench files editor code", core: true },
     { id: "assistant", label: "Open your main agent", hint: "P", icon: Star, available: canWrite, run: onOpenAssistant, keywords: "assistant main", core: true },
     { id: "notifications", label: "Open notifications", hint: "N", icon: Bell, available: true, run: go({ kind: "notifications" }), keywords: "bell inbox alerts unread" },
@@ -363,7 +371,7 @@ export function DesktopCommandPalette({
     { id: "schedules", label: "Schedules and routines", hint: "", icon: CalendarDots, available: canWrite, run: go({ kind: "surface", surface: "schedules" }), keywords: "cron heartbeat timers clock tower" },
     { id: "feeds", label: "Feeds and webhooks", hint: "", icon: Rss, available: canWrite, run: go({ kind: "surface", surface: "feeds" }), keywords: "rss observatory" },
     { id: "devices", label: "Manage execution devices", hint: "", icon: DeviceMobile, available: canWrite, run: onOpenDevices, keywords: "runners mac computers machines" },
-    { id: "you", label: "Open your profile", hint: "Y", icon: User, available: true, run: onOpenYou, keywords: "settings preferences account", core: true },
+    { id: "you", label: "Open settings", hint: "Y", icon: GearSix, available: true, run: onOpenYou, keywords: "settings preferences profile account you", core: true },
     { id: "new-quest", label: mainAgent ? `New quest for ${mainAgent.name}` : "New quest", hint: "", icon: Sword, available: canWrite, run: newQuest, group: "Create", keywords: "create task assign work start" },
     { id: "new-practice", label: "New practice with a coach", hint: "", icon: Student, available: canWrite, run: startPractice, group: "Create", keywords: "practise practice japanese kanji kana drawing handwriting sketch coach pencil pen canvas" },
     { id: "suggest-setup", label: "Suggest a setup from how I already work", hint: "", icon: PuzzlePiece, available: canWrite && !!mainAgent, run: suggestSetup, group: "Create", keywords: "onboarding scan claude code codex cursor omp skills rules mcp team import" },
@@ -390,7 +398,7 @@ export function DesktopCommandPalette({
     { id: "text-reset", label: "Reset text size", hint: `${mod} 0`, icon: ArrowCounterClockwise, available: true, run: () => stepTextScale(0), group: "Preferences", keywords: "text size zoom default font" },
     { id: "pro", label: "Loka Pro", hint: "", icon: Crown, available: true, run: onOpenPro, group: "Help", keywords: "team organizations devices waitlist" },
     { id: "check-updates", label: "Check for updates", hint: "", icon: ArrowsClockwise, available: isDesktopApp(), run: () => void desktopApi.checkForUpdates().catch(() => {}), group: "Help", keywords: "update upgrade version new release" },
-    { id: "changelog", label: "What's new", hint: "", icon: Sparkle, available: true, run: openChangelog, group: "Help", keywords: "changelog updates release notes" },
+    { id: "changelog", label: "What's new", hint: "", icon: MeaningIcon.whatsNew, available: true, run: openChangelog, group: "Help", keywords: "changelog updates release notes" },
     { id: "shortcuts", label: "Keyboard shortcuts", hint: "?", icon: Keyboard, available: true, run: onOpenShortcuts, group: "Help", keywords: "keys hotkeys" },
     { id: "docs", label: "Read the docs", hint: "", icon: BookOpenText, available: true, run: openTab("/docs"), group: "Help", keywords: "help guide documentation manual" },
   ];
@@ -401,6 +409,11 @@ export function DesktopCommandPalette({
     onOpenChange(false);
     run();
   };
+  const selectRecord = (run: () => void, value?: string) => select(() => {
+    if (!canOpenRecord()) return;
+    if (value) rememberRecent(value);
+    run();
+  });
   const tellTarget = canWrite && mainAgent ? mainAgent : null;
   const tellText = search.trim();
   const [sending, setSending] = useState(false);
@@ -420,7 +433,13 @@ export function DesktopCommandPalette({
     }
   };
   const agentName = (id: string | null) => (id ? agents.find((a) => a.id === id)?.name ?? null : null);
-  const jump = (to: PaletteJump) => () => select(() => onJump(to));
+  const jump = (to: PaletteJump) => () => {
+    const run = () => onJump(to);
+    if (to.kind === "teams" || to.kind === "list" || to.kind === "region" || to.kind === "place") select(run);
+    else selectRecord(run);
+  };
+  const academyHits = (results?.places ?? []).filter((p) => p.kind === "challenge" || p.kind === "adventure");
+  const mapPlaces = (results?.places ?? []).filter((p) => p.kind === "building" || p.kind === "npc");
   const giveQuest = (agentId: string) => {
     requestQuestTab(agentId);
     onOpenAgent(agentId);
@@ -460,7 +479,7 @@ export function DesktopCommandPalette({
     return action ? [{ kind: "action", action }] : [];
   });
   const agentItem = (agent: WorldAgent) => (
-    <Command.Item key={agent.id} value={`agent:${agent.id}`} keywords={[agent.name, agent.slug, agent.expertise ?? "", ...(agent.tags ?? [])]} onSelect={() => select(() => onOpenAgent(agent.id), `agent:${agent.id}`)} className={ITEM}>
+    <Command.Item key={agent.id} value={`agent:${agent.id}`} keywords={[agent.name, agent.slug, agent.expertise ?? "", ...(agent.tags ?? [])]} onSelect={() => selectRecord(() => onOpenAgent(agent.id), `agent:${agent.id}`)} className={ITEM}>
       <AgentFace agent={agent} size={20} />
       <span className="min-w-0 flex-1 truncate font-medium">{agent.name}</span>
       <span className="text-w-xs text-w-muted">@{agent.slug}</span>
@@ -534,7 +553,7 @@ export function DesktopCommandPalette({
               {(results.reports?.length ?? 0) > 0 && (
                 <HitGroup heading="Reports">
                   {results.reports?.map((report) => [
-                    <Command.Item key={report.id} value={`hit:report:${report.id}`} onSelect={() => select(() => (report.practice ? openPractice(report.id) : openReport(report.id)))} className={cn(ITEM, "items-start")}>
+                    <Command.Item key={report.id} value={`hit:report:${report.id}`} onSelect={() => selectRecord(() => (report.practice ? openPractice(report.id) : openReport(report.id)))} className={cn(ITEM, "items-start")}>
                       {report.practice ? <Student size={16} weight="duotone" className="mt-0.5 shrink-0 text-w-link" /> : report.kind === "canvas" ? <FlowArrow size={16} weight="duotone" className="mt-0.5 shrink-0 text-w-link" /> : <FileText size={16} weight="duotone" className="mt-0.5 shrink-0 text-w-link" />}
                       <span className="min-w-0 flex-1">
                         <span className="flex items-baseline gap-1.5 text-w-xs text-w-muted">
@@ -550,7 +569,7 @@ export function DesktopCommandPalette({
                       <Command.Item
                         key={`${report.id}#${item.id}`}
                         value={`hit:canvas-item:${report.id}#${item.id}`}
-                        onSelect={() => select(() => openReport(report.id, item.id))}
+                        onSelect={() => selectRecord(() => openReport(report.id, item.id))}
                         className={cn(ITEM, "items-start pl-9")}
                       >
                         <span className="mt-0.5 w-12 shrink-0 text-w-2xs font-semibold text-w-muted">{CANVAS_KIND_LABEL[item.kind as CanvasKind] ?? "Item"}</span>
@@ -563,7 +582,7 @@ export function DesktopCommandPalette({
               {results.messages.length > 0 && (
                 <HitGroup heading="Messages">
                   {results.messages.map((hit) => (
-                    <Command.Item key={hit.ref} value={`hit:message:${hit.ref}`} onSelect={() => select(() => openMessage(hit))} className={cn(ITEM, "items-start")}>
+                    <Command.Item key={hit.ref} value={`hit:message:${hit.ref}`} onSelect={() => selectRecord(() => openMessage(hit))} className={cn(ITEM, "items-start")}>
                       <span aria-hidden="true" className="shrink-0 pt-0.5">{(() => {
                         const agent = hit.kind === "agent" ? agents.find((a) => a.id === hit.agent_id) : null;
                         if (agent) return <AgentFace agent={agent} size={16} />;
@@ -589,7 +608,7 @@ export function DesktopCommandPalette({
                       <Command.Item
                         key={quest.id}
                         value={`hit:quest:${quest.id}`}
-                        onSelect={() => select(() => window.dispatchEvent(new CustomEvent("world:open-quest", { detail: { taskId: quest.id, agentId: quest.assigned_agent_id } })))}
+                        onSelect={() => selectRecord(() => window.dispatchEvent(new CustomEvent("world:open-quest", { detail: { taskId: quest.id, agentId: quest.assigned_agent_id } })))}
                         className={ITEM}
                       >
                         <StatusIcon status={quest.status} />
@@ -603,7 +622,7 @@ export function DesktopCommandPalette({
               {results.todos.length > 0 && (
                 <HitGroup heading="To-dos">
                   {results.todos.map((todo) => (
-                    <Command.Item key={todo.id} value={`hit:todo:${todo.id}`} onSelect={() => select(() => focusTodo(todo.id))} className={ITEM}>
+                    <Command.Item key={todo.id} value={`hit:todo:${todo.id}`} onSelect={() => selectRecord(() => focusTodo(todo.id))} className={ITEM}>
                       {todo.status === "done" ? <CheckSquare size={16} weight="duotone" className="text-w-ok" /> : <Square size={16} weight="duotone" className="text-w-muted" />}
                       <span className={cn("min-w-0 flex-1 truncate", todo.status !== "open" && "text-w-muted line-through")}>{todo.text}</span>
                       <span className="shrink-0 text-w-2xs text-w-muted">{shortDate(todo.added_at)}</span>
@@ -614,7 +633,7 @@ export function DesktopCommandPalette({
               {results.lists.length > 0 && (
                 <HitGroup heading="Lists and timers">
                   {results.lists.map((list) => (
-                    <Command.Item key={list.id} value={`hit:list:${list.id}`} onSelect={() => select(onOpenLists)} className={ITEM}>
+                    <Command.Item key={list.id} value={`hit:list:${list.id}`} onSelect={jump({ kind: "list", id: list.id })} className={ITEM}>
                       {list.kind === "timer" ? <Timer size={16} weight="duotone" className="text-w-link" /> : <ListChecks size={16} weight="duotone" className="text-w-link" />}
                       <span className="min-w-0 flex-1 truncate">{list.name}</span>
                     </Command.Item>
@@ -627,7 +646,7 @@ export function DesktopCommandPalette({
                     <Command.Item
                       key={channel.id}
                       value={`hit:channel:${channel.id}`}
-                      onSelect={() => select(() => window.dispatchEvent(new CustomEvent("world:open-channel", { detail: { id: channel.id } })))}
+                      onSelect={() => selectRecord(() => window.dispatchEvent(new CustomEvent("world:open-channel", { detail: { id: channel.id } })))}
                       className={ITEM}
                     >
                       <Hash size={16} weight="duotone" className="text-w-link" />
@@ -647,7 +666,7 @@ export function DesktopCommandPalette({
                       title={s.name}
                       detail={[agentName(s.agent_id), s.kind === "heartbeat" ? "heartbeat" : "routine", s.enabled ? null : "off"].filter(Boolean).join(" · ")}
                       aside={s.enabled ? cronLabel(s.cron_expression, s.next_run_at) : null}
-                      onSelect={jump({ kind: "schedules", agentId: s.agent_id })}
+                      onSelect={jump({ kind: "schedules", agentId: s.agent_id, id: s.id })}
                     />
                   ))}
                 </HitGroup>
@@ -661,12 +680,30 @@ export function DesktopCommandPalette({
                       icon={<UsersThree size={16} weight="duotone" className="shrink-0 text-w-link" />}
                       title={t.name}
                       detail={t.purpose || (t.lead_agent_id ? `Led by ${agentName(t.lead_agent_id) ?? "an agent"}` : null)}
-                      onSelect={jump({ kind: "teams" })}
+                      onSelect={jump({ kind: "teams", id: t.id })}
                     />
                   ))}
                 </HitGroup>
               )}
-              {((results.regions?.length ?? 0) > 0 || (results.places?.length ?? 0) > 0) && (
+              {academyHits.length > 0 && (
+                <HitGroup heading="Academy">
+                  {academyHits.map((p) => {
+                    const report = p.kind === "challenge" && typeof p.data.report_id === "string" ? p.data.report_id : null;
+                    return (
+                      <HitRow
+                        key={p.id}
+                        value={`hit:academy:${p.id}`}
+                        icon={p.kind === "adventure" ? <Compass size={16} weight="duotone" className="shrink-0 text-w-warn" /> : <GraduationCap size={16} weight="duotone" className="shrink-0 text-w-ok" />}
+                        title={p.name}
+                        detail={p.kind === "adventure" ? `Course${typeof p.data.skill === "string" ? ` in ${p.data.skill}` : ""}` : `${report ? "Canvas lesson" : "Lesson"}${typeof p.data.skill === "string" ? ` in ${p.data.skill}` : ""}`}
+                        aside="Open"
+                        onSelect={report ? () => select(() => openPractice(report)) : jump({ kind: "academy", challengeId: p.kind === "challenge" ? p.id : null, courseId: p.kind === "adventure" ? p.id : null })}
+                      />
+                    );
+                  })}
+                </HitGroup>
+              )}
+              {((results.regions?.length ?? 0) > 0 || mapPlaces.length > 0) && (
                 <HitGroup heading="Places in Loka">
                   {results.regions?.map((r) => (
                     <HitRow
@@ -679,7 +716,7 @@ export function DesktopCommandPalette({
                       onSelect={jump({ kind: "region", id: r.id, name: r.name })}
                     />
                   ))}
-                  {results.places?.map((p) => (
+                  {mapPlaces.map((p) => (
                     <HitRow
                       key={p.id}
                       value={`hit:place:${p.id}`}
@@ -687,7 +724,7 @@ export function DesktopCommandPalette({
                       title={p.name}
                       detail={`${p.kind === "npc" ? "Character" : "Building"} in ${p.region_name ?? "Home"}`}
                       aside={p.kind === "npc" ? "Talk" : "Visit"}
-                      onSelect={jump({ kind: "place", place: p })}
+                      onSelect={jump({ kind: "place", id: p.id })}
                     />
                   ))}
                 </HitGroup>
@@ -701,7 +738,7 @@ export function DesktopCommandPalette({
                       icon={<Rss size={16} weight="duotone" className={cn("shrink-0", f.paused ? "text-w-muted" : "text-w-link")} />}
                       title={f.name}
                       detail={[agentName(f.agent_id), f.kind === "rss" ? "RSS" : "webhook", f.paused ? "paused" : null].filter(Boolean).join(" · ")}
-                      onSelect={jump({ kind: "feeds", agentId: f.agent_id })}
+                      onSelect={jump({ kind: "feeds", agentId: f.agent_id, id: f.id })}
                     />
                   ))}
                 </HitGroup>
@@ -715,7 +752,7 @@ export function DesktopCommandPalette({
                       icon={<Gavel size={16} weight="duotone" className={cn("shrink-0", r.enabled ? "text-w-link" : "text-w-muted")} />}
                       title={r.excerpt}
                       detail={[r.global ? "For everyone" : "Yours", r.scope === "talk" ? "when talking" : r.scope === "work" ? "when working" : "always", r.enabled ? null : "off"].filter(Boolean).join(" · ")}
-                      onSelect={jump({ kind: "rules" })}
+                      onSelect={jump({ kind: "rules", id: r.id })}
                     />
                   ))}
                 </HitGroup>
@@ -730,7 +767,7 @@ export function DesktopCommandPalette({
                       title={k.name}
                       detail={[k.kind === "skill" ? "Skill" : "MCP server", k.description].filter(Boolean).join(" · ")}
                       aside={agentName(k.agent_id) ? `${agentName(k.agent_id)}'s kit` : null}
-                      onSelect={jump({ kind: "kit", agentId: k.agent_id })}
+                      onSelect={jump({ kind: "kit", agentId: k.agent_id, id: k.id, itemKind: k.kind })}
                     />
                   ))}
                 </HitGroup>
@@ -744,7 +781,7 @@ export function DesktopCommandPalette({
                       icon={<Desktop size={16} weight="duotone" className={cn("shrink-0", d.status === "online" ? "text-w-ok" : "text-w-muted")} />}
                       title={d.name}
                       detail={`${d.platform === "macos" ? "Mac" : d.platform} · ${d.status}`}
-                      onSelect={() => select(onOpenDevices)}
+                      onSelect={jump({ kind: "device", id: d.id })}
                     />
                   ))}
                 </HitGroup>
@@ -772,7 +809,7 @@ export function DesktopCommandPalette({
                 <HitRow
                   key={hit.index}
                   value={`log:${hit.index}`}
-                  icon={<Sparkle size={16} weight="duotone" className="shrink-0 text-w-link" />}
+                  icon={<MeaningIcon.whatsNew size={16} weight="duotone" className="shrink-0 text-w-link" />}
                   title={hit.title}
                   detail={hit.detail}
                   aside={hit.date}

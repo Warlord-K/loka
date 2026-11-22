@@ -14,11 +14,11 @@ export const MAIN_TARGET = "main";
 const TEXT_MAX = 2000;
 const CONTEXT_MAX = 4000;
 const BLOCKS = "p, li, td, th, pre, blockquote, h1, h2, h3, h4, h5, h6";
-const pending = new Map<string, { quote: MessageQuote; at: number }>();
+const pending = new Map<string, { quote: MessageQuote; until: number }>();
 const PICKUP_MS = 10_000;
 
-export function sendQuote(target: string, quote: MessageQuote) {
-  pending.set(target, { quote, at: Date.now() });
+export function sendQuote(target: string, quote: MessageQuote, keepMs = PICKUP_MS) {
+  pending.set(target, { quote, until: Date.now() + keepMs });
   window.dispatchEvent(new CustomEvent(QUOTE_EVENT, { detail: { target, quote } }));
 }
 
@@ -26,7 +26,7 @@ export function useQuote(target: string | null): [MessageQuote | null, (quote: M
   const [quote, setQuote] = useState<MessageQuote | null>(null);
   useEffect(() => {
     const waiting = target ? pending.get(target) : undefined;
-    setQuote(waiting && Date.now() - waiting.at < PICKUP_MS ? waiting.quote : null);
+    setQuote(waiting && Date.now() < waiting.until ? waiting.quote : null);
     if (!target) return;
     const onQuote = (e: Event) => {
       const detail = (e as CustomEvent<{ target: string; quote: MessageQuote }>).detail;
@@ -105,10 +105,7 @@ export function QuoteSelection() {
           return;
         }
         picked.current = { root: found.root, range: found.range.cloneRange() };
-        const rect = found.range.getBoundingClientRect();
-        const x = Math.min(Math.max(rect.left + rect.width / 2, 48), window.innerWidth - 48);
-        const y = rect.top > 56 ? rect.top - 8 : rect.bottom + 44;
-        setSpot({ x, y });
+        setSpot(spotAbove(found.range.getBoundingClientRect()));
       }, 120);
     };
     const hide = () => {
@@ -143,13 +140,17 @@ export function QuoteSelection() {
     setSpot(null);
   };
 
+  return <QuoteButton spot={spot} onQuote={quote} />;
+}
+
+export function QuoteButton({ spot, onQuote }: { spot: { x: number; y: number } | null; onQuote: () => void }) {
   if (!spot || typeof document === "undefined") return null;
   return createPortal(
     <div style={{ left: spot.x, top: spot.y }} className="fixed z-[1000] -translate-x-1/2 -translate-y-full">
       <button
         type="button"
         onPointerDown={(e) => e.preventDefault()}
-        onClick={quote}
+        onClick={onQuote}
         className={cn(CHUNKY, "flex items-center gap-1.5 bg-w-card px-2.5 py-1 text-w-sm font-semibold text-w-strong motion-safe:animate-w-rise")}
         title="Quote this in your reply"
       >
@@ -161,13 +162,19 @@ export function QuoteSelection() {
   );
 }
 
+export function spotAbove(rect: { left: number; top: number; bottom: number; width: number }) {
+  const x = Math.min(Math.max(rect.left + rect.width / 2, 48), window.innerWidth - 48);
+  const y = rect.top > 56 ? rect.top - 8 : rect.bottom + 44;
+  return { x, y };
+}
+
 export function QuotePreview({ quote, onClear }: { quote: MessageQuote; onClear: () => void }) {
   return (
     <div className="mx-2 mt-2 flex items-start gap-2 rounded-lg border-l-4 border-w-teal bg-w-sand/60 py-1.5 pl-2.5 pr-1.5">
       <Quotes size={14} weight="bold" className="mt-0.5 shrink-0 text-w-muted" />
       <div className="min-w-0 flex-1">
         {quote.label && <p className="truncate text-w-2xs font-semibold text-w-muted">{quote.label}</p>}
-        <p className="line-clamp-2 whitespace-pre-wrap text-w-sm text-w-text2">{quote.text}</p>
+        <p className="line-clamp-2 whitespace-pre-wrap break-words text-w-sm text-w-text2">{quote.text}</p>
       </div>
       <button type="button" onClick={onClear} aria-label="Remove quote" title="Remove quote" className="grid h-6 w-6 shrink-0 place-items-center rounded-md text-w-muted hover:bg-w-paper hover:text-w-strong">
         <X size={12} weight="bold" />
@@ -180,7 +187,7 @@ export function QuotedBlock({ quote, className }: { quote: MessageQuote; classNa
   return (
     <div className={cn("mb-1.5 border-l-4 border-w-line2 pl-2.5 text-w-sm text-w-muted", className)}>
       {quote.label && <p className="truncate text-w-2xs font-semibold">{quote.label}</p>}
-      <p className="line-clamp-3 whitespace-pre-wrap">{quote.text}</p>
+      <p className="line-clamp-3 whitespace-pre-wrap break-words">{quote.text}</p>
     </div>
   );
 }

@@ -332,7 +332,7 @@ async fn finish(state: &AppState, user: &UserId, before: &WorldAgent, progress: 
     let device = if has_device {
         String::new()
     } else {
-        " One thing before I can think: I need an execution device. Open your profile card at the top left and pair this computer under Devices.".to_string()
+        " One thing before I can think: I need an execution device. Open Settings from your name at the top left and pair this computer under Devices.".to_string()
     };
     let goal = progress.goal.as_deref().filter(|g| !g.trim().is_empty());
     let body = if skipped {

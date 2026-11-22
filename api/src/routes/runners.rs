@@ -16,6 +16,7 @@ use loka_shared::runners::{
     HandoffRunnerError, LeaseBeat, LeaseSteers, RunnerCompletion, RevokeRunner, RunnerEvents, RunnerHeartbeat, RunnerPoll, RunnerPolled,
     RunnerRegistration, RunnerView, UpdateRunner,
 };
+use base64::Engine;
 use ring::digest;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -484,6 +485,8 @@ pub struct WorkspaceTasks {
     tasks: Vec<Uuid>,
     #[serde(default)]
     pressure: bool,
+    #[serde(default)]
+    idle: bool,
 }
 
 pub async fn workspaces(
@@ -499,7 +502,12 @@ pub async fn workspaces(
         .await
         .map_err(internal)?;
     let closed: Vec<Uuid> = entries.iter().map(|entry| entry.id).collect();
-    Ok(Json(json!({ "closed": closed, "entries": entries })))
+    let idle = if request.idle {
+        state.runners.idle_tasks(runner_id, &request.tasks).await.map_err(internal)?
+    } else {
+        Vec::new()
+    };
+    Ok(Json(json!({ "closed": closed, "entries": entries, "idle": idle })))
 }
 
 pub async fn disk_low(
@@ -904,6 +912,46 @@ pub async fn media(
         Ok(up) => Ok((StatusCode::CREATED, Json(json!({ "id": up.id, "mime": up.mime, "name": up.name }))).into_response()),
         Err(error) => Err(problem(StatusCode::UNPROCESSABLE_ENTITY, "media_refused", error.to_string())),
     }
+}
+
+pub async fn lease_upload(
+    State(state): State<AppState>,
+    Path((lease_id, upload_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let token = authorization(&headers, "RunnerMcp")?;
+    let lease = state
+        .runners
+        .lease_for_mcp(token)
+        .await
+        .map_err(internal)?
+        .filter(|lease| lease.lease_id == lease_id && matches!(lease.kind.as_str(), "task" | "followup"))
+        .ok_or_else(|| problem(StatusCode::UNAUTHORIZED, "invalid_mcp_lease", "MCP lease is invalid"))?;
+    let agent = state
+        .world
+        .get_agent(lease.agent_id)
+        .await
+        .map_err(internal)?
+        .filter(|agent| agent.owner_user_id == Some(lease.owner_user_id))
+        .ok_or_else(|| problem(StatusCode::NOT_FOUND, "agent_not_found", "The agent is gone"))?;
+    let viewer = loka_shared::access::Viewer {
+        user: lease.owner_user_id,
+        org: agent.org_id,
+        role: loka_shared::access::Role::Write,
+        org_role: None,
+        instance_admin: false,
+    };
+    let (mime, bytes) = state
+        .world
+        .upload_for_viewer(upload_id, &viewer)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| problem(StatusCode::NOT_FOUND, "upload_not_found", "No upload with that id is visible to your owner"))?;
+    if bytes.len() > loka_shared::media::MAX_VIDEO {
+        return Err(problem(StatusCode::PAYLOAD_TOO_LARGE, "upload_too_large", "The upload is larger than 25 MB"));
+    }
+    let name = state.world.upload_name(upload_id).await.map_err(internal)?.unwrap_or_default();
+    Ok(Json(json!({ "id": upload_id, "name": name, "mime": mime, "data_base64": base64::engine::general_purpose::STANDARD.encode(bytes) })).into_response())
 }
 
 const RUNNER_AUTH_TTL: std::time::Duration = std::time::Duration::from_secs(10);

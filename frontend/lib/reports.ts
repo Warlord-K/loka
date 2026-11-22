@@ -19,6 +19,7 @@ export interface ReportBrief {
   open_marks: number;
   item_count: number;
   practice?: { subject: string; coach_agent_id?: string | null } | null;
+  challenge_id?: string | null;
 }
 
 export type ReportKind = "doc" | "canvas";
@@ -94,6 +95,7 @@ export interface ReportDetail {
   outlinks: ReportBrief[];
   can_edit: boolean;
   marks: CanvasMark[];
+  lesson?: string | null;
 }
 
 export interface RevisionBrief {
@@ -120,6 +122,7 @@ export interface ReportPatch {
   tags?: string[];
   pinned?: boolean;
   visibility?: "private" | "public";
+  base_updated_at?: string;
 }
 
 export class ReportError extends Error {
@@ -129,6 +132,28 @@ export class ReportError extends Error {
   ) {
     super(message);
   }
+}
+
+export class StaleReport extends ReportError {
+  constructor(
+    public latest: Report,
+    message: string,
+  ) {
+    super(409, message);
+  }
+}
+
+async function updated(res: Response): Promise<Report> {
+  if (res.status === 409) {
+    const text = await res.text().catch(() => "");
+    let body: { error?: string; report?: Report } | null = null;
+    try {
+      body = JSON.parse(text);
+    } catch {}
+    if (body?.report) throw new StaleReport(body.report, body.error || "Someone saved a newer version of this report.");
+    throw new ReportError(409, body?.error || text || res.statusText);
+  }
+  return json<Report>(res);
 }
 
 async function json<T>(res: Response): Promise<T> {
@@ -169,7 +194,7 @@ export const reportsApi = {
     const res = await send(`/api/world/reports/${id}/marks/${mark}`, "DELETE", undefined, opts);
     if (!res.ok) throw new ReportError(res.status, res.statusText);
   },
-  update: (id: string, patch: ReportPatch) => send(`/api/world/reports/${id}`, "PATCH", patch).then((r) => json<Report>(r)),
+  update: (id: string, patch: ReportPatch) => send(`/api/world/reports/${id}`, "PATCH", patch).then(updated),
   remove: async (id: string) => {
     const res = await send(`/api/world/reports/${id}`, "DELETE");
     if (!res.ok) throw new ReportError(res.status, res.statusText);

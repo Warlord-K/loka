@@ -49,6 +49,8 @@ type WorkspaceUse = {
   reclaimable_tasks: number;
   temp_bytes: number;
   reclaimable_temp_bytes: number;
+  build_bytes: number;
+  reclaimable_build_bytes: number;
 };
 
 type Report = { agents: AgentStorage[]; total_bytes: number; cleanups: PastCleanup[]; workspaces: WorkspaceUse[] };
@@ -62,8 +64,8 @@ const KINDS: { kind: CleanupKind; title: string; description: string; scoped?: b
   { kind: "activity", title: "Old activity", description: "The activity feed behind quest rooms and the bell, including cleared bell items." },
   {
     kind: "workspaces",
-    title: "Closed quest workspaces and temp folders",
-    description: "Checkouts, build output, test databases and scratch files of closed quests on your devices, oldest first. Open quests are never touched. Branches, commits and pull requests stay.",
+    title: "Closed quest workspaces, temp folders and build folders",
+    description: "Checkouts, build output, test databases and scratch files of closed quests on your devices, oldest first, plus the node_modules, .next and cargo target folders of idle open quests. Open quests keep their checkouts. Branches, commits and pull requests stay, and the next build starts from scratch.",
     scoped: false,
   },
 ];
@@ -241,7 +243,7 @@ export function StorageSection() {
       {report && report.workspaces.length > 0 && (
         <SettingsGroup
           title="Quest workspaces on your devices"
-          description="Each quest works in its own checkout and its own temp folder (build output and test databases) on the device that runs it. Loka clears the temp folder an hour after a quest closes, the checkout 3 days after it is done (7 days when it failed), and both sooner when the disk runs low."
+          description="Each quest works in its own checkout and its own temp folder (build output and test databases) on the device that runs it. Loka clears the temp folder an hour after a quest closes, the checkout 3 days after it is done (7 days when it failed), and build folders first, then closed folders, when the disk runs low."
         >
           <SettingsCard rows>
             {report.workspaces.map((w) => (
@@ -252,7 +254,7 @@ export function StorageSection() {
                 </span>
                 <span className="text-w-sm font-semibold tabular-nums text-w-strong">{size(w.bytes)}</span>
                 <span className="basis-full text-w-xs leading-relaxed text-w-muted">
-                  {w.tasks.toLocaleString()} folders{w.temp_bytes > 0 ? `, ${size(w.temp_bytes)} of it temp build output and test databases` : ""}, {size(w.reclaimable_bytes)} from closed quests ({w.reclaimable_tasks.toLocaleString()}){w.reclaimable_temp_bytes > 0 ? `, ${size(w.reclaimable_temp_bytes)} of that temp` : ""}.
+                  {w.tasks.toLocaleString()} folders{w.temp_bytes > 0 ? `, ${size(w.temp_bytes)} of it temp build output and test databases` : ""}, {size(w.reclaimable_bytes)} from closed quests ({w.reclaimable_tasks.toLocaleString()}){w.reclaimable_temp_bytes > 0 ? `, ${size(w.reclaimable_temp_bytes)} of that temp` : ""}.{w.build_bytes > 0 ? ` Build folders (cargo target, node_modules, .next) take ${size(w.build_bytes)}${w.reclaimable_build_bytes > 0 ? `, ${size(w.reclaimable_build_bytes)} of it from idle open quests can be cleared` : ""}.` : ""}
                   {w.free_gb !== null && (
                     <>
                       {" "}

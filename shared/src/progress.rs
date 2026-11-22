@@ -60,7 +60,7 @@ fn world_tool(tool: &str) -> Option<&'static str> {
         "make_list" | "update_list" | "list_items" => "Working on a list",
         "place_building" | "place_decoration" | "add_critter" | "remove_item" | "place_portal" | "add_npc" | "set_ambient" => "Building in Loka",
         "create_region" | "update_region" | "list_regions" => "Shaping Loka",
-        "create_challenge" | "create_adventure" => "Writing an Academy challenge",
+        "create_challenge" | "create_course" | "create_adventure" => "Writing an Academy lesson",
         "list_challenges" | "progress_of" => "Checking Academy progress",
         _ => return None,
     })

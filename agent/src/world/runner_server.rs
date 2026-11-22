@@ -7,10 +7,10 @@ use cron::Schedule as CronSchedule;
 use loka_shared::{
     db::Database,
     guests::{asked_by_user, in_thread},
-    milestones::MilestoneStore,
+    milestones::{finished_status, MilestoneStore},
     models::AgentTask,
     runners::{
-        ApplyCompletion, ClaimedRun, LeaseContext, RunnerCompletion, RunnerEvent, RunnerImage,
+        ApplyCompletion, ClaimedRun, LeaseContext, RunnerCompletion, RunnerEvent, RunnerFile, RunnerImage,
         RunnerJob, RunnerPublish, RunnerSkill, RunnerStore, RunnerUsage, RunnerWorkspace,
     },
     world::{
@@ -361,6 +361,12 @@ impl RunnerCoordinator {
         let system = prompts::persona(agent, &self.owner_name);
         let rules_hash = prompts::rules_hash(&format!("{system}\n{rules_text}"));
         let mut prompt = prompts::turn(items, &tasks);
+        if loka_shared::quests::owner_spoke(items) {
+            let note = loka_shared::quests::waiting_plans_note(&self.store.waiting_plans(agent.id).await.unwrap_or_default());
+            if !note.is_empty() {
+                prompt = format!("{prompt}\n\n{note}");
+            }
+        }
         if main.cli_session_id.is_some() {
             let last = prompts::last_replies(&self.store.last_turn_replies(agent.id, main.id).await.unwrap_or_default());
             if !last.is_empty() {
@@ -399,7 +405,7 @@ impl RunnerCoordinator {
     }
 
     pub async fn build_job(&self, claimed: ClaimedRun, mcp_token: String) -> Result<RunnerJob> {
-        let (session, agent, runner, task, parent_cli, skills, images, options, previous_run_id, live_sessions, keys_version) = tokio::try_join!(
+        let (session, agent, runner, task, parent_cli, skills, (images, files, skipped_note), options, previous_run_id, live_sessions, keys_version) = tokio::try_join!(
             async {
                 self.store
                     .get_session(claimed.session_id)
@@ -442,9 +448,9 @@ impl RunnerCoordinator {
             },
             async {
                 if claimed.kind == "turn" {
-                    self.run_images(claimed.run_id).await
+                    self.run_uploads(claimed.run_id).await
                 } else {
-                    Ok(Vec::new())
+                    Ok((Vec::new(), Vec::new(), None))
                 }
             },
             async {
@@ -614,7 +620,10 @@ impl RunnerCoordinator {
             kind: claimed.kind,
             cli: claimed.backend,
             model: options.model.unwrap_or(claimed.model),
-            prompt: claimed.prompt,
+            prompt: match skipped_note {
+                Some(note) => format!("{}\n\n{note}", claimed.prompt),
+                None => claimed.prompt,
+            },
             system_prompt,
             workspace,
             cli_session_id,
@@ -633,6 +642,7 @@ impl RunnerCoordinator {
             vault_refs,
             provider_keys,
             images,
+            files,
             publish,
             rewind_to,
             approval: Some(approval),
@@ -793,7 +803,14 @@ impl RunnerCoordinator {
                     .await?
             }
             "followup" => {
-                self.after_followup(&agent, &session, lease.run_id, &output, completion.work_summary.as_deref())
+                self.after_followup(
+                    &agent,
+                    &session,
+                    lease.run_id,
+                    &output,
+                    completion.work_summary.as_deref(),
+                    loka_shared::runners::PrSync::from_report(completion.publish_pr_state.as_deref()),
+                )
                     .await?
             }
             "aside" => self.after_aside(&agent, &session, &output).await?,
@@ -1107,6 +1124,7 @@ impl RunnerCoordinator {
             TaskResume::Busy(session_id) => bail!(
                 "it is already being worked on in session {session_id}; use message_session to steer that session instead of starting it again"
             ),
+            TaskResume::AwaitingPlan(session_id) => bail!("session {session_id} has a plan that {}", loka_shared::quests::PLAN_WAITING),
             TaskResume::Resumed { session_id, run_id } => {
                 self.db.update_status(task.id, "in_progress").await?;
                 self.store
@@ -1344,6 +1362,9 @@ impl RunnerCoordinator {
         let task_id = task_session
             .task_id
             .ok_or_else(|| anyhow!("task session has no task"))?;
+        if let Some(url) = self.store.quest_merged_pr(task_id).await? {
+            return self.settle_merged(agent, task_session, task_id, &url).await;
+        }
         let pending = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(
                SELECT 1 FROM agent_sessions s
@@ -1668,6 +1689,35 @@ impl RunnerCoordinator {
         }
     }
 
+    async fn review_failed(
+        &self,
+        agent: &WorldAgent,
+        task_session: &AgentSession,
+        run_id: Uuid,
+        error: &str,
+        stopped: bool,
+    ) -> Result<()> {
+        if let Some(task_id) = task_session.task_id {
+            if let Some(url) = self.store.quest_merged_pr(task_id).await? {
+                return self.settle_merged(agent, task_session, task_id, &url).await;
+            }
+            MilestoneStore::new(self.store.pool().clone()).check_now(task_id).await?;
+            let published = self.db.get_task(task_id).await?.is_some_and(|task| task.repo.is_some() && task.pr_url.is_some());
+            if stopped && published {
+                return self.queue_publish(agent, task_session, run_id).await;
+            }
+        }
+        self.finalize_task(
+            agent,
+            task_session,
+            Some(json!({ "verdict": "review failed", "summary": error })),
+            Some(error.to_string()),
+            None,
+            None,
+        )
+        .await
+    }
+
     async fn settle_merged(
         &self,
         agent: &WorldAgent,
@@ -1739,6 +1789,7 @@ impl RunnerCoordinator {
         run_id: Uuid,
         output: &str,
         work: Option<&str>,
+        pr_sync: loka_shared::runners::PrSync,
     ) -> Result<()> {
         if session.role == "task" && session.planning() {
             let run = self.store.get_run(run_id).await?.ok_or_else(|| anyhow!("completed follow-up disappeared"))?;
@@ -1795,6 +1846,10 @@ impl RunnerCoordinator {
                 session.wants_review(),
                 nudge_available,
             );
+            let step = match step {
+                FollowupStep::Review if !pr_sync.needs_review() && !session.racing() => FollowupStep::Settle,
+                step => step,
+            };
             if session.racing() && !matches!(step, FollowupStep::Nudge | FollowupStep::Leave) {
                 return self.attempt_done(agent, &session, run_id, !matches!(step, FollowupStep::Fail(_))).await;
             }
@@ -1808,6 +1863,13 @@ impl RunnerCoordinator {
                     self.queue_review(agent, &session, run_id).await?;
                 }
                 FollowupStep::Settle => {
+                    if pr_sync == loka_shared::runners::PrSync::Merged {
+                        if let Some(task_id) = session.task_id {
+                            if let Some(url) = self.db.get_task(task_id).await?.and_then(|task| task.pr_url) {
+                                return self.settle_merged(agent, &session, task_id, &url).await;
+                            }
+                        }
+                    }
                     let has_repo = match session.task_id {
                         Some(task_id) => self
                             .db
@@ -2022,13 +2084,8 @@ impl RunnerCoordinator {
                     .and_then(Value::as_str)
                     == Some("changes");
                 changes_requested = review_wants_changes;
-                task_status = if error.is_some() {
-                    "failed"
-                } else if pr_url.is_some() || review_wants_changes {
-                    "review"
-                } else {
-                    "done"
-                };
+                let already_merged = error.is_none() && milestones.merge_done(task.id).await?;
+                task_status = finished_status(error.is_some(), already_merged, pr_url.is_some(), review_wants_changes);
                 if let Some(error) = &error {
                     self.db.set_error(task.id, error).await?;
                 } else {
@@ -2268,16 +2325,8 @@ impl RunnerCoordinator {
             if !manual {
                 if let Some(parent) = session.parent_session_id {
                     if let Some(task_session) = self.store.get_session(parent).await? {
-                        return self
-                            .finalize_task(
-                                agent,
-                                &task_session,
-                                Some(json!({ "verdict": "review failed", "summary": error })),
-                                Some(error.to_string()),
-                                None,
-                                None,
-                            )
-                            .await;
+                        let stopped = diagnosis.as_ref().is_some_and(|d| d.cause == loka_shared::run_causes::Cause::Stopped);
+                        return self.review_failed(agent, &task_session, run_id, error, stopped).await;
                     }
                 }
             }
@@ -2573,7 +2622,7 @@ impl RunnerCoordinator {
         tasks
     }
 
-    async fn run_images(&self, run_id: Uuid) -> Result<Vec<RunnerImage>> {
+    async fn run_uploads(&self, run_id: Uuid) -> Result<(Vec<RunnerImage>, Vec<RunnerFile>, Option<String>)> {
         let payloads = sqlx::query_scalar::<_, Value>(
             "SELECT i.payload FROM agent_inbox i
              JOIN runner_run_inbox x ON x.inbox_id = i.id WHERE x.run_id = $1 ORDER BY i.id",
@@ -2581,19 +2630,31 @@ impl RunnerCoordinator {
         .bind(run_id)
         .fetch_all(self.store.pool())
         .await?;
-        let ids = payloads
-            .iter()
-            .filter_map(|payload| payload.get("attachments").and_then(Value::as_array))
-            .flatten()
-            .filter(|attachment| attachment.get("mime").and_then(Value::as_str).is_none_or(prompts::is_image))
-            .filter_map(|attachment| attachment.get("id").and_then(Value::as_str))
-            .filter_map(|id| id.parse::<Uuid>().ok())
-            .take(8)
-            .collect::<Vec<_>>();
-        let uploads = futures_util::future::try_join_all(ids.iter().map(|id| self.store.get_upload(*id, None))).await?;
-        Ok(ids
+        let attached = prompts::attached_ids(&payloads);
+        let file_ids: Vec<Uuid> = attached.files.iter().map(|(id, _)| *id).collect();
+        let infos = self.store.upload_infos(&file_ids).await?;
+        let mut total = 0usize;
+        let mut wanted = Vec::new();
+        let mut skipped = Vec::new();
+        for (id, name) in attached.files {
+            let Some((_, mime, size)) = infos.iter().find(|(known, _, _)| *known == id) else {
+                continue;
+            };
+            let file_name = loka_shared::media::attachment_file_name(id, &name, mime);
+            if loka_shared::media::fits_caps(&mut total, usize::try_from(*size).unwrap_or(usize::MAX)) {
+                wanted.push((id, file_name, mime.clone()));
+            } else {
+                skipped.push(file_name);
+            }
+        }
+        let (image_uploads, file_uploads) = tokio::try_join!(
+            futures_util::future::try_join_all(attached.images.iter().map(|id| self.store.get_upload(*id, None))),
+            futures_util::future::try_join_all(wanted.iter().map(|(id, _, _)| self.store.get_upload(*id, None))),
+        )?;
+        let images = attached
+            .images
             .into_iter()
-            .zip(uploads)
+            .zip(image_uploads)
             .filter_map(|(id, upload)| {
                 let (mime_type, bytes) = upload.filter(|(mime, _)| prompts::is_image(mime))?;
                 Some(RunnerImage {
@@ -2603,7 +2664,16 @@ impl RunnerCoordinator {
                     data_base64: STANDARD.encode(bytes),
                 })
             })
-            .collect())
+            .collect();
+        let files = wanted
+            .into_iter()
+            .zip(file_uploads)
+            .filter_map(|((id, name, _), upload)| {
+                let (mime_type, bytes) = upload?;
+                Some(RunnerFile { id, name, mime_type, data_base64: STANDARD.encode(bytes) })
+            })
+            .collect();
+        Ok((images, files, loka_shared::media::attached_files_note(&[], &skipped)))
     }
 
     async fn turn_options(&self, run_id: Uuid, backend: &str) -> Result<TurnOptions> {
@@ -3125,6 +3195,198 @@ mod tests {
         sqlx::query("DELETE FROM agent_profiles WHERE id = $1").bind(agent_id).execute(&pool).await?;
         sqlx::query("DELETE FROM world_skills WHERE name = $1").bind(format!("reset-{tag}-notes")).execute(&pool).await?;
         sqlx::query("DELETE FROM users WHERE id = $1").bind(owner).execute(&pool).await?;
+        Ok(())
+    }
+
+    struct Harness {
+        pool: sqlx::PgPool,
+        store: loka_shared::world::WorldStore,
+        coordinator: super::RunnerCoordinator,
+    }
+
+    struct MergedQuest {
+        agent: loka_shared::world::WorldAgent,
+        task: uuid::Uuid,
+        task_session: uuid::Uuid,
+    }
+
+    async fn harness() -> anyhow::Result<Option<Harness>> {
+        use loka_shared::{db::Database, world::WorldStore};
+        let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
+            return Ok(None);
+        };
+        let db = Database::connect(&url).await?;
+        let pool = db.pool().clone();
+        let store = WorldStore::new(pool.clone());
+        let mut coordinator = super::RunnerCoordinator::new(db, store.clone());
+        coordinator.reviews_enabled = true;
+        Ok(Some(Harness { pool, store, coordinator }))
+    }
+
+    async fn merged_quest(harness: &Harness, merged: bool) -> anyhow::Result<MergedQuest> {
+        use uuid::Uuid;
+        let pool = &harness.pool;
+        let tag = Uuid::new_v4().simple().to_string();
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email) VALUES ($1) RETURNING id")
+            .bind(format!("merged-{tag}@example.test"))
+            .fetch_one(pool)
+            .await?;
+        let agent_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id) VALUES ($1, 'Bun', 'claude', 'sonnet', $2) RETURNING id",
+        )
+        .bind(format!("merged-{tag}"))
+        .bind(owner)
+        .fetch_one(pool)
+        .await?;
+        let task: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_tasks (user_id, title, status, assigned_agent_id, pr_url) VALUES ($1, 'ship it', 'in_progress', $2, 'https://github.com/acme/app/pull/9') RETURNING id",
+        )
+        .bind(owner)
+        .bind(agent_id)
+        .fetch_one(pool)
+        .await?;
+        sqlx::query("DELETE FROM task_milestones WHERE task_id = $1 AND kind = 'merge'").bind(task).execute(pool).await?;
+        sqlx::query("INSERT INTO task_milestones (task_id, title, kind, status) VALUES ($1, 'merge', 'merge', $2)")
+            .bind(task)
+            .bind(if merged { "done" } else { "active" })
+            .execute(pool)
+            .await?;
+        let task_session: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_sessions (agent_id, role, backend, model, cli_session_id, task_id, status, working_dir)
+             VALUES ($1, 'task', 'claude', 'sonnet', $2, $3, 'active', $4) RETURNING id",
+        )
+        .bind(agent_id)
+        .bind(format!("cli-{tag}"))
+        .bind(task)
+        .bind(format!("tasks/{task}/app"))
+        .fetch_one(pool)
+        .await?;
+        let agent = harness.store.get_agent(agent_id).await?.expect("agent");
+        Ok(MergedQuest { agent, task, task_session })
+    }
+
+    async fn quest_status(harness: &Harness, quest: &MergedQuest) -> anyhow::Result<String> {
+        Ok(sqlx::query_scalar("SELECT status FROM agent_tasks WHERE id = $1").bind(quest.task).fetch_one(&harness.pool).await?)
+    }
+
+    async fn review_sessions(harness: &Harness, quest: &MergedQuest) -> anyhow::Result<i64> {
+        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM agent_sessions WHERE task_id = $1 AND role = 'review'")
+            .bind(quest.task)
+            .fetch_one(&harness.pool)
+            .await?)
+    }
+
+    #[tokio::test]
+    async fn a_followup_that_merged_or_changed_nothing_queues_no_review() -> anyhow::Result<()> {
+        use loka_shared::runners::PrSync;
+        use uuid::Uuid;
+        let Some(harness) = harness().await? else {
+            return Ok(());
+        };
+        let output = "Merged it.\n<!-- report {\"status\": \"done\", \"summary\": \"merged\"} report -->";
+        for (sync, reviews, status) in [
+            (PrSync::Merged, 0, "done"),
+            (PrSync::Unchanged, 0, "review"),
+            (PrSync::Changed, 1, "in_progress"),
+        ] {
+            let quest = merged_quest(&harness, false).await?;
+            let run: Uuid = sqlx::query_scalar(
+                "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, prompt) VALUES ($1, $2, $3, 'followup', 'completed', 'merge it') RETURNING id",
+            )
+            .bind(quest.task_session)
+            .bind(quest.agent.id)
+            .bind(quest.task)
+            .fetch_one(&harness.pool)
+            .await?;
+            let session = harness.store.get_session(quest.task_session).await?.expect("task session");
+            harness.coordinator.after_followup(&quest.agent, &session, run, output, None, sync).await?;
+            assert_eq!(review_sessions(&harness, &quest).await?, reviews, "{sync:?}");
+            let now = quest_status(&harness, &quest).await?;
+            if sync == PrSync::Unchanged {
+                assert_ne!(now, "failed", "{sync:?}");
+            } else {
+                assert_eq!(now, status, "{sync:?}");
+            }
+            if sync == PrSync::Merged {
+                let merged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_events WHERE task_id = $1 AND type = 'task.merged'")
+                    .bind(quest.task)
+                    .fetch_one(&harness.pool)
+                    .await?;
+                assert_eq!(merged, 1);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_review_stopped_after_the_pr_merged_settles_the_quest_as_done() -> anyhow::Result<()> {
+        use uuid::Uuid;
+        let Some(harness) = harness().await? else {
+            return Ok(());
+        };
+        for (merged, status) in [(true, "done"), (false, "failed")] {
+            let quest = merged_quest(&harness, merged).await?;
+            let task_session = harness.store.get_session(quest.task_session).await?.expect("task session");
+            harness.coordinator.review_failed(&quest.agent, &task_session, Uuid::new_v4(), "Stopped by Bun", false).await?;
+            assert_eq!(quest_status(&harness, &quest).await?, status, "merged: {merged}");
+            let nudged: bool = sqlx::query_scalar(
+                "SELECT COALESCE(next_check_at IS NOT NULL AND next_check_at <= NOW(), FALSE) FROM task_milestones WHERE task_id = $1 AND kind = 'merge'",
+            )
+            .bind(quest.task)
+            .fetch_one(&harness.pool)
+            .await?;
+            assert_eq!(nudged, !merged, "merged: {merged}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_stopped_review_of_a_published_quest_never_fails_it() -> anyhow::Result<()> {
+        use uuid::Uuid;
+        let Some(harness) = harness().await? else {
+            return Ok(());
+        };
+        let stopped = "Stopped by Tara. Do not restart this work unless they ask.";
+        let crashed = "timed out after 3600s";
+        for (error, merge_done, repo, status, publishes) in [
+            (stopped, true, true, "done", 0),
+            (stopped, false, true, "in_progress", 1),
+            (stopped, false, false, "failed", 0),
+            (crashed, false, true, "failed", 0),
+        ] {
+            let quest = merged_quest(&harness, merge_done).await?;
+            if repo {
+                sqlx::query("UPDATE agent_tasks SET repo = 'acme/app', pr_number = 9 WHERE id = $1")
+                    .bind(quest.task)
+                    .execute(&harness.pool)
+                    .await?;
+            }
+            let review: Uuid = sqlx::query_scalar(
+                "INSERT INTO agent_sessions (agent_id, role, backend, model, parent_session_id, task_id, status)
+                 VALUES ($1, 'review', 'claude', 'sonnet', $2, $3, 'active') RETURNING id",
+            )
+            .bind(quest.agent.id)
+            .bind(quest.task_session)
+            .bind(quest.task)
+            .fetch_one(&harness.pool)
+            .await?;
+            let run: Uuid = sqlx::query_scalar(
+                "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, prompt) VALUES ($1, $2, $3, 'review', 'running', 'review it') RETURNING id",
+            )
+            .bind(review)
+            .bind(quest.agent.id)
+            .bind(quest.task)
+            .fetch_one(&harness.pool)
+            .await?;
+            let session = harness.store.get_session(review).await?.expect("review session");
+            harness.coordinator.fail_run(run, "review", &session, &quest.agent, error, false).await?;
+            assert_eq!(quest_status(&harness, &quest).await?, status, "{error} merged: {merge_done} repo: {repo}");
+            let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_runs WHERE session_id = $1 AND kind = 'publish'")
+                .bind(quest.task_session)
+                .fetch_one(&harness.pool)
+                .await?;
+            assert_eq!(queued, publishes, "{error} merged: {merge_done} repo: {repo}");
+        }
         Ok(())
     }
 

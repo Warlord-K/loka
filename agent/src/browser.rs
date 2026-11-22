@@ -114,12 +114,16 @@ fn quest_kind(kind: &str) -> bool {
     matches!(kind, "task" | "followup")
 }
 
-pub fn launcher(agent_id: Uuid, kind: &str) -> Option<String> {
-    launcher_for(&launcher_exe()?, agent_id, Reach::for_job(kind, local_allowed()))
+pub fn launcher(agent_id: Uuid, run_id: Uuid, kind: &str) -> Option<String> {
+    launcher_for(&launcher_exe()?, agent_id, run_id, Reach::for_job(kind, local_allowed()))
 }
 
-fn launcher_for(exe: &str, agent_id: Uuid, reach: Reach) -> Option<String> {
-    Some(format!("{exe} browser {agent_id} {}", reach.word()))
+fn launcher_for(exe: &str, agent_id: Uuid, run_id: Uuid, reach: Reach) -> Option<String> {
+    Some(format!("{exe} browser {agent_id} {} {run_id}", reach.word()))
+}
+
+fn launcher_reach(launcher: &str) -> Option<Reach> {
+    Reach::from_word(launcher.split_whitespace().nth(3)?)
 }
 
 const APP_FOLDERS: &[&str] = &["dev.ygpt.loka"];
@@ -195,8 +199,8 @@ fn parse_engine(value: Option<&str>) -> Engine {
     }
 }
 
-pub fn environment(root: &Path, agent_id: Uuid, kind: &str) -> BTreeMap<String, String> {
-    launcher(agent_id, kind)
+pub fn environment(root: &Path, agent_id: Uuid, run_id: Uuid, kind: &str) -> BTreeMap<String, String> {
+    launcher(agent_id, run_id, kind)
         .map(|l| BTreeMap::from([(LAUNCHER_ENV.to_string(), l), (ROOT_ENV.to_string(), root.display().to_string())]))
         .unwrap_or_default()
 }
@@ -233,13 +237,14 @@ there is no window, screenshots come back blank and nothing stays signed in betw
 so stick to snapshots and text. If a site needs a login or does not work, say so in your report.",
     };
     let leave = match engine {
-        Engine::Chrome => "Leave the browser open when you finish so your owner can look at where you ended; do not run `close`.",
+        Engine::Chrome => "The tabs you open close by themselves when this run ends, so do not run `close` (it would also close tabs your other runs have open). Close a tab yourself with `tab close` as soon as you are done with it.",
         Engine::Lightpanda => "Run `{COMMAND} close` when you are done.",
     }
     .replace("{COMMAND}", launcher);
-    let local = if launcher.ends_with(" local") {
+    let reach = launcher_reach(launcher);
+    let local = if reach == Some(Reach::Local) {
         "Your owner allowed local addresses (localhost and the home network)."
-    } else if launcher.ends_with(" quest") {
+    } else if reach == Some(Reach::Loopback) {
         "Public web addresses and dev servers on this Mac open (localhost, 127.0.0.1, [::1]), so you can check what you run in your worktree. Private network addresses and file: links are blocked."
     } else {
         "Only public web addresses open: localhost, private network addresses and file: links are blocked."
@@ -587,7 +592,7 @@ fn settle_pins(root: &Path, agent_id: Uuid, reach: Reach, fresh: &[Pin]) -> Resu
 
 fn write_pins(file: &Path, text: &str) -> std::io::Result<()> {
     use std::io::Write;
-    let tmp = file.with_extension("pins.tmp");
+    let tmp = file.with_file_name(format!("{}.tmp", file.file_name().and_then(|n| n.to_str()).unwrap_or("browser")));
     let _ = std::fs::remove_file(&tmp);
     let mut out = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
     out.write_all(text.as_bytes())?;
@@ -634,6 +639,238 @@ fn current_url(binary: &Path, home: &Path, root: &Path, agent_id: Uuid, rules: O
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+const TABLESS: &[&str] = &[
+    "get", "is", "snapshot", "screenshot", "console", "errors", "highlight", "diff", "vitals", "a11y", "cookies", "storage", "network",
+    "skills", "set", "scroll", "scrollintoview", "wait", "help", "--help", "-h", "--version", "close",
+];
+
+const LEDGER_EXT: &str = "tabs";
+
+type Drive<'a> = &'a dyn Fn(&[&str], Option<&str>) -> Option<String>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Tab {
+    id: String,
+    url: String,
+    active: Option<bool>,
+}
+
+impl Tab {
+    fn blank(&self) -> bool {
+        matches!(self.url.trim(), "" | "about:blank" | "chrome://newtab" | "chrome://newtab/")
+    }
+}
+
+fn tab_id_ok(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 128 && !id.starts_with('-') && id.chars().all(|c| c.is_ascii_alphanumeric() || "-_.:".contains(c))
+}
+
+fn tab_items(value: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    match value {
+        serde_json::Value::Array(items) => Some(items),
+        serde_json::Value::Object(map) => ["data", "tabs", "result"].iter().find_map(|key| map.get(*key)).and_then(tab_items),
+        _ => None,
+    }
+}
+
+fn parse_tabs(text: &str) -> Option<Vec<Tab>> {
+    let value: serde_json::Value = serde_json::from_str(text.trim()).ok()?;
+    let tabs = tab_items(&value)?
+        .iter()
+        .filter_map(|item| {
+            let id = ["targetId", "tabId", "id"].iter().find_map(|key| item.get(*key)?.as_str())?;
+            tab_id_ok(id).then(|| Tab {
+                id: id.to_string(),
+                url: item.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                active: ["active", "isActive", "current"].iter().find_map(|key| item.get(*key)?.as_bool()),
+            })
+        })
+        .collect();
+    Some(tabs)
+}
+
+fn list_tabs(run: &dyn Fn(&[&str]) -> Option<String>) -> Option<Vec<Tab>> {
+    parse_tabs(&run(&["tab", "list", "--json"])?)
+}
+
+fn opens_tabs(args: &[String]) -> bool {
+    let positional: Vec<&str> = args.iter().map(String::as_str).filter(|a| !a.starts_with('-')).collect();
+    match positional.as_slice() {
+        ["tab", rest @ ..] => rest.first() == Some(&"new"),
+        [sub, ..] => !TABLESS.contains(sub),
+        [] => false,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Owned {
+    run: Uuid,
+    tab: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Ledger {
+    reach: Reach,
+    owned: Vec<Owned>,
+}
+
+fn ledger_file(root: &Path, agent_id: Uuid) -> PathBuf {
+    root.join("browser").join(format!("{agent_id}.{LEDGER_EXT}"))
+}
+
+fn parse_ledger(text: &str) -> Ledger {
+    let mut ledger = Ledger { reach: Reach::Public, owned: Vec::new() };
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        match parts.as_slice() {
+            ["reach", word] => {
+                if let Some(reach) = Reach::from_word(word) {
+                    ledger.reach = reach;
+                }
+            }
+            [run, tab] => {
+                if let (Ok(run), true) = (run.parse::<Uuid>(), tab_id_ok(tab)) {
+                    let owned = Owned { run, tab: tab.to_string() };
+                    if !ledger.owned.contains(&owned) {
+                        ledger.owned.push(owned);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    ledger
+}
+
+fn render_ledger(ledger: &Ledger) -> String {
+    let mut text = format!("reach {}\n", ledger.reach.word());
+    for owned in &ledger.owned {
+        text.push_str(&format!("{} {}\n", owned.run, owned.tab));
+    }
+    text
+}
+
+fn read_ledger(root: &Path, agent_id: Uuid) -> Ledger {
+    parse_ledger(&std::fs::read_to_string(ledger_file(root, agent_id)).unwrap_or_default())
+}
+
+fn save_ledger(root: &Path, agent_id: Uuid, ledger: &Ledger) -> std::io::Result<()> {
+    let file = ledger_file(root, agent_id);
+    if ledger.owned.is_empty() {
+        return match std::fs::remove_file(&file) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        };
+    }
+    write_pins(&file, &render_ledger(ledger))
+}
+
+struct Lock(#[allow(dead_code)] std::fs::File);
+
+fn lock(root: &Path, agent_id: Uuid) -> Option<Lock> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(root.join("browser").join(format!("{agent_id}.lock")))
+        .ok()?;
+    (unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0).then_some(Lock(file))
+}
+
+fn claimed_ids(before: &[Tab], after: &[Tab], ledger: &Ledger) -> Vec<String> {
+    after
+        .iter()
+        .filter(|tab| !ledger.owned.iter().any(|owned| owned.tab == tab.id))
+        .filter(|tab| match before.iter().find(|old| old.id == tab.id) {
+            None => true,
+            Some(old) => old.blank() && (old.active == Some(true) || before.len() == 1),
+        })
+        .map(|tab| tab.id.clone())
+        .collect()
+}
+
+fn record_claims(root: &Path, agent_id: Uuid, reach: Reach, run: Uuid, before: &[Tab], after: &[Tab]) {
+    let mut ledger = read_ledger(root, agent_id);
+    let saved = ledger.clone();
+    let fresh = claimed_ids(before, after, &ledger);
+    ledger.owned.retain(|owned| after.iter().any(|tab| tab.id == owned.tab));
+    ledger.owned.extend(fresh.into_iter().map(|tab| Owned { run, tab }));
+    ledger.reach = reach;
+    if ledger != saved {
+        let _ = save_ledger(root, agent_id, &ledger);
+    }
+}
+
+fn release_tabs(root: &Path, agent_id: Uuid, mine: &dyn Fn(Uuid) -> bool, drive: Drive) {
+    if !ledger_file(root, agent_id).exists() {
+        return;
+    }
+    let Some(_lock) = lock(root, agent_id) else {
+        return;
+    };
+    let mut ledger = read_ledger(root, agent_id);
+    let ours: Vec<String> = ledger.owned.iter().filter(|owned| mine(owned.run)).map(|owned| owned.tab.clone()).collect();
+    if ours.is_empty() {
+        return;
+    }
+    let pins = parse_pins(&std::fs::read_to_string(pins_file(root, agent_id)).unwrap_or_default(), ledger.reach);
+    let rules = resolver_rules(&pins);
+    let run = |args: &[&str]| drive(args, rules.as_deref());
+    let live = list_tabs(&run);
+    let mut closed: Vec<&String> = Vec::new();
+    if let Some(live) = &live {
+        for id in ours.iter().filter(|id| live.iter().any(|tab| &tab.id == *id)) {
+            run(&["tab", "close", id]);
+            closed.push(id);
+        }
+    }
+    ledger.owned.retain(|owned| !mine(owned.run));
+    let _ = save_ledger(root, agent_id, &ledger);
+    if live.is_none() || !ledger.owned.is_empty() {
+        return;
+    }
+    if let Some(rest) = list_tabs(&run) {
+        if rest.iter().all(|tab| tab.blank() || closed.contains(&&tab.id)) {
+            run(&["close"]);
+        }
+    }
+}
+
+fn real_drive(binary: PathBuf, home: PathBuf, root: PathBuf, agent_id: Uuid) -> impl Fn(&[&str], Option<&str>) -> Option<String> {
+    move |args, rules| {
+        let out = browser_command(&binary, &home, &root, agent_id, rules).args(args).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+}
+
+pub fn close_run(root: &Path, agent_id: Uuid, run_id: Uuid) {
+    let (Some(binary), Some(home)) = (real_binary(), real_home()) else {
+        return;
+    };
+    release_tabs(root, agent_id, &|run| run == run_id, &real_drive(binary, home, root.to_path_buf(), agent_id));
+}
+
+pub fn sweep(root: &Path) {
+    let (Some(binary), Some(home)) = (real_binary(), real_home()) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(root.join("browser")) else {
+        return;
+    };
+    for path in entries.flatten().map(|entry| entry.path()) {
+        let agent = path
+            .extension()
+            .filter(|ext| *ext == LEDGER_EXT)
+            .and_then(|_| path.file_stem()?.to_str()?.parse::<Uuid>().ok());
+        if let Some(agent_id) = agent {
+            release_tabs(root, agent_id, &|_| true, &real_drive(binary.clone(), home.clone(), root.to_path_buf(), agent_id));
+        }
+    }
+}
+
 pub fn gate(args: &[String]) -> i32 {
     match run_gate(args) {
         Ok(code) => code,
@@ -647,6 +884,10 @@ pub fn gate(args: &[String]) -> i32 {
 fn run_gate(args: &[String]) -> Result<i32, Refusal> {
     let [agent, mode, rest @ ..] = args else {
         return Err(Refusal::Usage("missing agent and mode".into()));
+    };
+    let (run, rest) = match rest.split_first().and_then(|(first, tail)| Some((first.parse::<Uuid>().ok()?, tail))) {
+        Some(split) => split,
+        None => (Uuid::nil(), rest),
     };
     let agent_id: Uuid = agent.parse().map_err(|_| Refusal::Usage("bad agent id".into()))?;
     let reach = Reach::from_word(mode).ok_or_else(|| Refusal::Usage("bad browser mode".into()))?;
@@ -664,10 +905,23 @@ fn run_gate(args: &[String]) -> Result<i32, Refusal> {
     let rules = resolver_rules(&pins);
     let rules = rules.as_deref();
     let sub = vetted.first().map(String::as_str).unwrap_or("");
+    let drive = real_drive(binary.clone(), home.clone(), root.clone(), agent_id);
+    let tabs = |args: &[&str]| drive(args, rules);
+    let tracked = opens_tabs(&vetted);
+    let guard = (tracked || sub == "close").then(|| lock(&root, agent_id)).flatten();
+    let before = guard.as_ref().filter(|_| tracked).and_then(|_| list_tabs(&tabs));
     let output = browser_command(&binary, &home, &root, agent_id, rules)
         .args(&vetted)
         .output()
         .map_err(|e| Refusal::Usage(format!("could not start {COMMAND}: {e}")))?;
+    if let Some(before) = &before {
+        if let Some(after) = list_tabs(&tabs) {
+            record_claims(&root, agent_id, reach, run, before, &after);
+        }
+    }
+    if sub == "close" && output.status.success() && guard.is_some() {
+        let _ = std::fs::remove_file(ledger_file(&root, agent_id));
+    }
     if !READ_ONLY.contains(&sub) {
         if let Some(url) = current_url(&binary, &home, &root, agent_id, rules) {
             if let Err(refusal) = check_url(&url, reach) {
@@ -705,8 +959,9 @@ mod tests {
         assert!(!env.contains_key("AGENT_BROWSER_ARGS"));
         assert_ne!(env["AGENT_BROWSER_SESSION"], browser_environment(root, b, Engine::Chrome, None)["AGENT_BROWSER_SESSION"]);
         assert!(wanted("task") && !wanted("turn") && !wanted("aside"));
-        let launcher = launcher_for("/Applications/Loka.app/Contents/MacOS/loka-agent", a, Reach::Public).unwrap();
-        assert_eq!(launcher, format!("/Applications/Loka.app/Contents/MacOS/loka-agent browser {a} web"));
+        let run = Uuid::new_v4();
+        let launcher = launcher_for("/Applications/Loka.app/Contents/MacOS/loka-agent", a, run, Reach::Public).unwrap();
+        assert_eq!(launcher, format!("/Applications/Loka.app/Contents/MacOS/loka-agent browser {a} web {run}"));
         let skill = skill_for(Engine::Chrome, &launcher);
         assert!(skill.starts_with("---\nname: browser\n"));
         assert!(skill.contains(&format!("`{launcher} open <url>`")) && skill.contains("are blocked"));
@@ -801,8 +1056,10 @@ mod tests {
         assert_eq!(Reach::for_job("review", false), Reach::Public);
         assert_eq!(Reach::for_job("task", true), Reach::Local);
         let a = Uuid::new_v4();
-        let launcher = launcher_for("/x/loka-agent", a, Reach::Loopback).unwrap();
-        assert_eq!(launcher, format!("/x/loka-agent browser {a} quest"));
+        let run = Uuid::new_v4();
+        let launcher = launcher_for("/x/loka-agent", a, run, Reach::Loopback).unwrap();
+        assert_eq!(launcher, format!("/x/loka-agent browser {a} quest {run}"));
+        assert_eq!(launcher_reach(&launcher), Some(Reach::Loopback));
         assert_eq!(Reach::from_word("quest"), Some(Reach::Loopback));
         let skill = skill_for(Engine::Chrome, &launcher);
         assert!(skill.contains("localhost, 127.0.0.1") && skill.contains("Private network addresses"));
@@ -843,10 +1100,10 @@ mod tests {
         };
         assert_eq!(root_in(spoofed_first, &home), None);
         std::fs::remove_dir_all(&base).unwrap();
-        let env = environment(Path::new("/runner/root"), Uuid::new_v4(), "task");
+        let env = environment(Path::new("/runner/root"), Uuid::new_v4(), Uuid::new_v4(), "task");
         if let Some(launcher) = env.get(LAUNCHER_ENV) {
             assert_eq!(env[ROOT_ENV], "/runner/root");
-            assert!(launcher.ends_with(" quest") || launcher.ends_with(" local"));
+            assert!(matches!(launcher_reach(launcher), Some(Reach::Loopback | Reach::Local)));
         }
     }
 
@@ -950,12 +1207,193 @@ mod tests {
         std::fs::create_dir_all(root.join("browser")).unwrap();
         let first = settle_pins(&root, agent, Reach::Public, &[pin("example.com", &["8.8.8.8"])]).unwrap();
         assert_eq!(settle_pins(&root, agent, Reach::Public, &[]).unwrap(), first);
-        std::os::unix::fs::symlink(root.join("elsewhere"), pins_file(&root, agent).with_extension("pins.tmp")).unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), pins_file(&root, agent).with_file_name(format!("{agent}.pins.tmp"))).unwrap();
         let second = settle_pins(&root, agent, Reach::Public, &[pin("other.test", &["1.1.1.1"])]).unwrap();
         assert_eq!(second.len(), 2);
         assert!(!root.join("elsewhere").exists());
         assert_eq!(parse_pins(&std::fs::read_to_string(pins_file(&root, agent)).unwrap(), Reach::Public), second);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+
+    struct FakeBrowser {
+        tabs: std::cell::RefCell<Vec<Tab>>,
+        calls: std::cell::RefCell<Vec<String>>,
+        next: std::cell::Cell<u32>,
+        down: bool,
+    }
+
+    impl FakeBrowser {
+        fn new(tabs: &[(&str, &str, bool)]) -> FakeBrowser {
+            let tabs = tabs.iter().map(|(id, url, active)| Tab { id: id.to_string(), url: url.to_string(), active: Some(*active) }).collect();
+            FakeBrowser { tabs: std::cell::RefCell::new(tabs), calls: Default::default(), next: std::cell::Cell::new(1), down: false }
+        }
+
+        fn drive(&self, args: &[&str], _rules: Option<&str>) -> Option<String> {
+            self.calls.borrow_mut().push(args.join(" "));
+            if self.down {
+                return None;
+            }
+            match args {
+                ["tab", "list", "--json"] => {
+                    let items: Vec<String> = self
+                        .tabs
+                        .borrow()
+                        .iter()
+                        .map(|t| format!(r#"{{"tabId":"t","targetId":"{}","url":"{}","active":{}}}"#, t.id, t.url, t.active == Some(true)))
+                        .collect();
+                    Some(format!(r#"{{"success":true,"data":{{"tabs":[{}]}}}}"#, items.join(",")))
+                }
+                ["tab", "close", id] => {
+                    self.tabs.borrow_mut().retain(|t| t.id != *id);
+                    Some(String::new())
+                }
+                ["close"] => {
+                    self.tabs.borrow_mut().clear();
+                    Some(String::new())
+                }
+                _ => None,
+            }
+        }
+
+        fn open_tab(&self, url: &str) -> String {
+            let id = format!("T{}", self.next.get());
+            self.next.set(self.next.get() + 1);
+            self.tabs.borrow_mut().push(Tab { id: id.clone(), url: url.to_string(), active: Some(false) });
+            id
+        }
+
+        fn navigate_active(&self, url: &str) {
+            if let Some(tab) = self.tabs.borrow_mut().iter_mut().find(|t| t.active == Some(true)) {
+                tab.url = url.to_string();
+            }
+        }
+
+        fn ids(&self) -> Vec<String> {
+            self.tabs.borrow().iter().map(|t| t.id.clone()).collect()
+        }
+
+        fn closed_all(&self) -> bool {
+            self.calls.borrow().iter().any(|c| c == "close")
+        }
+    }
+
+    fn gate_step(root: &Path, agent: Uuid, run: Uuid, fake: &FakeBrowser, act: impl FnOnce(&FakeBrowser)) {
+        let run_cmd = |args: &[&str]| fake.drive(args, None);
+        let before = list_tabs(&run_cmd).unwrap();
+        act(fake);
+        let after = list_tabs(&run_cmd).unwrap();
+        record_claims(root, agent, Reach::Loopback, run, &before, &after);
+    }
+
+    fn release(root: &Path, agent: Uuid, fake: &FakeBrowser, mine: &dyn Fn(Uuid) -> bool) {
+        release_tabs(root, agent, mine, &|args, rules| fake.drive(args, rules));
+    }
+
+    fn tab_scratch() -> (PathBuf, Uuid) {
+        let root = scratch();
+        std::fs::create_dir_all(root.join("browser")).unwrap();
+        (root, Uuid::new_v4())
+    }
+
+    #[test]
+    fn a_runs_tabs_close_when_it_ends_and_nobody_elses_do() {
+        let (root, agent) = tab_scratch();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let fake = FakeBrowser::new(&[("P", "https://person.example/", false), ("first", "about:blank", true)]);
+        gate_step(&root, agent, a, &fake, |f| f.navigate_active("http://localhost:3000/"));
+        gate_step(&root, agent, a, &fake, |f| {
+            f.open_tab("https://a.example/");
+        });
+        gate_step(&root, agent, b, &fake, |f| {
+            f.open_tab("https://b.example/");
+        });
+        assert_eq!(fake.ids(), ["P", "first", "T1", "T2"]);
+        release(&root, agent, &fake, &|run| run == a);
+        assert_eq!(fake.ids(), ["P", "T2"], "run A's tabs close, the person's tab and run B's tab stay");
+        assert!(!fake.closed_all());
+        release(&root, agent, &fake, &|run| run == b);
+        assert_eq!(fake.ids(), ["P"], "the person's tab is never closed");
+        assert!(!fake.closed_all(), "the browser stays up while a tab of someone else is in it");
+        assert!(!ledger_file(&root, agent).exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_browser_shuts_down_when_the_last_run_leaves_nothing_behind() {
+        let (root, agent) = tab_scratch();
+        let run = Uuid::new_v4();
+        let fake = FakeBrowser::new(&[("first", "about:blank", true)]);
+        gate_step(&root, agent, run, &fake, |f| f.navigate_active("https://a.example/"));
+        release(&root, agent, &fake, &|r| r == run);
+        assert!(fake.ids().is_empty() && fake.closed_all());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_run_without_tabs_never_touches_the_browser() {
+        let (root, agent) = tab_scratch();
+        let fake = FakeBrowser::new(&[("P", "https://person.example/", true)]);
+        release(&root, agent, &fake, &|_| true);
+        assert!(fake.calls.borrow().is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn tabs_the_agent_already_closed_and_a_dead_browser_leave_no_ledger_behind() {
+        let (root, agent) = tab_scratch();
+        let run = Uuid::new_v4();
+        let mut fake = FakeBrowser::new(&[("first", "about:blank", true)]);
+        gate_step(&root, agent, run, &fake, |f| {
+            f.open_tab("https://a.example/");
+        });
+        fake.tabs.borrow_mut().retain(|t| t.id != "T1");
+        gate_step(&root, agent, run, &fake, |f| f.navigate_active("https://b.example/"));
+        let owned = read_ledger(&root, agent).owned;
+        assert!(owned.iter().all(|o| o.tab != "T1"), "a tab that is gone is forgotten");
+        fake.down = true;
+        release(&root, agent, &fake, &|r| r == run);
+        assert!(!ledger_file(&root, agent).exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_start_up_sweep_closes_every_leftover_run() {
+        let (root, agent) = tab_scratch();
+        let fake = FakeBrowser::new(&[("P", "https://person.example/", false), ("first", "about:blank", true)]);
+        gate_step(&root, agent, Uuid::new_v4(), &fake, |f| f.navigate_active("https://a.example/"));
+        gate_step(&root, agent, Uuid::nil(), &fake, |f| {
+            f.open_tab("https://b.example/");
+        });
+        release(&root, agent, &fake, &|_| true);
+        assert_eq!(fake.ids(), ["P"]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn reads_tab_lists_and_picks_the_commands_that_can_open_tabs() {
+        let listed = r#"{"success":true,"data":{"tabs":[{"tabId":"t1","targetId":"AB12","url":"about:blank","active":true},{"tabId":"t2","url":"https://x.test"},{"tabId":"-bad"}]}}"#;
+        let tabs = parse_tabs(listed).unwrap();
+        assert_eq!(tabs.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["AB12", "t2"]);
+        assert!(tabs[0].blank() && tabs[0].active == Some(true) && tabs[1].active.is_none());
+        assert_eq!(parse_tabs(r#"[{"targetId":"X","url":"https://y.test"}]"#).unwrap().len(), 1);
+        assert!(parse_tabs("not json").is_none() && parse_tabs(r#"{"success":true}"#).is_none());
+        for opens in ["open https://a.test", "click @e1 --new-tab", "tab new https://a.test", "press Enter", "eval x"] {
+            assert!(opens_tabs(&words(opens)), "{opens}");
+        }
+        for quiet in ["snapshot -i", "get url", "tab list", "tab close t2", "tab t3", "screenshot", "wait --load networkidle", "close"] {
+            assert!(!opens_tabs(&words(quiet)), "{quiet}");
+        }
+    }
+
+    #[test]
+    fn the_ledger_is_read_back_and_never_trusts_odd_lines() {
+        let run = Uuid::new_v4();
+        let text = format!("reach quest\n{run} AB12\n{run} AB12\nnot-a-uuid X\n{run} -flag\n{run} bad;id\njunk\n");
+        let ledger = parse_ledger(&text);
+        assert_eq!(ledger.reach, Reach::Loopback);
+        assert_eq!(ledger.owned, [Owned { run, tab: "AB12".into() }]);
+        assert_eq!(parse_ledger(&render_ledger(&ledger)), ledger);
     }
 
     #[test]

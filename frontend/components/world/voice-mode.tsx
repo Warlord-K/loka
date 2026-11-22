@@ -47,6 +47,7 @@ const LABEL: Record<Phase, string> = {
 
 export function VoiceMode({
   agent,
+  quickId = null,
   portrait,
   minimised,
   slot,
@@ -56,6 +57,7 @@ export function VoiceMode({
   onPill,
 }: {
   agent: WorldAgent;
+  quickId?: string | null;
   portrait: string;
   minimised: boolean;
   slot: HTMLElement | null;
@@ -68,7 +70,7 @@ export function VoiceMode({
   const [muted, setMuted] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lines, setLines] = useState<{ id: number; key?: string; who: "you" | "them"; text: string; partial?: boolean }[]>([]);
-  const [engine, setEngine] = useState<Engine>(engineChoice);
+  const [engine, setEngine] = useState<Engine>(() => (quickId ? "live" : engineChoice()));
   const [note, setNote] = useState<string | null>(null);
   const [fellBack, setFellBack] = useState(false);
   const [settled, setSettled] = useState(false);
@@ -118,16 +120,20 @@ export function VoiceMode({
     if (engine !== "live") return;
     let cancelled = false;
     setPhase("connecting");
-    startLive(agent.id, {
-      onPhase: (p) => !cancelled && setPhase(p),
-      onCaption: (key, who, text, partial) => !cancelled && caption(key, who, text, partial),
-      onError: (message) => !cancelled && setError(message),
-      onEnd: () => {
-        if (cancelled) return;
-        liveRef.current = null;
-        setEnded(true);
+    startLive(
+      agent.id,
+      {
+        onPhase: (p) => !cancelled && setPhase(p),
+        onCaption: (key, who, text, partial) => !cancelled && caption(key, who, text, partial),
+        onError: (message) => !cancelled && setError(message),
+        onEnd: () => {
+          if (cancelled) return;
+          liveRef.current = null;
+          setEnded(true);
+        },
       },
-    })
+      quickId,
+    )
       .then((call) => {
         if (cancelled) {
           void call.close();
@@ -138,7 +144,7 @@ export function VoiceMode({
       })
       .catch((e: unknown) => {
         if (cancelled) return;
-        if (e instanceof LiveUnavailable) {
+        if (e instanceof LiveUnavailable && !quickId) {
           setEngine("device");
           setFellBack(true);
           setNote("Live voice is not set up, so this call runs on your device.");
@@ -159,7 +165,7 @@ export function VoiceMode({
       void liveRef.current?.close();
       liveRef.current = null;
     };
-  }, [engine, agent.id, caption]);
+  }, [engine, agent.id, quickId, caption]);
 
   useEffect(() => {
     liveRef.current?.setMuted(muted);
@@ -172,8 +178,8 @@ export function VoiceMode({
       let text = "";
       try {
         text = (await speech().transcribe(audio)).replace(/\[[^\]]*\]/g, " ").trim();
-      } catch {
-        setError(MODEL_PROBLEM);
+      } catch (e) {
+        setError(e instanceof Error && e.message.includes("disk space") ? e.message : MODEL_PROBLEM);
         setPhase("listening");
         return;
       }
@@ -183,6 +189,7 @@ export function VoiceMode({
           return;
         }
         setError(null);
+        speech().clearError();
         say("you", text);
         waiting.current++;
         setPhase("thinking");
@@ -202,6 +209,7 @@ export function VoiceMode({
     let closed = false;
     const startedAt = Date.now();
     setPhase("starting");
+    speech().clearError();
     speech().unlock();
     speech().warm("stt");
     speech().warm("tts");
@@ -257,9 +265,10 @@ export function VoiceMode({
   }, [agent, say, engine]);
 
   const loading = engine === "device" ? (status.loading.stt ?? status.loading.tts) : null;
+  const problem = error ?? (engine === "device" ? status.error : null);
   const elapsed = callClock(clock.seconds);
-  const statusText = ended ? (error ? `Call ended. ${error}` : "Call ended") : error ?? note ?? (muted ? "Muted" : loading !== null ? `Setting up on-device voice (${loading}%)` : LABEL[phase]);
-  const statusLive = !ended && !error && !note && !muted && (loading !== null || LIVE_PHASES.has(phase));
+  const statusText = ended ? (problem ? `Call ended. ${problem}` : "Call ended") : problem ?? note ?? (muted ? "Muted" : loading !== null ? `Setting up on-device voice (${loading}%)` : LABEL[phase]);
+  const statusLive = !ended && !problem && !note && !muted && (loading !== null || LIVE_PHASES.has(phase));
   const latest = lines[lines.length - 1];
   const docked = !minimised && slot;
   const showPill = !docked && (minimised || settled);
@@ -275,11 +284,11 @@ export function VoiceMode({
             {!ended && <span className="shrink-0 font-normal tabular-nums text-w-text2">{elapsed}</span>}
             {engine === "live" && clock.usd > 0 && <span className="hidden shrink-0 text-w-xs font-normal text-w-muted @md:inline">{`about $${clock.usd.toFixed(3)}`}</span>}
           </p>
-          <p className={cn("truncate text-w-xs", error ? "text-w-danger" : "text-w-text2")} aria-live="polite" title={ended ? statusText : undefined}>
+          <p className={cn("truncate text-w-xs", problem ? "text-w-danger" : "text-w-text2")} aria-live="polite" title={ended ? statusText : undefined}>
             {statusLive ? <Shimmer>{statusText}</Shimmer> : statusText}
           </p>
         </div>
-        <div role="radiogroup" aria-label="Voice engine" className={cn(SEGMENT, "hidden shrink-0 @lg:inline-flex")}>
+        <div role="radiogroup" aria-label="Voice engine" className={cn(SEGMENT, "hidden shrink-0 @lg:inline-flex", quickId && "@lg:hidden")}>
           {(live?.state === "unavailable" ? (["device"] as const) : (["live", "device"] as const)).map((e) => (
             <button
               key={e}

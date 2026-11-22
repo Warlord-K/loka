@@ -28,6 +28,8 @@ export function micProblem(e: unknown): string {
   return "Could not start the microphone. Try again.";
 }
 
+export const SOUND_BLOCKED = "This device is not playing sound right now. Click anywhere in Loka and check your speaker or headphones.";
+
 export const MODEL_PROBLEM = "On-device voice could not load its speech model. Check your connection and try again.";
 
 export interface SpeechStatus {
@@ -51,7 +53,7 @@ function hash(text: string): number {
 }
 
 export function voiceFor(agent: { slug: string; persona: string | null; look: Record<string, unknown> }): string {
-  const chosen = typeof agent.look.voice === "string" ? agent.look.voice : null;
+  const chosen = typeof agent.look.voice === "string" ? agent.look.voice.trim().toLowerCase() : null;
   if (chosen && ALL.includes(chosen)) return chosen;
   const words = ` ${(agent.persona ?? "").toLowerCase()} `;
   const pool = /\b(she|her|woman|girl|lady|queen)\b/.test(words) ? FEMALE : /\b(he|him|his|man|guy|boy|king)\b/.test(words) ? MALE : ALL;
@@ -134,6 +136,7 @@ class Speech {
   private source: AudioBufferSourceNode | null = null;
   private remaining = 0;
   private held: (() => void) | null = null;
+  private waitingForGesture = false;
   status: SpeechStatus = { loading: { stt: null, tts: null }, device: null, speaking: false, error: null };
 
   private ensure(): Worker {
@@ -210,8 +213,10 @@ class Speech {
           if (epoch !== this.epoch) return;
           await this.play(audio, sampling_rate);
         })
-        .catch(() => {
-          if (epoch === this.epoch) this.set({ error: "Could not read the reply aloud. It is in the chat." });
+        .catch((e: unknown) => {
+          if (epoch !== this.epoch) return;
+          const why = e instanceof Error && e.message ? ` ${e.message}` : "";
+          this.set({ error: `Could not read the reply aloud. It is in the chat.${why}` });
         })
         .then(() => {
           if (epoch !== this.epoch) return;
@@ -249,14 +254,68 @@ class Speech {
     const src = ctx.createBufferSource();
     src.buffer = buffer;
     src.connect(ctx.destination);
+    if (ctx.state !== "running" && this.status.error === SOUND_BLOCKED) {
+      this.resumeOnGesture(ctx);
+      return Promise.resolve();
+    }
     this.source = src;
+    const epoch = this.epoch;
     return new Promise((resolve) => {
-      src.onended = () => {
+      let gaveUp = false;
+      const current = () => epoch === this.epoch && this.source === src;
+      const blocked = () => {
+        gaveUp = true;
+        if (current()) {
+          this.set({ error: SOUND_BLOCKED });
+          this.resumeOnGesture(ctx);
+        }
         if (this.source === src) this.source = null;
         resolve();
       };
-      void ctx.resume().then(() => src.start());
+      const wait = window.setTimeout(blocked, 3000);
+      src.onended = () => {
+        window.clearTimeout(wait);
+        if (this.source === src) this.source = null;
+        resolve();
+      };
+      ctx
+        .resume()
+        .then(() => {
+          if (gaveUp) return;
+          if (!current()) {
+            window.clearTimeout(wait);
+            resolve();
+            return;
+          }
+          if (ctx.state !== "running") throw new Error("audio is not running");
+          window.clearTimeout(wait);
+          if (this.status.error === SOUND_BLOCKED) this.set({ error: null });
+          src.start();
+        })
+        .catch(() => {
+          window.clearTimeout(wait);
+          if (!gaveUp) blocked();
+        });
     });
+  }
+
+  private resumeOnGesture(ctx: AudioContext) {
+    if (this.waitingForGesture) return;
+    this.waitingForGesture = true;
+    const resume = () => {
+      window.removeEventListener("pointerdown", resume, true);
+      window.removeEventListener("keydown", resume, true);
+      this.waitingForGesture = false;
+      void ctx
+        .resume()
+        .then(() => {
+          if (ctx.state !== "running") throw new Error("audio is not running");
+          if (this.status.error === SOUND_BLOCKED) this.set({ error: null });
+        })
+        .catch(() => this.resumeOnGesture(ctx));
+    };
+    window.addEventListener("pointerdown", resume, true);
+    window.addEventListener("keydown", resume, true);
   }
 
   clearError() {

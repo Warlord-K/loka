@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Duration, Utc};
-use loka_shared::items::NewItem;
+use loka_shared::items::{NewItem, NewList};
 use loka_shared::todos::{age_label, clean_proposals, priority_from, NewTodo, Todo, TodoActor, PRIORITIES};
 use loka_shared::world::{WorldAgent, WorldStore};
 use serde_json::{json, Value};
@@ -205,13 +205,20 @@ pub async fn call(store: &WorldStore, caller: &WorldAgent, name: &str, args: &Va
         }
         "make_list" => {
             let title = arg("title").ok_or_else(|| anyhow!("title is required"))?.to_string();
-            let items: Vec<Value> = str_list(args.get("items")).into_iter().map(|t| json!({ "text": t, "done": false })).collect();
-            let mut data = json!({ "items": items });
             let note = note_style(args, &Value::Null)?;
-            if note.as_object().is_some_and(|n| !n.is_empty()) {
-                data["note"] = note;
-            }
-            let item = base("list", title, data, None).await?;
+            let owner = owner.ok_or_else(|| anyhow!("you have no person to keep a list for"))?;
+            let org = caller.org_id.ok_or_else(|| anyhow!("you have no organization for the list"))?;
+            let item = store
+                .create_list(NewList {
+                    owner,
+                    creator: Some(caller.id),
+                    org,
+                    title: &title,
+                    items: str_list(args.get("items")),
+                    note: Some(note),
+                    region: region_id,
+                })
+                .await?;
             Ok(format!("Made the list:\n{}", render_list(&item.name, item.data["items"].as_array().map(Vec::as_slice).unwrap_or(&[]))))
         }
         "update_list" => {
@@ -351,28 +358,21 @@ pub async fn call(store: &WorldStore, caller: &WorldAgent, name: &str, args: &Va
                     }
                 }
                 "challenge" => {
-                    let fields = ["title", "type", "prompt", "skill", "difficulty", "minutes", "xp", "hints", "rubric", "tests", "choices", "correct"];
-                    if fields.iter().any(|f| args.get(*f).is_some()) {
-                        let mut merged = data.clone();
-                        merged.insert("title".into(), json!(arg("title").unwrap_or(&item.name)));
-                        for f in fields {
-                            if let Some(v) = args.get(f) {
-                                merged.insert(f.to_string(), v.clone());
-                            }
-                        }
-                        if args.get("choices").is_some() && args.get("correct").is_none() {
-                            merged.remove("correct");
-                        }
-                        let (title, fresh) = loka_shared::academy::challenge_data(&Value::Object(merged))?;
-                        for k in ["rubric", "choices", "correct"] {
-                            data.remove(k);
-                        }
-                        data.extend(fresh.as_object().cloned().unwrap_or_default());
+                    let mut lesson_args = args.clone();
+                    if let (Some(name), None) = (arg("name"), args.get("title")) {
+                        lesson_args["title"] = json!(name);
+                    }
+                    if let Some((title, fresh)) = store.edit_lesson(&item, &lesson_args).await? {
+                        data = fresh.as_object().cloned().unwrap_or_default();
                         new_name = Some(title);
                         changed.push("details");
                     }
                 }
                 "adventure" => {
+                    if let Some(fresh) = store.edit_course(&item, args).await? {
+                        data = fresh.as_object().cloned().unwrap_or_default();
+                        changed.push("details");
+                    }
                     if let Some(st) = args.get("story").and_then(Value::as_str) {
                         set(&mut data, "story", json!(st.trim().chars().take(4000).collect::<String>()), &mut changed);
                     }

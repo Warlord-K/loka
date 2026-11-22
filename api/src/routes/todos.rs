@@ -33,6 +33,20 @@ pub async fn list(
     Ok(Json(state.world.todos_for(user.0, days).await.map_err(internal)?))
 }
 
+async fn owned(state: &AppState, user: Uuid, id: Uuid) -> Result<Todo, StatusCode> {
+    state.world.get_todo(id).await.map_err(internal)?
+        .filter(|todo| todo.owner_user_id == user)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+pub async fn get(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserId>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Todo>, StatusCode> {
+    owned(&state, user.0, id).await.map(Json)
+}
+
 #[derive(Deserialize)]
 pub struct CreateTodo {
     text: String,
@@ -82,10 +96,7 @@ pub async fn update(
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateTodo>,
 ) -> Result<Json<Todo>, StatusCode> {
-    let todo = state.world.get_todo(id).await.map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
-    if todo.owner_user_id != user.0 {
-        return Err(StatusCode::NOT_FOUND);
-    }
+    let todo = owned(&state, user.0, id).await?;
     if body.status.as_deref().is_some_and(|s| !matches!(s, "open" | "done" | "dismissed")) {
         return Err(StatusCode::BAD_REQUEST);
     }

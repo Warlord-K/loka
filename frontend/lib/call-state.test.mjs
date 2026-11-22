@@ -1,22 +1,22 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { callClock, callReducer, NO_CALL } from "./call-state.ts";
+import { callClock, callReducer, isCallOf, NO_CALL } from "./call-state.ts";
 
 const start = (agentId) => callReducer(NO_CALL, { type: "start", agentId });
 
 test("starting a call opens it in full", () => {
   const call = start("a");
-  assert.deepEqual(call, { agentId: "a", minimised: false });
+  assert.deepEqual(call, { agentId: "a", quickId: null, minimised: false });
 });
 
 test("minimising keeps the call running", () => {
   const call = callReducer(start("a"), { type: "minimise" });
-  assert.deepEqual(call, { agentId: "a", minimised: true });
+  assert.deepEqual(call, { agentId: "a", quickId: null, minimised: true });
 });
 
 test("restoring brings the same call back", () => {
   const call = callReducer(callReducer(start("a"), { type: "minimise" }), { type: "restore" });
-  assert.deepEqual(call, { agentId: "a", minimised: false });
+  assert.deepEqual(call, { agentId: "a", quickId: null, minimised: false });
 });
 
 test("only hanging up ends the call", () => {
@@ -41,7 +41,7 @@ test("unchanged actions keep the same state object", () => {
 
 test("starting a call while one is minimised opens the new one in full", () => {
   const call = callReducer(callReducer(start("a"), { type: "minimise" }), { type: "start", agentId: "b" });
-  assert.deepEqual(call, { agentId: "b", minimised: false });
+  assert.deepEqual(call, { agentId: "b", quickId: null, minimised: false });
 });
 
 test("the clock reads minutes and seconds, then hours", () => {
@@ -50,4 +50,15 @@ test("the clock reads minutes and seconds, then hours", () => {
   assert.equal(callClock(75), "1:15");
   assert.equal(callClock(3725), "1:02:05");
   assert.equal(callClock(-3), "0:00");
+});
+
+test("a call from a quick chat belongs to that chat, not the agent's main chat", () => {
+  const call = callReducer(NO_CALL, { type: "start", agentId: "a", quickId: "q1" });
+  assert.deepEqual(call, { agentId: "a", quickId: "q1", minimised: false });
+  assert.equal(isCallOf(call, "a", "q1"), true);
+  assert.equal(isCallOf(call, "a", null), false);
+  assert.equal(isCallOf(call, "a", "q2"), false);
+  assert.equal(isCallOf(start("a"), "a", null), true);
+  assert.deepEqual(callReducer(callReducer(call, { type: "minimise" }), { type: "restore" }), call);
+  assert.deepEqual(callReducer(call, { type: "hang_up" }), NO_CALL);
 });

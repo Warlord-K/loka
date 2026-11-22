@@ -220,6 +220,20 @@ pub(crate) fn quest_temp_dir(working_dir: &Path) -> Option<PathBuf> {
     Some(std::env::temp_dir().join(quest_temp_name(quest_id(working_dir)?)))
 }
 
+pub(crate) const QUEST_TARGET_DIR: &str = "cargo-target";
+
+fn is_quest_target(dir: &Path) -> bool {
+    dir.file_name().is_some_and(|name| name == QUEST_TARGET_DIR)
+        && dir.parent().and_then(Path::file_name).is_some_and(|name| name.to_string_lossy().starts_with(QUEST_TEMP_PREFIX))
+}
+
+pub(crate) fn drop_default_quest_target(cmd: &mut tokio::process::Command) {
+    let default = cmd.as_std().get_envs().find(|(name, _)| *name == "CARGO_TARGET_DIR").and_then(|(_, value)| value).map(PathBuf::from);
+    if default.is_some_and(|dir| is_quest_target(&dir)) {
+        cmd.env_remove("CARGO_TARGET_DIR");
+    }
+}
+
 fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
@@ -1138,8 +1152,12 @@ pub fn configure_child_environment(
         }
     }
     cmd.envs(explicit);
+    let target_chosen = cmd.as_std().get_envs().any(|(name, value)| name == "CARGO_TARGET_DIR" && value.is_some());
     if let Some(dir) = cmd.as_std().get_current_dir().and_then(quest_temp_dir) {
         ensure_private_dir(&dir)?;
+        if !target_chosen {
+            cmd.env("CARGO_TARGET_DIR", dir.join(QUEST_TARGET_DIR));
+        }
         cmd.env("TMPDIR", dir);
     }
     for (name, value) in environment {
@@ -1344,6 +1362,36 @@ mod environment_tests {
         configure_child_environment(&mut elsewhere, &BTreeMap::new()).unwrap();
         let temp = child_env(&elsewhere).get("TMPDIR").cloned().flatten().unwrap_or_default();
         assert!(!temp.contains(super::QUEST_TEMP_PREFIX));
+    }
+
+    #[test]
+    fn quest_runs_build_into_their_own_target_dir_inside_their_temp_dir() {
+        let (first, second) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let target_of = |id: uuid::Uuid, granted: &BTreeMap<String, String>| {
+            let mut command = tokio::process::Command::new("true");
+            command.current_dir(format!("/r/workspaces/tasks/{id}/world"));
+            configure_child_environment(&mut command, granted).unwrap();
+            let target = child_env(&command).get("CARGO_TARGET_DIR").cloned().flatten();
+            let _ = std::fs::remove_dir_all(std::env::temp_dir().join(super::quest_temp_name(id)));
+            (target, command)
+        };
+        let none = BTreeMap::new();
+        let (one, mut command) = target_of(first, &none);
+        let (two, _) = target_of(second, &none);
+        let expected = |id: uuid::Uuid| std::env::temp_dir().join(super::quest_temp_name(id)).join("cargo-target").to_string_lossy().to_string();
+        assert_eq!(one, Some(expected(first)));
+        assert_eq!(two, Some(expected(second)));
+        super::drop_default_quest_target(&mut command);
+        assert!(child_env(&command).get("CARGO_TARGET_DIR").cloned().flatten().is_none(), "sandboxes with their own temp dir drop it");
+        let granted = BTreeMap::from([("CARGO_TARGET_DIR".to_string(), "/granted".to_string())]);
+        let (kept, mut command) = target_of(first, &granted);
+        assert_eq!(kept.as_deref(), Some("/granted"));
+        super::drop_default_quest_target(&mut command);
+        assert_eq!(child_env(&command).get("CARGO_TARGET_DIR").cloned().flatten().as_deref(), Some("/granted"), "a chosen target is never dropped");
+        let mut elsewhere = tokio::process::Command::new("true");
+        elsewhere.current_dir("/r/workspaces/agents/main");
+        configure_child_environment(&mut elsewhere, &none).unwrap();
+        assert!(child_env(&elsewhere).get("CARGO_TARGET_DIR").cloned().flatten().is_none(), "only quest runs get one");
     }
 
     #[test]

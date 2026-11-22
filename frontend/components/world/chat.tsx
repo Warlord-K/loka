@@ -2,6 +2,7 @@
 
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ArrowLeft, CaretRight, ChatsCircle, Hash, PencilSimple, Plus, Star, UserCircle, UsersThree, X } from "@phosphor-icons/react";
+import { latestOnly } from "@/lib/latest";
 import { useTeams } from "@/lib/teams";
 import { cn } from "@/lib/utils";
 import { Shimmer, StatusMark } from "./work-ui";
@@ -35,6 +36,7 @@ import { ChannelSeen } from "./seen";
 import { RepliesButton, ThreadPanel, type ThreadItem } from "./thread-panel";
 import { MessageAuthor, MessageRow } from "./message-row";
 import { PaneResizer, usePaneWidth } from "./pane-resizer";
+import { RunCommandContext, runCommandFor, type RunCommand } from "./run-command";
 
 const SECTIONS_KEY = "world.chat.sections";
 
@@ -110,10 +112,14 @@ export function ChatPanel({
   }, []);
   const [current, setCurrentChannel] = useState<string | null>(initialChannel ?? null);
   const [agentId, setAgentId] = useState<string | null>(initialChannel ? null : initialAgent);
+  const selectionVersion = useRef(0);
+  const activeChannel = useRef<string | null>(null);
+  activeChannel.current = agentId ? null : current;
   const [listOpen, setListOpen] = useState(false);
   const listPane = usePaneWidth("chat.list", 18, 12, 30);
   const threadPane = usePaneWidth("chat.thread", 26, 18, 44);
   const setCurrent = useCallback((id: string | null) => {
+    selectionVersion.current++;
     setCurrentChannel(id);
     setAgentId(null);
     setListOpen(false);
@@ -143,11 +149,13 @@ export function ChatPanel({
   const onSelectRef = useRef(onSelect);
   onSelectRef.current = onSelect;
   useEffect(() => {
-    if (agentId || current) onSelectRef.current?.({ agentId, channelId: agentId ? null : current });
+    onSelectRef.current?.({ agentId, channelId: agentId ? null : current });
   }, [agentId, current]);
   const selectedAgent = agentId ? talkable.find((a) => a.id === agentId) ?? null : null;
-  const [detail, setDetail] = useState<ChannelDetail | null>(null);
-  const [messages, setMessages] = useState<ChannelMessage[]>([]);
+  const [channelDetail, setDetail] = useState<ChannelDetail | null>(null);
+  const [channelMessages, setMessages] = useState<ChannelMessage[]>([]);
+  const detail = channelDetail?.id === current ? channelDetail : null;
+  const messages = useMemo(() => channelMessages.filter((m) => m.channel_id === current), [channelMessages, current]);
   const [draft, setDraft] = useDraft(`channel:${current ?? "none"}`);
   const [creating, setCreating] = useState(false);
   const [picking, setPicking] = useState(false);
@@ -165,27 +173,53 @@ export function ChatPanel({
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  const loadChannels = useCallback(() => {
+  const [channelLists] = useState(latestOnly);
+  const [channelReads] = useState(latestOnly);
+  const loadChannels = useCallback(function loadChannels() {
+    const isLatest = channelLists.begin();
+    const selection = selectionVersion.current;
     worldApi
       .channels()
       .then((list) => {
+        if (!isLatest()) return;
+        if (selection !== selectionVersion.current) {
+          loadChannels();
+          return;
+        }
         setChannels(list);
-        setCurrentChannel((cur) => cur ?? list.find((c) => c.kind === "channel" && c.name === "general")?.id ?? list[0]?.id ?? null);
+        const hasChannel = (id: string) => list.some((channel) => channel.id === id);
+        if (activeChannel.current && !hasChannel(activeChannel.current)) {
+          activeChannel.current = null;
+          channelReads.begin();
+        }
+        setCurrentChannel((cur) => {
+          if (cur && hasChannel(cur)) return cur;
+          return list.find((c) => c.name === cur?.toLowerCase())?.id ?? list.find((c) => c.kind === "channel" && c.name === "general")?.id ?? list[0]?.id ?? null;
+        });
+        setThread((open) => open && hasChannel(open.channel) ? open : null);
+        setDetail((detail) => detail && hasChannel(detail.id) ? detail : null);
+        setMessages((messages) => messages.length && !hasChannel(messages[0].channel_id) ? [] : messages);
       })
       .catch(() => {});
-  }, [setChannels]);
+  }, [channelLists, channelReads, setChannels]);
 
   useEffect(() => {
     loadChannels();
     worldApi.people().then(setPeople).catch(() => {});
-  }, [loadChannels, setPeople]);
+    return () => { channelLists.begin(); };
+  }, [channelLists, loadChannels, setPeople]);
 
   const loadCurrent = useCallback(() => {
-    if (!current || agentId) return;
-    worldApi.channel(current).then(setDetail).catch(() => {});
+    if (!current || agentId || activeChannel.current !== current) return;
+    const isLatest = channelReads.begin();
+    const stillOpen = () => isLatest() && activeChannel.current === current;
+    worldApi.channel(current).then((detail) => {
+      if (stillOpen()) setDetail(detail);
+    }).catch(() => {});
     worldApi
       .channelMessages(current)
       .then((m) => {
+        if (!stillOpen()) return;
         setMessages((cur) => {
           const oldest = m[0]?.id;
           if (oldest === undefined) return m;
@@ -199,14 +233,26 @@ export function ChatPanel({
         });
       })
       .catch(() => {});
-  }, [current, agentId, loadChannels]);
+  }, [current, agentId, channelReads, loadChannels]);
 
-  useEffect(() => loadCurrent(), [loadCurrent]);
-  useRefetchOnResume(loadCurrent);
+  useEffect(() => {
+    loadCurrent();
+    return () => { channelReads.begin(); };
+  }, [channelReads, loadCurrent]);
+  useRefetchOnResume(() => {
+    loadChannels();
+    loadCurrent();
+  });
 
   useEffect(() => {
     const onEvent = (e: Event) => {
       const ev = (e as CustomEvent<WorldEvent>).detail;
+      if (ev.type.startsWith("team.")) {
+        loadChannels();
+        loadCurrent();
+        unreadRef.current();
+        return;
+      }
       if (ev.type === "channel.deleted") {
         const gone = Number(ev.payload.message_id);
         setMessages((cur) => cur.filter((m) => m.id !== gone));
@@ -228,7 +274,7 @@ export function ChatPanel({
     const oldest = messagesRef.current[0];
     if (!current || !oldest || oldest.channel_id !== current) return false;
     const page = await worldApi.channelMessagesBefore(current, oldest.id);
-    if (!page.length) return false;
+    if (!page.length || activeChannel.current !== current) return false;
     setMessages((cur) => {
       const seen = new Set(cur.map((m) => m.id));
       return [...page.filter((m) => !seen.has(m.id)), ...cur];
@@ -492,6 +538,15 @@ export function ChatPanel({
     if (person && id !== meId) void dm(person);
   };
   const openThread = current && !agentId && thread?.channel === current ? thread.root : null;
+  const runners = useMemo(() => {
+    const map = new Map<string, RunCommand>();
+    for (const a of agents) {
+      const runner = runCommandFor(a, meId, { where: a.runner_name ? `on ${a.runner_name}, output goes to ${a.name}'s chat` : `on ${a.name}'s device, output goes to its chat` });
+      if (runner) map.set(a.id, runner);
+    }
+    return map;
+  }, [agents, meId]);
+  const runnerOf = (m: ChannelMessage) => (m.author_kind === "agent" && m.author_agent_id ? runners.get(m.author_agent_id) ?? null : null);
   const threadItem = (m: ChannelMessage): ThreadItem => {
     const agent = m.author_agent_id ? agents.find((a) => a.id === m.author_agent_id) : undefined;
     const name = m.author_name ?? "Someone";
@@ -505,6 +560,9 @@ export function ChatPanel({
       editedAt: m.edited_at,
       attachments: m.meta?.attachments ?? [],
       spoken: !!m.meta?.spoken,
+      quote: m.meta?.quote,
+      quoteSource: `msg:${channelRef(m.id)}`,
+      runner: runnerOf(m),
       ...(canPost && m.author_kind === "user" && !!meId && m.author_user_id === meId
         ? {
             onEdit: async (body: string) => {
@@ -756,7 +814,9 @@ export function ChatPanel({
                           <>
                             {m.meta?.quote && <QuotedBlock quote={m.meta.quote} />}
                             <div {...quoteProps(`msg:${channelRef(m.id)}`, `${name}'s message${detail.kind === "dm" ? "" : ` in #${detail.name}`}`, `channel:${m.channel_id}`)}>
-                              <RichText text={m.body} handles={agentsByHandle} people={peopleByHandle} onOpenAgent={openAgentChat} onOpenPerson={openPerson} className="select-text text-w-text" />
+                              <RunCommandContext.Provider value={runnerOf(m)}>
+                                <RichText text={m.body} handles={agentsByHandle} people={peopleByHandle} onOpenAgent={openAgentChat} onOpenPerson={openPerson} className="select-text text-w-text" />
+                              </RunCommandContext.Provider>
                             </div>
                             {!first && m.edited_at && <span className="text-w-3xs text-w-faint">(edited)</span>}
                             {!first && m.meta?.spoken && <SpokenMark className="ml-1.5" />}
@@ -864,8 +924,9 @@ export function ChatPanel({
               ev.payload.channel_id === current &&
               (ev.payload.reply_to === openThread || ev.payload.message_id === openThread || ev.type === "channel.edited")
             }
-            send={async (text, spoken, attachments) => {
-              await worldApi.postChannel(current, text, attachments, openThread, spoken || undefined);
+            quoteTarget={`thread:channel:${current}:${openThread}`}
+            send={async (text, spoken, attachments, quote) => {
+              await worldApi.postChannel(current, text, attachments, openThread, spoken || undefined, quote);
               if (spoken) expectSpokenReply(`channel:${current}`);
               loadCurrent();
             }}

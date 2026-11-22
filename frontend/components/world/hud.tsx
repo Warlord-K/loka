@@ -45,8 +45,8 @@ export function PlayerCard({ me, progress, onOpen, onProgress }: { me: Me | null
       <button
         type="button"
         onClick={onOpen}
-        title="Profile and settings (Y)"
-        aria-label={`${name}, open profile and settings`}
+        title="Settings (Y)"
+        aria-label={`${name}, open settings`}
         className={cn("group flex w-full items-center gap-3 p-2 pr-3 text-left transition-colors duration-200 hover:bg-w-sand/70", FOCUS, "focus-visible:ring-inset focus-visible:ring-offset-0")}
       >
         <AgentAvatar portrait={portrait} size="3.5rem" tall />
@@ -65,7 +65,7 @@ export function PlayerCard({ me, progress, onOpen, onProgress }: { me: Me | null
           size={16}
           weight="bold"
           aria-hidden
-          className="shrink-0 -translate-x-1 text-w-muted opacity-0 transition-[opacity,transform] duration-200 [transition-timing-function:cubic-bezier(0.22,1,0.36,1)] group-hover:translate-x-0 group-hover:opacity-100 group-focus-visible:translate-x-0 group-focus-visible:opacity-100 motion-reduce:transform-none"
+          className="shrink-0 text-w-muted transition-colors duration-200 group-hover:text-w-text group-focus-visible:text-w-text"
         />
       </button>
       {progress && <XpRow progress={progress} onClick={onProgress} />}

@@ -62,7 +62,7 @@ export const uiCatalog = defineCatalog(schema, {
     },
     Ref: {
       props: z.object({ ref: z.string() }),
-      description: "A live Loka card for quest:<id>, report:<id>, todo:<id> or msg:<id>",
+      description: "A live Loka card for quest:<id>, report:<id>, todo:<id>, msg:<id>, challenge:<id> or course:<id>",
     },
     Link: {
       props: z.object({ label: z.string(), href: z.string() }),

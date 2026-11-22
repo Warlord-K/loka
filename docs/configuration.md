@@ -17,7 +17,7 @@ Settings the app reads from your login shell (CLI tokens, `WORLD_BROWSER_LOCAL` 
 
 ## Saved keys
 
-Keys are entered under **You > Environment**, outside agent chat. The app lists only each name, when it changed and which agents may use it; values are never shown again. Grant a key to an agent, then tell the agent to use `${secret:NAME}` in an MCP server's environment or headers. The value is resolved only for that agent's runs.
+Keys are entered under **Settings > Environment**, outside agent chat. The app lists only each name, when it changed and which agents may use it; values are never shown again. Grant a key to an agent, then tell the agent to use `${secret:NAME}` in an MCP server's environment or headers. The value is resolved only for that agent's runs.
 
 Values are encrypted with `WORLD_SECRETS_KEY` (32 random bytes, base64). The app generates one on first start. To rotate it, set the new key as `WORLD_SECRETS_KEY` and the old one as `WORLD_SECRETS_KEY_PREVIOUS` (comma separated when there are several); the API re-encrypts every saved key on startup.
 
@@ -84,6 +84,7 @@ Everything has a working default.
 | `WORLD_CI_FEEDBACK` | off | `on` sends failing CI back to every quest, not only those that ask |
 | `WORLD_SILENT_SECS` | 600 | A Cursor run that prints nothing for this long is retried once (0 turns it off) |
 | `WORLD_MCP_HUB`, `WORLD_MCP_HUB_IDLE_SECS` | on, 60 | One shared process per MCP server, and how long an unused one keeps running |
+| `WORLD_API_COMMITS` | on | Quests publish their commits through the GitHub API so GitHub signs them; `off` uses a signed `git push` only |
 | `WORLD_BROWSER`, `WORLD_BROWSER_ENGINE` | on, Chrome | Browser tool for agents |
 | `WORLD_BROWSER_LOCAL` | off | `on` lets the agent browser open localhost and private addresses |
 | `WORLD_FEEDS_ALLOW_PRIVATE` | off | Lets feeds and skill downloads reach private addresses |

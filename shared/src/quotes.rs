@@ -1,9 +1,12 @@
 use serde_json::{json, Value};
+use uuid::Uuid;
+
+use crate::{access::{Role, Viewer}, world::WorldStore};
 
 pub const TEXT_CHARS: usize = 2000;
 pub const CONTEXT_CHARS: usize = 4000;
 const LABEL_CHARS: usize = 120;
-const SOURCE_KINDS: &[&str] = &["msg:ch", "msg:", "report:", "todo:", "quest:", "agent:", "practice:"];
+const SOURCE_KINDS: &[&str] = &["msg:ch", "msg:", "report:", "todo:", "quest:", "agent:", "practice:", "team:", "list:", "challenge:", "course:"];
 
 fn capped(value: Option<&Value>, max: usize) -> Option<String> {
     let text = value?.as_str()?.trim();
@@ -17,6 +20,9 @@ fn source(value: Option<&Value>) -> Option<String> {
         return crate::canvas::quote_source(raw).map(|_| raw.to_string());
     }
     let id = &raw[kind.len()..];
+    if matches!(*kind, "team:" | "list:" | "challenge:" | "course:") {
+        return (id.len() == 36 && Uuid::parse_str(id).is_ok()).then(|| raw.to_string());
+    }
     if *kind == "practice:" && id.chars().filter(|c| *c != '-').count() < crate::practice::MIN_PREFIX {
         return None;
     }
@@ -40,6 +46,28 @@ pub fn clean(raw: Option<&Value>) -> Option<Value> {
         quote["context"] = json!(context);
     }
     Some(quote)
+}
+
+impl WorldStore {
+    pub async fn clean_quote(&self, viewer: &Viewer, raw: Option<&Value>) -> anyhow::Result<Option<Value>> {
+        let Some(mut quote) = clean(raw) else { return Ok(None) };
+        let reference = quote.get("source").and_then(Value::as_str).and_then(|source| source.split_once(':'));
+        let visible = match reference {
+            Some(("team", id)) => self.team_visible_to(viewer.user, id.parse()?).await?.is_some(),
+            Some(("list", id)) => self
+                .item_for_viewer(id.parse()?, viewer.user, viewer.org(), viewer.role == Role::Admin)
+                .await?
+                .is_some_and(|item| matches!(item.kind.as_str(), "list" | "timer")),
+            Some((kind @ ("challenge" | "course"), id)) => self.academy_item_for(viewer.user, viewer.org(), kind, id.parse()?).await?.is_some(),
+            _ => true,
+        };
+        if !visible {
+            if let Some(fields) = quote.as_object_mut() {
+                fields.remove("source");
+            }
+        }
+        Ok(Some(quote))
+    }
 }
 
 pub fn render(payload: &Value) -> String {
@@ -89,6 +117,9 @@ mod tests {
     #[test]
     fn practice_attempts_are_quote_sources_with_their_check_as_text() {
         assert_eq!(clean(Some(&json!({ "text": "x", "source": "practice:abcdef12" }))).unwrap()["source"], "practice:abcdef12");
+        let lesson = format!("challenge:{}", Uuid::nil());
+        assert_eq!(clean(Some(&json!({ "text": "x", "source": lesson }))).unwrap()["source"], json!(lesson));
+        assert!(clean(Some(&json!({ "text": "x", "source": "course:abc123" }))).unwrap().get("source").is_none(), "course refs take a full id");
         assert!(clean(Some(&json!({ "text": "x", "source": "practice:abc123" }))).unwrap().get("source").is_none());
         assert!(clean(Some(&json!({ "text": "x", "source": "practice:abcdefgh" }))).unwrap().get("source").is_none());
         let check = crate::practice::Check::new("Even spacing", "Lift at the end", "Write it again", Some(80.0)).unwrap();
@@ -97,5 +128,18 @@ mod tests {
             "Japanese practice, attempt 3, score 80/100. Right: Even spacing Fix: Lift at the end Next: Write it again"
         );
         assert_eq!(crate::practice::quote_text("life-drawing", 1, None), "Life Drawing practice, attempt 1 (waiting for the coach)");
+    }
+
+    #[test]
+    fn team_and_list_sources_require_full_uuids() {
+        let id = Uuid::new_v4();
+        for kind in ["team", "list"] {
+            let reference = format!("{kind}:{id}");
+            assert_eq!(clean(Some(&json!({ "text": "x", "source": reference }))).unwrap()["source"], reference);
+            for invalid in ["abcdef12".to_string(), id.simple().to_string(), format!("{id}#extra")] {
+                let source = format!("{kind}:{invalid}");
+                assert!(clean(Some(&json!({ "text": "x", "source": source }))).unwrap().get("source").is_none());
+            }
+        }
     }
 }

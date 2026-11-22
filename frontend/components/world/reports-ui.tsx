@@ -4,7 +4,8 @@ import { quoteProps } from "./quote";
 import { SOLO } from "@/lib/edition";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { latestRequests } from "@/lib/canvas-marks";
-import { ArrowCounterClockwise, SquaresFour, Student, ArrowLeft, CaretDown, CaretRight, Check, ClockCounterClockwise, FileText, Folder, FolderOpen, Globe, Link as LinkIcon, ListBullets, Lock, Code, Copy, DownloadSimple, PencilSimple, Plus, Trash, Clock, Files, FolderSimple, Hash, Notebook, PushPinSimple, UserCircle, type Icon as PhosphorIcon, SidebarSimple } from "@phosphor-icons/react";
+import { applyLatest, latestOnly } from "@/lib/latest";
+import { ArrowCounterClockwise, SquaresFour, Student, GraduationCap, ArrowLeft, CaretDown, CaretRight, Check, ClockCounterClockwise, FileText, Folder, FolderOpen, Globe, Link as LinkIcon, ListBullets, Lock, Code, Copy, DownloadSimple, PencilSimple, Plus, Trash, Clock, Files, FolderSimple, Hash, Notebook, PushPinSimple, UserCircle, type Icon as PhosphorIcon, SidebarSimple } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
 import { WindowHeader, EmptyState, GHOST_ICON_BTN } from "./settings-shell";
 import { AgentFace } from "./channel-ui";
@@ -18,19 +19,21 @@ import {
   reportsApi,
   wikify,
   ReportError,
+  StaleReport,
+  type Report,
   type ReportBrief,
   type ReportDetail,
   type Revision,
   type RevisionBrief,
 } from "@/lib/reports";
 import { RichText, useAgentHandles } from "./chat-kit";
-import { RunCommandContext, type RunCommand } from "./run-command";
+import { RunCommandContext, useRunCommand } from "./run-command";
 import { LocalPathContext } from "./local-path";
 import { UiCard } from "./lazy";
 import { FilterField } from "./filter-field";
 import { RelativeTime } from "./relative-time";
 import { ScopeToggle, useEveryone } from "./scope";
-import { BTN_PRIMARY, BTN_SECONDARY, EASE, FOCUS, ICON_BTN, NAV_GLIDE, NAV_ITEM, NAV_OFF, NAV_ON, NAV_PILL, PANEL, PILL_INFO, PILL_NEUTRAL, SIDEBAR, ICON_BTN_MD, COUNT } from "./styles";
+import { BTN_PRIMARY, BTN_PRIMARY_SM, BTN_SECONDARY, BTN_SECONDARY_SM, EASE, FOCUS, ICON_BTN, NAV_GLIDE, NAV_ITEM, NAV_OFF, NAV_ON, NAV_PILL, PANEL, PILL_INFO, PILL_NEUTRAL, SIDEBAR, ICON_BTN_MD, COUNT } from "./styles";
 import Glide from "./glide";
 import { Shimmer } from "./work-ui";
 import { scrollWithin } from "@/lib/scroll";
@@ -40,7 +43,9 @@ import { focusPointAt, type FocusPoint } from "@/lib/caret";
 import { downloadText, fileSlug, useCopy } from "@/lib/copy";
 import { PaneResizer, usePaneWidth } from "./pane-resizer";
 import { AnimatePresence } from "framer-motion";
-import { PRACTICE_OPEN, subjectLabel, takePracticeWanted } from "@/lib/practice";
+import { attemptFromItem, keptInReport, subjectLabel } from "@/lib/practice";
+import { openAcademy } from "@/lib/loka";
+import { PRACTICE_THIS_HINT, usePracticeThis } from "./practice-this";
 
 const ReportCanvas = dynamic(() => import("./report-canvas"), {
   ssr: false,
@@ -60,7 +65,6 @@ const PracticeView = dynamic(() => import("./practice-view").then((m) => m.Pract
   ),
 });
 
-const NewPracticeDialog = dynamic(() => import("./practice-view").then((m) => m.NewPracticeDialog), { ssr: false });
 
 const DocEditor = dynamic(() => import("./doc-editor").then((m) => m.DocEditor), {
   ssr: false,
@@ -75,6 +79,41 @@ type Scope = { kind: "all" } | { kind: "pinned" } | { kind: "folder"; path: stri
 type Mode = "read" | "edit" | "history";
 type Draft = { title: string; folder: string; tags: string; body: string };
 type SaveState = "idle" | "saving" | "saved" | "failed";
+type DraftField = keyof Draft;
+type Conflict = { latest: Report; fields: DraftField[] };
+
+const DRAFT_FIELDS: DraftField[] = ["title", "body", "folder", "tags"];
+const FIELD_NAMES: Record<DraftField, string> = { title: "title", body: "text", folder: "folder", tags: "tags" };
+const SAVE_TRIES = 3;
+const MAX_TAGS = 12;
+
+const words = (text: string) => text.split(/\s+/).filter(Boolean).join(" ");
+
+function normalized(field: DraftField, value: string): string {
+  if (field === "title") return words(value.replace(/[[\]|]/g, ""));
+  if (field === "folder") return value.split(/[/\\]/).map(words).filter((p) => p && p !== "." && p !== "..").join("/");
+  if (field === "tags") {
+    const tags = value.split(",").map((t) => words(t.trim().replace(/^#+/, "").toLowerCase()).replace(/ /g, "-").replace(/[^\p{L}\p{N}_/-]/gu, "").slice(0, 40));
+    return [...new Set(tags.filter(Boolean))].slice(0, MAX_TAGS).join(", ");
+  }
+  return value;
+}
+
+function rebaseDraft(mine: Draft, base: Draft, theirs: Draft): { draft: Draft; clashes: DraftField[] } {
+  const draft = { ...mine };
+  const clashes: DraftField[] = [];
+  const same = (field: DraftField, a: Draft, b: Draft) => normalized(field, a[field]) === normalized(field, b[field]);
+  for (const field of DRAFT_FIELDS) {
+    if (same(field, mine, base)) draft[field] = theirs[field];
+    else if (!same(field, theirs, base) && !same(field, theirs, mine)) clashes.push(field);
+  }
+  return { draft, clashes };
+}
+
+function fieldList(fields: DraftField[]): string {
+  const names = fields.map((f) => FIELD_NAMES[f]);
+  return names.length > 1 ? `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}` : names[0] ?? "report";
+}
 
 function same(a: Draft, b: Draft): boolean {
   return a.title === b.title && a.body === b.body && a.folder === b.folder && a.tags === b.tags;
@@ -299,19 +338,21 @@ function ReportCard({
   );
 }
 
+type ReportSelection = { id: string | null; item?: string | null };
+
 export function ReportsPanel({
   agents,
   meId,
-  initialId,
-  focus,
+  selection,
+  onSelectionApplied,
   sideToggle,
   onClose,
   onOpenAgent,
 }: {
   agents: WorldAgent[];
   meId: string | null;
-  initialId?: string | null;
-  focus?: { id: string | null; item?: string | null } | null;
+  selection: ReportSelection;
+  onSelectionApplied: () => void;
   sideToggle?: ReactNode;
   onClose: () => void;
   onOpenAgent: (id: string) => void;
@@ -326,7 +367,9 @@ export function ReportsPanel({
   const [hits, setHits] = useState<ReportBrief[] | null>(null);
   const [scope, setScope] = useState<Scope>({ kind: "all" });
   const [openFolders, setOpenFolders] = useState<Set<string>>(new Set());
-  const [selected, setSelected] = useState<string | null>(initialId ?? null);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [focus, setFocus] = useState<ReportSelection | null>(null);
+  const selectionRequests = useRef(latestOnly()).current;
   const [detail, setDetail] = useState<ReportDetail | null>(null);
   const [missing, setMissing] = useState(false);
   const [mode, setMode] = useState<Mode>("read");
@@ -335,6 +378,7 @@ export function ReportsPanel({
   const [saving, setSaving] = useState(false);
   const [saveState, setSaveState] = useState<SaveState>("idle");
   const [error, setError] = useState<string | null>(null);
+  const [conflict, setConflict] = useState<Conflict | null>(null);
   const [revisions, setRevisions] = useState<RevisionBrief[] | null>(null);
   const [revision, setRevision] = useState<Revision | null>(null);
   const [copied, copy] = useCopy();
@@ -357,16 +401,6 @@ export function ReportsPanel({
       return !v;
     });
   const [focusPoint, setFocusPoint] = useState<FocusPoint | null>(null);
-  const [practiceDialog, setPracticeDialog] = useState(false);
-  useEffect(() => {
-    const open = () => {
-      takePracticeWanted();
-      setPracticeDialog(true);
-    };
-    if (takePracticeWanted()) setPracticeDialog(true);
-    window.addEventListener(PRACTICE_OPEN, open);
-    return () => window.removeEventListener(PRACTICE_OPEN, open);
-  }, []);
   const editing = mode === "edit";
   const dirty = useMemo(() => {
     if (!draft) return false;
@@ -436,14 +470,6 @@ export function ReportsPanel({
     readerRef.current?.scrollTo({ top: 0 });
   }, [selected]);
 
-  useEffect(() => {
-    if (initialId) {
-      setSelected(initialId);
-      setMode("read");
-      setDraft(null);
-    }
-  }, [initialId]);
-
   const detailRef = useRef(detail);
   detailRef.current = detail;
   const editingRef = useRef(editing);
@@ -472,12 +498,33 @@ export function ReportsPanel({
   const draftRef = useRef(draft);
   draftRef.current = draft;
   const savingRef = useRef<Promise<boolean> | null>(null);
+  const baseRef = useRef<Report | null>(null);
+  const conflictRef = useRef(conflict);
+  conflictRef.current = conflict;
+
+  const showConflict = useCallback((next: Conflict | null) => {
+    conflictRef.current = next;
+    setConflict(next);
+  }, []);
+
+  const adoptLatest = useCallback((latest: Report): DraftField[] => {
+    const base = baseRef.current;
+    const mine = draftRef.current;
+    baseRef.current = latest;
+    setDetail((d) => (d && d.report.id === latest.id ? { ...d, report: latest } : d));
+    if (!base || !mine) return [];
+    const { draft, clashes } = rebaseDraft(mine, draftOf(base), draftOf(latest));
+    draftRef.current = draft;
+    setDraft(draft);
+    return clashes;
+  }, []);
 
   const persist = useCallback(async (): Promise<boolean> => {
     const id = selectedRef.current;
     const current = draftRef.current;
     if (!id || !current) return true;
-    if (savingRef.current) await savingRef.current;
+    while (savingRef.current) await savingRef.current;
+    if (conflictRef.current) return false;
     const snapshot = selectedRef.current === id ? draftRef.current ?? current : current;
     if (!snapshot.title.trim()) {
       setError("Give it a title first.");
@@ -487,11 +534,30 @@ export function ReportsPanel({
       setError("Reports are at most 512 KB. Split it into linked reports with [[Title]] links.");
       return false;
     }
-    const tagList = snapshot.tags.split(",").map((t) => t.trim()).filter(Boolean);
     setSaveState("saving");
-    const run = reportsApi
-      .update(id, { title: snapshot.title, body: snapshot.body, folder: snapshot.folder, tags: tagList })
+    const send = async (): Promise<Report> => {
+      let mine = snapshot;
+      for (let tries = 1; ; tries++) {
+        const base = baseRef.current?.id === id ? baseRef.current.updated_at : undefined;
+        if (tries > 1 && !base) throw new Error("Could not save. Your text is still here, try again.");
+        const tags = mine.tags.split(",").map((t) => t.trim()).filter(Boolean);
+        try {
+          return await reportsApi.update(id, { title: mine.title, body: mine.body, folder: mine.folder, tags, base_updated_at: base });
+        } catch (e) {
+          if (!(e instanceof StaleReport) || selectedRef.current !== id || tries >= SAVE_TRIES) throw e;
+          const clashes = adoptLatest(e.latest);
+          if (clashes.length) {
+            showConflict({ latest: e.latest, fields: clashes });
+            throw e;
+          }
+          if (!draftRef.current) throw e;
+          mine = draftRef.current;
+        }
+      }
+    };
+    const run = send()
       .then((saved) => {
+        if (baseRef.current?.id === saved.id) baseRef.current = saved;
         setDetail((d) => (d && d.report.id === saved.id ? { ...d, report: { ...d.report, ...saved } } : d));
         setError(null);
         setSaveState("saved");
@@ -501,21 +567,40 @@ export function ReportsPanel({
       })
       .catch((e) => {
         setSaveState("failed");
-        setError(e instanceof Error && e.message ? e.message : "Could not save. Your text is still here, try again.");
+        if (!draftRef.current) return false;
+        setError(conflictRef.current ? null : e instanceof Error && e.message ? e.message : "Could not save. Your text is still here, try again.");
         return false;
       })
       .finally(() => {
-        savingRef.current = null;
+        if (savingRef.current === run) savingRef.current = null;
       });
     savingRef.current = run;
     return run;
-  }, [loadAll]);
+  }, [loadAll, adoptLatest, showConflict]);
+
+  const settleConflict = (keep: "mine" | "theirs") => {
+    const open = conflictRef.current;
+    if (!open) return;
+    showConflict(null);
+    if (keep === "mine") {
+      void persist();
+      return;
+    }
+    const mine = draftRef.current;
+    if (!mine) return;
+    const theirs = draftOf(open.latest);
+    const next = { ...mine };
+    for (const field of open.fields) next[field] = theirs[field];
+    draftRef.current = next;
+    setDraft(next);
+    setSaveState(same(next, theirs) ? "saved" : "idle");
+  };
 
   useEffect(() => {
-    if (mode !== "edit" || !selected || !draft || !dirty) return;
+    if (mode !== "edit" || !selected || !draft || !dirty || conflict) return;
     const t = window.setTimeout(() => void persist(), 1200);
     return () => window.clearTimeout(t);
-  }, [mode, selected, draft, dirty, persist]);
+  }, [mode, selected, draft, dirty, conflict, persist]);
 
   const leaveEdit = useCallback(async (): Promise<boolean> => {
     if (selectedRef.current) {
@@ -526,8 +611,10 @@ export function ReportsPanel({
     setError(null);
     setSource(false);
     setSaveState("idle");
+    showConflict(null);
+    baseRef.current = null;
     return true;
-  }, [dirty, persist]);
+  }, [dirty, persist, showConflict]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -591,12 +678,23 @@ export function ReportsPanel({
     return <span>{userId && userId === meId ? "you" : "someone"}</span>;
   };
 
-  const select = async (id: string | null) => {
-    if (editing && !(await leaveEdit())) return;
-    setError(null);
-    setMode("read");
-    setSelected(id);
+  const select = async (id: string | null, requested?: ReportSelection) => {
+    const current = selectionRequests.begin();
+    await applyLatest(() => !editing || leaveEdit(), current, (allowed) => {
+      if (!allowed) return;
+      setError(null);
+      setMode("read");
+      setSelected(id);
+      setFocus(requested ?? null);
+      if (requested) onSelectionApplied();
+    });
   };
+  const selectRef = useRef(select);
+  selectRef.current = select;
+  useEffect(() => {
+    if (selection.id) void selectRef.current(selection.id, selection);
+  }, [selection]);
+  useEffect(() => () => { selectionRequests.begin(); }, [selectionRequests]);
 
   const openWiki = (title: string) => {
     const key = title.toLowerCase();
@@ -644,6 +742,8 @@ export function ReportsPanel({
     if (!detail || revision || detail.report.kind === "canvas") return;
     setFocusPoint(point);
     setDraft(draftOf(detail.report));
+    baseRef.current = detail.report;
+    showConflict(null);
     setMode("edit");
     setSource(false);
     setSaveState("idle");
@@ -676,6 +776,7 @@ export function ReportsPanel({
       setSelected(saved.id);
       setDetail({ report: saved, backlinks: [], outlinks: [], can_edit: true, marks: [] });
       setDraft(draftOf(saved));
+      baseRef.current = saved;
       setSaveState("saved");
       loadAll();
       window.dispatchEvent(new CustomEvent(REPORTS_STALE, { detail: { report_id: saved.id } }));
@@ -925,23 +1026,16 @@ export function ReportsPanel({
   const liveCard = (source: string, index: number) => (
     <ReportCard source={source} stateKey={`report:${report?.id ?? "none"}:${revision ? `r${revision.revision}` : "live"}:${index}`} report={report && !revision ? report : null} author={reportAuthor} handles={handles} onOpenAgent={onOpenAgent} />
   );
-  const reportRunner: RunCommand | null =
-    reportAuthor && meId && reportAuthor.owner_user_id === meId && !revision
-      ? {
-          where: reportAuthor.runner_name ? `on ${reportAuthor.runner_name}, output goes to ${reportAuthor.name}'s chat` : `on ${reportAuthor.name}'s device, output goes to its chat`,
-          who: reportAuthor.name,
-          run: async (command: string, runOn?: string) => {
-            try {
-              await worldApi.runCommand(reportAuthor.id, command, runOn);
-            } catch (err) {
-              const status = err instanceof Error ? parseInt(err.message, 10) : NaN;
-              if (status === 409) throw new Error(`${reportAuthor.name}'s device is offline or not set, so the command could not run. Check Devices, then try again.`);
-              if (status === 403) throw new Error("Only the owner of this agent can run commands.");
-              throw new Error("That did not start. Try again.");
-            }
-          },
-        }
-      : null;
+  const practice = usePracticeThis(report?.id ?? "");
+  const ownReport = Boolean(report && meId && report.owner_user_id === meId);
+  const focusAttempt = report && focus?.id && report.id.startsWith(focus.id) ? attemptFromItem(focus.item) : null;
+  const lessonRedirect = report && !revision && report.practice && detail?.lesson && ownReport && !keptInReport(report.id) ? report.id : null;
+  useEffect(() => {
+    if (lessonRedirect) openAcademy({ reportId: lessonRedirect, attemptId: focusAttempt });
+  }, [lessonRedirect, focusAttempt]);
+  const reportRunner = useRunCommand(revision ? null : reportAuthor, meId, {
+    where: reportAuthor ? (reportAuthor.runner_name ? `on ${reportAuthor.runner_name}, output goes to ${reportAuthor.name}'s chat` : `on ${reportAuthor.name}'s device, output goes to its chat`) : undefined,
+  });
 
   const titles = useMemo(() => (all ?? []).map((r) => r.title), [all]);
   const focusBody = () => {
@@ -1002,6 +1096,21 @@ export function ReportsPanel({
               )}
             </div>
           </div>
+          {conflict && (
+            <div role="alert" className="mb-6 rounded-lg bg-w-warn/15 px-4 py-3 text-w-sm text-w-text">
+              <p>
+                Someone changed the {fieldList(conflict.fields)} while you were editing. Keep mine saves yours over theirs, and a version saved by someone else stays in History. Use theirs swaps in their {fieldList(conflict.fields)} and keeps the rest of your changes.
+              </p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <button type="button" onClick={() => settleConflict("mine")} className={BTN_PRIMARY_SM}>
+                  Keep mine
+                </button>
+                <button type="button" onClick={() => settleConflict("theirs")} className={BTN_SECONDARY_SM}>
+                  Use theirs
+                </button>
+              </div>
+            </div>
+          )}
           <textarea
             ref={grow}
             rows={1}
@@ -1126,6 +1235,11 @@ export function ReportsPanel({
     <div className="mx-auto flex w-full max-w-[72rem] gap-12 px-5 pb-20 pt-5 @xl/reader:px-10 @xl/reader:pt-6 @4xl/reader:px-14">
       <article className="mx-auto min-w-0 max-w-[72ch] flex-1">
         <header className="mb-8">
+          {practice.error && (
+            <p role="alert" className="mb-2 text-w-sm text-w-danger">
+              {practice.error}
+            </p>
+          )}
           <div className="mb-6 flex flex-wrap items-center gap-2">
             {report.folder ? (
               <nav aria-label="Folder" className="flex min-w-0 flex-1 flex-wrap items-center gap-1 text-w-sm text-w-muted">
@@ -1157,6 +1271,12 @@ export function ReportsPanel({
                 {copied ? <Check size={15} weight="bold" className="text-w-ok" /> : <LinkIcon size={15} />}
                 <span>{copied ? "Link copied" : "Share"}</span>
               </button>
+              {ownReport && !revision && (
+                <button type="button" onClick={practice.run} disabled={practice.busy} className={TOOL_BTN} title={practice.error ?? PRACTICE_THIS_HINT}>
+                  <GraduationCap size={15} />
+                  <span>{practice.busy ? "Making the lesson" : "Practice this"}</span>
+                </button>
+              )}
               <button type="button" onClick={downloadMarkdown} title="Download as a Markdown file" aria-label="Download as a Markdown file" className={TOOL_ICON}>
                 <DownloadSimple size={16} />
               </button>
@@ -1370,10 +1490,6 @@ export function ReportsPanel({
         actions={
           <>
             <ScopeToggle others={othersCount} className="hidden @3xl:inline-flex" />
-            <button type="button" onClick={() => setPracticeDialog(true)} className={BTN_SECONDARY} title="Practise writing or drawing, and a coach agent checks each attempt">
-              <Student size={14} weight="bold" />
-              <span className="hidden @lg:inline">New practice</span>
-            </button>
             <button type="button" onClick={() => void newCanvas()} className={BTN_SECONDARY} title="Start a canvas: a board for images, notes and live cards">
               <SquaresFour size={14} weight="bold" />
               <span className="hidden @lg:inline">New canvas</span>
@@ -1419,6 +1535,10 @@ export function ReportsPanel({
         <div ref={readerRef} className={cn("min-h-0 flex-1 @container/reader", report?.kind === "canvas" && mode === "read" ? "overflow-hidden" : "overflow-y-auto", !readerOpen && "hidden @2xl:block")}>
           {mode === "edit" ? (
             editor
+          ) : lessonRedirect ? (
+            <div className="grid h-full place-items-center p-6 text-w-base text-w-muted">
+              <Shimmer>Opening the lesson in the Academy</Shimmer>
+            </div>
           ) : detail && report?.practice && mode !== "history" ? (
             <PracticeView
               key={report.id}
@@ -1482,23 +1602,6 @@ export function ReportsPanel({
           )}
         </div>
       </div>
-      <AnimatePresence>
-        {practiceDialog && (
-          <NewPracticeDialog
-            key="new-practice"
-            agents={agents}
-            onClose={() => setPracticeDialog(false)}
-            onCreated={(id) => {
-              setPracticeDialog(false);
-              setMode("read");
-              setDraft(null);
-              setSelected(id);
-              loadAll();
-              window.dispatchEvent(new CustomEvent(REPORTS_STALE, { detail: { report_id: id } }));
-            }}
-          />
-        )}
-      </AnimatePresence>
     </div>
   );
 }

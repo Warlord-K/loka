@@ -1,21 +1,28 @@
 "use client";
 
 import { useEffect, useState, type ReactNode } from "react";
-import { ArrowSquareOut, CheckSquare, FileText, FlowArrow, Hash, Square, Student, Timer, UserCircle } from "@phosphor-icons/react";
+import { ArrowSquareOut, Books, Buildings, CheckSquare, FileText, FlowArrow, Hash, ListChecks, MapTrifold, Square, Student, Timer, UserCircle, UsersThree } from "@phosphor-icons/react";
+import { latestOnly } from "@/lib/latest";
 import { cn, safeDecode } from "@/lib/utils";
-import { messageTime, dayLabel, worldApi, type ChannelSummary, type TaskBrief, type Todo, type WorldAgent } from "@/lib/world";
+import { messageTime, dayLabel, worldApi, type ChannelSummary, type TaskBrief, type Todo, type WorldAgent, type WorldEvent } from "@/lib/world";
 import { AgentFace } from "./channel-ui";
-import { MessageLink, messageRefFromHref, worldRefFromHref } from "./message-links";
+import { MessageLink, messageRefFromHref, openWorldLink, worldRefFromHref } from "./message-links";
 import { SetupCard } from "./setup-hint";
 import { SlackMark } from "./panels";
 import { StatusIcon, statusLabel } from "./quest-ui";
 import { countdown, focusTodo, isTimerTodo } from "./todos-ui";
 import { canvasItemKind, canvasItemLabel, openReport, REPORTS_STALE, reportsApi, type CanvasItem, type ReportBrief } from "@/lib/reports";
 import { ATTEMPT_ID, ATTEMPT_ID_SOURCE, checkOf, openPractice, practiceApi, subjectLabel, type AttemptCard } from "@/lib/practice";
+import { teamsApi, type Team } from "@/lib/teams";
+import type { WorldItem } from "@/lib/world";
+import { openAcademy, type AdventureCard, type ChallengeDetail, type RegionDetail } from "@/lib/loka";
+import { lokaApi } from "./loka-client";
 
 const REF_SOURCE = "ch\\d{1,18}|[0-9a-fA-F][0-9a-fA-F-]{5,35}";
 const ID_SOURCE = "[0-9a-fA-F][0-9a-fA-F-]{5,35}";
 const ID = new RegExp(`^(?:${ID_SOURCE})$`);
+const EXACT_ID_SOURCE = "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
+const EXACT_ID = new RegExp(`^(?:${EXACT_ID_SOURCE})$`);
 const ITEM_SOURCE = "#[A-Za-z0-9_-]{1,40}";
 
 function matchesId(id: string, ref: string): boolean {
@@ -28,6 +35,8 @@ export type Embed =
   | { kind: "quest"; ref: string }
   | { kind: "report"; ref: string; item?: string }
   | { kind: "practice"; ref: string }
+  | { kind: "team" | "list" | "place" | "region"; ref: string }
+  | { kind: "challenge" | "course"; ref: string }
   | { kind: "agent"; ref: string }
   | { kind: "setup"; key: string }
   | { kind: "channel"; id: string }
@@ -58,8 +67,12 @@ export function embedFromHref(href?: string | null): Embed | null {
   if (item) return { kind: "report", ref: item[1].toLowerCase(), item: item[2].slice(1) };
   const agent = href.match(/^agent:([A-Za-z0-9][A-Za-z0-9_-]{0,63})$/i);
   if (agent) return { kind: "agent", ref: agent[1].toLowerCase() };
-  const scheme = href.match(/^(todo|quest|report|practice):(.+)$/i);
-  if (scheme) return (scheme[1].toLowerCase() === "practice" ? ATTEMPT_ID : ID).test(scheme[2]) ? { kind: scheme[1].toLowerCase() as "todo" | "quest" | "report" | "practice", ref: scheme[2].toLowerCase() } : null;
+  const scheme = href.match(/^(todo|quest|report|practice|team|list|place|region|challenge|course):(.+)$/i);
+  if (scheme) {
+    const kind = scheme[1].toLowerCase() as "todo" | "quest" | "report" | "practice" | "team" | "list" | "place" | "region" | "challenge" | "course";
+    const valid = kind === "practice" ? ATTEMPT_ID : ["team", "list", "place", "region", "challenge", "course"].includes(kind) ? EXACT_ID : ID;
+    return valid.test(scheme[2]) ? { kind, ref: scheme[2].toLowerCase() } : null;
+  }
   if (href.startsWith("#channel-")) return { kind: "channel", id: href.slice(9) };
   const slack = href.match(SLACK);
   if (slack) return { kind: "slack", url: href, workspace: slack[1], thread: /[?&]thread_ts=/.test(href) };
@@ -71,12 +84,13 @@ export function embedFromHref(href?: string | null): Embed | null {
 }
 
 export function allowedEmbedUrl(url: string): boolean {
-  return /^(msg|todo|quest|report|practice):/i.test(url) || SETUP.test(url) || url.startsWith("#channel-");
+  return /^(msg|todo|quest|report|practice|team|list|place|region|challenge|course):/i.test(url) || SETUP.test(url) || url.startsWith("#channel-");
 }
 
 const SETUP = /^setup:([a-z][a-z_-]{1,31})$/i;
-const CARD_LINE = new RegExp(`^([ \\t]*)((?:msg|todo|quest|report):(?:${REF_SOURCE})(?:${ITEM_SOURCE})?|practice:(?:${ATTEMPT_ID_SOURCE})|setup:[A-Za-z][A-Za-z_-]{1,31}|https?:\\/\\/\\S+)[ \\t]*$`, "gm");
+const CARD_LINE = new RegExp(`^([ \\t]*)((?:msg|todo|quest|report):(?:${REF_SOURCE})(?:${ITEM_SOURCE})?|(?:team|list|place|region|challenge|course):(?:${EXACT_ID_SOURCE})|practice:(?:${ATTEMPT_ID_SOURCE})|setup:[A-Za-z][A-Za-z_-]{1,31}|https?:\\/\\/\\S+)[ \\t]*$`, "gm");
 const BARE = new RegExp(`(^|[\\s(])(msg|todo|quest|report):(${REF_SOURCE})(${ITEM_SOURCE})?`, "gi");
+const WORLD_BARE = new RegExp(`(^|[\\s(])(team|list|place|region|challenge|course):(${EXACT_ID_SOURCE})(?![0-9a-fA-F-])`, "gi");
 const PRACTICE_BARE = new RegExp(`(^|[\\s(])practice:(${ATTEMPT_ID_SOURCE})(?![0-9a-fA-F-])`, "gi");
 const CHANNEL = /(^|[\s(])#([A-Za-z][\w-]{0,79})/g;
 
@@ -91,6 +105,9 @@ export function linkEmbeds(text: string, channels: Map<string, string>): string 
       const tail = item && scheme.toLowerCase() === "report" ? item : "";
       return `${lead}[${scheme}:${ref}${tail}](${scheme.toLowerCase()}:${ref}${tail})${item && !tail ? item : ""}`;
     })
+    .replace(WORLD_BARE, (whole, lead: string, scheme: string, ref: string, offset: number, all: string) =>
+      lead === "(" && all[offset - 1] === "]" ? whole : `${lead}[${scheme}:${ref}](${scheme.toLowerCase()}:${ref})`,
+    )
     .replace(PRACTICE_BARE, (whole, lead: string, ref: string, offset: number, all: string) => (lead === "(" && all[offset - 1] === "]" ? whole : `${lead}[practice:${ref}](practice:${ref})`))
     .replace(CHANNEL, (whole, lead: string, name: string) => {
       const id = channels.get(name.toLowerCase());
@@ -271,6 +288,127 @@ function QuestEmbed({ refId, label, card }: { refId: string; label?: string; car
       }
     />
   );
+}
+
+type WorldTarget = Team | WorldItem | RegionDetail;
+
+function WorldTargetEmbed({ kind, refId, label, card }: { kind: "team" | "list" | "place" | "region"; refId: string; label?: string; card: boolean }) {
+  const [state, setState] = useState<{ key: string; target: WorldTarget | null } | null>(null);
+  const key = `${kind}:${refId}`;
+  useEffect(() => {
+    const reads = latestOnly();
+    const load = () => {
+      const isLatest = reads.begin();
+      const request = kind === "team" ? teamsApi.get(refId) : kind === "region" ? lokaApi.region(refId) : worldApi.item(refId);
+      void request
+        .then((target) => {
+          const valid =
+            kind === "team" ||
+            (kind === "region" && "region" in target) ||
+            (kind === "list" && "kind" in target && (target.kind === "list" || target.kind === "timer")) ||
+            (kind === "place" && "kind" in target && (target.kind === "building" || target.kind === "npc"));
+          if (isLatest()) setState({ key, target: valid ? target : null });
+        })
+        .catch(() => {
+          if (isLatest()) setState({ key, target: null });
+        });
+    };
+    const refreshTeam = () => {
+      setState(null);
+      load();
+    };
+    const onEvent = (event: Event) => {
+      const ev = (event as CustomEvent<WorldEvent>).detail;
+      if ((ev.type === "team.updated" || ev.type === "team.deleted") && ev.payload.team_id === refId.toLowerCase()) refreshTeam();
+    };
+    load();
+    if (kind === "team") {
+      window.addEventListener("world-event", onEvent);
+      window.addEventListener("world-reconnected", refreshTeam);
+    }
+    return () => {
+      reads.begin();
+      if (kind === "team") {
+        window.removeEventListener("world-event", onEvent);
+        window.removeEventListener("world-reconnected", refreshTeam);
+      }
+    };
+  }, [key, kind, refId]);
+  const target = state?.key === key ? state.target : undefined;
+  const icon =
+    kind === "team" ? <UsersThree size={12} weight="bold" /> : kind === "list" ? <ListChecks size={12} weight="bold" /> : kind === "place" ? <Buildings size={12} weight="bold" /> : <MapTrifold size={12} weight="bold" />;
+  if (target === undefined) return <Shell card={card} icon={icon} label={label || kind} />;
+  if (!target) return <Missing label={label || `a ${kind} you cannot open`} />;
+  const name = "region" in target ? target.region.name : target.name;
+  const detail =
+    kind === "team"
+      ? (target as Team).purpose || `${(target as Team).members.length} members`
+      : kind === "region"
+        ? `${(target as RegionDetail).region.visibility === "public" ? "Shared" : "Private"} ${(target as RegionDetail).region.theme} region`
+        : kind === "place"
+          ? (target as WorldItem).kind === "npc"
+            ? "Character in Loka"
+            : "Building in Loka"
+          : (target as WorldItem).kind === "timer"
+            ? "Timer"
+            : `${Array.isArray((target as WorldItem).data.items) ? ((target as WorldItem).data.items as unknown[]).length : 0} items`;
+  return <Shell card={card} icon={icon} label={label || name} byline={`${kind[0].toUpperCase()}${kind.slice(1)} · ${detail}`} body={name} onClick={() => openWorldLink(kind, refId)} />;
+}
+
+type AcademyRef = { title: string; byline: string; body: string };
+
+function lessonRef(d: ChallengeDetail): AcademyRef {
+  const c = d.card;
+  const kind = c.type === "canvas" ? "Canvas lesson" : c.type === "reading" ? "Reading lesson" : "Lesson";
+  const state = c.state === "passed" ? "passed" : c.attempts > 0 ? `${c.attempts} ${c.attempts === 1 ? "attempt" : "attempts"}` : `${c.xp} xp`;
+  return { title: c.title, byline: `${kind} · ${subjectLabel(c.skill)} · ${state}`, body: c.title };
+}
+
+function courseRef(a: AdventureCard): AcademyRef {
+  const state = a.completed ? "finished" : `${a.passed} of ${a.total} lessons passed`;
+  return { title: a.title, byline: `Course${a.skill ? ` · ${subjectLabel(a.skill)}` : ""} · ${state}`, body: a.story ? `${a.title}: ${a.story}` : a.title };
+}
+
+const ACADEMY_EVENTS = new Set(["challenge.graded", "challenge.created", "adventure.created", "adventure.completed", "item.updated", "item.removed", "practice.checked", "report.updated"]);
+
+function AcademyEmbed({ kind, refId, label, card }: { kind: "challenge" | "course"; refId: string; label?: string; card: boolean }) {
+  const key = `${kind}:${refId}`;
+  const [state, setState] = useState<{ key: string; ref: AcademyRef | null } | null>(null);
+  useEffect(() => {
+    const reads = latestOnly();
+    const load = () => {
+      const isLatest = reads.begin();
+      const request: Promise<AcademyRef | null> =
+        kind === "challenge" ? lokaApi.challenge(refId).then(lessonRef) : lokaApi.adventures().then((list) => {
+          const found = list.find((a) => a.id === refId);
+          return found ? courseRef(found) : null;
+        });
+      void request
+        .then((ref) => {
+          if (isLatest()) setState({ key, ref });
+        })
+        .catch(() => {
+          if (isLatest()) setState({ key, ref: null });
+        });
+    };
+    const onEvent = (event: Event) => {
+      const ev = (event as CustomEvent<WorldEvent>).detail;
+      if (ev && ACADEMY_EVENTS.has(ev.type)) load();
+    };
+    load();
+    window.addEventListener("world-event", onEvent);
+    window.addEventListener("world-reconnected", load);
+    return () => {
+      reads.begin();
+      window.removeEventListener("world-event", onEvent);
+      window.removeEventListener("world-reconnected", load);
+    };
+  }, [key, kind, refId]);
+  const icon = kind === "course" ? <Books size={12} weight="bold" /> : <Student size={12} weight="bold" />;
+  const ref = state?.key === key ? state.ref : undefined;
+  if (ref === undefined) return <Shell card={card} icon={icon} label={label || (kind === "course" ? "course" : "lesson")} />;
+  if (!ref) return <Missing label={label || `a ${kind === "course" ? "course" : "lesson"} you cannot open`} />;
+  return <Shell card={card} icon={icon} label={label || ref.title} byline={ref.byline} body={ref.body} onClick={() => openAcademy(kind === "course" ? { courseId: refId } : { challengeId: refId })} />;
 }
 
 function AgentEmbed({ refId, label, card }: { refId: string; label?: string; card: boolean }) {
@@ -680,6 +818,14 @@ export function EmbedView({ embed, label, card }: { embed: Embed; label?: string
       return <ReportEmbed refId={embed.ref} item={embed.item} label={label} card={card} />;
     case "practice":
       return <PracticeEmbed refId={embed.ref} label={label} card={card} />;
+    case "team":
+    case "list":
+    case "place":
+    case "region":
+      return <WorldTargetEmbed kind={embed.kind} refId={embed.ref} label={label} card={card} />;
+    case "challenge":
+    case "course":
+      return <AcademyEmbed kind={embed.kind} refId={embed.ref} label={label} card={card} />;
     case "setup":
       return <SetupCard featureKey={embed.key} />;
     case "channel":

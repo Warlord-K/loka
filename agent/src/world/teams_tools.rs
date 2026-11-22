@@ -218,6 +218,7 @@ pub async fn call(store: &WorldStore, caller: &WorldAgent, name: &str, args: &Va
                 purpose: args.get("purpose").and_then(Value::as_str).map(String::from),
                 rules: args.get("rules").and_then(Value::as_str).map(String::from),
                 lead,
+                ..Default::default()
             };
             if edit.name.is_none() && edit.purpose.is_none() && edit.rules.is_none() && edit.lead.is_none() {
                 bail!("give name, purpose, rules or lead");

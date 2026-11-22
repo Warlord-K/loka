@@ -82,6 +82,13 @@ pub fn thread_prompt(asker: &str, transcript: &str, text: &str, attached: &[Stri
     )
 }
 
+pub fn with_quote(text: &str, quote: Option<&Value>) -> String {
+    match quote {
+        Some(quote) => format!("{}{text}", crate::quotes::render(&json!({ "quote": quote }))),
+        None => text.to_string(),
+    }
+}
+
 pub fn next_prompt(asker: &str, text: &str, attached: &[String]) -> String {
     let files = if attached.is_empty() { String::new() } else { format!("\n[attached: {}]", attached.join(", ")) };
     format!("{asker}: {text}{files}")
@@ -690,6 +697,16 @@ mod tests {
         assert_eq!(store.quick_sessions(owner, org, None, false, 10).await?.len(), 1);
         assert_eq!(store.quick_sessions(owner, org, None, true, 10).await?.len(), 1);
         assert!(store.quick_session_for(Uuid::new_v4(), org, session.id).await?.is_none(), "only the asker reads it");
+        let colleague: Uuid = sqlx::query_scalar("INSERT INTO users (email, name, world_role) VALUES ($1, 'Kit', 'write') RETURNING id")
+            .bind(format!("quick-kit-{tag}@test.dev"))
+            .fetch_one(&pool)
+            .await?;
+        crate::orgs::join_default_for_tests(&pool, colleague, None).await?;
+        assert!(store.quick_session_for(colleague, org, session.id).await?.is_none(), "a teammate in the same org cannot read it either");
+        let quote = crate::quotes::clean(Some(&json!({ "text": "Frieren", "label": "Quill's message", "source": format!("msg:{}", reply.as_ref().expect("reply").id) }))).unwrap();
+        let quoted = store.post_quick_message(&agent, &session, Some(owner), "More like it?", None, json!({ "quote": quote })).await?;
+        assert_eq!(quoted.meta["quote"]["text"], "Frieren");
+        assert!(store.quick_messages(session.id, 50).await?.iter().any(|m| m.id == quoted.id && m.meta["quote"]["label"] == "Quill's message"));
 
         let queued = store.queue_quick(&session, "Sam: more?").await?;
         store.close_quick(session.id).await?;
@@ -698,6 +715,16 @@ mod tests {
         assert!(store.queue_quick(&session, "Sam: still there?").await.is_err());
         assert!(store.quick_sessions(owner, org, None, false, 10).await?.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn a_quote_leads_the_prompt_text_and_plain_text_is_unchanged() {
+        assert_eq!(with_quote("why?", None), "why?");
+        let quote = crate::quotes::clean(Some(&json!({ "text": "cache misses doubled", "label": "Quill's message", "source": "msg:abcdef12" }))).unwrap();
+        let text = with_quote("why?", Some(&quote));
+        assert!(text.contains("from Quill's message (msg:abcdef12)") && text.contains("> cache misses doubled") && text.ends_with("\n\nwhy?"));
+        let prompt = next_prompt("Sam", &text, &[]);
+        assert!(prompt.starts_with("Sam: (they selected and quoted this") && prompt.ends_with("why?"));
     }
 
     #[test]

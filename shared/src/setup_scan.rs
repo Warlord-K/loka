@@ -732,7 +732,7 @@ pub struct Device {
 
 pub fn device_from(runner: Option<RunnerView>, owner: Uuid, main: &WorldAgent) -> std::result::Result<Device, String> {
     let Some(runner) = runner else {
-        return Err("Connect your Mac first: pair it under Devices on your profile card, then ask me to look at your setup.".into());
+        return Err("Connect your Mac first: pair it in Settings, under Devices, then ask me to look at your setup.".into());
     };
     let mac = runner.platform == "macos" || runner.capabilities.get("platform").and_then(Value::as_str) == Some("macos");
     if runner.owner_user_id != owner || !mac {
@@ -1080,7 +1080,7 @@ impl WorldStore {
                 Ok((name, missing)) => {
                     applied.created.push(format!("MCP server {name}"));
                     applied.problems.push(format!(
-                        "{name} needs the keys {}. Save them under You > Keys, grant them to {}, then equip {name} in their Kit.",
+                        "{name} needs the keys {}. Save them under Settings > Keys, grant them to {}, then equip {name} in their Kit.",
                         missing.join(", "),
                         main.name
                     ));

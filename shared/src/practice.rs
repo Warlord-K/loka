@@ -5,7 +5,9 @@ use serde_json::{json, Value};
 use sqlx::FromRow;
 use uuid::Uuid;
 
+use crate::academy::{self, Grade};
 use crate::canvas::Canvas;
+use crate::items::WorldItem;
 use crate::reports::{NewReport, Report, ReportActor, ReportBrief, ReportPatch};
 use crate::world::{emit_in, NewEvent, WorldAgent, WorldStore};
 
@@ -30,6 +32,7 @@ pub const TOO_BIG: &str = "Stroke data is at most 2 MB once saved; send fewer po
 pub const MIN_PREFIX: usize = 8;
 pub const NO_IMAGE_TO_RESEND: &str = "That attempt has no picture, so the coach would have nothing to look at. Press Ready again to send a new attempt.";
 pub const RESEND_SECS: i64 = 30;
+pub const LESSON_REMOVED: &str = "This lesson was removed from the Academy, so it takes no new attempts. Ask an agent to make a new lesson.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
@@ -58,7 +61,10 @@ pub const DRAWING_MIMES: &[&str] = &["image/png", "image/jpeg", "image/gif", "im
 
 const ATTEMPT_COLUMNS: &str = "a.id, a.report_id, a.user_id, a.subject, a.coach_agent_id, a.n, a.image_upload_id, a.note, a.status,
   a.\"check\", a.coach_message_id, a.created_at, a.checked_at,
-  CASE WHEN jsonb_typeof(a.strokes->'strokes') = 'array' THEN jsonb_array_length(a.strokes->'strokes') ELSE 0 END AS stroke_count";
+  CASE WHEN jsonb_typeof(a.strokes->'strokes') = 'array' THEN jsonb_array_length(a.strokes->'strokes') ELSE 0 END AS stroke_count,
+  (SELECT g.status FROM challenge_attempts g WHERE g.id = a.id) AS grade_status,
+  (SELECT g.score FROM challenge_attempts g WHERE g.id = a.id) AS grade_score,
+  (SELECT g.xp_awarded FROM challenge_attempts g WHERE g.id = a.id) AS xp_awarded";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Practice {
@@ -130,6 +136,12 @@ pub struct Attempt {
     pub created_at: DateTime<Utc>,
     pub checked_at: Option<DateTime<Utc>>,
     pub stroke_count: i32,
+    #[sqlx(default)]
+    pub grade_status: Option<String>,
+    #[sqlx(default)]
+    pub grade_score: Option<i32>,
+    #[sqlx(default)]
+    pub xp_awarded: Option<i32>,
     #[sqlx(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strokes: Option<Value>,
@@ -408,12 +420,37 @@ pub fn quote_text(subject: &str, n: i32, check: Option<&Check>) -> String {
     }
 }
 
+pub fn course_title(subject: &str) -> String {
+    subject_title(subject).trim_end_matches(" practice").to_string()
+}
+
+pub fn lesson_data(subject: &str, coach: Option<Uuid>, task: Option<Uuid>, report: Option<Uuid>) -> Value {
+    json!({
+        "type": academy::CANVAS,
+        "prompt": academy::CANVAS_PROMPT,
+        "hints": [],
+        "skill": subject,
+        "difficulty": "medium",
+        "xp": 40,
+        "minutes": 15,
+        "tests": null,
+        "reading": [],
+        "coach_agent_id": coach,
+        "task_id": task,
+        "report_id": report,
+    })
+}
+
+pub fn ledger_feedback(check: &Check) -> String {
+    format!("Right: {}\n\nFix: {}\n\nNext: {}", check.right, check.fix, check.next)
+}
+
 pub fn attempt_key(raw: &str) -> String {
     raw.trim().trim_start_matches("practice:").trim().to_lowercase()
 }
 
 impl WorldStore {
-    async fn owned_coach(&self, owner: Uuid, org: Option<Uuid>, agent: Uuid) -> Result<bool> {
+    pub(crate) async fn owned_coach(&self, owner: Uuid, org: Option<Uuid>, agent: Uuid) -> Result<bool> {
         Ok(sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (SELECT 1 FROM agent_profiles WHERE id = $1 AND owner_user_id = $2 AND org_id IS NOT DISTINCT FROM $3 AND archived_at IS NULL)",
         )
@@ -422,6 +459,189 @@ impl WorldStore {
         .bind(org)
         .fetch_one(self.pool())
         .await?)
+    }
+
+    pub async fn subject_course(&self, owner: Uuid, org: Uuid, subject: &str, coach: Option<Uuid>, agent: Option<Uuid>) -> Result<WorldItem> {
+        Ok(self.subject_course_made(owner, org, subject, coach, agent).await?.0)
+    }
+
+    pub(crate) async fn subject_course_made(&self, owner: Uuid, org: Uuid, subject: &str, coach: Option<Uuid>, agent: Option<Uuid>) -> Result<(WorldItem, bool)> {
+        let subject = clean_subject(subject)?;
+        let find = "SELECT * FROM world_items WHERE kind = 'adventure' AND status <> 'archived' AND owner_user_id = $1 AND org_id = $2 AND data->>'skill' = $3
+                    ORDER BY (data->>'folder' = $4) DESC NULLS LAST, created_at LIMIT 1";
+        if let Some(course) = sqlx::query_as::<_, WorldItem>(find).bind(owner).bind(org).bind(&subject).bind(FOLDER).fetch_optional(self.pool()).await? {
+            return Ok((course, false));
+        }
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))").bind(format!("course:{owner}:{org}:{subject}")).execute(&mut *tx).await?;
+        if let Some(course) = sqlx::query_as::<_, WorldItem>(find).bind(owner).bind(org).bind(&subject).bind(FOLDER).fetch_optional(&mut *tx).await? {
+            return Ok((course, false));
+        }
+        let data = json!({ "story": "", "challenges": [], "folder": FOLDER, "skill": subject, "coach_agent_id": coach });
+        let course = self.insert_academy_item(&mut tx, "adventure", &course_title(&subject), owner, org, agent, data, None).await?;
+        tx.commit().await?;
+        self.item_event("item.created", &course).await?;
+        let mut event = NewEvent::new("adventure.created").actor(Some(owner)).payload(json!({
+            "adventure_id": course.id,
+            "title": course.name,
+            "challenges": [],
+            "region_id": null,
+            "owner_user_id": owner,
+        }));
+        if let Some(a) = agent {
+            event = event.agent(a);
+        }
+        self.emit(event, None).await?;
+        Ok((course, true))
+    }
+
+    pub async fn attach_canvas(&self, lesson: &WorldItem, course: Option<&WorldItem>, by: ReportActor) -> Result<Report> {
+        let owner = lesson.owner_user_id.ok_or_else(|| anyhow!("that lesson has no owner"))?;
+        let subject = clean_subject(lesson.data.get("skill").and_then(Value::as_str).unwrap_or("practice"))?;
+        let coach = self.coach_for(lesson).await?;
+        let folder = course.and_then(|c| c.data.get("folder").and_then(Value::as_str)).filter(|f| !f.is_empty()).unwrap_or(FOLDER).to_string();
+        let practice = json!(Practice { subject: subject.clone(), coach_agent_id: coach });
+        let report = self
+            .create_canvas_with(
+                NewReport {
+                    owner_user_id: owner,
+                    by,
+                    title: lesson.name.clone(),
+                    body: String::new(),
+                    folder: Some(folder),
+                    tags: vec![TAG.into(), subject],
+                    visibility: None,
+                    pinned: false,
+                    task_id: academy::uuid_in(&lesson.data, "task_id"),
+                },
+                Canvas::default(),
+                Some(&practice),
+            )
+            .await?;
+        let linked = self.link_canvas(lesson.id, report.id).await;
+        let report = match linked {
+            Ok(report) => report,
+            Err(e) => {
+                self.delete_report(report.id, by).await?;
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.announce_practice(&report, by).await {
+            tracing::warn!(error = %e, report = %report.id, "could not announce a new practice canvas");
+        }
+        Ok(report)
+    }
+
+    async fn link_canvas(&self, lesson: Uuid, report: Uuid) -> Result<Report> {
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("UPDATE world_items SET data = data || jsonb_build_object('report_id', $2::text), updated_at = NOW() WHERE id = $1")
+            .bind(lesson)
+            .bind(report)
+            .execute(&mut *tx)
+            .await?;
+        let report = sqlx::query_as::<_, Report>("UPDATE world_reports SET challenge_id = $2 WHERE id = $1 RETURNING *").bind(report).bind(lesson).fetch_one(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(report)
+    }
+
+    pub(crate) async fn drop_unattached(&self, lesson: Uuid, made_course: bool) -> Result<()> {
+        let mut tx = self.pool().begin().await?;
+        let course: Option<Option<String>> = sqlx::query_scalar("SELECT data->>'adventure_id' FROM world_items WHERE id = $1 FOR UPDATE").bind(lesson).fetch_optional(&mut *tx).await?;
+        if let Some(course) = course.flatten().and_then(|c| c.parse::<Uuid>().ok()) {
+            sqlx::query(
+                "UPDATE world_items SET data = jsonb_set(data, '{challenges}', COALESCE((SELECT jsonb_agg(x) FROM jsonb_array_elements(data->'challenges') x WHERE x <> to_jsonb($2::text)), '[]'::jsonb)), updated_at = NOW()
+                 WHERE id = $1 AND kind = 'adventure'",
+            )
+            .bind(course)
+            .bind(lesson.to_string())
+            .execute(&mut *tx)
+            .await?;
+            if made_course {
+                sqlx::query("UPDATE world_items SET status = 'archived', updated_at = NOW() WHERE id = $1 AND kind = 'adventure' AND jsonb_array_length(data->'challenges') = 0")
+                    .bind(course)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        sqlx::query("UPDATE world_items SET status = 'archived', data = data - 'adventure_id' - 'order', updated_at = NOW() WHERE id = $1").bind(lesson).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn sync_canvas_report(&self, id: Uuid, owner: Uuid, name: &str, skill: &str, coach: Option<Option<Uuid>>) -> Result<()> {
+        let Some(report) = self.get_report(id).await?.filter(|r| r.owner_user_id == owner) else { return Ok(()) };
+        let Some(current) = Practice::of(&report) else { return Ok(()) };
+        let title = crate::reports::clean_title(name)?;
+        let mut report = report;
+        if title != report.title {
+            report = self
+                .update_report(id, ReportActor::User(owner), &ReportPatch { title: Some(title), ..Default::default() })
+                .await?
+                .ok_or_else(|| anyhow!("That practice canvas is gone."))?;
+        }
+        let next = Practice { subject: clean_subject(skill)?, coach_agent_id: coach.unwrap_or(current.coach_agent_id) };
+        if next != current {
+            let mut tags: Vec<String> = report.tags.iter().filter(|t| **t != current.subject).cloned().collect();
+            if !tags.contains(&next.subject) {
+                tags.push(next.subject.clone());
+            }
+            report = sqlx::query_as::<_, Report>("UPDATE world_reports SET practice = $2, tags = $3, updated_at = NOW() WHERE id = $1 RETURNING *")
+                .bind(id)
+                .bind(json!(next))
+                .bind(crate::reports::clean_tags(&tags))
+                .fetch_one(self.pool())
+                .await?;
+            if let Some(c) = next.coach_agent_id.filter(|_| coach.is_some()) {
+                self.save_coach_pref(owner, &next.subject, c).await?;
+            }
+            self.announce_practice(&report, ReportActor::User(owner)).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn ensure_lesson(&self, report: &Report) -> Result<WorldItem> {
+        if let Some(id) = report.challenge_id {
+            if let Some(item) = self.get_item(id).await?.filter(|i| i.kind == "challenge") {
+                return Ok(item);
+            }
+        }
+        let practice = Practice::of(report).ok_or_else(|| anyhow!(NOT_PRACTICE))?;
+        let org = report.org_id.ok_or_else(|| anyhow!(NOT_PRACTICE))?;
+        let course = self.subject_course(report.owner_user_id, org, &practice.subject, practice.coach_agent_id, report.author_agent_id).await?;
+        let mut tx = self.pool().begin().await?;
+        let lesson = self
+            .insert_academy_item(&mut tx, "challenge", &report.title, report.owner_user_id, org, report.author_agent_id, lesson_data(&practice.subject, practice.coach_agent_id, report.task_id, Some(report.id)), None)
+            .await?;
+        self.append_lesson(&mut tx, course.id, lesson.id).await?;
+        let linked: Option<Uuid> = sqlx::query_scalar("UPDATE world_reports SET challenge_id = $2 WHERE id = $1 AND challenge_id IS NULL RETURNING id")
+            .bind(report.id)
+            .bind(lesson.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if linked.is_none() {
+            drop(tx);
+            let current: Option<Uuid> = sqlx::query_scalar("SELECT challenge_id FROM world_reports WHERE id = $1").bind(report.id).fetch_optional(self.pool()).await?.flatten();
+            return match current {
+                Some(id) => self.get_item(id).await?.ok_or_else(|| anyhow!("that lesson is gone")),
+                None => bail!("That practice canvas is gone."),
+            };
+        }
+        tx.commit().await?;
+        Ok(self.get_item(lesson.id).await?.unwrap_or(lesson))
+    }
+
+    pub async fn move_lesson(&self, tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, lesson: Uuid, from: Option<Uuid>, to: Uuid) -> Result<i32> {
+        if let Some(old) = from.filter(|o| *o != to) {
+            sqlx::query(
+                "UPDATE world_items SET data = jsonb_set(data, '{challenges}', COALESCE((SELECT jsonb_agg(x) FROM jsonb_array_elements(data->'challenges') x WHERE x <> to_jsonb($2::text)), '[]'::jsonb)), updated_at = NOW()
+                 WHERE id = $1 AND kind = 'adventure'",
+            )
+            .bind(old)
+            .bind(lesson.to_string())
+            .execute(&mut **tx)
+            .await?;
+        }
+        self.append_lesson(tx, to, lesson).await
     }
 
     pub async fn find_coach(&self, owner: Uuid, org: Uuid, key: &str) -> Result<Uuid> {
@@ -530,28 +750,36 @@ impl WorldStore {
             }
         }
         let title = title.map(str::trim).filter(|t| !t.is_empty()).map(String::from).unwrap_or_else(|| subject_title(&subject));
-        let practice = json!(Practice { subject: subject.clone(), coach_agent_id: coach });
-        let report = self
-            .create_canvas_with(
-                NewReport {
-                    owner_user_id: owner,
-                    by,
-                    title,
-                    body: String::new(),
-                    folder: Some(FOLDER.into()),
-                    tags: vec![TAG.into(), subject.clone()],
-                    visibility: None,
-                    pinned: false,
-                    task_id,
-                },
-                Canvas::default(),
-                Some(&practice),
-            )
-            .await?;
+        let (course, made_course) = self.subject_course_made(owner, org, &subject, coach, by.agent()).await?;
+        let mut tx = self.pool().begin().await?;
+        let lesson = self.insert_academy_item(&mut tx, "challenge", &title, owner, org, by.agent(), lesson_data(&subject, coach, task_id, None), None).await?;
+        self.append_lesson(&mut tx, course.id, lesson.id).await?;
+        tx.commit().await?;
+        let lesson = self.get_item(lesson.id).await?.unwrap_or(lesson);
+        let report = match self.attach_canvas(&lesson, Some(&course), by).await {
+            Ok(report) => report,
+            Err(e) => {
+                self.drop_unattached(lesson.id, made_course).await?;
+                return Err(e);
+            }
+        };
         if let Some(c) = coach {
             self.save_coach_pref(owner, &subject, c).await?;
         }
-        self.announce_practice(&report, by).await?;
+        let mut event = NewEvent::new("challenge.created").actor(by.user()).payload(json!({
+            "challenge_id": lesson.id,
+            "title": lesson.name,
+            "type": academy::CANVAS,
+            "skill": subject,
+            "adventure_id": course.id,
+            "report_id": report.id,
+            "owner_user_id": owner,
+            "quiet": true,
+        }));
+        if let Some(a) = by.agent() {
+            event = event.agent(a);
+        }
+        self.emit(event, None).await?;
         Ok(report)
     }
 
@@ -589,8 +817,37 @@ impl WorldStore {
         if let Some(c) = next.coach_agent_id.filter(|_| coach.is_some() || next.subject != current.subject) {
             self.save_coach_pref(report.owner_user_id, &subject, c).await?;
         }
+        if next != current || title.is_some() {
+            self.sync_lesson(&report, &next, &current).await?;
+        }
         self.announce_practice(&report, by).await?;
         Ok(report)
+    }
+
+    async fn sync_lesson(&self, report: &Report, next: &Practice, current: &Practice) -> Result<()> {
+        let lesson = self.ensure_lesson(report).await?;
+        let org = report.org_id.ok_or_else(|| anyhow!(NOT_PRACTICE))?;
+        let target = if next.subject != current.subject {
+            Some(self.subject_course(report.owner_user_id, org, &next.subject, next.coach_agent_id, None).await?)
+        } else {
+            None
+        };
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("SELECT id FROM world_items WHERE id = $1 FOR UPDATE").bind(lesson.id).execute(&mut *tx).await?;
+        sqlx::query(
+            "UPDATE world_items SET name = $2, data = data || jsonb_build_object('skill', $3::text, 'coach_agent_id', $4::uuid), updated_at = NOW() WHERE id = $1",
+        )
+        .bind(lesson.id)
+        .bind(&report.title)
+        .bind(&next.subject)
+        .bind(next.coach_agent_id)
+        .execute(&mut *tx)
+        .await?;
+        if let Some(course) = target {
+            self.move_lesson(&mut tx, lesson.id, academy::uuid_in(&lesson.data, "adventure_id"), course.id).await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn list_practice(&self, owner: Uuid, org: Uuid, subject: Option<&str>, query: Option<&str>, limit: i64) -> Result<Vec<PracticeBrief>> {
@@ -692,13 +949,19 @@ impl WorldStore {
             .into_iter()
             .find(|u| DRAWING_MIMES.contains(&u.mime.as_str()))
             .ok_or_else(|| anyhow!(NOT_AN_IMAGE))?;
+        let lesson = self.ensure_lesson(report).await?;
+        if lesson.status == "archived" {
+            bail!(LESSON_REMOVED);
+        }
+        let report = &self.get_report(report.id).await?.ok_or_else(|| anyhow!("That practice canvas is gone."))?;
         let coach = self.current_coach(report, &practice).await?;
         let mut tx = self.pool().begin().await?;
+        sqlx::query("SELECT id FROM world_items WHERE id = $1 FOR UPDATE").bind(lesson.id).execute(&mut *tx).await?;
         sqlx::query("SELECT id FROM world_reports WHERE id = $1 FOR UPDATE").bind(report.id).execute(&mut *tx).await?;
-        let id: Uuid = sqlx::query_scalar(
+        let (id, n): (Uuid, i32) = sqlx::query_as(
             "INSERT INTO world_practice_attempts (report_id, user_id, subject, coach_agent_id, n, image_upload_id, strokes, note)
              VALUES ($1, $2, $3, $4, (SELECT COALESCE(MAX(n), 0) + 1 FROM world_practice_attempts WHERE report_id = $1), $5, $6, $7)
-             RETURNING id",
+             RETURNING id, n",
         )
         .bind(report.id)
         .bind(user)
@@ -713,6 +976,20 @@ impl WorldStore {
             Some("23514") => anyhow!(TOO_BIG),
             _ => e.into(),
         })?;
+        sqlx::query("UPDATE challenge_attempts SET status = 'error', feedback = $3, graded_at = NOW() WHERE user_id = $1 AND challenge_id = $2 AND status = 'pending'")
+            .bind(user)
+            .bind(lesson.id)
+            .bind(format!("Replaced by attempt {n}."))
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO challenge_attempts (id, user_id, challenge_id, answer, grader_agent_id) VALUES ($1, $2, $3, $4, $5)")
+            .bind(id)
+            .bind(user)
+            .bind(lesson.id)
+            .bind(note.clone().unwrap_or_else(|| format!("Canvas attempt {n}")))
+            .bind(coach)
+            .execute(&mut *tx)
+            .await?;
         let attempt = self.emit_ready(&mut tx, report, id, coach, &strokes).await?;
         sqlx::query("UPDATE world_reports SET updated_at = NOW() WHERE id = $1").bind(report.id).execute(&mut *tx).await?;
         tx.commit().await?;
@@ -722,6 +999,14 @@ impl WorldStore {
 
     async fn current_coach(&self, report: &Report, practice: &Practice) -> Result<Uuid> {
         let org = report.org_id.ok_or_else(|| anyhow!(NOT_PRACTICE))?;
+        if let Some(lesson) = match report.challenge_id {
+            Some(id) => self.get_item(id).await?,
+            None => None,
+        } {
+            if let Some(c) = self.coach_for(&lesson).await? {
+                return Ok(c);
+            }
+        }
         match practice.coach_agent_id {
             Some(c) if self.owned_coach(report.owner_user_id, Some(org), c).await? => Ok(c),
             _ => self.default_coach(report.owner_user_id, org, &practice.subject).await?.ok_or_else(|| anyhow!(NO_COACH)),
@@ -771,20 +1056,28 @@ impl WorldStore {
 
     pub async fn resend_practice(&self, report: &Report, attempt: Uuid) -> Result<Attempt> {
         let practice = Practice::of(report).ok_or_else(|| anyhow!(NOT_PRACTICE))?;
+        let lesson = self.ensure_lesson(report).await?;
+        if lesson.status == "archived" {
+            bail!(LESSON_REMOVED);
+        }
+        let report = &self.get_report(report.id).await?.unwrap_or_else(|| report.clone());
         let coach = self.current_coach(report, &practice).await?;
         let mut tx = self.pool().begin().await?;
+        sqlx::query("SELECT id FROM world_items WHERE id = $1 FOR UPDATE").bind(lesson.id).execute(&mut *tx).await?;
         let found: Option<(String, Option<Uuid>)> =
             sqlx::query_as("SELECT status, image_upload_id FROM world_practice_attempts WHERE id = $1 AND report_id = $2 FOR UPDATE")
                 .bind(attempt)
                 .bind(report.id)
                 .fetch_optional(&mut *tx)
                 .await?;
+        let ledger: Option<String> = sqlx::query_scalar("SELECT status FROM challenge_attempts WHERE id = $1 FOR UPDATE").bind(attempt).fetch_optional(&mut *tx).await?;
         match found {
-            Some((status, _)) if status != "waiting" => return Err(Refusal::NotWaiting.into()),
+            Some((status, _)) if status != "waiting" || ledger.as_deref().is_some_and(|s| s != "pending") => return Err(Refusal::NotWaiting.into()),
             Some((_, None)) => return Err(Refusal::NoImage.into()),
             Some(_) => {}
             None => return Err(Refusal::Missing.into()),
         }
+        sqlx::query("UPDATE challenge_attempts SET grader_agent_id = $2 WHERE id = $1").bind(attempt).bind(coach).execute(&mut *tx).await?;
         let strokes: Value = sqlx::query_scalar("UPDATE world_practice_attempts SET coach_agent_id = $2 WHERE id = $1 RETURNING strokes")
             .bind(attempt)
             .bind(coach)
@@ -855,14 +1148,32 @@ impl WorldStore {
         Ok(())
     }
 
-    pub async fn practice_check(&self, coach: &WorldAgent, attempt: Uuid, check: Check) -> Result<Attempt> {
+    pub async fn practice_check(&self, coach: &WorldAgent, attempt: Uuid, check: Check, passed: Option<bool>) -> Result<Attempt> {
+        let report: Option<Uuid> = sqlx::query_scalar("SELECT report_id FROM world_practice_attempts WHERE id = $1").bind(attempt).fetch_optional(self.pool()).await?;
+        if let Some(report) = match report {
+            Some(id) => self.get_report(id).await?,
+            None => None,
+        } {
+            if report.challenge_id.is_none() && Practice::of(&report).is_some() {
+                self.ensure_lesson(&report).await?;
+            }
+        }
         let mut tx = self.pool().begin().await?;
+        let lesson: Option<Uuid> = sqlx::query_scalar("SELECT r.challenge_id FROM world_practice_attempts a JOIN world_reports r ON r.id = a.report_id WHERE a.id = $1")
+            .bind(attempt)
+            .fetch_optional(&mut *tx)
+            .await?
+            .flatten();
+        if let Some(lesson) = lesson {
+            sqlx::query("SELECT id FROM world_items WHERE id = $1 FOR UPDATE").bind(lesson).execute(&mut *tx).await?;
+        }
         let updated = sqlx::query_as::<_, Attempt>(&format!(
             "UPDATE world_practice_attempts a SET status = 'checked', \"check\" = $3, checked_at = NOW(), coach_agent_id = $2
              WHERE a.id = $1 AND a.status = 'waiting'
                AND (a.coach_agent_id = $2
                     OR (a.coach_agent_id IS NULL AND EXISTS (
-                      SELECT 1 FROM world_reports r WHERE r.id = a.report_id AND r.practice->>'coach_agent_id' = $2::text)))
+                      SELECT 1 FROM world_reports r LEFT JOIN world_items i ON i.id = r.challenge_id
+                      WHERE r.id = a.report_id AND (r.practice->>'coach_agent_id' = $2::text OR i.data->>'coach_agent_id' = $2::text))))
              RETURNING {ATTEMPT_COLUMNS}, NULL::jsonb AS strokes"
         ))
         .bind(attempt)
@@ -882,7 +1193,34 @@ impl WorldStore {
         };
         let (title, task_id, owner, org): (String, Option<Uuid>, Uuid, Option<Uuid>) =
             sqlx::query_as("SELECT title, task_id, owner_user_id, org_id FROM world_reports WHERE id = $1").bind(saved.report_id).fetch_one(&mut *tx).await?;
-        let body = check.message(saved.n, &title, saved.id);
+        let grade = Grade {
+            passed: passed.unwrap_or_else(|| academy::passed_from_score(check.score)),
+            score: check.score.map(|s| s.round().clamp(0.0, 100.0) as i32),
+            feedback: ledger_feedback(&check),
+        };
+        sqlx::query(
+            "INSERT INTO challenge_attempts (id, user_id, challenge_id, answer, grader_agent_id)
+             SELECT a.id, a.user_id, r.challenge_id, COALESCE(NULLIF(btrim(a.note), ''), 'Canvas attempt ' || a.n), $2
+             FROM world_practice_attempts a JOIN world_reports r ON r.id = a.report_id
+             WHERE a.id = $1 AND r.challenge_id IS NOT NULL
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(saved.id)
+        .bind(coach.id)
+        .execute(&mut *tx)
+        .await?;
+        let graded = self.grade_in(&mut tx, saved.id, Some(grade), None, Some(coach.id)).await?;
+        if let Some(g) = &graded {
+            saved.grade_status = Some(g.attempt.status.clone());
+            saved.grade_score = g.attempt.score;
+            saved.xp_awarded = Some(g.attempt.xp_awarded);
+        }
+        let mut body = check.message(saved.n, &title, saved.id);
+        if let Some(g) = &graded {
+            let verdict = if g.attempt.status == "passed" { "Passed" } else { "Not passed yet" };
+            let xp = if g.attempt.xp_awarded > 0 { format!(", +{} xp", g.attempt.xp_awarded) } else { String::new() };
+            body = body.replacen("\n\n**Right:**", &format!("\n\n**{verdict}**{xp}\n\n**Right:**"), 1);
+        }
         let meta = json!({ "practice": { "attempt_id": saved.id, "report_id": saved.report_id, "n": saved.n, "subject": saved.subject } });
         let message: Uuid = sqlx::query_scalar(
             "INSERT INTO agent_messages (agent_id, author_kind, author_agent_id, body, meta) VALUES ($1, 'agent', $1, $2, $3) RETURNING id",
@@ -918,6 +1256,8 @@ impl WorldStore {
                 "n": saved.n,
                 "status": saved.status,
                 "check": saved.check,
+                "grade_status": saved.grade_status,
+                "xp_awarded": saved.xp_awarded,
                 "coach_agent_id": coach.id,
                 "coach_message_id": message,
                 "quiet": true,
@@ -1136,10 +1476,10 @@ mod tests {
         let hana_agent = store.get_agent(hana).await?.ok_or_else(|| anyhow!("no hana"))?;
         let vincent_agent = store.get_agent(vincent).await?.ok_or_else(|| anyhow!("no vincent"))?;
         let check = Check::new("Even spacing", "Stroke 1 starts too far left", "Write 三 three times", Some(80.0))?;
-        assert!(store.practice_check(&vincent_agent, first.id, check.clone()).await.unwrap_err().to_string().contains("another coach"));
-        let checked = store.practice_check(&hana_agent, first.id, check.clone()).await?;
+        assert!(store.practice_check(&vincent_agent, first.id, check.clone(), None).await.unwrap_err().to_string().contains("another coach"));
+        let checked = store.practice_check(&hana_agent, first.id, check.clone(), None).await?;
         assert_eq!(checked.status, "checked");
-        assert!(store.practice_check(&hana_agent, first.id, check).await.unwrap_err().to_string().contains("already checked"));
+        assert!(store.practice_check(&hana_agent, first.id, check, None).await.unwrap_err().to_string().contains("already checked"));
         let message: (String, Value) = sqlx::query_as("SELECT body, meta FROM agent_messages WHERE id = $1").bind(checked.coach_message_id).fetch_one(&pool).await?;
         assert!(message.0.contains(&format!("practice:{}", first.id)));
         assert_eq!(message.1["practice"]["n"], 1);
@@ -1148,8 +1488,8 @@ mod tests {
 
         sqlx::query("UPDATE world_practice_attempts SET coach_agent_id = NULL WHERE id = $1").bind(second_try.id).execute(&pool).await?;
         let check = Check::new("Steady line", "Lift at the end", "Write 一 again", None)?;
-        assert!(store.practice_check(&vincent_agent, second_try.id, check.clone()).await.unwrap_err().to_string().contains("lost its coach"));
-        let adopted = store.practice_check(&hana_agent, second_try.id, check).await?;
+        assert!(store.practice_check(&vincent_agent, second_try.id, check.clone(), None).await.unwrap_err().to_string().contains("lost its coach"));
+        let adopted = store.practice_check(&hana_agent, second_try.id, check, None).await?;
         assert_eq!((adopted.status.as_str(), adopted.coach_agent_id), ("checked", Some(hana)));
 
         let points: Vec<Value> = (0..40_000).map(|i| point((i % 997) as f64 + 0.25, (i % 613) as f64 + 0.5, i as f64)).collect();
@@ -1228,6 +1568,306 @@ mod tests {
         sqlx::query("DELETE FROM world_reports WHERE owner_user_id = $1").bind(owner).execute(&pool).await?;
         sqlx::query("DELETE FROM agent_profiles WHERE owner_user_id = ANY($1)").bind(vec![owner, stranger]).execute(&pool).await?;
         sqlx::query("DELETE FROM world_uploads WHERE id = ANY($1)").bind(vec![png, theirs_png, heic]).execute(&pool).await?;
+        Ok(())
+    }
+
+    async fn seed_attempt(pool: &sqlx::PgPool, report: Uuid, owner: Uuid, coach: Uuid, n: i32, check: Option<Value>) -> Result<Uuid> {
+        Ok(sqlx::query_scalar(
+            "INSERT INTO world_practice_attempts (report_id, user_id, subject, coach_agent_id, n, strokes, status, \"check\", checked_at)
+             SELECT $1, $2, practice->>'subject', $3, $4, '{\"width\":10,\"height\":10,\"strokes\":[]}', CASE WHEN $5::jsonb IS NULL THEN 'waiting' ELSE 'checked' END, $5, CASE WHEN $5::jsonb IS NULL THEN NULL ELSE NOW() END
+             FROM world_reports WHERE id = $1 RETURNING id",
+        )
+        .bind(report)
+        .bind(owner)
+        .bind(coach)
+        .bind(n)
+        .bind(check)
+        .fetch_one(pool)
+        .await?)
+    }
+
+    #[tokio::test]
+    async fn migration_folds_old_practice_into_courses_without_losing_attempts() -> Result<()> {
+        let Ok(url) = std::env::var("PRACTICE_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string()[..10].to_string();
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email, name) VALUES ($1, 'Old practiser') RETURNING id").bind(format!("{tag}@fold.test")).fetch_one(&pool).await?;
+        crate::orgs::join_default_for_tests(&pool, owner, None).await?;
+        let org = crate::orgs::DEFAULT_ORG;
+        let hana = agent(&store, owner, &tag, "hana").await?;
+        let kana = store.create_practice(owner, org, ReportActor::User(owner), "japanese", Some("Kana"), Some(hana), None).await?;
+        let kanji = store.create_practice(owner, org, ReportActor::User(owner), "japanese", Some("Kanji"), Some(hana), None).await?;
+        let gesture = store.create_practice(owner, org, ReportActor::User(owner), "drawing", Some("Gestures"), Some(hana), None).await?;
+        sqlx::query("UPDATE world_reports SET challenge_id = NULL WHERE owner_user_id = $1").bind(owner).execute(&pool).await?;
+        sqlx::query("DELETE FROM world_items WHERE owner_user_id = $1 AND kind IN ('challenge', 'adventure')").bind(owner).execute(&pool).await?;
+        sqlx::query("INSERT INTO user_progress (user_id, xp, level, skills, streak, best_streak, last_active_day) VALUES ($1, 10, 1, '{\"logic\": 10}', 3, 4, CURRENT_DATE)")
+            .bind(owner)
+            .execute(&pool)
+            .await?;
+        let check = |score: Option<f64>| json!({ "right": "r", "fix": "f", "next": "n", "score": score });
+        let a1 = seed_attempt(&pool, kana.id, owner, hana, 1, Some(check(Some(80.0)))).await?;
+        let a2 = seed_attempt(&pool, kana.id, owner, hana, 2, Some(check(Some(40.0)))).await?;
+        let a3 = seed_attempt(&pool, kana.id, owner, hana, 3, None).await?;
+        let a4 = seed_attempt(&pool, kana.id, owner, hana, 4, None).await?;
+        let b1 = seed_attempt(&pool, kanji.id, owner, hana, 1, Some(json!({ "right": "r", "fix": "f", "next": "n" }))).await?;
+        let c1 = seed_attempt(&pool, gesture.id, owner, hana, 1, Some(check(Some(59.0)))).await?;
+
+        sqlx::raw_sql(include_str!("../../migrations/143_academy_courses.sql")).execute(&pool).await?;
+        sqlx::raw_sql(include_str!("../../migrations/143_academy_courses.sql")).execute(&pool).await?;
+
+        let courses = store.adventures_for(owner, Some(org)).await?;
+        assert_eq!(courses.len(), 2, "one course per subject");
+        let japanese = courses.iter().find(|c| c.skill.as_deref() == Some("japanese")).ok_or_else(|| anyhow!("no japanese course"))?;
+        assert_eq!((japanese.title.as_str(), japanese.folder.as_deref(), japanese.coach_agent_id), ("Japanese", Some(FOLDER), Some(hana)));
+        let linked: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as("SELECT id, challenge_id FROM world_reports WHERE id = ANY($1) ORDER BY created_at").bind(vec![kana.id, kanji.id]).fetch_all(&pool).await?;
+        assert_eq!(japanese.challenges, linked.iter().filter_map(|(_, c)| *c).collect::<Vec<_>>(), "lessons keep the canvases' order");
+        let cards = store.challenge_cards(owner, Some(org)).await?;
+        assert_eq!(cards.len(), 3);
+        assert!(cards.iter().all(|c| c.challenge_type == "canvas" && c.report_id.is_some()));
+
+        let ledger = |id: Uuid| {
+            let pool = pool.clone();
+            async move { sqlx::query_as::<_, (String, Option<i32>, i32)>("SELECT status, score, xp_awarded FROM challenge_attempts WHERE id = $1").bind(id).fetch_one(&pool).await }
+        };
+        assert_eq!(ledger(a1).await?, ("passed".into(), Some(80), 40));
+        assert_eq!(ledger(a2).await?, ("failed".into(), Some(40), 0));
+        assert_eq!(ledger(a3).await?.0, "error");
+        assert_eq!(ledger(a4).await?.0, "pending");
+        assert_eq!(ledger(b1).await?, ("passed".into(), None, 40));
+        assert_eq!(ledger(c1).await?, ("failed".into(), Some(59), 0));
+
+        let progress = store.progress(owner).await?;
+        assert_eq!((progress.xp, progress.level, progress.streak, progress.best_streak), (90, academy::level_for(90), 3, 4));
+        assert_eq!((progress.skills["japanese"].as_i64(), progress.skills["logic"].as_i64()), (Some(80), Some(10)));
+        let unlocks: Vec<String> = progress.unlocks.as_array().map(|a| a.iter().filter_map(|u| u["id"].as_str().map(String::from)).collect()).unwrap_or_default();
+        assert!(unlocks.contains(&format!("trophy:{}", japanese.id)), "a course already fully passed gets its trophy: {unlocks:?}");
+        assert!(unlocks.contains(&"lantern-post".to_string()), "level unlocks follow the backfilled xp: {unlocks:?}");
+        let drawing = courses.iter().find(|c| c.skill.as_deref() == Some("drawing")).ok_or_else(|| anyhow!("no drawing course"))?;
+        assert!(!unlocks.contains(&format!("trophy:{}", drawing.id)), "a course with a failed lesson gets no trophy");
+        let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_practice_attempts WHERE report_id = ANY($1)").bind(vec![kana.id, kanji.id, gesture.id]).fetch_one(&pool).await?;
+        assert_eq!(kept, 6, "the old attempts stay where they were");
+
+        let waiting = store.get_report(kana.id).await?.ok_or_else(|| anyhow!("no kana"))?;
+        assert_eq!(store.resend_practice(&waiting, a3).await.map(|a| a.id).unwrap_err().downcast::<Refusal>().ok(), Some(Refusal::NotWaiting));
+
+        sqlx::query("DELETE FROM world_events WHERE payload->>'owner_user_id' = $1 OR agent_id = $2").bind(owner.to_string()).bind(hana).execute(&pool).await?;
+        sqlx::query("DELETE FROM world_reports WHERE owner_user_id = $1").bind(owner).execute(&pool).await?;
+        sqlx::query("DELETE FROM world_items WHERE owner_user_id = $1").bind(owner).execute(&pool).await?;
+        sqlx::query("DELETE FROM agent_profiles WHERE owner_user_id = $1").bind(owner).execute(&pool).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn canvas_lessons_grade_into_the_academy() -> Result<()> {
+        let Ok(url) = std::env::var("PRACTICE_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string()[..10].to_string();
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email, name) VALUES ($1, 'Learner') RETURNING id").bind(format!("{tag}@lesson.test")).fetch_one(&pool).await?;
+        crate::orgs::join_default_for_tests(&pool, owner, None).await?;
+        let org = crate::orgs::DEFAULT_ORG;
+        let hana = agent(&store, owner, &tag, "hana").await?;
+        let vincent = agent(&store, owner, &tag, "vincent").await?;
+        let stranger: Uuid = sqlx::query_scalar("INSERT INTO users (email, name) VALUES ($1, 'Other') RETURNING id").bind(format!("{tag}-x@lesson.test")).fetch_one(&pool).await?;
+        crate::orgs::join_default_for_tests(&pool, stranger, None).await?;
+
+        let report = store.create_practice(owner, org, ReportActor::User(owner), "kanji", None, Some(hana), None).await?;
+        let lesson = store.get_item(report.challenge_id.ok_or_else(|| anyhow!("practice made no lesson"))?).await?.ok_or_else(|| anyhow!("no lesson"))?;
+        assert_eq!((lesson.kind.as_str(), lesson.data["type"].as_str(), lesson.data["report_id"].as_str()), ("challenge", Some("canvas"), Some(report.id.to_string().as_str())));
+        let course = store.get_item(academy::uuid_in(&lesson.data, "adventure_id").ok_or_else(|| anyhow!("no course"))?).await?.ok_or_else(|| anyhow!("no course"))?;
+        assert_eq!((course.name.as_str(), course.data["skill"].as_str(), course.data["challenges"].clone()), ("Kanji", Some("kanji"), json!([lesson.id])));
+        assert_eq!(store.coach_for(&lesson).await?, Some(hana));
+        let again = store.create_practice(owner, org, ReportActor::User(owner), "kanji", Some("Radicals"), None, None).await?;
+        let again_lesson = store.get_item(again.challenge_id.unwrap_or_default()).await?.ok_or_else(|| anyhow!("no second lesson"))?;
+        assert_eq!(academy::uuid_in(&again_lesson.data, "adventure_id"), Some(course.id), "the same subject shares one course");
+
+        let png: Uuid = sqlx::query_scalar("INSERT INTO world_uploads (mime, name, size, bytes, uploaded_by, org_id) VALUES ('image/png', 'a.png', 3, '\\x010203', $1, $2) RETURNING id")
+            .bind(owner)
+            .bind(org)
+            .fetch_one(&pool)
+            .await?;
+        let strokes = json!({ "width": 100, "height": 100, "strokes": [line(vec![point(10.0, 50.0, 0.0), point(90.0, 50.0, 200.0)])] });
+        let ready = || Ready { image_upload_id: png, strokes: strokes.clone(), note: None };
+        let first = store.practice_ready(&report, owner, ready()).await?;
+        let second = store.practice_ready(&report, owner, ready()).await?;
+        let status = |id: Uuid| {
+            let pool = pool.clone();
+            async move { sqlx::query_as::<_, (String, Option<String>)>("SELECT status, feedback FROM challenge_attempts WHERE id = $1").bind(id).fetch_one(&pool).await }
+        };
+        assert_eq!(status(first.id).await?, ("error".into(), Some("Replaced by attempt 2.".into())), "one pending attempt per lesson");
+        assert_eq!(status(second.id).await?.0, "pending");
+        assert_eq!(store.resend_practice(&report, first.id).await.map(|a| a.id).unwrap_err().downcast::<Refusal>().ok(), Some(Refusal::NotWaiting));
+
+        let hana_agent = store.get_agent(hana).await?.ok_or_else(|| anyhow!("no hana"))?;
+        let vincent_agent = store.get_agent(vincent).await?.ok_or_else(|| anyhow!("no vincent"))?;
+        let good = Check::new("Balanced", "Stroke 2 is short", "Write it five times", Some(75.0))?;
+        assert!(store.practice_check(&vincent_agent, second.id, good.clone(), None).await.unwrap_err().to_string().contains("another coach"));
+        let graded = store.practice_check(&hana_agent, second.id, good, None).await?;
+        assert_eq!((graded.grade_status.as_deref(), graded.grade_score, graded.xp_awarded), (Some("passed"), Some(75), Some(40)));
+        let body: String = sqlx::query_scalar("SELECT body FROM agent_messages WHERE id = $1").bind(graded.coach_message_id).fetch_one(&pool).await?;
+        assert!(body.contains("**Passed**, +40 xp"), "{body}");
+        let progress = store.progress(owner).await?;
+        assert_eq!((progress.xp, progress.skills["kanji"].as_i64(), progress.streak), (40, Some(40), 1));
+        let next: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_inbox WHERE agent_id = $1 AND kind = 'course.next'").bind(hana).fetch_one(&pool).await?;
+        assert_eq!(next, 0, "the course still has an open lesson");
+
+        let stale = store.practice_check(&hana_agent, first.id, Check::new("ok", "ok", "ok", Some(90.0))?, None).await?;
+        assert_eq!((stale.grade_status.as_deref(), stale.xp_awarded), (Some("error"), Some(0)), "a replaced attempt keeps its check but earns nothing");
+
+        let second_report = store.get_report(again.id).await?.ok_or_else(|| anyhow!("no radicals"))?;
+        let radical = store.practice_ready(&second_report, owner, ready()).await?;
+        let failed = store.practice_check(&hana_agent, radical.id, Check::new("ok", "ok", "ok", Some(30.0))?, None).await?;
+        assert_eq!((failed.grade_status.as_deref(), failed.xp_awarded), (Some("failed"), Some(0)));
+        let retry = store.practice_ready(&second_report, owner, ready()).await?;
+        store.practice_check(&hana_agent, retry.id, Check::new("ok", "ok", "ok", Some(30.0))?, Some(true)).await?;
+        let (kind, payload): (String, Value) = sqlx::query_as("SELECT kind, payload FROM agent_inbox WHERE agent_id = $1 AND kind = 'course.next'").bind(hana).fetch_one(&pool).await?;
+        assert_eq!((kind.as_str(), payload["title"].as_str(), payload["lessons"].as_i64()), ("course.next", Some("Kanji"), Some(2)));
+
+        let theirs = store.create_canvas_with(
+            NewReport { owner_user_id: stranger, by: ReportActor::User(stranger), title: "Theirs".into(), body: String::new(), folder: None, tags: vec![], visibility: Some("public".into()), pinned: false, task_id: None },
+            Canvas::default(),
+            None,
+        ).await?;
+        let lesson_args = |reading: Vec<String>| json!({ "title": "Stroke order", "type": "canvas", "skill": "kanji", "course": "Kanji", "reading": reading, "coach": format!("vincent-{tag}") });
+        assert!(store.create_challenge(owner, org, Some(hana), &lesson_args(vec![theirs.id.to_string()]), None).await.is_err(), "reading is only the owner's own reports");
+        let (made, _) = store.create_challenge(owner, org, Some(hana), &lesson_args(vec![format!("report:{}", report.id)]), None).await?;
+        assert_eq!((made.data["reading"].clone(), academy::uuid_in(&made.data, "coach_agent_id")), (json!([report.id]), Some(vincent)));
+        assert!(made.data["report_id"].is_string(), "a canvas lesson gets its canvas");
+        assert_eq!(store.get_item(course.id).await?.map(|c| c.data["challenges"].as_array().map(Vec::len)), Some(Some(3)));
+        assert!(store.edit_lesson(&made, &json!({ "type": "quiz", "choices": ["a"], "correct": [1] })).await.is_err(), "a lesson never leaves the canvas type");
+        let detail = store.challenge_detail(owner, Some(org), made.id).await?.ok_or_else(|| anyhow!("no detail"))?;
+        assert_eq!((detail.reading.len(), detail.coach.map(|c| c.id)), (1, Some(vincent)));
+        assert!(store.challenge_cards(stranger, Some(org)).await?.is_empty(), "lessons are private to their person");
+
+        let lessons_now = store.get_item(course.id).await?.map(|c| c.data["challenges"].clone()).unwrap_or_default();
+        assert!(store.create_challenge(owner, org, Some(hana), &json!({ "title": "[[ ]]", "type": "canvas", "skill": "kanji", "course": "Kanji" }), None).await.is_err(), "a title no canvas can take fails");
+        assert_eq!(store.get_item(course.id).await?.map(|c| c.data["challenges"].clone()).unwrap_or_default(), lessons_now, "the half-made lesson leaves the course");
+        let stray: Vec<String> = sqlx::query_scalar("SELECT status FROM world_items WHERE owner_user_id = $1 AND kind = 'challenge' AND name = '[[ ]]'").bind(owner).fetch_all(&pool).await?;
+        assert_eq!(stray, vec!["archived".to_string()]);
+
+        let made_report = store.get_report(made.data["report_id"].as_str().unwrap_or_default().parse()?).await?.ok_or_else(|| anyhow!("no stroke order canvas"))?;
+        let imported: Uuid = sqlx::query_scalar(
+            "INSERT INTO world_practice_attempts (report_id, user_id, subject, coach_agent_id, n, strokes) VALUES ($1, $2, 'kanji', $3, 1, '{\"width\":10,\"height\":10,\"strokes\":[]}') RETURNING id",
+        )
+        .bind(made_report.id)
+        .bind(owner)
+        .bind(vincent)
+        .fetch_one(&pool)
+        .await?;
+        let earned = store.practice_check(&vincent_agent, imported, Check::new("ok", "ok", "ok", Some(85.0))?, None).await?;
+        assert_eq!((earned.grade_status.as_deref(), earned.xp_awarded), (Some("passed"), Some(40)), "an attempt with no ledger row still earns its xp");
+
+        let (title, fresh) = store.edit_lesson(&made, &json!({ "title": "Brush strokes", "skill": "calligraphy", "coach": format!("hana-{tag}") })).await?.ok_or_else(|| anyhow!("nothing edited"))?;
+        assert_eq!(title, "Brush strokes");
+        let synced = store.get_report(made_report.id).await?.ok_or_else(|| anyhow!("canvas gone"))?;
+        assert_eq!((synced.title.as_str(), Practice::of(&synced)), ("Brush strokes", Some(Practice { subject: "calligraphy".into(), coach_agent_id: Some(hana) })));
+        let moved_to = store.get_item(academy::uuid_in(&fresh, "adventure_id").ok_or_else(|| anyhow!("no course"))?).await?.ok_or_else(|| anyhow!("no course"))?;
+        assert_eq!(moved_to.data["skill"].as_str(), Some("calligraphy"), "a skill change moves the lesson to that skill's course");
+
+        let travel = store.create_course(owner, org, Some(hana), &json!({ "title": "Travel Japanese", "coach": format!("vincent-{tag}") }), None).await?;
+        let (phrase, _) = store.create_challenge(owner, org, Some(hana), &json!({ "title": "Station signs", "type": "canvas", "skill": "kana", "course": "Travel Japanese" }), None).await?;
+        let phrase_report = phrase.data["report_id"].as_str().unwrap_or_default().parse::<Uuid>()?;
+        let coach_of = |id: Uuid| {
+            let store = store.clone();
+            async move { Ok::<_, anyhow::Error>(store.get_report(id).await?.and_then(|r| Practice::of(&r)).and_then(|p| p.coach_agent_id)) }
+        };
+        assert_eq!(coach_of(phrase_report).await?, Some(vincent), "the canvas takes the course coach");
+        let (_, kept) = store.edit_lesson(&phrase, &json!({ "title": "Station signs, day two", "skill": "kanji" })).await?.ok_or_else(|| anyhow!("nothing edited"))?;
+        assert_eq!(coach_of(phrase_report).await?, Some(vincent), "an edit that does not name a coach keeps the canvas coach");
+        assert_eq!(academy::uuid_in(&kept, "adventure_id"), Some(travel.id), "a skill change leaves a course the person made alone");
+        assert_eq!(store.get_report(phrase_report).await?.and_then(|r| Practice::of(&r)).map(|p| p.subject), Some("kanji".to_string()));
+
+        sqlx::query("UPDATE world_items SET status = 'archived' WHERE id = $1").bind(made.id).execute(&pool).await?;
+        assert_eq!(store.practice_ready(&synced, owner, ready()).await.unwrap_err().to_string(), LESSON_REMOVED);
+
+        store.delete_report(again.id, ReportActor::User(owner)).await?;
+        assert_eq!(store.get_item(again_lesson.id).await?.map(|i| i.status), Some("archived".into()), "deleting a lesson's canvas archives the lesson");
+
+        sqlx::query("DELETE FROM world_events WHERE payload->>'owner_user_id' = $1 OR agent_id = ANY($2)").bind(owner.to_string()).bind(vec![hana, vincent]).execute(&pool).await?;
+        sqlx::query("DELETE FROM world_reports WHERE owner_user_id = ANY($1)").bind(vec![owner, stranger]).execute(&pool).await?;
+        sqlx::query("DELETE FROM world_items WHERE owner_user_id = $1").bind(owner).execute(&pool).await?;
+        sqlx::query("DELETE FROM agent_profiles WHERE owner_user_id = $1").bind(owner).execute(&pool).await?;
+        sqlx::query("DELETE FROM world_uploads WHERE id = $1").bind(png).execute(&pool).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn practice_this_makes_one_lesson_per_report_and_renames_stay_in_sync() -> Result<()> {
+        let Ok(url) = std::env::var("PRACTICE_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string()[..10].to_string();
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email, name) VALUES ($1, 'Reader') RETURNING id").bind(format!("{tag}@this.test")).fetch_one(&pool).await?;
+        crate::orgs::join_default_for_tests(&pool, owner, None).await?;
+        let org = crate::orgs::DEFAULT_ORG;
+        let stranger: Uuid = sqlx::query_scalar("INSERT INTO users (email, name) VALUES ($1, 'Other') RETURNING id").bind(format!("{tag}-x@this.test")).fetch_one(&pool).await?;
+        crate::orgs::join_default_for_tests(&pool, stranger, None).await?;
+        let new = |title: &str, tags: Vec<String>| NewReport {
+            owner_user_id: owner,
+            by: ReportActor::User(owner),
+            title: title.into(),
+            body: "Raft elects a leader, then replicates a log.".into(),
+            folder: Some("Notes".into()),
+            tags,
+            visibility: None,
+            pinned: false,
+            task_id: None,
+        };
+
+        let doc = store.create_report(new("Raft in a page", vec!["distributed-systems".into()])).await?;
+        let (lesson, created) = store.practice_this(owner, org, doc.id).await?;
+        assert!(created);
+        assert_eq!((lesson.data["type"].as_str(), lesson.data["skill"].as_str()), (Some("reading"), Some("distributed-systems")));
+        assert_eq!((lesson.data["reading"].clone(), lesson.data["source_report"].as_str()), (json!([doc.id]), Some(doc.id.to_string().as_str())));
+        assert!(lesson.data["rubric"].is_string() && academy::uuid_in(&lesson.data, "adventure_id").is_some());
+        let (again, created_again) = store.practice_this(owner, org, doc.id).await?;
+        assert_eq!((again.id, created_again), (lesson.id, false), "practising the same report opens its lesson");
+        assert!(store.practice_this(stranger, org, doc.id).await.is_err(), "only the owner practises a report");
+        let excerpts = store.reading_excerpts(owner, &lesson).await?;
+        assert_eq!(excerpts, vec![("Raft in a page".to_string(), "Raft elects a leader, then replicates a log.".to_string())]);
+
+        let board = store.create_canvas_with(new("Hiragana chart", vec![]), Canvas::default(), None).await?;
+        let (drawn, _) = store.practice_this(owner, org, board.id).await?;
+        let pad = academy::uuid_in(&drawn.data, "report_id").ok_or_else(|| anyhow!("no practice canvas"))?;
+        assert_ne!(pad, board.id, "the source canvas stays as reading, practice gets its own pad");
+        assert_eq!((drawn.data["type"].as_str(), drawn.data["reading"].clone()), (Some("canvas"), json!([board.id])));
+        assert_eq!(store.practice_this(owner, org, board.id).await?.0.id, drawn.id);
+
+        let practice = store.create_practice(owner, org, ReportActor::User(owner), "kanji", Some("Numbers"), None, None).await?;
+        let (own, made) = store.practice_this(owner, org, practice.id).await?;
+        assert_eq!((Some(own.id), made), (practice.challenge_id, false), "a practice canvas already is its lesson");
+
+        let renamed = store.update_report(pad, ReportActor::User(owner), &ReportPatch { title: Some("Hiragana from memory".into()), ..Default::default() }).await?.ok_or_else(|| anyhow!("no pad"))?;
+        assert_eq!(renamed.title, "Hiragana from memory");
+        assert_eq!(store.get_item(drawn.id).await?.map(|i| i.name), Some("Hiragana from memory".to_string()), "renaming the canvas renames its lesson");
+        let current = store.get_item(drawn.id).await?.ok_or_else(|| anyhow!("no lesson"))?;
+        let (title, _) = store.edit_lesson(&current, &json!({ "title": "Kana drills" })).await?.ok_or_else(|| anyhow!("nothing edited"))?;
+        assert_eq!(title, "Kana drills");
+        assert_eq!(store.get_report(pad).await?.map(|r| r.title), Some("Kana drills".to_string()), "renaming the lesson renames its canvas");
+        assert_eq!(store.get_item(drawn.id).await?.map(|i| i.name), Some("Kana drills".to_string()));
+
+        let linked = store.get_report(practice.id).await?.ok_or_else(|| anyhow!("no practice"))?;
+        assert_eq!(store.live_lesson(&linked).await?, Some(own.id));
+        store.update_item(own.id, None, None, Some("archived")).await?;
+        let removed = store.get_report(practice.id).await?.ok_or_else(|| anyhow!("no practice"))?;
+        assert_eq!(store.live_lesson(&removed).await?, None, "a removed lesson is no lesson for its canvas");
+        assert_eq!(store.practice_this(owner, org, practice.id).await.unwrap_err().to_string(), LESSON_REMOVED, "a removed lesson is never reopened");
+        store.update_item(drawn.id, None, None, Some("archived")).await?;
+        let pad_report = store.get_report(pad).await?.ok_or_else(|| anyhow!("no pad"))?;
+        assert_eq!(store.live_lesson(&pad_report).await?, None);
+        let (fresh, made_fresh) = store.practice_this(owner, org, board.id).await?;
+        assert!(made_fresh && fresh.id != drawn.id && fresh.status != "archived", "practising a source again after its lesson was removed makes a new lesson");
+
+        sqlx::query("DELETE FROM world_events WHERE payload->>'owner_user_id' = $1").bind(owner.to_string()).execute(&pool).await?;
+        sqlx::query("DELETE FROM world_reports WHERE owner_user_id = $1").bind(owner).execute(&pool).await?;
+        sqlx::query("DELETE FROM world_items WHERE owner_user_id = $1").bind(owner).execute(&pool).await?;
         Ok(())
     }
 }

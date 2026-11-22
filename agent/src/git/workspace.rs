@@ -393,6 +393,15 @@ pub enum Signing {
     Unset,
 }
 
+fn config_values(list: &str) -> std::collections::HashMap<String, String> {
+    let mut values = std::collections::HashMap::new();
+    for entry in list.split('\0').filter(|entry| !entry.is_empty()) {
+        let (name, value) = entry.split_once('\n').unwrap_or((entry, "true"));
+        values.insert(name.to_ascii_lowercase(), value.to_string());
+    }
+    values
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GitSigning {
     pub key: String,
@@ -403,11 +412,7 @@ pub struct GitSigning {
 
 impl GitSigning {
     pub fn from_config_list(list: &str) -> Self {
-        let mut values: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        for entry in list.split('\0').filter(|entry| !entry.is_empty()) {
-            let (name, value) = entry.split_once('\n').unwrap_or((entry, "true"));
-            values.insert(name.to_ascii_lowercase(), value.to_string());
-        }
+        let values = config_values(list);
         let get = |name: &str| values.get(name).map(|value| value.trim().to_string()).unwrap_or_default();
         let format = match get("gpg.format").to_ascii_lowercase().as_str() {
             "" => "openpgp".to_string(),
@@ -479,6 +484,63 @@ pub fn loka_key_config(key: &Path) -> [(&'static str, String); 3] {
         ("user.signingkey", key.display().to_string()),
         ("commit.gpgsign", "true".to_string()),
     ]
+}
+
+const PINNED_SIGNING_KEYS: [(&str, &str); 4] = [
+    ("gpg.format", "gpg.format"),
+    ("user.signingkey", "user.signingKey"),
+    ("commit.gpgsign", "commit.gpgSign"),
+    ("gpg.ssh.allowedsignersfile", "gpg.ssh.allowedSignersFile"),
+];
+
+pub fn signing_pins(list: &str, home: Option<&Path>, path: Option<&std::ffi::OsStr>) -> Vec<(String, String)> {
+    match signing_choice(&GitSigning::from_config_list(list), home, path) {
+        Signing::Unset => Vec::new(),
+        Signing::Loka(key) => loka_key_config(&key).into_iter().map(|(name, value)| (name.to_string(), value)).collect(),
+        Signing::Configured => {
+            let values = config_values(list);
+            PINNED_SIGNING_KEYS
+                .iter()
+                .filter_map(|(lookup, name)| Some((name.to_string(), values.get(*lookup).filter(|value| !value.trim().is_empty())?.clone())))
+                .collect()
+        }
+    }
+}
+
+fn split_by_scope(scoped: &str) -> (String, String) {
+    let (mut inherited, mut repo_level) = (String::new(), String::new());
+    let mut parts = scoped.split('\0');
+    while let (Some(scope), Some(entry)) = (parts.next(), parts.next()) {
+        let target = if matches!(scope, "local" | "worktree") { &mut repo_level } else { &mut inherited };
+        target.push_str(entry);
+        target.push('\0');
+    }
+    (inherited, repo_level)
+}
+
+pub async fn pin_signing(worktree_path: &Path) {
+    if crate::cli::job_user().is_some() {
+        return;
+    }
+    if let Err(error) = pin_signing_with_home(worktree_path, std::env::var_os("HOME").map(PathBuf::from).as_deref()).await {
+        warn!(worktree = %worktree_path.display(), %error, "could not write the signing settings into the quest worktree");
+    }
+}
+
+async fn pin_signing_with_home(worktree_path: &Path, home: Option<&Path>) -> Result<()> {
+    let scoped = run_git_checked_output(worktree_path, &["config", "--list", "-z", "--show-scope"]).await?;
+    let (inherited, repo_level) = split_by_scope(&scoped);
+    let pins = signing_pins(&inherited, home, std::env::var_os("PATH").as_deref());
+    if pins.is_empty() {
+        return Ok(());
+    }
+    if config_values(&repo_level).get("extensions.worktreeconfig").map(|value| value.as_str()) != Some("true") {
+        run_git(worktree_path, &["config", "--local", "extensions.worktreeConfig", "true"]).await?;
+    }
+    for (name, value) in &pins {
+        run_git(worktree_path, &["config", "--worktree", name, value]).await?;
+    }
+    Ok(())
 }
 
 fn command_env(command: &std::process::Command, name: &str) -> Option<std::ffi::OsString> {
@@ -608,6 +670,61 @@ fn signing_view_of(git: &GitSigning, home: Option<&Path>, path: Option<&std::ffi
 }
 
 const SIGNING_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+pub struct PublishCommit {
+    api: bool,
+    leftover: Option<String>,
+}
+
+pub struct PublishTarget<'a> {
+    pub repo: &'a str,
+    pub base: &'a str,
+    pub onto: &'a str,
+    pub quest_branch: &'a str,
+}
+
+pub async fn commit_for_publish(worktree_path: &Path, repo: &str, message: &str) -> Result<PublishCommit> {
+    if !super::api_commits::available(worktree_path, repo).await {
+        commit_signed(worktree_path, message).await?;
+        return Ok(PublishCommit { api: false, leftover: None });
+    }
+    let leftover = commit_unsigned(worktree_path, message).await?.then(|| message.to_string());
+    Ok(PublishCommit { api: true, leftover })
+}
+
+async fn commit_unsigned(worktree_path: &Path, message: &str) -> Result<bool> {
+    let status = pending_changes(worktree_path, "--untracked-files=all").await?;
+    if status.trim().is_empty() {
+        return Ok(false);
+    }
+    stage_all(worktree_path).await?;
+    if let Err(error) = run_git(worktree_path, &["-c", "commit.gpgsign=false", "commit", "-m", &without_coauthors(message)]).await {
+        unstage(worktree_path).await?;
+        return Err(error);
+    }
+    Ok(true)
+}
+
+pub async fn publish_commits(worktree_path: &Path, committed: &PublishCommit, target: &PublishTarget<'_>, branch: &str) -> Result<()> {
+    if !is_quest_branch(branch, target.quest_branch) {
+        bail!("Publish refused to push to {branch}: a quest only pushes its own branch ({}). Its pull request opens from that branch instead.", target.quest_branch);
+    }
+    if committed.api {
+        match super::api_commits::replay(worktree_path, target.repo, target.onto, branch, target.quest_branch).await {
+            Ok(super::api_commits::Replay::Published { .. }) => return Ok(()),
+            Ok(super::api_commits::Replay::Unsupported(reason)) => {
+                info!(branch, "Publishing with a signed push instead of the GitHub API: {reason}");
+            }
+            Err(error) => warn!(branch, "Publishing through the GitHub API failed, using a signed push instead: {error:#}"),
+        }
+        if let Some(message) = &committed.leftover {
+            undo_head_commit(worktree_path).await?;
+            commit_signed(worktree_path, message).await?;
+        }
+    }
+    ensure_signed_commits(worktree_path, target.base).await?;
+    push_quest_branch(worktree_path, branch, target.quest_branch).await
+}
 
 pub async fn commit_signed(worktree_path: &Path, message: &str) -> Result<bool> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -784,7 +901,7 @@ async fn fetched_stack_parent_over(
     Some(parent.to_string())
 }
 
-fn without_coauthors(message: &str) -> String {
+pub(super) fn without_coauthors(message: &str) -> String {
     message
         .lines()
         .filter(|line| !line.trim_start().to_ascii_lowercase().starts_with("co-authored-by:"))
@@ -1213,7 +1330,7 @@ pub async fn ensure_agents_md_symlink(repo_path: &Path) {
     }
 }
 
-async fn run_git(dir: &Path, args: &[&str]) -> Result<()> {
+pub(super) async fn run_git(dir: &Path, args: &[&str]) -> Result<()> {
     let output = workspace_command("git", dir)
         .await
         .args(args)
@@ -1241,7 +1358,7 @@ async fn run_git_output(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-async fn run_git_checked_output(dir: &Path, args: &[&str]) -> Result<String> {
+pub(super) async fn run_git_checked_output(dir: &Path, args: &[&str]) -> Result<String> {
     let output = workspace_command("git", dir)
         .await
         .args(args)
@@ -1845,6 +1962,119 @@ mod tests {
         (0..count).map(|i| (env[&format!("GIT_CONFIG_KEY_{i}")].clone(), env[&format!("GIT_CONFIG_VALUE_{i}")].clone())).collect()
     }
 
+    #[test]
+    fn signing_pins_copy_the_configured_settings_or_the_loka_key() {
+        let configured = "gpg.format\nssh\0user.signingkey\n~/.ssh/loka_signing.pub\0commit.gpgsign\ntrue\0gpg.ssh.allowedsignersfile\n/s/allowed\0user.name\nT\0";
+        let pins = signing_pins(configured, None, None);
+        let names: Vec<&str> = pins.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["gpg.format", "user.signingKey", "commit.gpgSign", "gpg.ssh.allowedSignersFile"]);
+        assert_eq!(pins[1].1, "~/.ssh/loka_signing.pub");
+        assert_eq!(pins[3].1, "/s/allowed");
+
+        let key_only = signing_pins("user.signingkey\n/k.pub\0", None, None);
+        assert_eq!(key_only, [("user.signingKey".to_string(), "/k.pub".to_string())]);
+
+        assert!(signing_pins("user.name\nT\0", None, None).is_empty(), "nothing configured and no Loka key means nothing is written");
+
+        let home = std::env::temp_dir().join(format!("loka-pins-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(home.join(LOKA_SIGNING_KEY), "key").unwrap();
+        let loka = signing_pins("user.name\nT\0", Some(&home), None);
+        std::fs::remove_dir_all(&home).ok();
+        assert_eq!(
+            loka,
+            [
+                ("gpg.format".to_string(), "ssh".to_string()),
+                ("user.signingkey".to_string(), home.join(LOKA_SIGNING_KEY).display().to_string()),
+                ("commit.gpgsign".to_string(), "true".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn scopes_split_into_inherited_and_repo_level_settings() {
+        let scoped = "global\0gpg.format\nssh\0worktree\0gpg.format\nopenpgp\0local\0extensions.worktreeconfig\ntrue\0command\0safe.directory\n*\0";
+        let (inherited, repo_level) = split_by_scope(scoped);
+        assert_eq!(inherited, "gpg.format\nssh\0safe.directory\n*\0");
+        assert_eq!(repo_level, "gpg.format\nopenpgp\0extensions.worktreeconfig\ntrue\0");
+    }
+
+    #[tokio::test]
+    async fn quest_worktrees_sign_without_the_global_git_config() -> Result<()> {
+        let _guard = env_lock().await;
+        let _restore = EnvRestore::stash(&["HOME", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"]);
+        let base = temp_path("loka-pin");
+        let home = base.join("home");
+        tokio::fs::create_dir_all(home.join(".ssh")).await?;
+        let key = home.join(".ssh/loka_signing");
+        ssh_key(&key).await?;
+        let public = format!("{}.pub", key.display());
+        let signers = base.join("allowed_signers");
+        tokio::fs::write(&signers, "").await?;
+        let global = base.join("gitconfig");
+        tokio::fs::write(
+            &global,
+            format!(
+                "[user]\n\tname = T\n\temail = t@example.com\n[gpg]\n\tformat = ssh\n[gpg \"ssh\"]\n\tallowedSignersFile = {}\n[user]\n\tsigningkey = {public}\n[commit]\n\tgpgsign = true\n",
+                signers.display()
+            ),
+        )
+        .await?;
+        std::env::set_var("HOME", &home);
+        std::env::set_var("GIT_CONFIG_GLOBAL", &global);
+        std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+
+        let main = base.join("main");
+        tokio::fs::create_dir_all(&main).await?;
+        run_git(&main, &["init", "--initial-branch=main"]).await?;
+        tokio::fs::write(main.join("base"), "base").await?;
+        run_git(&main, &["add", "base"]).await?;
+        run_git(&main, &["commit", "-q", "-m", "base"]).await?;
+        let quest = base.join("quest");
+        run_git(&main, &["worktree", "add", "-b", "quest", &quest.to_string_lossy()]).await?;
+        let sibling = base.join("sibling");
+        run_git(&main, &["worktree", "add", "-b", "sibling", &sibling.to_string_lossy()]).await?;
+
+        pin_signing_with_home(&quest, Some(&home)).await?;
+        pin_signing_with_home(&quest, Some(&home)).await?;
+
+        let without_global = |dir: &Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env_remove("GIT_CONFIG_GLOBAL")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("HOME", base.join("empty-home"))
+                .env("GIT_AUTHOR_NAME", "T")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "T")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap()
+        };
+        let worktree_config = without_global(&quest, &["config", "--worktree", "--list"]);
+        let text = String::from_utf8_lossy(&worktree_config.stdout).to_lowercase();
+        assert!(text.contains("gpg.format=ssh") && text.contains("commit.gpgsign=true"), "{text}");
+        assert!(text.contains(&format!("user.signingkey={}", public.to_lowercase())), "{text}");
+        assert!(text.contains("gpg.ssh.allowedsignersfile"), "{text}");
+        assert_eq!(text.matches("gpg.format").count(), 1, "pinning twice must not duplicate entries: {text}");
+
+        tokio::fs::write(quest.join("work"), "work").await?;
+        assert!(without_global(&quest, &["add", "work"]).status.success());
+        let committed = without_global(&quest, &["commit", "-q", "-m", "feat: work"]);
+        assert!(committed.status.success(), "{}", String::from_utf8_lossy(&committed.stderr));
+        let commit = without_global(&quest, &["cat-file", "commit", "HEAD"]);
+        assert!(has_signature(&String::from_utf8_lossy(&commit.stdout)), "a commit made with GIT_CONFIG_GLOBAL unset must stay signed");
+
+        let sibling_config = without_global(&sibling, &["config", "--get", "commit.gpgsign"]);
+        assert!(!sibling_config.status.success(), "other worktrees of the repo are not touched");
+        let shared = std::fs::read_to_string(main.join(".git/config"))?;
+        assert!(!shared.contains("signingkey"), "the shared config never receives the signing settings:\n{shared}");
+        std::fs::remove_dir_all(&base).ok();
+        Ok(())
+    }
+
     #[tokio::test]
     async fn sessions_get_the_loka_key_only_when_nothing_else_is_configured() -> Result<()> {
         let repo = test_repo().await?;
@@ -2108,6 +2338,23 @@ mod tests {
             bail!("git for-each-ref failed: {}", String::from_utf8_lossy(&output.stderr));
         }
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    #[tokio::test]
+    async fn leftovers_for_the_api_path_are_committed_without_a_signature() -> Result<()> {
+        let repo = test_repo().await?;
+        run_git(&repo.0, &["config", "commit.gpgsign", "true"]).await?;
+        run_git(&repo.0, &["config", "gpg.format", "ssh"]).await?;
+        run_git(&repo.0, &["config", "user.signingkey", "/nonexistent/key"]).await?;
+        assert!(!commit_unsigned(&repo.0, "feat: nothing").await?);
+        tokio::fs::write(repo.0.join("leftover"), "work").await?;
+        assert!(commit_unsigned(&repo.0, "feat: work\n\nCo-Authored-By: A <a@b>").await?);
+        assert!(!commit_is_signed(&repo.0, "HEAD").await?);
+        let message = run_git_checked_output(&repo.0, &["log", "-1", "--format=%B"]).await?;
+        assert!(!message.contains("Co-Authored-By"), "{message}");
+        undo_head_commit(&repo.0).await?;
+        assert!(pending_changes(&repo.0, "--untracked-files=all").await?.contains("leftover"));
+        Ok(())
     }
 
     #[tokio::test]

@@ -1,14 +1,28 @@
 import { decode, encode } from "@msgpack/msgpack";
 import { holdMusic } from "./music";
 import { holdSounds } from "./sounds";
-import { CallTurns, CallUtterances, RESERVATION_MS, ReplyWait, UTTERANCE_SETTLE_MS } from "@/lib/call-turns";
+import {
+  BargeGuard,
+  CallTurns,
+  CallUtterances,
+  ClientTurns,
+  RESERVATION_MS,
+  ReplyWait,
+  SESSION_WAIT_MS,
+  UTTERANCE_SETTLE_MS,
+  serverTurnsApplied,
+  sessionFallback,
+  spokenUpdate,
+  type CallEvent,
+  type SessionStep,
+} from "@/lib/call-turns";
 
 export type LivePhase = "connecting" | "listening" | "hearing" | "thinking" | "speaking";
 
 export type LiveHandlers = {
   onPhase: (phase: LivePhase) => void;
   onCaption: (key: string, who: "you" | "them", text: string, partial?: boolean) => void;
-  onError: (message: string) => void;
+  onError: (message: string | null) => void;
   onEnd: () => void;
 };
 
@@ -22,6 +36,12 @@ export type LiveCall = {
 };
 
 export class LiveUnavailable extends Error {}
+
+const SOUND_BLOCKED = "This device is not playing the call's sound. Click anywhere in Loka to turn it on, and check your speaker or headphones.";
+
+const DUCKED_GAIN = 0.15;
+
+const CLIENT_BARGE_MS = 600;
 
 let primed: AudioContext | null = null;
 
@@ -109,13 +129,16 @@ async function fetchGreeting(base: string): Promise<Greeting | null> {
   return { text, rate, pcm: new Int16Array(bytes.buffer, 0, bytes.length >> 1) };
 }
 
-export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveCall> {
-  const base = `/api/world/agents/${agentId}/voice`;
+export async function startLive(agentId: string, h: LiveHandlers, quickId: string | null = null): Promise<LiveCall> {
+  const base = quickId ? `/api/world/quick/${quickId}/voice` : `/api/world/agents/${agentId}/voice`;
   const pendingGreeting = fetchGreeting(base);
   const greeting = await Promise.race([pendingGreeting, new Promise<null>((resolve) => window.setTimeout(() => resolve(null), 900))]);
   const res = await post(greeting ? `${base}?greeted=true` : base);
   if (res.status === 503) throw new LiveUnavailable("Live voice is not set up on this server.");
-  if (!res.ok) throw new Error(`Could not start live voice (${res.status}).`);
+  if (!res.ok) {
+    const refusal = quickId ? ((await res.json().catch(() => null)) as { error?: string } | null)?.error : null;
+    throw new Error(refusal || `Could not start live voice (${res.status}).`);
+  }
   const cfg = (await res.json()) as Session;
   const rate = cfg.sample_rate || 24000;
   const callId = crypto.randomUUID();
@@ -173,7 +196,36 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
   let lastHeardAt = 0;
   let dropAudio = false;
   let sessionSent: Record<string, unknown> = cfg.session;
-  let sessionRetried = false;
+  const sessionTried = new Set<SessionStep>();
+  let refused = "";
+  let appliedSilence: number | null = null;
+  let appliedVoice = "";
+  const guard = new BargeGuard();
+  let speechStarts = 0;
+  let commits = 0;
+  let bargeIns = 0;
+  let audioChunks = 0;
+  let droppedChunks = 0;
+  let audioState = "";
+  let soundBlocked = false;
+  let soundTimer = 0;
+  let sessionSettled = false;
+  let sessionTimer = 0;
+  let clientTurns: ClientTurns<string> | null = null;
+  let clientCommits = 0;
+  let turnsChecked = false;
+  let switchPending = false;
+  let expectedCommits = 0;
+  let pendingCreate = false;
+  let createTimer = 0;
+  let clientDropped = "";
+  let switchTimer = 0;
+  const serverDetection = cfg.session.turn_detection ?? null;
+  let shown: string | null = null;
+  const report = (message: string | null) => {
+    shown = message;
+    h.onError(message);
+  };
   let configured = false;
   let flushTimer = 0;
   let flushDue = 0;
@@ -268,6 +320,8 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
       context: request || end ? context() : undefined,
       end,
       seconds: end ? elapsed() : undefined,
+      client: end ? ("__TAURI_INTERNALS__" in window ? "desktop" : "web") : undefined,
+      diagnostics: end ? diagnostics() : undefined,
     });
     for (let attempt = 0; attempt < (end ? 4 : 1); attempt++) {
       if (attempt) await new Promise((resolve) => window.setTimeout(resolve, 600 * attempt));
@@ -279,9 +333,27 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
       }
       if (r && r.status >= 400 && r.status < 500 && r.status !== 429) break;
     }
-    if (end) h.onError("Part of this call could not be saved to the chat.");
+    if (end) report("Part of this call could not be saved to the chat.");
     else if (lines.length) schedule(3000);
   };
+  const diagnostics = () => ({
+    configured,
+    transcribing,
+    refused: refused || undefined,
+    silence_ms: appliedSilence,
+    voice: appliedVoice || str(sessionSent.voice) || undefined,
+    speech_started: speechStarts,
+    commits,
+    barge_ins: bargeIns,
+    ...guard.stats(),
+    audio_chunks: audioChunks,
+    dropped_chunks: droppedChunks,
+    audio_state: audioState || undefined,
+    sound_blocked: soundBlocked,
+    turns: clientTurns ? "client" : "server",
+    client_commits: clientCommits,
+    client_dropped: clientDropped || undefined,
+  });
   const flush = (end: boolean, request?: string) => {
     const next = saving.then(() => save(end, request));
     saving = next.catch(() => undefined);
@@ -305,9 +377,43 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
     sources.clear();
     playhead = ctx.currentTime;
   };
+  const soundBack = () => {
+    window.removeEventListener("pointerdown", unblock, true);
+    window.removeEventListener("keydown", unblock, true);
+    if (!closed && shown === SOUND_BLOCKED) report(null);
+  };
+  const unblock = () => {
+    void ctx
+      .resume()
+      .then(() => {
+        if (ctx.state === "running") soundBack();
+      })
+      .catch(() => undefined);
+  };
+  const ensureSound = () => {
+    audioState = ctx.state;
+    if (closed || ctx.state === "running") return;
+    void ctx.resume().catch(() => undefined);
+    if (soundTimer) return;
+    soundTimer = window.setTimeout(() => {
+      soundTimer = 0;
+      if (closed || ctx.state === "running") return;
+      soundBlocked = true;
+      report(SOUND_BLOCKED);
+      window.addEventListener("pointerdown", unblock, true);
+      window.addEventListener("keydown", unblock, true);
+    }, 1500);
+  };
+  ctx.onstatechange = () => {
+    if (closed) return;
+    if (ctx.state === "running") soundBack();
+    else ensureSound();
+  };
+  const setGain = (value: number) => out.gain.setTargetAtTime(value, ctx.currentTime, 0.03);
   const play = (b64: string) => {
     const pcm = fromBase64(b64);
     if (!pcm.length) return;
+    ensureSound();
     const buf = ctx.createBuffer(1, pcm.length, rate);
     const ch = buf.getChannelData(0);
     for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
@@ -327,8 +433,10 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
   };
 
   const bargeIn = () => {
+    bargeIns++;
     replyWait.interrupted();
     stopPlayback();
+    setGain(1);
     if (responding) {
       dropAudio = true;
       send({ type: "response.cancel" });
@@ -350,13 +458,11 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
   };
 
   const sendUpdates = () => {
-    if (responding || openCalls || !updates.length) return;
+    if (responding || openCalls || clientTurns?.isOpen() || !updates.length) return;
     for (const text of updates.splice(0, updates.length)) {
       send({ type: "conversation.item.create", item: { type: "message", role: "user", content: [{ type: "input_text", text: `[update from your full self] ${text}` }] } });
     }
-    send({ type: "response.create" });
-    responding = true;
-    settle();
+    requestResponse();
   };
 
   const runTool = async (name: string, callIdOf: string, args: string) => {
@@ -386,41 +492,73 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
     }
     send({ type: "conversation.item.create", item: { type: "function_call_output", call_id: callIdOf, output } });
     openCalls--;
-    if (!openCalls) {
-      send({ type: "response.create" });
-      responding = true;
-    }
+    if (!openCalls) requestResponse();
     settle();
   };
 
   const onEvent = (ev: Event) => {
     const type = str(ev.type);
     if (type === "x-fal-error") {
-      if (ev.error !== "TIMEOUT") h.onError(`${str(ev.error)} ${str(ev.reason)}`.trim());
+      if (ev.error !== "TIMEOUT") report(`${str(ev.error)} ${str(ev.reason)}`.trim());
       return;
     }
     if (type === "error") {
       if (closed) return;
-      if (!configured && !sessionRetried && JSON.stringify(sessionSent).includes("transcription")) {
-        sessionRetried = true;
-        const audio = { ...((sessionSent.audio ?? {}) as Record<string, unknown>) };
-        audio.input = { ...((audio.input ?? {}) as Record<string, unknown>), transcription: undefined };
-        transcribing = false;
-        sessionSent = { ...sessionSent, audio: JSON.parse(JSON.stringify(audio)) };
-        send({ type: "session.update", session: sessionSent });
+      const err = (ev.error ?? {}) as Record<string, unknown>;
+      const message = str(err.message) || str(ev.message);
+      if (!sessionSettled) {
+        const next = sessionFallback(sessionSent, message, sessionTried);
+        if (next) {
+          sessionTried.add(next.dropped);
+          refused = [refused, `${next.dropped}: ${message}`.slice(0, 200)].filter(Boolean).join("; ");
+          if (next.dropped === "transcription") transcribing = false;
+          if (next.dropped === "turns") useClientTurns();
+          sessionSent = next.session;
+          send({ type: "session.update", session: sessionSent });
+          awaitSession();
+          return;
+        }
+        settleSession();
+        report(`The voice service refused this call's settings, so it may answer before you finish. ${message}`.trim());
         return;
       }
-      const err = (ev.error ?? {}) as Record<string, unknown>;
-      h.onError(str(err.message) || str(ev.message) || "The voice service reported an error.");
+      if (clientTurns && /buffer/i.test(message)) {
+        if (/commit/i.test(message) && expectedCommits > 0) expectedCommits--;
+        return;
+      }
+      if (switchPending) {
+        endSwitch();
+        dropClientTurns(`refused: ${message}`.slice(0, 200), false);
+        return;
+      }
+      report(message || "The voice service reported an error.");
       return;
     }
     if (type === "session.updated") {
       configured = true;
-      if (!transcribing) h.onError("This call cannot write down what you say, so only the agent's side will show in the chat.");
-      begin();
+      if (switchPending && sessionSettled) {
+        endSwitch();
+        return;
+      }
+      if (!turnsChecked) {
+        turnsChecked = true;
+        const applied = (ev.session ?? {}) as Record<string, unknown>;
+        const detection = (applied.turn_detection ?? {}) as Record<string, unknown>;
+        appliedSilence = typeof detection.silence_duration_ms === "number" ? detection.silence_duration_ms : null;
+        appliedVoice = str(applied.voice);
+        if (!clientTurns && !serverTurnsApplied(sessionSent, applied)) switchToClientTurns();
+      }
+      if (sessionSettled) return;
+      settleSession();
+      if (!transcribing) report("This call cannot write down what you say, so only the agent's side will show in the chat.");
       return;
     }
     if (type === "input_audio_buffer.committed") {
+      commits++;
+      if (clientTurns && !closed) {
+        if (expectedCommits > 0) expectedCommits--;
+        else if (!switchPending) dropClientTurns("provider ended a turn itself", true);
+      }
       uncommitted = false;
       committing = false;
       if (str(ev.item_id)) {
@@ -431,8 +569,11 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
       return;
     }
     if (type === "input_audio_buffer.speech_started") {
+      speechStarts++;
       hearing = true;
+      guard.server();
       if (sources.size || responding) bargeIn();
+      else setGain(1);
       settle();
       return;
     }
@@ -457,7 +598,9 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
       return;
     }
     if (AUDIO_DELTA.has(type)) {
-      if (!dropAudio) play(str(ev.delta));
+      audioChunks++;
+      if (dropAudio) droppedChunks++;
+      else play(str(ev.delta));
       return;
     }
     const ids = str(ev.item_id) || str(ev.response_id);
@@ -504,12 +647,99 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
       for (const k of [key, ...agentText.keys()]) if (agentText.has(k)) finishAgent(k);
       if (!ids && !response.id) agentSeq++;
       responding = false;
+      if (pendingCreate) sendCreate();
       settle();
       afterReply();
       sendUpdates();
     }
   };
 
+  const settleSession = () => {
+    sessionSettled = true;
+    window.clearTimeout(sessionTimer);
+    sessionTimer = 0;
+    begin();
+  };
+  const awaitSession = () => {
+    window.clearTimeout(sessionTimer);
+    sessionTimer = window.setTimeout(() => {
+      sessionTimer = 0;
+      if (sessionSettled) return;
+      if (!turnsChecked && !clientTurns) {
+        turnsChecked = true;
+        switchToClientTurns();
+      }
+      settleSession();
+    }, SESSION_WAIT_MS);
+  };
+  const useClientTurns = () => {
+    clientTurns ??= new ClientTurns<string>();
+    guard.cancel();
+    setGain(1);
+  };
+  const endSwitch = () => {
+    switchPending = false;
+    window.clearTimeout(switchTimer);
+    switchTimer = 0;
+  };
+  const switchToClientTurns = () => {
+    useClientTurns();
+    switchPending = true;
+    window.clearTimeout(switchTimer);
+    switchTimer = window.setTimeout(endSwitch, SESSION_WAIT_MS);
+    sessionSent = { ...sessionSent, turn_detection: null };
+    send({ type: "session.update", session: sessionSent });
+    if (!hearing) send({ type: "input_audio_buffer.clear" });
+  };
+  const dropClientTurns = (why: string, restore: boolean) => {
+    if (!clientTurns) return;
+    clientTurns = null;
+    expectedCommits = 0;
+    clientDropped = why;
+    if (!restore || !serverDetection || sessionTried.has("turns")) return;
+    sessionSent = { ...sessionSent, turn_detection: serverDetection };
+    send({ type: "session.update", session: sessionSent });
+  };
+  const sendCreate = () => {
+    window.clearTimeout(createTimer);
+    createTimer = 0;
+    pendingCreate = false;
+    send({ type: "response.create" });
+    responding = true;
+    settle();
+  };
+  const requestResponse = () => {
+    if (openCalls) return;
+    if (!responding) {
+      sendCreate();
+      return;
+    }
+    if (pendingCreate) return;
+    pendingCreate = true;
+    createTimer = window.setTimeout(() => {
+      if (pendingCreate) sendCreate();
+    }, 2000);
+  };
+  const endClientTurn = (commit: boolean, respond: boolean) => {
+    if (responding) bargeIn();
+    if (commit) {
+      clientCommits++;
+      committing = true;
+      uncommitted = false;
+      expectedCommits++;
+      send({ type: "input_audio_buffer.commit" });
+    }
+    if (!respond) return;
+    requestResponse();
+    hearing = false;
+    lastHeardAt = Date.now();
+    window.clearTimeout(waiting);
+    waiting = window.setTimeout(() => {
+      waiting = 0;
+      settle();
+    }, 8000);
+    settle();
+  };
   const begin = () => {
     if (started || closed) return;
     started = performance.now();
@@ -523,6 +753,7 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
     const src = ctx.createBufferSource();
     src.buffer = buf;
     src.connect(out);
+    ensureSound();
     const at = ctx.currentTime + 0.02;
     src.start(at);
     playhead = at + buf.duration;
@@ -540,6 +771,7 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
   }
   ws.onopen = () => {
     send({ type: "session.update", session: sessionSent });
+    awaitSession();
     window.setTimeout(begin, 2500);
   };
   ws.onmessage = async (msg) => {
@@ -548,10 +780,10 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
       if (data && typeof data === "object") onEvent(data as Event);
     } catch {}
   };
-  ws.onerror = () => h.onError("Lost the connection to the voice service.");
+  ws.onerror = () => report("Lost the connection to the voice service.");
   ws.onclose = (e) => {
     if (!closed) {
-      if (e.code !== 1000) h.onError(e.reason || "The voice call dropped.");
+      if (e.code !== 1000) report(e.reason || "The voice call dropped.");
       void call.close();
     }
   };
@@ -574,15 +806,15 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
       const pcm = new Int16Array(chunk.length);
       for (let i = 0; i < chunk.length; i++) pcm[i] = Math.max(-32768, Math.min(32767, Math.round(chunk[i] * 32767)));
       chunk = [];
-      send({ type: "input_audio_buffer.append", audio: toBase64(new Uint8Array(pcm.buffer)) });
-      if (hearing) uncommitted = true;
+      const audio = toBase64(new Uint8Array(pcm.buffer));
+      for (const part of clientTurns ? clientTurns.audio(audio) : [audio]) send({ type: "input_audio_buffer.append", audio: part });
+      if (clientTurns ? clientTurns.isOpen() : hearing) uncommitted = true;
     }
   };
 
   const onWorld = (e: globalThis.Event) => {
-    const ev = (e as CustomEvent<{ type: string; agent_id: string | null; payload: Record<string, unknown> }>).detail;
-    if (ev.type !== "message.created" || ev.agent_id !== agentId || ev.payload.author_kind !== "agent" || ev.payload.author_agent_id) return;
-    const body = str(ev.payload.body).trim();
+    if (closed) return;
+    const body = spokenUpdate((e as CustomEvent<CallEvent>).detail, agentId, quickId);
     if (!body) return;
     updates.push(body);
     sendUpdates();
@@ -614,11 +846,23 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
     if (!playing && !localHearing) floor = floor * 0.97 + Math.min(level, 0.05) * 0.03;
     const threshold = Math.max(playing ? 0.045 : 0.025, floor * (playing ? 4 : 2.5), echo * 0.4);
     const now = performance.now();
-    if (level > threshold) {
+    if (guard.expired(now)) setGain(1);
+    const loud = level > threshold;
+    if (clientTurns) {
+      const speaking = loud && loudSince > 0 && now - loudSince >= (playing ? CLIENT_BARGE_MS : 120) && (!playing || level > echo * 0.8);
+      const step = clientTurns.tick(now, speaking);
+      for (const audio of step.flush) send({ type: "input_audio_buffer.append", audio });
+      if (step.opened) {
+        uncommitted = true;
+        if (sources.size || responding) bargeIn();
+      }
+      if (step.commit || step.respond) endClientTurn(step.commit, step.respond);
+    }
+    if (loud) {
       quietSince = 0;
       loudSince ||= now;
       if (now - loudSince >= (playing ? 220 : 120)) {
-        if (playing) bargeIn();
+        if (!clientTurns && playing && !guard.ducking() && guard.local(now)) setGain(DUCKED_GAIN);
         if (!localHearing) {
           localHearing = true;
           hearing = true;
@@ -641,6 +885,11 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
     setMuted: (m) => {
       muted = m;
       chunk = [];
+      if (m) clientTurns?.close();
+      if (m && guard.ducking()) {
+        guard.cancel();
+        setGain(1);
+      }
       if (m) send({ type: "input_audio_buffer.clear" });
     },
     level: () => {
@@ -657,6 +906,12 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
       window.clearTimeout(settleTimer);
       window.clearTimeout(stopTimer);
       window.clearTimeout(waiting);
+      window.clearTimeout(soundTimer);
+      window.clearTimeout(sessionTimer);
+      window.clearTimeout(createTimer);
+      window.clearTimeout(switchTimer);
+      window.removeEventListener("pointerdown", unblock, true);
+      window.removeEventListener("keydown", unblock, true);
       window.clearInterval(vad);
       window.removeEventListener("world-event", onWorld);
       stopPlayback();

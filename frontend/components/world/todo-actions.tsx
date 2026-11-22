@@ -1,13 +1,14 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { ChatCircleText, CheckCircle, PaperPlaneTilt, Rocket, Sparkle } from "@phosphor-icons/react";
+import { ChatCircleText, CheckCircle, PaperPlaneTilt, Rocket } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
 import { worldApi, type Todo, type TodoProposal, type WorldAgent } from "@/lib/world";
 import { BTN_PRIMARY, BTN_PRIMARY_SM } from "./styles";
 import { LinkedText } from "./review-draft";
+import { MeaningIcon } from "@/lib/meaning-icons";
 
-const KIND_ICON = { reply: ChatCircleText, message: PaperPlaneTilt, task: Rocket, other: Sparkle } as const;
+const KIND_ICON = { reply: ChatCircleText, message: PaperPlaneTilt, task: Rocket, other: MeaningIcon.otherAction } as const;
 
 function same(a: TodoProposal, b: TodoProposal): boolean {
   const norm = (p: TodoProposal) => JSON.stringify([p.label ?? "", p.to ?? "", p.via ?? "", p.title ?? "", p.agent ?? "", p.repo ?? "", p.body.trim()]);
@@ -33,7 +34,7 @@ export function ProposalStrip({ todo, agents, onDecided, onOpen }: { todo: Todo;
   }
   if (!proposals.length || todo.status !== "open") return null;
   const first = proposals[0];
-  const Icon = KIND_ICON[first.kind] ?? Sparkle;
+  const Icon = KIND_ICON[first.kind] ?? MeaningIcon.otherAction;
   const choose = proposals.length > 1 && onOpen;
   const approve = async (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -151,7 +152,7 @@ export function ProposalPanel({ todo, agents, onDecided }: { todo: Todo; agents:
   return (
     <div className="shrink-0 rounded-lg border-2 border-w-ink bg-w-card p-3 shadow-[0_2px_0_rgb(var(--w-ink))]">
       <p className="mb-2 flex items-center gap-1.5 text-w-xs font-semibold text-w-muted">
-        <Sparkle size={12} weight="fill" className="text-w-warn" />
+        <MeaningIcon.suggestion size={12} weight="fill" className="text-w-warn" />
         {suggester} suggests
       </p>
       {many && (
@@ -159,7 +160,7 @@ export function ProposalPanel({ todo, agents, onDecided }: { todo: Todo; agents:
           <p className="mb-1.5 text-w-xs text-w-muted">Tick every action to approve, untick to skip. Click one to read or edit it.</p>
           <div className="mb-2 flex flex-wrap gap-1" role="tablist" aria-label="Suggested actions">
             {proposals.map((p, i) => {
-              const Icon = KIND_ICON[p.kind] ?? Sparkle;
+              const Icon = KIND_ICON[p.kind] ?? MeaningIcon.otherAction;
               const on = chosen.has(i);
               return (
                 <span

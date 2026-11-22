@@ -42,6 +42,7 @@ pub(super) struct Entry {
 pub(super) struct Removed {
     pub count: usize,
     pub bytes: u64,
+    pub cache_bytes: u64,
     pub trash_roots: Vec<PathBuf>,
     pub cleaned: Vec<Uuid>,
 }
@@ -55,6 +56,7 @@ impl Removed {
             }
         }
         self.bytes += other.bytes;
+        self.cache_bytes += other.cache_bytes;
         for root in other.trash_roots {
             if !self.trash_roots.contains(&root) {
                 self.trash_roots.push(root);
@@ -63,12 +65,21 @@ impl Removed {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct QuestUse {
+    id: Uuid,
+    bytes: u64,
+    temp: u64,
+    build: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 struct Usage {
     bytes: u64,
     tasks: usize,
     temp_bytes: u64,
-    largest: Vec<(Uuid, u64, u64)>,
+    build_bytes: u64,
+    largest: Vec<QuestUse>,
 }
 
 static USAGE: Mutex<Option<Usage>> = Mutex::new(None);
@@ -104,10 +115,11 @@ pub(super) fn view() -> Value {
         "bytes": usage.bytes,
         "tasks": usage.tasks,
         "temp_bytes": usage.temp_bytes,
+        "build_bytes": usage.build_bytes,
         "free_gb": (free / GIB).floor(),
         "total_gb": (total / GIB).floor(),
         "low": free < LOW_DISK_BYTES,
-        "largest": usage.largest.iter().map(|(id, bytes, temp)| json!({ "id": id, "bytes": bytes, "temp_bytes": temp })).collect::<Vec<_>>(),
+        "largest": usage.largest.iter().map(|quest| json!({ "id": quest.id, "bytes": quest.bytes, "temp_bytes": quest.temp, "build_bytes": quest.build })).collect::<Vec<_>>(),
     })
 }
 
@@ -142,7 +154,7 @@ fn quest_temp_sizes() -> std::collections::HashMap<String, u64> {
 
 fn scan(roots: &[PathBuf]) -> Usage {
     let temps = quest_temp_sizes();
-    let mut sizes: Vec<(Uuid, u64, u64)> = Vec::new();
+    let mut sizes: Vec<QuestUse> = Vec::new();
     for root in roots {
         let Ok(entries) = std::fs::read_dir(root.join("workspaces").join("tasks")) else {
             continue;
@@ -150,17 +162,124 @@ fn scan(roots: &[PathBuf]) -> Usage {
         for entry in entries.flatten() {
             if let Ok(id) = entry.file_name().to_string_lossy().parse::<Uuid>() {
                 let temp = temps.get(&crate::cli::quest_temp_name(id)).copied().unwrap_or(0);
-                sizes.push((id, dir_size(&entry.path()) + temp, temp));
+                let target = quest_target_dir(id);
+                let build = build_dirs_in(&entry.path()).iter().chain(std::iter::once(&target)).map(|dir| dir_size(dir)).sum();
+                sizes.push(QuestUse { id, bytes: dir_size(&entry.path()) + temp, temp, build });
             }
         }
     }
-    sizes.sort_by(|a, b| b.1.cmp(&a.1));
+    sizes.sort_by(|a, b| b.bytes.cmp(&a.bytes));
     Usage {
-        bytes: sizes.iter().map(|(_, bytes, _)| bytes).sum(),
+        bytes: sizes.iter().map(|quest| quest.bytes).sum(),
         tasks: sizes.len(),
-        temp_bytes: sizes.iter().map(|(_, _, temp)| temp).sum(),
-        largest: sizes.into_iter().filter(|(_, bytes, _)| *bytes >= LISTED_MIN_BYTES).take(LISTED_MAX).collect(),
+        temp_bytes: sizes.iter().map(|quest| quest.temp).sum(),
+        build_bytes: sizes.iter().map(|quest| quest.build).sum(),
+        largest: sizes.into_iter().filter(|quest| quest.bytes >= LISTED_MIN_BYTES).take(LISTED_MAX).collect(),
     }
+}
+
+const BUILD_DIRS: [&str; 3] = ["node_modules", ".next", "target"];
+
+fn real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
+}
+
+fn build_dirs_under(folder: &Path) -> Vec<PathBuf> {
+    BUILD_DIRS
+        .iter()
+        .filter(|name| **name != "target" || folder.join("Cargo.toml").is_file())
+        .map(|name| folder.join(name))
+        .filter(|path| real_dir(path))
+        .collect()
+}
+
+const BUILD_SEARCH_DEPTH: u8 = 3;
+
+fn build_dirs_below(folder: &Path, depth: u8, found: &mut Vec<PathBuf>) {
+    found.extend(build_dirs_under(folder));
+    if depth >= BUILD_SEARCH_DEPTH {
+        return;
+    }
+    let Ok(children) = std::fs::read_dir(folder) else {
+        return;
+    };
+    for child in children.flatten() {
+        let name = child.file_name().to_string_lossy().into_owned();
+        if name != ".git" && !BUILD_DIRS.contains(&name.as_str()) && real_dir(&child.path()) {
+            build_dirs_below(&child.path(), depth + 1, found);
+        }
+    }
+}
+
+pub(super) fn build_dirs_in(task_dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(repos) = std::fs::read_dir(task_dir) else {
+        return found;
+    };
+    for repo in repos.flatten().map(|entry| entry.path()).filter(|path| real_dir(path)) {
+        build_dirs_below(&repo, 0, &mut found);
+    }
+    found
+}
+
+async fn process_listing() -> Option<String> {
+    let output = tokio::process::Command::new("ps").args(["-axo", "pid=,command="]).output().await.ok()?;
+    (output.status.success() && !output.stdout.is_empty()).then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn in_use(listing: &str, dir: &Path) -> bool {
+    let mut dirs = vec![dir.to_string_lossy().into_owned()];
+    if let Ok(real) = std::fs::canonicalize(dir) {
+        let real = real.to_string_lossy().into_owned();
+        if !dirs.contains(&real) {
+            dirs.push(real);
+        }
+    }
+    !pids_under(listing, &dirs, std::process::id()).is_empty()
+}
+
+async fn remove_cache_dir(dir: &Path) -> u64 {
+    let measured = dir.to_path_buf();
+    let bytes = tokio::task::spawn_blocking(move || dir_size(&measured)).await.unwrap_or(0);
+    match tokio::fs::remove_dir_all(dir).await {
+        Ok(()) => bytes,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                warn!(error = %error, dir = %dir.display(), "Failed to clear a build cache");
+            }
+            0
+        }
+    }
+}
+
+fn quest_target_dir(id: Uuid) -> PathBuf {
+    std::env::temp_dir().join(crate::cli::quest_temp_name(id)).join(crate::cli::QUEST_TARGET_DIR)
+}
+
+pub(super) async fn clear_build_dirs(quests: &[(Uuid, PathBuf)]) -> u64 {
+    clear_build_dirs_with(quests, process_listing().await).await
+}
+
+async fn clear_build_dirs_with(quests: &[(Uuid, PathBuf)], listing: Option<String>) -> u64 {
+    let Some(listing) = listing else {
+        warn!("Could not list processes, so no build folder was cleared");
+        return 0;
+    };
+    let mut freed = 0;
+    for (id, task_dir) in quests {
+        let target = quest_target_dir(*id);
+        if in_use(&listing, task_dir) || in_use(&listing, &target) {
+            continue;
+        }
+        let dirs = {
+            let task_dir = task_dir.clone();
+            tokio::task::spawn_blocking(move || build_dirs_in(&task_dir)).await.unwrap_or_default()
+        };
+        for dir in dirs.into_iter().chain(std::iter::once(target).filter(|target| real_dir(target))) {
+            freed += remove_cache_dir(&dir).await;
+        }
+    }
+    freed
 }
 
 pub(super) fn dir_size(path: &Path) -> u64 {
@@ -335,6 +454,7 @@ pub(super) async fn remove_task_workspace(dir: &Path, trash: &Path) -> Result<()
 async fn clear(api: &RunnerApi, root: &Path, mode: Sweep, free: f64) -> Result<Removed> {
     let mut entries = Vec::new();
     let mut temp_ids = Vec::new();
+    let mut cache_quests: Vec<(Uuid, PathBuf)> = Vec::new();
     for base in [root.to_path_buf()] {
         let tasks_dir = base.join("workspaces").join("tasks");
         let Ok(mut listing) = tokio::fs::read_dir(&tasks_dir).await else {
@@ -353,12 +473,21 @@ async fn clear(api: &RunnerApi, root: &Path, mode: Sweep, free: f64) -> Result<R
         if base == root {
             let settled = if mode == Sweep::Routine { api.closed_tasks(&tasks, true).await? } else { closed.clone() };
             temp_ids.extend(settled.into_iter().map(|task| task.id));
+            if mode != Sweep::Routine {
+                let idle = api.idle_tasks(&tasks).await.unwrap_or_default();
+                cache_quests.extend(closed.iter().map(|task| task.id).chain(idle).map(|id| (id, tasks_dir.join(id.to_string()))));
+            }
         }
         for task in closed {
             entries.push(Entry { dir: tasks_dir.join(task.id.to_string()), trash_root: base.join("trash"), task });
         }
     }
     let mut removed = remove_temps(temp_ids).await;
+    if mode != Sweep::Routine {
+        let cache_bytes = clear_build_dirs(&cache_quests).await;
+        removed.cache_bytes += cache_bytes;
+        removed.bytes += cache_bytes;
+    }
     let more = remove_entries(by_age(entries), mode, free + removed.bytes as f64).await;
     removed.absorb(more);
     Ok(removed)
@@ -417,7 +546,7 @@ async fn guard_with(api: &RunnerApi, root: &Path, floor: f64, free: &(dyn Fn() -
         return Ok(());
     }
     anyhow::bail!(
-        "No space left on device: this device has only {:.1} GB free, so Loka did not start this run. Closed quest workspaces and temp folders were cleared first. {}",
+        "No space left on device: this device has only {:.1} GB free, so Loka did not start this run. Build caches, closed quest workspaces and temp folders were cleared first. {}",
         free / 1e9,
         folder_list(&biggest_folders(root).await)
     )
@@ -466,7 +595,7 @@ async fn biggest_folders(root: &Path) -> Vec<DiskFolder> {
 
 async fn warn_owner(api: &RunnerApi, root: &Path, free: f64, removed: &Removed) {
     let still_low = free < LOW_DISK_BYTES;
-    if removed.count == 0 && !still_low {
+    if removed.count == 0 && removed.cache_bytes == 0 && !still_low {
         return;
     }
     {
@@ -477,7 +606,7 @@ async fn warn_owner(api: &RunnerApi, root: &Path, free: f64, removed: &Removed) 
         *last = Some(Instant::now());
     }
     let folders = if still_low { biggest_folders(root).await } else { Vec::new() };
-    let notice = DiskNotice { free_bytes: free as u64, freed_bytes: removed.bytes, removed: removed.count, still_low, folders };
+    let notice = DiskNotice { free_bytes: free as u64, freed_bytes: removed.bytes, removed: removed.count, still_low, folders, caches_bytes: removed.cache_bytes };
     if let Err(error) = api.disk_low(&notice).await {
         warn!(error = %format!("{error:#}"), "Failed to tell the owner the disk is low");
     }
@@ -797,5 +926,88 @@ mod tests {
         assert!(guard_with(&api, &root, LOW_DISK_BYTES, &|| 50.0e9).await.is_ok(), "plenty of room never touches the API");
         assert!(guard_with(&api, &root, 0.5e9, &|| 1.0e9).await.is_ok(), "a small disk is judged by its own floor, not 5 GB");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn build_tree(base: &Path) -> (PathBuf, PathBuf) {
+        let task = base.join("workspaces").join("tasks").join(Uuid::new_v4().to_string());
+        let repo = task.join("app");
+        for dir in ["node_modules/pkg", ".next/cache", "frontend/node_modules/pkg", "frontend/.next", "target/debug", "src", "docs/target", "desktop/src-tauri/target/debug", "a/b/c/d/node_modules"] {
+            std::fs::create_dir_all(repo.join(dir)).unwrap();
+            std::fs::write(repo.join(dir).join("f.bin"), vec![5u8; 100_000]).unwrap();
+        }
+        std::fs::write(repo.join("Cargo.toml"), "[package]").unwrap();
+        std::fs::write(repo.join("desktop/src-tauri/Cargo.toml"), "[package]").unwrap();
+        std::fs::write(repo.join("src").join("main.rs"), "fn main() {}").unwrap();
+        (task, repo)
+    }
+
+    #[test]
+    fn build_dirs_are_node_modules_next_and_cargo_targets_and_nothing_else() {
+        let base = std::env::temp_dir().join(format!("loka-build-{}", Uuid::new_v4()));
+        let (task, repo) = build_tree(&base);
+        let mut found = build_dirs_in(&task);
+        found.sort();
+        let mut expected = vec![repo.join(".next"), repo.join("node_modules"), repo.join("target"), repo.join("frontend/.next"), repo.join("frontend/node_modules"), repo.join("desktop/src-tauri/target")];
+        expected.sort();
+        assert_eq!(found, expected, "docs/target has no Cargo.toml beside it, src is source and a/b/c/d is below the search depth");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn build_dirs_skip_symlinks_so_nothing_outside_the_quest_is_reached() {
+        let base = std::env::temp_dir().join(format!("loka-build-link-{}", Uuid::new_v4()));
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let repo = base.join("task").join("app");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::os::unix::fs::symlink(&outside, repo.join("node_modules")).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("task").join("linked-repo")).unwrap();
+        assert!(build_dirs_in(&base.join("task")).is_empty());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn clearing_build_dirs_keeps_the_source_and_reports_the_bytes() {
+        let base = std::env::temp_dir().join(format!("loka-build-clear-{}", Uuid::new_v4()));
+        let (task, repo) = build_tree(&base);
+        let id = Uuid::new_v4();
+        let freed = clear_build_dirs_with(&[(id, task.clone())], Some(String::new())).await;
+        assert!(freed >= 500_000, "{freed}");
+        assert!(!repo.join("node_modules").exists() && !repo.join("frontend/.next").exists() && !repo.join("target").exists());
+        assert!(repo.join("src/main.rs").is_file() && repo.join("Cargo.toml").is_file() && repo.join("docs/target/f.bin").is_file());
+        assert_eq!(clear_build_dirs_with(&[(id, task)], Some(String::new())).await, 0);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_idle_quests_cargo_target_goes_but_a_running_build_keeps_it_and_other_quests_are_untouched() {
+        let (idle, busy, other) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let base = std::env::temp_dir().join(format!("loka-build-quests-{}", Uuid::new_v4()));
+        let task_dir = |id: Uuid| base.join(id.to_string());
+        for id in [idle, busy, other] {
+            std::fs::create_dir_all(task_dir(id)).unwrap();
+            std::fs::create_dir_all(quest_target_dir(id).join("debug")).unwrap();
+            std::fs::write(quest_target_dir(id).join("debug").join("lib.rlib"), vec![9u8; 150_000]).unwrap();
+        }
+        let listing = format!(" 501 rustc --out-dir {}/debug/deps\n 502 zsh -l\n", quest_target_dir(busy).display());
+        let freed = clear_build_dirs_with(&[(idle, task_dir(idle)), (busy, task_dir(busy))], Some(listing)).await;
+        assert!(freed >= 150_000, "{freed}");
+        assert!(!quest_target_dir(idle).exists(), "an idle quest's cargo target is cleared");
+        assert!(quest_target_dir(busy).exists(), "a target a process runs in is kept");
+        assert!(quest_target_dir(other).exists(), "a quest that was not asked about is never touched");
+        assert_eq!(clear_build_dirs_with(&[(other, task_dir(other))], None).await, 0, "without a process list nothing is cleared");
+        assert!(quest_target_dir(other).exists());
+        for id in [busy, other] {
+            let _ = std::fs::remove_dir_all(std::env::temp_dir().join(crate::cli::quest_temp_name(id)));
+        }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_process_running_in_a_cache_dir_marks_it_in_use() {
+        let dir = Path::new("/c/loka-cargo-target/world");
+        let listing = " 301 rustc --out-dir /c/loka-cargo-target/world/debug/deps\n 302 /c/loka-cargo-target/world2/debug/x\n 303 zsh -l\n";
+        assert!(in_use(listing, dir));
+        assert!(!in_use(" 302 /c/loka-cargo-target/world2/debug/x\n", dir));
     }
 }

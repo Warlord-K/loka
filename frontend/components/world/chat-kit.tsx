@@ -3,7 +3,7 @@
 import { useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import ReactMarkdown, { defaultUrlTransform, type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { ArrowCounterClockwise, Brain, Check, CheckCircle, Copy, File as FileIcon, GitPullRequest, Lightning, Paperclip, PencilSimple, Play, Scroll, Terminal, Trash, WarningCircle, X } from "@phosphor-icons/react";
+import { ArrowCounterClockwise, Brain, Check, CheckCircle, Copy, File as FileIcon, GitPullRequest, Lightning, Paperclip, PencilSimple, Play, Scroll, Terminal, TerminalWindow, Trash, WarningCircle, X } from "@phosphor-icons/react";
 import { cn, safeDecode } from "@/lib/utils";
 import { useCopy } from "@/lib/copy";
 import { SCROLL_JUMP } from "@/lib/scroll";
@@ -18,7 +18,9 @@ import { allowedEmbedUrl, embedFromHref, EmbedView, linkEmbeds, useChannelNames 
 import { headingSlug } from "@/lib/reports";
 import { isMedia, MediaGrid, mediaUrl, ZoomImage } from "./media-view";
 import { cliName, modelName } from "@/lib/model-names";
-import { RunCommandContext } from "./run-command";
+import { RunCommandContext, TerminalTargetContext, openInTerminal, useAppRunner, useOwnDevices } from "./run-command";
+import { defaultDevice, devicePickerShown, devicesLoading } from "@/lib/run-device";
+import { Shimmer } from "./shimmer";
 
 function handleOf(name: string): string {
   return name.replace(/[^A-Za-z0-9]/g, "").toLowerCase();
@@ -449,64 +451,126 @@ function hostOf(src: string) {
   }
 }
 
-type RunState = "idle" | "armed" | "sending" | "sent";
+type RunState = "idle" | "run" | "open" | "sending" | "sent" | "opened";
 
 function CodeBlock({ children, command = null }: { children: React.ReactNode; command?: string | null }) {
   const ref = useRef<HTMLPreElement>(null);
   const runner = useContext(RunCommandContext);
+  const workshop = useContext(TerminalTargetContext);
   const [state, setState] = useState<RunState>("idle");
   const [problem, setProblem] = useState<string | null>(null);
+  const [picked, setPicked] = useState<string | null>(null);
   const runnable = !!runner && !!command;
+  const openable = !!command && (!!workshop || !!runner);
+  const armed = state === "run" || state === "open";
+  const devices = useOwnDevices(runner?.ownerId ?? null, armed && !workshop);
+  const app = useAppRunner();
+  const ids = useMemo(() => (devices ?? []).map((d) => d.id), [devices]);
+  const chosen = picked && ids.includes(picked) ? picked : defaultDevice({ devices: ids, home: runner?.home ?? null, appRunner: app?.id ?? null });
+  const nameOf = (id: string | null) => (id === app?.id ? "this Mac" : devices?.find((d) => d.id === id)?.name ?? "the agent's device");
+  const picker = !!runner && devices !== null && devicePickerShown({ devices: ids, chosen, home: runner.home });
+  const loading = devicesLoading({ needed: !!runner && !workshop, devices, appRunner: app });
   useEffect(() => {
-    if (state !== "sent") return;
+    if (state !== "sent" && state !== "opened") return;
     const id = window.setTimeout(() => setState("idle"), 2400);
     return () => window.clearTimeout(id);
   }, [state]);
+  const arm = (next: "run" | "open") => (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setProblem(null);
+    if (next === "open" && workshop && command) {
+      workshop.type(command);
+      setState("opened");
+      return;
+    }
+    setState(next);
+  };
   const run = async (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (!runner || !command || state === "sending") return;
+    if (!runner || !command || state === "sending" || loading) return;
     setState("sending");
     setProblem(null);
     try {
-      await runner.run(command);
+      await runner.run(command, chosen ?? undefined);
       setState("sent");
     } catch (err) {
       setProblem(err instanceof Error && err.message ? err.message : "That did not start. Try again.");
       setState("idle");
     }
   };
+  const open = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!command || loading) return;
+    const source = ref.current?.closest("[data-quote]")?.getAttribute("data-quote") ?? undefined;
+    openInTerminal({
+      command,
+      runnerId: chosen,
+      agentId: runner?.agentId,
+      quote: runner
+        ? { text: command, label: `Command from ${runner.who}`, source }
+        : undefined,
+    });
+    setState("opened");
+  };
+  const done = state === "sent" || state === "opened";
+  const iconButton = (visible: boolean) =>
+    cn(
+      "grid h-7 w-7 place-items-center rounded-md border-2 border-w-ink transition-opacity focus-visible:opacity-100 group-hover/code:opacity-100 disabled:opacity-60 [@media(hover:none)]:opacity-100",
+      visible ? "opacity-100" : "opacity-0",
+    );
   return (
     <div className="group/code relative my-2">
-      <pre ref={ref} className={cn("overflow-x-auto rounded-lg border-2 border-w-line2 bg-w-sand/60 p-3 font-mono text-w-xs leading-relaxed text-w-strong", runnable ? "pr-[4.75rem]" : "pr-10")}>{children}</pre>
+      <pre ref={ref} className={cn("overflow-x-auto rounded-lg border-2 border-w-line2 bg-w-sand/60 p-3 font-mono text-w-xs leading-relaxed text-w-strong", openable && runnable ? "pr-[6.75rem]" : openable || runnable ? "pr-[4.75rem]" : "pr-10")}>{children}</pre>
       <div className="absolute right-1.5 top-1.5 flex items-center gap-1">
-        {runnable && state !== "armed" && (
+        {openable && !armed && (
           <button
             type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              setProblem(null);
-              setState("armed");
-            }}
+            onClick={arm("open")}
+            aria-label={state === "opened" ? "Typed in the terminal" : "Open in terminal"}
+            title={state === "opened" ? "Typed in the terminal" : workshop ? `Type it in ${workshop.where}` : "Open in terminal"}
+            className={cn(iconButton(state !== "idle" && state !== "sent"), state === "opened" ? "bg-w-card text-w-ok" : "bg-w-card text-w-strong hover:bg-w-sand")}
+          >
+            {state === "opened" ? <Check size={14} weight="bold" /> : <TerminalWindow size={14} weight="bold" />}
+          </button>
+        )}
+        {runnable && !armed && (
+          <button
+            type="button"
+            onClick={arm("run")}
             disabled={state === "sending"}
             aria-label={state === "sent" ? "Started" : "Run this command"}
             title={state === "sent" ? "Started" : `Run ${runner.where}`}
-            className={cn(
-              "grid h-7 w-7 place-items-center rounded-md border-2 border-w-ink bg-w-teal text-w-strong transition-opacity hover:bg-w-teal2 focus-visible:opacity-100 group-hover/code:opacity-100 disabled:opacity-60 [@media(hover:none)]:opacity-100",
-              state === "idle" ? "opacity-0" : "opacity-100",
-              state === "sent" && "bg-w-card text-w-ok",
-            )}
+            className={cn(iconButton(state !== "idle" && state !== "opened"), state === "sent" ? "bg-w-card text-w-ok" : "bg-w-teal text-w-strong hover:bg-w-teal2")}
           >
             {state === "sent" ? <Check size={14} weight="bold" /> : <Play size={13} weight="fill" />}
           </button>
         )}
-        <CornerCopy text={() => ref.current?.innerText ?? ""} label="Copy code" />
+        <CornerCopy text={() => (command ?? ref.current?.innerText ?? "")} label={command ? "Copy command" : "Copy code"} className={done ? "opacity-100" : undefined} />
       </div>
-      {runnable && state === "armed" && (
-        <div role="group" aria-label="Run this command" className="mt-1 flex flex-wrap items-center gap-2 rounded-lg border-2 border-w-line2 bg-w-card px-2 py-1.5 text-w-xs">
+      {armed && (
+        <div role="group" aria-label={state === "run" ? "Run this command" : "Open in terminal"} className="mt-1 flex flex-wrap items-center gap-2 rounded-lg border-2 border-w-line2 bg-w-card px-2 py-1.5 text-w-xs">
           <Terminal size={14} weight="bold" className="shrink-0 text-w-muted" />
-          <span className="min-w-0 flex-1 text-w-text2">Run this {runner.where}? The output shows here and goes back to {runner.who}.</span>
-          <button type="button" autoFocus onClick={(e) => void run(e)} className={BTN_PRIMARY_SM}>
-            Run
+          <span className="min-w-0 flex-1 text-w-text2">
+            {loading ? (
+              <Shimmer>Finding your devices</Shimmer>
+            ) : state === "run"
+              ? picker
+                ? `Run this on ${nameOf(chosen)}? The output shows here and goes back to ${runner?.who ?? "the agent"}.`
+                : `Run this ${runner?.where ?? ""}? The output shows here and goes back to ${runner?.who ?? "the agent"}.`
+              : `Type this at the prompt in the terminal on ${nameOf(chosen)}. Nothing runs until you press Enter.`}
+          </span>
+          {picker && (
+            <WSelect
+              size="sm"
+              ariaLabel="Device"
+              value={chosen ?? ""}
+              onChange={setPicked}
+              className="max-w-[12rem]"
+              options={(devices ?? []).map((d) => ({ value: d.id, label: d.name, hint: d.id === app?.id ? "this Mac" : d.id === runner?.home ? "agent's device" : undefined }))}
+            />
+          )}
+          <button type="button" autoFocus disabled={loading} aria-busy={loading} onClick={(e) => void (state === "run" ? run(e) : open(e))} className={BTN_PRIMARY_SM}>
+            {state === "run" ? "Run" : "Open in terminal"}
           </button>
           <button
             type="button"

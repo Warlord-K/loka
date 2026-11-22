@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { GitBranch, Hammer, MagnifyingGlass, Plus, Robot, SidebarSimple, TerminalWindow, X } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
 import { worldApi, type SessionBrief, type WorldAgent, type WorldEvent } from "@/lib/world";
@@ -11,6 +11,9 @@ import { sessionKeyFor, setOpenWorkshop, wb, type OpenWorkshopDetail, type WbCha
 import { EditorPane, type EditorHandle, type Tab, type TabMode } from "./editor-pane";
 import { baseName, FileTree, STATUS_COLOR } from "./file-tree";
 import { TerminalPane } from "./terminal-pane";
+import { TerminalTargetContext } from "../run-command";
+import { sendQuote, type MessageQuote } from "../quote";
+import type { TerminalReader } from "../terminal";
 import { scrollWithin } from "@/lib/scroll";
 
 interface Layout {
@@ -318,12 +321,14 @@ export function Workbench({
   renderAgent,
   onOpenAgent,
   onClose,
+  closeRequest,
 }: {
   request: OpenWorkshopDetail;
   agents: WorldAgent[];
-  renderAgent: (agent: WorldAgent) => React.ReactNode;
+  renderAgent: (agent: WorldAgent, attach: { on: string; off: string; read: () => MessageQuote | null }) => React.ReactNode;
   onOpenAgent: (id: string) => void;
   onClose: () => void;
+  closeRequest: RefObject<(() => boolean) | null>;
 }) {
   const [session, setSession] = useState<SessionBrief | null>(null);
   const [choices, setChoices] = useState<SessionBrief[] | null>(null);
@@ -458,6 +463,32 @@ export function Workbench({
     setLayout((l) => ({ ...l, ...(typeof next === "function" ? next(l) : next) }));
   }, []);
 
+  const terminalReader = useRef<TerminalReader | null>(null);
+  const [typeRequest, setTypeRequest] = useState<{ id: number; command: string } | null>(null);
+  const terminalTarget = useMemo(
+    () => ({
+      where: "the Workshop terminal",
+      type: (command: string) => {
+        patch({ terminal: true });
+        setTypeRequest({ id: Date.now(), command });
+      },
+    }),
+    [patch],
+  );
+  const terminalAttach = useMemo(
+    () => ({ on: "Sends your Workshop terminal selection, or its last lines", off: "Terminal not sent", read: () => terminalReader.current?.() ?? null }),
+    [],
+  );
+  const requestTaken = useCallback((id: number) => setTypeRequest((current) => (current?.id === id ? null : current)), []);
+  const quoteToAgent = useCallback(
+    (quote: MessageQuote) => {
+      if (!agentId) return;
+      patch({ pane: "agent", rightOpen: true });
+      sendQuote(`agent:${agentId}`, quote);
+    },
+    [agentId, patch],
+  );
+
   const [extras, setExtras] = useState<SessionBrief[]>([]);
   const [adding, setAdding] = useState(false);
   const [addingFor, setAddingFor] = useState<string | null>(null);
@@ -554,9 +585,17 @@ export function Workbench({
 
   const attemptClose = useCallback(() => {
     const unsaved = editor.current?.dirtyPaths() ?? [];
-    if (unsaved.length && !window.confirm(`${unsaved.length} file${unsaved.length === 1 ? " has" : "s have"} unsaved changes. Leave the workshop anyway?`)) return;
+    if (unsaved.length && !window.confirm(`${unsaved.length} file${unsaved.length === 1 ? " has" : "s have"} unsaved changes. Leave the workshop anyway?`)) return false;
     onClose();
+    return true;
   }, [onClose]);
+
+  useLayoutEffect(() => {
+    closeRequest.current = attemptClose;
+    return () => {
+      closeRequest.current = null;
+    };
+  }, [closeRequest, attemptClose]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -760,7 +799,15 @@ export function Workbench({
             <>
               <Resizer axis="y" onDrag={(d) => patch((l) => ({ bottom: Math.max(120, Math.min(window.innerHeight - 220, l.bottom - d)) }))} />
               <div style={{ height: layout.bottom }} className="shrink-0">
-                <TerminalPane sessionKey={wkey} onHide={() => patch({ terminal: false })} onError={say} />
+                <TerminalPane
+                  sessionKey={wkey}
+                  readerRef={terminalReader}
+                  request={typeRequest}
+                  onRequestTaken={requestTaken}
+                  onQuote={agent ? quoteToAgent : undefined}
+                  onHide={() => patch({ terminal: false })}
+                  onError={say}
+                />
               </div>
             </>
           )}
@@ -889,7 +936,9 @@ export function Workbench({
                 ) : layout.pane !== "agent" ? (
                   <p className="p-4 text-w-sm text-w-muted">This session is closed.</p>
                 ) : agent ? (
-                  <div className="h-full overflow-hidden">{renderAgent(agent)}</div>
+                  <div className="h-full overflow-hidden">
+                    <TerminalTargetContext.Provider value={terminalTarget}>{renderAgent(agent, terminalAttach)}</TerminalTargetContext.Provider>
+                  </div>
                 ) : (
                   <p className="p-4 text-w-sm text-w-muted">This agent is not visible to you.</p>
                 )}

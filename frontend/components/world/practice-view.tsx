@@ -1,5 +1,6 @@
 "use client";
 
+import { openAcademy } from "@/lib/loka";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import {
@@ -14,7 +15,6 @@ import {
   PenNib,
   PencilSimple,
   Plus,
-  Sparkle,
   Student,
   X,
   type Icon as PhosphorIcon,
@@ -56,6 +56,7 @@ import { RelativeTime } from "./relative-time";
 import { Shimmer } from "./shimmer";
 import { BTN_GHOST, BTN_PRIMARY, BTN_SECONDARY, BTN_SECONDARY_SM, EASE, FOCUS, ICON_BTN, INPUT, MODAL, PILL_INFO, PILL_NEUTRAL, PILL_OK, SCRIM, SEGMENT, SEGMENT_ITEM, SEGMENT_OFF, SEGMENT_ON } from "./styles";
 import { VoiceField } from "./voice-ui";
+import { MeaningIcon } from "@/lib/meaning-icons";
 
 const TOOLS: { tool: InkTool; label: string; icon: PhosphorIcon }[] = [
   { tool: "pen", label: "Pen", icon: PenNib },
@@ -121,6 +122,9 @@ function CheckBody({
 }) {
   const check = checkOf(attempt.check);
   const handles = useMemo(() => new Map<string, WorldAgent>(coach ? [[coach.slug.toLowerCase(), coach]] : []), [coach]);
+  if (!check && attempt.grade_status === "error") {
+    return <p className="text-w-sm text-w-text2">A newer attempt replaced this one, so it was not graded.</p>;
+  }
   if (!check && late) {
     return (
       <div className="flex flex-wrap items-center gap-2" aria-live="polite">
@@ -145,8 +149,15 @@ function CheckBody({
     ["fix", "What to fix", check.fix],
     ["next", "Next exercise", check.next],
   ];
+  const xp = attempt.xp_awarded ?? 0;
   return (
     <div className="space-y-3" aria-live="polite">
+      {(attempt.grade_status === "passed" || attempt.grade_status === "failed") && (
+        <p className={cn("text-w-sm font-semibold", attempt.grade_status === "passed" ? "text-w-ok" : "text-w-warn")}>
+          {attempt.grade_status === "passed" ? "Passed" : "Not passed yet"}
+          {xp > 0 && <span className="ml-1.5 font-normal text-w-muted">+{xp} xp</span>}
+        </p>
+      )}
       {typeof check.score === "number" && (
         <p className="flex items-baseline gap-1.5">
           <span className="text-w-xl font-semibold tabular-nums text-w-strong">{check.score}</span>
@@ -170,6 +181,7 @@ export function PracticeView({
   focusItem,
   onOpenAgent,
   onChanged,
+  embedded = false,
 }: {
   detail: ReportDetail;
   agents: WorldAgent[];
@@ -177,6 +189,7 @@ export function PracticeView({
   focusItem: string | null;
   onOpenAgent: (id: string) => void;
   onChanged: () => void;
+  embedded?: boolean;
 }) {
   const report = detail.report;
   const [data, setData] = useState<PracticeDetail | null>(null);
@@ -585,7 +598,7 @@ export function PracticeView({
         ) : (
           <div className="space-y-1.5">
             <p className="flex items-center gap-1.5 text-w-sm font-semibold text-w-strong">
-              <Sparkle size={14} weight="duotone" className="text-w-link" /> How it works
+              <MeaningIcon.tip size={14} weight="duotone" className="text-w-link" /> How it works
             </p>
             <p className="text-w-sm leading-relaxed text-w-text2">
               {subject === "japanese" ? "Write a character in the grid" : "Draw on the page"}, then press Ready or say ready. {coach ? coach.name : "Your coach"} sees the picture and every stroke, and answers with what is right, what to fix and the next exercise.
@@ -660,7 +673,14 @@ export function PracticeView({
           className="min-w-0 flex-1 basis-40 rounded-md bg-transparent px-1 py-0.5 text-w-md font-semibold text-w-strong outline-none hover:bg-w-sand/60 focus:bg-w-field focus:ring-2 focus:ring-w-teal"
         />
         )}
-        {subject && <span className={PILL_INFO}>Practice · {subjectLabel(subject)}</span>}
+        {subject &&
+          (detail.lesson && !readOnly && !embedded ? (
+            <button type="button" onClick={() => openAcademy(detail.lesson)} title="Open this lesson's course in the Academy" className={cn(PILL_INFO, "hover:underline")}>
+              Lesson · {subjectLabel(subject)}
+            </button>
+          ) : (
+            <span className={PILL_INFO}>{detail.lesson ? "Lesson" : "Practice"} · {subjectLabel(subject)}</span>
+          ))}
         {attempts.length > 0 && <span className={PILL_NEUTRAL}>{attempts.length === 1 ? "1 attempt" : `${attempts.length} attempts`}</span>}
         {readOnly ? (
           coach && (

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use loka_shared::runners::{pr_sync_from, PrSync};
 use std::path::Path;
 use tracing::info;
 
@@ -110,9 +111,50 @@ pub fn is_final_pr_state(state: &str) -> bool {
     matches!(state, "MERGED" | "CLOSED")
 }
 
+pub async fn pr_sync(worktree_path: &Path, since: std::time::SystemTime) -> PrSync {
+    pr_sync_checked(worktree_path, since).await.unwrap_or(PrSync::Changed)
+}
+
+async fn pr_sync_checked(worktree_path: &Path, since: std::time::SystemTime) -> Result<PrSync> {
+    let git = |args: Vec<String>| async move {
+        let output = workspace_command("git", worktree_path)
+            .await
+            .args(args)
+            .output()
+            .await
+            .context("Failed to run git")?;
+        anyhow::ensure!(output.status.success(), "git failed");
+        Ok::<String, anyhow::Error>(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+    let branch = git(vec!["rev-parse".into(), "--abbrev-ref".into(), "HEAD".into()]).await?;
+    let mut view = workspace_command("gh", worktree_path).await;
+    view.args(["pr", "view"]);
+    if !branch.is_empty() && branch != "HEAD" {
+        view.arg(&branch);
+    }
+    let state = match view.args(["--json", "state"]).output().await {
+        Ok(output) if output.status.success() => serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .ok()
+            .and_then(|json| json["state"].as_str().map(str::to_string)),
+        _ => None,
+    };
+    if state.as_deref() == Some("MERGED") {
+        return Ok(PrSync::Merged);
+    }
+    let dirty = !git(vec!["status".into(), "--porcelain".into(), "--untracked-files=all".into()]).await?.is_empty();
+    let since = chrono::DateTime::<chrono::Utc>::from(since).to_rfc3339();
+    let new_commits = !git(vec!["rev-list".into(), "--max-count=1".into(), format!("--since={since}"), "HEAD".into()]).await?.is_empty();
+    Ok(pr_sync_from(state.as_deref(), dirty, new_commits))
+}
+
+pub fn extends_recorded_pr(recorded: Option<i64>, number: i32) -> bool {
+    recorded.is_none_or(|recorded| recorded == i64::from(number))
+}
+
 pub enum HeadPr {
     Own(PrInfo, String),
     Elsewhere(PrInfo),
+    Extends(PrInfo, String),
     Missing,
 }
 
@@ -121,6 +163,7 @@ pub async fn open_pr_containing_head(
     repo: &str,
     base_branch: &str,
     quest_branch: &str,
+    parent_pr: Option<i64>,
 ) -> Result<HeadPr> {
     let output = workspace_command("gh", worktree_path)
         .await
@@ -147,7 +190,7 @@ pub async fn open_pr_containing_head(
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    head_pr_from_list(worktree_path, &output.stdout, base_branch, quest_branch).await
+    head_pr_from_list(worktree_path, &output.stdout, base_branch, quest_branch, parent_pr).await
 }
 
 pub async fn stack_base(worktree_path: &Path, repo: &str, base_branch: &str, quest_branch: &str, parent_pr: Option<i64>) -> String {
@@ -194,6 +237,7 @@ async fn head_pr_from_list(
     listed: &[u8],
     base_branch: &str,
     quest_branch: &str,
+    parent_pr: Option<i64>,
 ) -> Result<HeadPr> {
     let prs: Vec<serde_json::Value> = serde_json::from_slice(listed)?;
     let prs: Vec<serde_json::Value> = prs.into_iter().filter(|pr| !pr["isCrossRepository"].as_bool().unwrap_or(false)).collect();
@@ -214,6 +258,10 @@ async fn head_pr_from_list(
             Some(commits) => commits.contains(&head),
             None => is_ancestor(worktree_path, &head, "HEAD").await? && !is_ancestor(worktree_path, &head, &base_ref).await?,
         };
+        let distance = match (contains, head_sha.as_deref()) {
+            (true, Some(tip)) if tip != head => commits_between(worktree_path, &head, tip).await,
+            _ => 0,
+        };
         open.push(OpenPr {
             info: PrInfo {
                 url: pr["url"].as_str().unwrap_or("").to_string(),
@@ -222,9 +270,10 @@ async fn head_pr_from_list(
             head_ref: pr["headRefName"].as_str().unwrap_or("").to_string(),
             head,
             contains,
+            distance,
         });
     }
-    Ok(classify_open_prs(open, head_sha.as_deref(), quest_branch, checked_out.as_deref()))
+    Ok(classify_open_prs(open, head_sha.as_deref(), quest_branch, checked_out.as_deref(), parent_pr))
 }
 
 struct OpenPr {
@@ -232,6 +281,7 @@ struct OpenPr {
     head_ref: String,
     head: String,
     contains: bool,
+    distance: usize,
 }
 
 fn branch_name(name: &str) -> &str {
@@ -254,9 +304,11 @@ fn classify_open_prs(
     head_sha: Option<&str>,
     quest_branch: &str,
     checked_out: Option<&str>,
+    parent_pr: Option<i64>,
 ) -> HeadPr {
     let mut by_branch = None;
     let mut elsewhere = None;
+    let mut extends: Option<(PrInfo, String, usize)> = None;
     for pr in prs {
         if crate::git::workspace::is_quest_branch(&pr.head_ref, quest_branch) {
             if pr.contains {
@@ -267,14 +319,25 @@ fn classify_open_prs(
             }
             continue;
         }
-        if pr.contains && elsewhere.is_none() && head_sha == Some(pr.head.as_str()) {
-            elsewhere = Some(pr.info);
+        if !pr.contains {
+            continue;
+        }
+        if head_sha == Some(pr.head.as_str()) {
+            if elsewhere.is_none() {
+                elsewhere = Some(pr.info);
+            }
+        } else if parent_pr.is_none()
+            && loka_shared::git_names::validate_git_ref(branch_name(&pr.head_ref)).is_ok()
+            && extends.as_ref().is_none_or(|(_, _, nearest)| pr.distance < *nearest)
+        {
+            extends = Some((pr.info, branch_name(&pr.head_ref).to_string(), pr.distance));
         }
     }
-    match (by_branch, elsewhere) {
-        (Some(pr), _) => HeadPr::Own(pr.info, pr.head_ref),
-        (None, Some(info)) => HeadPr::Elsewhere(info),
-        (None, None) => HeadPr::Missing,
+    match (by_branch, elsewhere, extends) {
+        (Some(pr), _, _) => HeadPr::Own(pr.info, pr.head_ref),
+        (None, Some(info), _) => HeadPr::Elsewhere(info),
+        (None, None, Some((info, head_ref, _))) => HeadPr::Extends(info, head_ref),
+        (None, None, None) => HeadPr::Missing,
     }
 }
 
@@ -304,6 +367,19 @@ async fn commits_only_in_head(worktree_path: &Path, base_ref: &str) -> Option<st
         .then(|| String::from_utf8_lossy(&output.stdout).lines().map(str::to_string).collect())
 }
 
+async fn commits_between(worktree_path: &Path, from: &str, to: &str) -> usize {
+    let output = workspace_command("git", worktree_path)
+        .await
+        .args(["rev-list", "--count", &format!("{from}..{to}"), "--"])
+        .output()
+        .await;
+    output
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8_lossy(&output.stdout).trim().parse().ok())
+        .unwrap_or(usize::MAX)
+}
+
 async fn is_ancestor(worktree_path: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
     let output = workspace_command("git", worktree_path)
         .await
@@ -328,6 +404,7 @@ mod tests {
             head_ref: head_ref.to_string(),
             head: head.to_string(),
             contains,
+            distance: usize::from(contains),
         }
     }
 
@@ -335,11 +412,12 @@ mod tests {
     fn a_contained_parent_pr_is_never_the_quest_own() {
         let quest = "add-sprite-stack-8210017e";
         let parent = || open_pr(113, "sprite-stacked-world-characters-buildings-7d988444", "parent", true);
-        assert_eq!(label(classify_open_prs(vec![parent()], Some("child"), quest, Some(quest))), "missing");
-        assert_eq!(label(classify_open_prs(vec![parent()], Some("child"), quest, None)), "missing");
-        assert_eq!(label(classify_open_prs(vec![parent()], Some("parent"), quest, Some(quest))), "elsewhere 113");
+        assert_eq!(label(classify_open_prs(vec![parent()], Some("child"), quest, Some(quest), Some(113))), "missing");
+        assert_eq!(label(classify_open_prs(vec![parent()], Some("child"), quest, None, Some(113))), "missing");
+        assert_eq!(label(classify_open_prs(vec![parent()], Some("child"), quest, None, None)), "extends 113 sprite-stacked-world-characters-buildings-7d988444");
+        assert_eq!(label(classify_open_prs(vec![parent()], Some("parent"), quest, Some(quest), None)), "elsewhere 113");
         let own = open_pr(120, quest, "child", true);
-        assert_eq!(label(classify_open_prs(vec![parent(), own], Some("child"), quest, Some(quest))), "own 120 add-sprite-stack-8210017e");
+        assert_eq!(label(classify_open_prs(vec![parent(), own], Some("child"), quest, Some(quest), None)), "own 120 add-sprite-stack-8210017e");
     }
 
     #[test]
@@ -358,6 +436,7 @@ mod tests {
         match found {
             HeadPr::Own(pr, head) => format!("own {} {head}", pr.number),
             HeadPr::Elsewhere(pr) => format!("elsewhere {}", pr.number),
+            HeadPr::Extends(pr, head) => format!("extends {} {head}", pr.number),
             HeadPr::Missing => "missing".to_string(),
         }
     }
@@ -372,43 +451,63 @@ mod tests {
     }
 
     #[test]
+    fn work_on_top_of_an_open_pr_updates_that_pr_unless_it_is_the_stack_parent() {
+        let quest = "merge-pr-98-d22f2222";
+        let nearer = || OpenPr { distance: 1, ..open_pr(98, "browser-gate", "aaa", true) };
+        let deeper = || OpenPr { distance: 4, ..open_pr(97, "browser-base", "bbb", true) };
+        assert_eq!(label(classify_open_prs(vec![deeper(), nearer()], Some("ccc"), quest, Some(quest), None)), "extends 98 browser-gate");
+        assert_eq!(label(classify_open_prs(vec![nearer(), deeper()], Some("ccc"), quest, Some(quest), None)), "extends 98 browser-gate");
+        assert_eq!(label(classify_open_prs(vec![nearer(), deeper()], Some("ccc"), quest, Some(quest), Some(98))), "missing");
+        assert_eq!(label(classify_open_prs(vec![nearer(), deeper()], Some("ccc"), quest, Some(quest), Some(55))), "missing");
+        assert!(extends_recorded_pr(None, 98));
+        assert!(extends_recorded_pr(Some(98), 98));
+        assert!(!extends_recorded_pr(Some(94), 98));
+        assert_eq!(label(classify_open_prs(vec![nearer()], Some("aaa"), quest, Some(quest), None)), "elsewhere 98");
+        assert_eq!(label(classify_open_prs(vec![open_pr(98, "browser-gate", "aaa", false)], Some("ccc"), quest, Some(quest), None)), "missing");
+        assert_eq!(label(classify_open_prs(vec![open_pr(98, "", "aaa", true)], Some("ccc"), quest, Some(quest), None)), "missing");
+        assert_eq!(label(classify_open_prs(vec![open_pr(98, "bad..ref", "aaa", true)], Some("ccc"), quest, Some(quest), None)), "missing");
+        assert_eq!(label(classify_open_prs(vec![nearer(), open_pr(94, quest, "ddd", true)], Some("ccc"), quest, Some(quest), None)), "own 94 merge-pr-98-d22f2222");
+    }
+
+    #[test]
     fn open_prs_are_classified_by_quest_branch_first() {
         let quest = "fix-x-dcec4a9d";
         let own = || open_pr(94, quest, "aaa", true);
         let foreign_at_head = || open_pr(86, "pr84", "bbb", true);
-        assert_eq!(label(classify_open_prs(vec![foreign_at_head(), own()], Some("bbb"), quest, None)), "own 94 fix-x-dcec4a9d");
-        assert_eq!(label(classify_open_prs(vec![foreign_at_head()], Some("bbb"), quest, None)), "elsewhere 86");
-        assert_eq!(label(classify_open_prs(vec![open_pr(86, "pr84", "bbb", true)], Some("ccc"), quest, None)), "missing");
-        assert_eq!(label(classify_open_prs(vec![open_pr(86, "pr84", "bbb", false)], Some("bbb"), quest, None)), "missing");
-        assert_eq!(label(classify_open_prs(vec![], Some("bbb"), quest, None)), "missing");
+        assert_eq!(label(classify_open_prs(vec![foreign_at_head(), own()], Some("bbb"), quest, None, None)), "own 94 fix-x-dcec4a9d");
+        assert_eq!(label(classify_open_prs(vec![foreign_at_head()], Some("bbb"), quest, None, None)), "elsewhere 86");
+        assert_eq!(label(classify_open_prs(vec![open_pr(86, "pr84", "bbb", true)], Some("ccc"), quest, None, None)), "extends 86 pr84");
+        assert_eq!(label(classify_open_prs(vec![open_pr(86, "pr84", "bbb", true)], Some("ccc"), quest, None, Some(86))), "missing");
+        assert_eq!(label(classify_open_prs(vec![open_pr(86, "pr84", "bbb", false)], Some("bbb"), quest, None, None)), "missing");
+        assert_eq!(label(classify_open_prs(vec![], Some("bbb"), quest, None, None)), "missing");
     }
 
     #[test]
     fn a_pr_on_the_quest_branch_stays_own_after_runtime_commits() {
         let quest = "fix-x-dcec4a9d";
         let stale_own = open_pr(94, quest, "old", false);
-        assert_eq!(label(classify_open_prs(vec![stale_own], Some("new"), quest, None)), "own 94 fix-x-dcec4a9d");
+        assert_eq!(label(classify_open_prs(vec![stale_own], Some("new"), quest, None, None)), "own 94 fix-x-dcec4a9d");
         let renamed = || open_pr(95, "fix-x-dcec4a9d-2", "old", false);
         let foreign = || open_pr(86, "pr84", "new", true);
         assert_eq!(
-            label(classify_open_prs(vec![foreign(), renamed()], Some("new"), quest, Some("fix-x-dcec4a9d-2"))),
+            label(classify_open_prs(vec![foreign(), renamed()], Some("new"), quest, Some("fix-x-dcec4a9d-2"), None)),
             "own 95 fix-x-dcec4a9d-2"
         );
-        assert_eq!(label(classify_open_prs(vec![foreign(), renamed()], Some("new"), quest, None)), "elsewhere 86");
-        assert_eq!(label(classify_open_prs(vec![renamed()], Some("new"), quest, Some(quest))), "missing");
+        assert_eq!(label(classify_open_prs(vec![foreign(), renamed()], Some("new"), quest, None, None)), "elsewhere 86");
+        assert_eq!(label(classify_open_prs(vec![renamed()], Some("new"), quest, Some(quest), None)), "missing");
     }
 
     #[test]
     fn variants_of_the_quest_branch_count_only_when_they_hold_head() {
         let quest = "fix-login-1a2b3c4d";
         let prs = || vec![open_pr(40, "fix-login", "aaa", false), open_pr(41, "fix-login-2", "bbb", false)];
-        assert_eq!(label(classify_open_prs(prs(), Some("ccc"), quest, None)), "missing");
-        assert_eq!(label(classify_open_prs(prs(), Some("ccc"), quest, Some(quest))), "missing");
-        assert_eq!(label(classify_open_prs(prs(), Some("ccc"), quest, Some("main"))), "missing");
+        assert_eq!(label(classify_open_prs(prs(), Some("ccc"), quest, None, None)), "missing");
+        assert_eq!(label(classify_open_prs(prs(), Some("ccc"), quest, Some(quest), None)), "missing");
+        assert_eq!(label(classify_open_prs(prs(), Some("ccc"), quest, Some("main"), None)), "missing");
         let shared = vec![open_pr(42, "eng-12/fix-login", "ddd", false)];
-        assert_eq!(label(classify_open_prs(shared, Some("ccc"), quest, Some("eng-12/fix-login"))), "missing");
-        assert_eq!(label(classify_open_prs(vec![open_pr(41, "fix-login-2", "ccc", true)], Some("ccc"), quest, None)), "own 41 fix-login-2");
-        assert_eq!(label(classify_open_prs(prs(), Some("ccc"), quest, Some("fix-login-2"))), "own 41 fix-login-2");
+        assert_eq!(label(classify_open_prs(shared, Some("ccc"), quest, Some("eng-12/fix-login"), None)), "missing");
+        assert_eq!(label(classify_open_prs(vec![open_pr(41, "fix-login-2", "ccc", true)], Some("ccc"), quest, None, None)), "own 41 fix-login-2");
+        assert_eq!(label(classify_open_prs(prs(), Some("ccc"), quest, Some("fix-login-2"), None)), "own 41 fix-login-2");
     }
 
     struct TempRepos(std::path::PathBuf);
@@ -485,22 +584,31 @@ mod tests {
         git(&work, &["fetch", "origin"]).await;
 
         let all = listed(&[(40, "fix-login", &old_style), (41, "other", &other), (94, quest, &published)]);
-        assert_eq!(label(head_pr_from_list(&work, &all, "main", quest).await.unwrap()), format!("own 94 {quest}"));
+        assert_eq!(label(head_pr_from_list(&work, &all, "main", quest, None).await.unwrap()), format!("own 94 {quest}"));
 
         let variants = listed(&[(40, "fix-login", &old_style), (41, "fix-login-2", &other)]);
-        assert_eq!(label(head_pr_from_list(&work, &variants, "main", quest).await.unwrap()), "missing");
+        assert_eq!(label(head_pr_from_list(&work, &variants, "main", quest, None).await.unwrap()), "missing");
 
         let stale = listed(&[(94, quest, &other)]);
-        assert_eq!(label(head_pr_from_list(&work, &stale, "main", quest).await.unwrap()), format!("own 94 {quest}"));
+        assert_eq!(label(head_pr_from_list(&work, &stale, "main", quest, None).await.unwrap()), format!("own 94 {quest}"));
 
         let at_head = listed(&[(41, "other", &other), (86, "pr84", &local)]);
-        assert_eq!(label(head_pr_from_list(&work, &at_head, "main", quest).await.unwrap()), "elsewhere 86");
+        assert_eq!(label(head_pr_from_list(&work, &at_head, "main", quest, None).await.unwrap()), "elsewhere 86");
 
         git(&work, &["switch", "fix-login"]).await;
         let checked_out = listed(&[(40, "fix-login", &other)]);
-        assert_eq!(label(head_pr_from_list(&work, &checked_out, "main", quest).await.unwrap()), "own 40 fix-login");
+        assert_eq!(label(head_pr_from_list(&work, &checked_out, "main", quest, None).await.unwrap()), "own 40 fix-login");
+        git(&work, &["switch", "-c", "pr-91", &published]).await;
+        let fix_one = commit_file(&work, "fix-one").await;
+        let fix_two = commit_file(&work, "fix-two").await;
+        let on_top = listed(&[(91, "pr-91", &fix_one), (92, "pr-92", &published)]);
+        assert_eq!(label(head_pr_from_list(&work, &on_top, "main", quest, None).await.unwrap()), "extends 91 pr-91");
+        let exact = listed(&[(91, "pr-91", &fix_two)]);
+        assert_eq!(label(head_pr_from_list(&work, &exact, "main", quest, None).await.unwrap()), "elsewhere 91");
+        assert_eq!(label(head_pr_from_list(&work, &on_top, "main", quest, Some(91)).await.unwrap()), "missing");
+        git(&work, &["switch", "fix-login"]).await;
         let cousin = listed(&[(41, "fix-login-2", &other)]);
-        assert_eq!(label(head_pr_from_list(&work, &cousin, "main", quest).await.unwrap()), "missing");
+        assert_eq!(label(head_pr_from_list(&work, &cousin, "main", quest, None).await.unwrap()), "missing");
     }
 
     #[test]

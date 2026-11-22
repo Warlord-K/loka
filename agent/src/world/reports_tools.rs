@@ -86,7 +86,7 @@ fn line(r: &ReportBrief) -> String {
         extra.push("pinned".into());
     }
     if let Some(subject) = r.practice.as_ref().and_then(|p| p.get("subject")).and_then(Value::as_str) {
-        extra.push(format!("{subject} practice canvas, read_practice"));
+        extra.push(format!("{subject} canvas lesson, list_challenges"));
     } else if r.kind == "canvas" {
         extra.push(if r.open_marks > 0 { format!("canvas, {} open marks", r.open_marks) } else { "canvas".into() });
     }
@@ -178,6 +178,7 @@ pub async fn call(store: &WorldStore, caller: &WorldAgent, quest: Option<Uuid>, 
                 tags: tags_arg(args),
                 pinned: args.get("pinned").and_then(Value::as_bool),
                 visibility: arg("visibility").map(String::from),
+                base_updated_at: None,
                 canvas: None,
             };
             let updated = store.update_report(report.id, by, &patch).await?.ok_or_else(|| anyhow!("that report is gone"))?;

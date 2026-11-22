@@ -11,6 +11,7 @@ import {
   type NpcLine,
   type NpcTalk,
   type OfferOutcome,
+  type Practiced,
   type Progress,
   type Region,
   type RegionDetail,
@@ -56,6 +57,7 @@ export const lokaApi = {
   adventures: () => call<AdventureCard[]>(LOKA_ROUTES.adventures),
   progress: () => call<Progress>(LOKA_ROUTES.progress),
   offer: (taskId: string | null) => post<OfferOutcome>(LOKA_ROUTES.offer, taskId ? { task_id: taskId } : {}),
+  practiceThis: (reportId: string) => call<Practiced>(LOKA_ROUTES.practiceThis(reportId), { method: "POST" }),
   setAcademy: (on: boolean) => call<Progress>(LOKA_ROUTES.academy, { method: "PUT", body: JSON.stringify({ on }) }),
 };
 

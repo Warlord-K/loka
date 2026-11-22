@@ -35,6 +35,13 @@ async fn asker_name(state: &AppState, user: Uuid) -> Result<String, StatusCode> 
     Ok(state.world.user_display_name(user).await.map_err(internal)?.unwrap_or_else(|| "Your person".to_string()))
 }
 
+pub struct Said<'a> {
+    pub text: &'a str,
+    pub attachments: &'a Value,
+    pub spoken: bool,
+    pub quote: Option<&'a Value>,
+}
+
 #[derive(Deserialize)]
 pub struct StartQuick {
     text: String,
@@ -46,6 +53,8 @@ pub struct StartQuick {
     cli: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    quote: Option<Value>,
 }
 
 pub async fn start(
@@ -73,6 +82,7 @@ pub async fn start(
         return Err(refuse(StatusCode::CONFLICT, &problem));
     }
     let attachments = attachment_meta(&state, &viewer, &body.attachments).await.map_err(failed)?;
+    let quote = state.world.clean_quote(&viewer, body.quote.as_ref()).await.map_err(|e| failed(internal(e)))?;
     let name = asker_name(&state, viewer.user).await.map_err(failed)?;
     let session = state
         .world
@@ -80,8 +90,9 @@ pub async fn start(
         .await
         .map_err(|e| refuse(StatusCode::CONFLICT, &e.to_string()))?;
     let memory = state.world.quick_memory_note(&session).await.map_err(|e| failed(internal(e)))?;
-    let prompt = quick::opening_prompt(&name, text, &attached_names(&attachments), memory.as_deref());
-    let message = post_person(&state, &agent, &session, viewer.user, text, &attachments, body.spoken).await?;
+    let prompt = quick::opening_prompt(&name, &quick::with_quote(text, quote.as_ref()), &attached_names(&attachments), memory.as_deref());
+    let said = Said { text, attachments: &attachments, spoken: body.spoken, quote: quote.as_ref() };
+    let message = post_person(&state, &agent, &session, viewer.user, &said).await?;
     let run = state.world.queue_quick(&session, &prompt).await.map_err(|e| refuse(StatusCode::CONFLICT, &e.to_string()))?;
     Ok((StatusCode::CREATED, Json(json!({ "session_id": session.id, "run_id": run.id, "message": message }))))
 }
@@ -91,17 +102,18 @@ async fn post_person(
     agent: &WorldAgent,
     session: &AgentSession,
     user: Uuid,
-    text: &str,
-    attachments: &Value,
-    spoken: bool,
+    said: &Said<'_>,
 ) -> Result<AgentMessage, Refusal> {
-    let mut meta = json!({ "attachments": attachments });
-    if spoken {
+    let mut meta = json!({ "attachments": said.attachments });
+    if said.spoken {
         meta["spoken"] = json!(true);
+    }
+    if let Some(quote) = said.quote {
+        meta["quote"] = quote.clone();
     }
     state
         .world
-        .post_quick_message(agent, session, Some(user), text, None, meta)
+        .post_quick_message(agent, session, Some(user), said.text, None, meta)
         .await
         .map_err(|e| failed(internal(e)))
 }
@@ -168,6 +180,8 @@ pub struct QuickPost {
     spoken: bool,
     #[serde(default)]
     answers: Option<Uuid>,
+    #[serde(default)]
+    quote: Option<Value>,
 }
 
 pub async fn send(
@@ -189,19 +203,13 @@ pub async fn send(
         return Err(refuse(StatusCode::BAD_REQUEST, "Write something first."));
     }
     let attachments = attachment_meta(&state, &viewer, &body.attachments).await.map_err(failed)?;
-    let (message, run) = continue_session(&state, &agent, &session, viewer.user, text, &attachments, body.spoken).await?;
+    let quote = state.world.clean_quote(&viewer, body.quote.as_ref()).await.map_err(|e| failed(internal(e)))?;
+    let said = Said { text, attachments: &attachments, spoken: body.spoken, quote: quote.as_ref() };
+    let (message, run) = continue_session(&state, &agent, &session, viewer.user, &said).await?;
     Ok((StatusCode::CREATED, Json(json!({ "session_id": session.id, "run_id": run, "message": message }))))
 }
 
-async fn continue_session(
-    state: &AppState,
-    agent: &WorldAgent,
-    session: &AgentSession,
-    user: Uuid,
-    text: &str,
-    attachments: &Value,
-    spoken: bool,
-) -> Result<(AgentMessage, Uuid), Refusal> {
+async fn ready_prompt(state: &AppState, agent: &WorldAgent, session: &AgentSession, said: &Said<'_>) -> Result<String, Refusal> {
     if session.status == "archived" {
         return Err(refuse(StatusCode::CONFLICT, "This quick chat is closed. Start a new one."));
     }
@@ -209,22 +217,35 @@ async fn continue_session(
         return Err(refuse(StatusCode::CONFLICT, &problem));
     }
     let name = quick::asker_name(session);
-    let names = attached_names(attachments);
+    let names = attached_names(said.attachments);
+    let prompt_text = quick::with_quote(said.text, said.quote);
     let started = state.world.quick_has_started(session.id).await.map_err(|e| failed(internal(e)))?;
     let prompt = match (started, quick::thread_root(session)) {
-        (true, _) => quick::next_prompt(&name, text, &names),
+        (true, _) => quick::next_prompt(&name, &prompt_text, &names),
         (false, root) => {
             let memory = state.world.quick_memory_note(session).await.map_err(|e| failed(internal(e)))?;
             match root {
                 Some(root) => {
                     let transcript = state.world.quick_thread_transcript(agent.id, root).await.map_err(|e| failed(internal(e)))?;
-                    quick::thread_prompt(&name, &transcript, text, &names, memory.as_deref())
+                    quick::thread_prompt(&name, &transcript, &prompt_text, &names, memory.as_deref())
                 }
-                None => quick::opening_prompt(&name, text, &names, memory.as_deref()),
+                None => quick::opening_prompt(&name, &prompt_text, &names, memory.as_deref()),
             }
         }
     };
-    let message = post_person(state, agent, session, user, text, attachments, spoken).await?;
+    let plans = loka_shared::quests::waiting_plans_note(&state.world.waiting_plans(agent.id).await.map_err(|e| failed(internal(e)))?);
+    Ok(if plans.is_empty() { prompt } else { format!("{prompt}\n\n{plans}") })
+}
+
+async fn continue_session(
+    state: &AppState,
+    agent: &WorldAgent,
+    session: &AgentSession,
+    user: Uuid,
+    said: &Said<'_>,
+) -> Result<(AgentMessage, Uuid), Refusal> {
+    let prompt = ready_prompt(state, agent, session, said).await?;
+    let message = post_person(state, agent, session, user, said).await?;
     let run = state.world.queue_quick(session, &prompt).await.map_err(|e| refuse(StatusCode::CONFLICT, &e.to_string()))?;
     Ok((message, run.id))
 }
@@ -288,10 +309,9 @@ pub async fn reply_in_thread(
     viewer: &Viewer,
     agent: &WorldAgent,
     root: Uuid,
-    text: &str,
-    attachments: &Value,
-    spoken: bool,
+    said: &Said<'_>,
 ) -> Result<Option<AgentMessage>, StatusCode> {
+    let text = said.text;
     if agent.owner_user_id != Some(viewer.user) || text.is_empty() || text.starts_with('!') {
         return Ok(None);
     }
@@ -325,8 +345,30 @@ pub async fn reply_in_thread(
     if quick::asker(&session) != Some(viewer.user) {
         return Ok(None);
     }
-    continue_session(state, agent, &session, viewer.user, text, attachments, spoken)
+    continue_session(state, agent, &session, viewer.user, said)
         .await
         .map(|(message, _)| Some(message))
         .map_err(|(status, _)| status)
+}
+
+pub async fn voice_request(
+    state: &AppState,
+    agent: &WorldAgent,
+    session: &AgentSession,
+    user: Uuid,
+    text: &str,
+    context: &str,
+    call_id: &str,
+) -> Result<(), Refusal> {
+    let said = Said { text, attachments: &json!([]), spoken: true, quote: None };
+    let prompt = ready_prompt(state, agent, session, &said).await?;
+    let prompt = if context.is_empty() { prompt } else { format!("{prompt}\n\n[the call so far]\n{context}") };
+    let prompt = loka_shared::voice::with_note(prompt, &json!({ "voice": true }));
+    state
+        .world
+        .post_quick_message(agent, session, Some(user), text, None, json!({ "kind": "voice", "voice_request": true, "call_id": call_id, "spoken": true }))
+        .await
+        .map_err(|e| failed(internal(e)))?;
+    state.world.queue_quick(session, &prompt).await.map_err(|e| refuse(StatusCode::CONFLICT, &e.to_string()))?;
+    Ok(())
 }

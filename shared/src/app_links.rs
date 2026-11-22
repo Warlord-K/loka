@@ -40,6 +40,22 @@ pub fn todo_url(id: Uuid) -> String {
     format!("{}/world?todo={id}", app_url())
 }
 
+pub fn list_url(id: Uuid) -> String {
+    format!("{}/world?list={id}", app_url())
+}
+
+pub fn team_url(id: Uuid) -> String {
+    format!("{}/world?team={id}", app_url())
+}
+
+pub fn region_url(id: Uuid) -> String {
+    format!("{}/world?region={id}", app_url())
+}
+
+pub fn place_url(id: Uuid) -> String {
+    format!("{}/world?place={id}", app_url())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,5 +67,9 @@ mod tests {
         assert!(agent_url("ada lovelace").ends_with("/world?agent=ada%20lovelace"));
         assert!(message_url("ch12").ends_with("/world?msg=ch12"));
         assert!(canvas_item_url(id, "i1a2").ends_with(&format!("/world?report={id}&item=i1a2")));
+        assert!(list_url(id).ends_with(&format!("/world?list={id}")));
+        assert!(team_url(id).ends_with(&format!("/world?team={id}")));
+        assert!(region_url(id).ends_with(&format!("/world?region={id}")));
+        assert!(place_url(id).ends_with(&format!("/world?place={id}")));
     }
 }

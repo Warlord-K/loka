@@ -16,12 +16,12 @@ import { WindowHeader, EmptyState } from "./settings-shell";
 import { escapeTaken } from "@/lib/escape";
 
 export type PlaceSheet =
-  | { kind: "agents"; surface: "schedules" | "usage" | "feeds"; agentId?: string }
+  | { kind: "agents"; surface: "schedules" | "usage" | "feeds"; agentId?: string; focusId?: string }
   | { kind: "setup"; feature: FeatureKey; title: string }
   | { kind: "skills"; agentId: string }
   | { kind: "notes"; agentId: string }
   | { kind: "notes-all" }
-  | { kind: "kit"; agentId: string };
+  | { kind: "kit"; agentId: string; focus?: { id: string; kind: "skill" | "mcp" } };
 
 const AGENT_TITLE = { schedules: "Schedules and heartbeats", usage: "Usage and budgets", feeds: "Feeds" } as const;
 
@@ -169,6 +169,7 @@ function NotesSheet({ agent, agents, onClose, onBack, onOpenAgent }: { agent: Wo
 function AgentsSheet({
   surface,
   initialAgent,
+  focusId,
   agents,
   meId,
   isAdmin,
@@ -177,6 +178,7 @@ function AgentsSheet({
 }: {
   surface: "schedules" | "usage" | "feeds";
   initialAgent?: string;
+  focusId?: string;
   agents: WorldAgent[];
   meId: string | null;
   isAdmin: boolean;
@@ -185,7 +187,8 @@ function AgentsSheet({
 }) {
   const mine = useMemo(() => agents.filter((a) => isAdmin || a.owner_user_id === meId), [agents, isAdmin, meId]);
   const [picked, setPicked] = useState<string | null>(initialAgent ?? null);
-  const agent = mine.find((a) => a.id === picked) ?? mine[0] ?? null;
+  const agent = picked ? mine.find((a) => a.id === picked) : mine[0];
+  const recordId = agent?.id === initialAgent ? focusId : undefined;
   const total = mine.reduce((n, a) => n + (a.cost_usd ?? 0), 0);
   const paused = mine.filter((a) => (a.paused_reason ?? "").startsWith("Daily budget of"));
   return (
@@ -202,14 +205,14 @@ function AgentsSheet({
         </div>
       )}
       {!agent ? (
-        <p className="text-w-base text-w-muted">You have no agents of your own yet.</p>
+        <p className="text-w-base text-w-muted">{picked ? "This agent is not around any more." : "You have no agents of your own yet."}</p>
       ) : (
         <>
           {mine.length > 1 && <AgentPicker agents={mine} value={agent.id} onChange={setPicked} />}
           {surface === "schedules" ? (
-            <SchedulesSection key={agent.id} agentId={agent.id} agentName={agent.name} />
+            <SchedulesSection key={agent.id} agentId={agent.id} agentName={agent.name} focusId={recordId} />
           ) : surface === "feeds" ? (
-            <FeedsSection key={agent.id} agentId={agent.id} agentName={agent.name} canChange />
+            <FeedsSection key={agent.id} agentId={agent.id} agentName={agent.name} focusId={recordId} canChange />
           ) : (
             <UsageSection key={agent.id} agent={agent} canChange onUpdated={onUpdated} />
           )}
@@ -250,7 +253,7 @@ export function PlaceSheetView({
   onAgentUpdated: (agent: WorldAgent) => void;
 }) {
   const agentOf = (id: string) => agents.find((a) => a.id === id) ?? null;
-  if (sheet.kind === "agents") return <AgentsSheet key={`${sheet.surface}:${sheet.agentId ?? ""}`} surface={sheet.surface} initialAgent={sheet.agentId} agents={agents} meId={meId} isAdmin={isAdmin} onClose={onClose} onUpdated={onAgentUpdated} />;
+  if (sheet.kind === "agents") return <AgentsSheet key={`${sheet.surface}:${sheet.agentId ?? ""}:${sheet.focusId ?? ""}`} surface={sheet.surface} initialAgent={sheet.agentId} focusId={sheet.focusId} agents={agents} meId={meId} isAdmin={isAdmin} onClose={onClose} onUpdated={onAgentUpdated} />;
   if (sheet.kind === "setup") return <SetupSheet feature={sheet.feature} title={sheet.title} onClose={onClose} />;
   if (sheet.kind === "notes-all") {
     const mine = agents.filter((a) => isAdmin || a.owner_user_id === meId);
@@ -285,7 +288,7 @@ export function PlaceSheetView({
   if (sheet.kind === "notes") return <NotesSheet agent={agent} agents={agents} onClose={onClose} onOpenAgent={onOpenAgent} />;
   return (
     <Shell eyebrow={`${agent.name}'s machines`} title="Kit" onClose={onClose}>
-      <KitSection agentId={agent.id} agentName={agent.name} canInstall={canInstall} />
+      <KitSection agentId={agent.id} agentName={agent.name} focus={sheet.focus} canInstall={canInstall} />
     </Shell>
   );
 }

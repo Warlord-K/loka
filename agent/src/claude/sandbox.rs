@@ -182,6 +182,8 @@ pub(crate) fn owner_temp_patterns(dirs: &[PathBuf]) -> Vec<String> {
         .collect()
 }
 
+const GIT_CONFIG_FILES: [&str; 3] = ["config", "config.worktree", "worktrees/*/config.worktree"];
+
 pub fn git_write_roots(dir: &Path) -> Vec<String> {
     let mut dirs = vec![dir.to_path_buf()];
     if !dir.join(".git").exists() {
@@ -292,7 +294,7 @@ pub fn settings(
         .collect();
     let allow_write: Vec<String> = WRITABLE_CACHES.iter().map(|p| p.to_string()).chain(writable.iter().cloned()).collect();
     let deny_write: Vec<String> =
-        writable.iter().flat_map(|root| ["config", "config.worktree"].map(|name| format!("{}/{name}", root.trim_end_matches('/')))).collect();
+        writable.iter().flat_map(|root| GIT_CONFIG_FILES.map(|name| format!("{}/{name}", root.trim_end_matches('/')))).collect();
     let mut sandbox = json!({
         "enabled": true,
         "failIfUnavailable": mode == Mode::Strict,
@@ -465,7 +467,7 @@ mod tests {
         assert_eq!(owner["sandbox"]["filesystem"]["allowGitConfig"], json!(true));
         assert!(guest["sandbox"]["filesystem"].get("allowGitConfig").is_none());
         let deny = owner["sandbox"]["filesystem"]["denyWrite"].as_array().unwrap();
-        for name in ["config", "config.worktree"] {
+        for name in ["config", "config.worktree", "worktrees/*/config.worktree"] {
             assert!(deny.iter().any(|p| *p == format!("/runner/repos/o/r/.git/{name}")), "{name} of the shared clone must stay protected");
         }
         assert_eq!(owner["sandbox"]["network"]["allowMachLookup"], json!(["com.apple.CoreSimulator.*"]));
@@ -486,6 +488,47 @@ mod tests {
                 assert!(write.contains(&pattern.as_str()), "{pattern} missing from allowWrite");
             }
         }
+    }
+
+    fn claude_glob(glob: &str) -> regex_lite::Regex {
+        let mut pattern = String::from("^");
+        let mut rest = glob;
+        while let Some(c) = rest.chars().next() {
+            let (piece, used) = if rest.starts_with("**/") {
+                ("(.*/)?".to_string(), 3)
+            } else if rest.starts_with("**") {
+                (".*".to_string(), 2)
+            } else if c == '*' {
+                ("[^/]*".to_string(), 1)
+            } else {
+                (regex_lite::escape(&c.to_string()), c.len_utf8())
+            };
+            pattern.push_str(&piece);
+            rest = &rest[used..];
+        }
+        pattern.push('$');
+        regex_lite::Regex::new(&pattern).unwrap()
+    }
+
+    #[test]
+    fn owner_temp_patterns_reach_inside_the_named_entries_and_nowhere_else() {
+        let globs: Vec<regex_lite::Regex> = owner_temp_patterns(&[PathBuf::from("/private/var/folders/ab/cd/T")]).iter().map(|g| claude_glob(g)).collect();
+        let allowed = |path: &str| globs.iter().any(|glob| glob.is_match(path));
+        let root = "/private/var/folders/ab/cd/T";
+        for inside in [
+            "TemporaryDirectory.Ab12",
+            "TemporaryDirectory.Ab12/a",
+            "TemporaryDirectory.Ab12/SourcePackages/checkouts/x/Package.resolved",
+            "swift-build-1/x/y",
+            "com.apple.dt.XCBuild/a/b",
+            "xcrun_db-abc",
+        ] {
+            assert!(allowed(&format!("{root}/{inside}")), "{root}/{inside} refused");
+        }
+        for outside in ["", "/x", "/loka-outbox/a", "/TemporaryDirectoryAb/a", "/other/TemporaryDirectory.a/b"] {
+            assert!(!allowed(&format!("{root}{outside}")), "{root}{outside} allowed");
+        }
+        assert!(!allowed("/private/var/folders/zz/yy/T/TemporaryDirectory.a/b"));
     }
 
     #[test]

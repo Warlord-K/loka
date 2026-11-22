@@ -31,7 +31,7 @@ export const SHORTCUTS: [string | string[], string][] = [
   ["T", "Terminal"],
   ["N", "Notifications"],
   ["P", "Your main agent"],
-  ["Y", "Your profile and settings"],
+  ["Y", "Settings"],
   ["Esc", "Close a window"],
 ];
 

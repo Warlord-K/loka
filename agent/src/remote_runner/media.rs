@@ -46,6 +46,48 @@ pub(super) fn wants_files(request: &Value) -> bool {
     }
 }
 
+pub(super) fn wants_upload(request: &Value) -> bool {
+    request.get("method").and_then(Value::as_str) == Some("tools/call") && request.pointer("/params/name").and_then(Value::as_str) == Some("get_upload")
+}
+
+pub(super) fn upload_id(request: &Value) -> Result<Uuid, String> {
+    let raw = request.pointer("/params/arguments/upload_id").and_then(Value::as_str).unwrap_or("").trim();
+    raw.trim_start_matches("upload:").parse().map_err(|_| format!("{raw:?} is not an upload id"))
+}
+
+pub(super) fn answer(request: &Value, text: String) -> Value {
+    json!({ "jsonrpc": "2.0", "id": request.get("id").cloned().unwrap_or(Value::Null), "result": { "content": [{ "type": "text", "text": text }] } })
+}
+
+pub(super) async fn save_upload(api: &RunnerApi, lease_id: Uuid, token: &str, roots: &[PathBuf], request: &Value) -> Result<String, String> {
+    let id = upload_id(request)?;
+    let dir = roots.get(1).ok_or_else(|| "this job has no media folder to save into: get_upload works only in quests on your owner's own device, not on cloud runners".to_string())?;
+    let response = api
+        .client
+        .get(api.lease_url(lease_id, &format!("/uploads/{id}")))
+        .header("Authorization", format!("RunnerMcp {token}"))
+        .send()
+        .await
+        .map_err(|e| format!("could not fetch the upload: {e}"))?;
+    let status = response.status();
+    let answer: Value = response.json().await.unwrap_or(Value::Null);
+    if !status.is_success() {
+        return Err(answer.get("message").and_then(Value::as_str).unwrap_or("the upload could not be fetched").to_string());
+    }
+    let text = |key: &str| answer.get(key).and_then(Value::as_str).unwrap_or("");
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, text("data_base64")).map_err(|_| "the upload came back unreadable".to_string())?;
+    if bytes.len() > loka_shared::media::MAX_VIDEO {
+        return Err(format!("the upload is larger than {} MB", loka_shared::media::MAX_VIDEO / (1024 * 1024)));
+    }
+    let name = loka_shared::media::attachment_file_name(id, text("name"), text("mime"));
+    let path = dir.join(&name);
+    if path.parent() != Some(dir.as_path()) {
+        return Err("the upload name is not usable".into());
+    }
+    tokio::fs::write(&path, &bytes).await.map_err(|e| format!("could not save the upload: {e}"))?;
+    Ok(format!("Saved {} ({}, {} bytes) to {}", text("name"), text("mime"), bytes.len(), path.display()))
+}
+
 pub(super) fn refusal(request: &Value, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": request.get("id").cloned().unwrap_or(Value::Null), "result": {
         "content": [{ "type": "text", "text": message }], "isError": true
@@ -167,6 +209,19 @@ mod tests {
         assert!(resolve(base.join("secret.png").to_str().unwrap(), &roots).is_err());
         assert!(resolve("missing.png", &roots).is_err());
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn get_upload_calls_are_recognised_and_their_ids_checked() {
+        let call = |name: &str, args: Value| json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": name, "arguments": args } });
+        let id = Uuid::new_v4();
+        assert!(wants_upload(&call("get_upload", json!({ "upload_id": id.to_string() }))));
+        assert!(!wants_upload(&call("show_media", json!({ "upload_id": id.to_string() }))));
+        assert!(!wants_upload(&json!({ "method": "tools/list", "params": { "name": "get_upload" } })));
+        assert_eq!(upload_id(&call("get_upload", json!({ "upload_id": id.to_string() }))), Ok(id));
+        assert_eq!(upload_id(&call("get_upload", json!({ "upload_id": format!("upload:{id}") }))), Ok(id));
+        assert!(upload_id(&call("get_upload", json!({ "upload_id": "../../etc/passwd" }))).is_err());
+        assert!(upload_id(&call("get_upload", json!({}))).is_err());
     }
 
     #[test]

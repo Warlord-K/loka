@@ -370,22 +370,20 @@ impl WorldStore {
 
         let quest_id = id_prefix(query);
         let quests = async {
-            if read {
+            if write {
                 sqlx::query_as::<_, QuestHit>(&format!(
                 "SELECT t.id, t.title, t.status, t.assigned_agent_id, t.updated_at
                  FROM agent_tasks t
                  LEFT JOIN agent_profiles a ON a.id = t.assigned_agent_id
-                 WHERE t.org_id = $6 AND (t.assigned_agent_id IS NOT NULL
+                 WHERE t.org_id = $5 AND (t.assigned_agent_id IS NOT NULL
                         OR (COALESCE(t.source, '') <> 'chat' AND (t.user_id = $1 OR t.assignee_user_id = $1)))
-                   AND CASE WHEN t.assigned_agent_id IS NULL THEN $3
-                            ELSE ($2 OR a.visibility = 'public' OR a.owner_user_id = $1) END
-                   AND ({quest_title} ILIKE $4 OR {quest_description} ILIKE $4 OR t.id::text LIKE $7)
-                 ORDER BY COALESCE(t.id::text LIKE $7, false) DESC, t.updated_at DESC NULLS LAST
-                 LIMIT $5"
+                   AND ($2 OR t.user_id = $1 OR (a.org_id = $5 AND (a.visibility = 'public' OR a.owner_user_id = $1)))
+                   AND ({quest_title} ILIKE $3 OR {quest_description} ILIKE $3 OR t.id::text LIKE $6)
+                 ORDER BY COALESCE(t.id::text LIKE $6, false) DESC, t.updated_at DESC NULLS LAST
+                 LIMIT $4"
                 ))
             .bind(user)
             .bind(admin)
-            .bind(write)
             .bind(&pattern)
             .bind(limit)
             .bind(org)
@@ -409,16 +407,20 @@ impl WorldStore {
         .fetch_all(pool);
 
         let lists = sqlx::query_as::<_, ListHit>(
-            "SELECT id, kind, name, status, updated_at FROM world_items
-             WHERE kind IN ('list', 'timer') AND owner_user_id = $1 AND org_id = $4 AND status <> 'archived'
-               AND (name ILIKE $2 OR COALESCE(data->>'items', '') ILIKE $2)
-             ORDER BY (kind = 'list') DESC, updated_at DESC
+            "SELECT i.id, i.kind, i.name, i.status, i.updated_at FROM world_items i
+             LEFT JOIN world_regions r ON r.id = i.region_id
+             WHERE i.kind IN ('list', 'timer') AND i.owner_user_id = $1 AND i.org_id = $4 AND i.status <> 'archived'
+               AND (i.region_id IS NULL OR (r.status = 'active' AND r.org_id = $4
+                    AND (r.owner_user_id = $1 OR r.visibility = 'public' OR $5)))
+               AND (i.name ILIKE $2 OR COALESCE(i.data->>'items', '') ILIKE $2)
+             ORDER BY (i.kind = 'list') DESC, i.updated_at DESC
              LIMIT $3",
         )
         .bind(user)
         .bind(&pattern)
         .bind(limit)
         .bind(org)
+        .bind(admin)
         .fetch_all(pool);
 
         let channels = async {
@@ -444,7 +446,8 @@ impl WorldStore {
             sqlx::query_as::<_, ScheduleHit>(
                 "SELECT s.id, s.agent_id, s.name, s.kind, s.cron_expression, s.enabled, s.next_run_at
                  FROM schedules s JOIN agent_profiles a ON a.id = s.agent_id
-                 WHERE a.org_id = $4 AND ($5 OR a.owner_user_id = $1)
+                 WHERE a.org_id = $4 AND a.archived_at IS NULL AND ($5 OR a.owner_user_id = $1)
+                   AND (s.expires_at IS NULL OR s.expires_at > NOW())
                    AND (s.name ILIKE $2 OR s.prompt ILIKE $2)
                  ORDER BY s.enabled DESC, s.name
                  LIMIT $3",
@@ -462,7 +465,7 @@ impl WorldStore {
             sqlx::query_as::<_, FeedHit>(
                 "SELECT f.id, f.agent_id, f.name, f.kind, f.paused
                  FROM agent_feeds f JOIN agent_profiles a ON a.id = f.agent_id
-                 WHERE a.org_id = $4 AND ($5 OR a.owner_user_id = $1)
+                 WHERE a.org_id = $4 AND a.archived_at IS NULL AND ($5 OR a.owner_user_id = $1)
                    AND (f.name ILIKE $2 OR f.url ILIKE $2)
                  ORDER BY f.paused, f.name
                  LIMIT $3",
@@ -510,10 +513,12 @@ impl WorldStore {
         .fetch_all(pool);
 
         let places = sqlx::query_as::<_, PlaceHit>(
-            "SELECT i.id, i.kind, i.name, i.region_id, r.name AS region_name, i.data
+            "SELECT i.id, i.kind, i.name, i.region_id, r.name AS region_name,
+                    CASE WHEN i.kind IN ('challenge', 'adventure') THEN i.data - 'rubric' - 'correct' - 'solution' - 'tests' ELSE i.data END AS data
              FROM world_items i
              LEFT JOIN world_regions r ON r.id = i.region_id
-             WHERE i.kind IN ('building', 'npc') AND i.status <> 'archived' AND i.org_id = $4
+             WHERE (i.kind IN ('building', 'npc') OR (i.kind IN ('challenge', 'adventure') AND i.owner_user_id = $1))
+               AND i.status <> 'archived' AND i.org_id = $4
                AND (i.region_id IS NULL OR (r.status = 'active' AND r.org_id = $4
                     AND (r.owner_user_id = $1 OR r.visibility = 'public' OR $5)))
                AND i.name ILIKE $2
@@ -557,7 +562,7 @@ impl WorldStore {
                 "SELECT * FROM (
                    SELECT s.id, 'skill' AS kind, s.name, left(s.description, 300) AS description,
                           (SELECT p.id FROM agent_profiles p
-                           WHERE p.org_id = $4 AND ($5 OR p.owner_user_id = $1)
+                           WHERE p.org_id = $4 AND p.archived_at IS NULL AND ($5 OR p.owner_user_id = $1)
                            ORDER BY EXISTS (SELECT 1 FROM agent_skills x WHERE x.skill_id = s.id AND x.agent_id = p.id) DESC,
                                     (p.owner_user_id = $1) DESC,
                                     EXISTS (SELECT 1 FROM org_members om WHERE om.user_id = $1 AND om.org_id = $4 AND om.main_agent_id = p.id) DESC,
@@ -572,7 +577,7 @@ impl WorldStore {
                    UNION ALL
                    SELECT m.id, 'mcp' AS kind, m.name, '' AS description,
                           (SELECT p.id FROM agent_profiles p
-                           WHERE p.org_id = $4 AND ($5 OR p.owner_user_id = $1)
+                           WHERE p.org_id = $4 AND p.archived_at IS NULL AND ($5 OR p.owner_user_id = $1)
                            ORDER BY EXISTS (SELECT 1 FROM agent_mcp_servers x WHERE x.server_id = m.id AND x.agent_id = p.id) DESC,
                                     (p.owner_user_id = $1) DESC,
                                     EXISTS (SELECT 1 FROM org_members om WHERE om.user_id = $1 AND om.org_id = $4 AND om.main_agent_id = p.id) DESC,
@@ -654,6 +659,7 @@ impl WorldStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn snippet_centres_on_match() {
@@ -693,7 +699,7 @@ mod tests {
         let Ok(url) = std::env::var("SEARCH_TEST_DATABASE_URL") else {
             return Ok(());
         };
-        let pool = sqlx::postgres::PgPoolOptions::new().max_connections(2).connect(&url).await?;
+        let pool = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect(&url).await?;
         let store = WorldStore::new(pool.clone());
         let tag = Uuid::new_v4().simple().to_string()[..10].to_string();
         let word = format!("qz{tag}");
@@ -797,23 +803,50 @@ mod tests {
         let org = crate::orgs::DEFAULT_ORG;
         crate::orgs::join_default_for_tests(&pool, alice, None).await?;
         crate::orgs::join_default_for_tests(&pool, bob, None).await?;
+        let made = store
+            .create_list(crate::items::NewList {
+                owner: alice,
+                creator: None,
+                org,
+                title: &format!(" made-{tag} "),
+                items: vec![" milk ".into(), "".into()],
+                note: None,
+                region: None,
+            })
+            .await?;
+        assert_eq!(made.name, format!("made-{tag}"));
+        assert_eq!(made.org_id, Some(org));
+        assert_eq!(made.data["items"], json!([{ "text": "milk", "done": false }]));
+        assert!(store
+            .create_list(crate::items::NewList { owner: alice, creator: None, org, title: "  ", items: Vec::new(), note: None, region: None })
+            .await
+            .is_err());
         sqlx::query("INSERT INTO world_items (kind, name, owner_user_id, data) VALUES ('timer', $2, $1, '{}')")
             .bind(alice)
             .bind(format!("timer {word}"))
             .execute(&pool)
             .await?;
-        sqlx::query("INSERT INTO schedules (user_id, agent_id, name, prompt, cron_expression) VALUES ($1, $2, $3, 'check', '0 9 * * *')")
-            .bind(alice)
-            .bind(private)
-            .bind(format!("routine {word}"))
-            .execute(&pool)
-            .await?;
-        sqlx::query("INSERT INTO agent_feeds (agent_id, owner_user_id, kind, name, url) VALUES ($1, $2, 'rss', $3, 'https://example.com/feed')")
-            .bind(public)
-            .bind(alice)
-            .bind(format!("feed {word}"))
-            .execute(&pool)
-            .await?;
+        sqlx::query(
+            "INSERT INTO schedules (user_id, agent_id, name, prompt, cron_expression, expires_at)
+             VALUES ($1, $2, $4, 'check', '0 9 * * *', NULL),
+                    ($1, $3, $4, 'check', '0 9 * * *', NOW() + INTERVAL '1 hour'),
+                    ($1, $2, $5, 'check', '0 9 * * *', NOW() - INTERVAL '1 hour')",
+        )
+        .bind(alice)
+        .bind(private)
+        .bind(public)
+        .bind(format!("routine {word}"))
+        .bind(format!("expired routine {word}"))
+        .execute(&pool)
+        .await?;
+        for id in [private, public] {
+            sqlx::query("INSERT INTO agent_feeds (agent_id, owner_user_id, kind, name, url) VALUES ($1, $2, 'rss', $3, 'https://example.com/feed')")
+                .bind(id)
+                .bind(alice)
+                .bind(format!("feed {word}"))
+                .execute(&pool)
+                .await?;
+        }
         let team_room: Uuid = sqlx::query_scalar("INSERT INTO channels (name, kind, org_id) VALUES ($1, 'team', $2) RETURNING id")
             .bind(format!("team-{tag}"))
             .bind(org)
@@ -865,12 +898,13 @@ mod tests {
             .fetch_one(&pool)
             .await?;
         sqlx::query("INSERT INTO agent_skills (agent_id, skill_id) VALUES ($1, $2)").bind(public).bind(skill).execute(&pool).await?;
-        sqlx::query("INSERT INTO world_mcp_servers (name, definition, created_by, org_id) VALUES ($1, '{\"url\": \"https://mcp.example.com\"}', $2, $3)")
+        let server: Uuid = sqlx::query_scalar("INSERT INTO world_mcp_servers (name, definition, created_by, org_id) VALUES ($1, '{\"url\": \"https://mcp.example.com\"}', $2, $3) RETURNING id")
             .bind(format!("mcp-{word}"))
             .bind(alice)
             .bind(org)
-            .execute(&pool)
+            .fetch_one(&pool)
             .await?;
+        sqlx::query("INSERT INTO agent_mcp_servers (agent_id, server_id) VALUES ($1, $2)").bind(public).bind(server).execute(&pool).await?;
         sqlx::query("INSERT INTO world_runners (owner_user_id, name, token_hash) VALUES ($1, $2, $3)")
             .bind(alice)
             .bind(format!("mac {word}"))
@@ -892,15 +926,15 @@ mod tests {
         assert!(mine.reports[1].excerpt.contains(&word));
 
         assert_eq!(mine.lists.iter().filter(|l| l.kind == "timer").count(), 1);
-        assert_eq!(mine.schedules.len(), 1);
-        assert_eq!(mine.feeds.len(), 1);
+        assert_eq!(mine.schedules.len(), 2);
+        assert_eq!(mine.feeds.len(), 2);
         assert_eq!(mine.teams.len(), 1);
         assert_eq!(mine.regions.len(), 2);
         assert_eq!(mine.places.len(), 3);
         assert_eq!(mine.rules.len(), 2);
         assert!(mine.rules.iter().any(|r| r.global));
         assert_eq!(mine.kit.len(), 2);
-        assert_eq!(mine.kit.iter().find(|k| k.kind == "skill").map(|k| k.agent_id), Some(public));
+        assert!(mine.kit.iter().all(|k| k.agent_id == public));
         assert_eq!(mine.devices.len(), 1);
         assert_eq!(mine.people.len(), 2);
 
@@ -936,7 +970,11 @@ mod tests {
 
         let reader = store.search(bob, Role::Read, crate::orgs::DEFAULT_ORG, &word, 20).await?;
         assert!(reader.messages.iter().all(|m| m.kind == "channel"));
-        assert_eq!(reader.quests.len(), 1);
+        assert!(reader.quests.is_empty());
+        let public_quest = theirs.quests[0].id;
+        let public_ref = format!("quest:{public_quest}");
+        assert!(store.search(bob, Role::Read, org, &public_ref, 20).await?.quests.is_empty());
+        assert_eq!(store.search(bob, Role::Write, org, &public_ref, 20).await?.quests.first().map(|q| q.id), Some(public_quest));
         let viewer = store.search(bob, Role::View, crate::orgs::DEFAULT_ORG, &word, 20).await?;
         assert!(viewer.messages.is_empty() && viewer.quests.is_empty() && viewer.channels.is_empty());
         assert!(viewer.people.is_empty() && viewer.rules.is_empty() && viewer.teams.is_empty() && viewer.devices.is_empty());
@@ -951,13 +989,65 @@ mod tests {
         assert_eq!(admin.regions.len(), 2);
         assert_eq!(admin.places.len(), 3);
         assert!(admin.teams.is_empty() && admin.devices.is_empty());
+        let list_id: Uuid = sqlx::query_scalar("SELECT id FROM world_items WHERE owner_user_id = $1 AND kind = 'list' AND name = $2")
+            .bind(alice)
+            .bind(format!("list {word}"))
+            .fetch_one(&pool)
+            .await?;
+        let home_building: Uuid = sqlx::query_scalar("SELECT id FROM world_items WHERE kind = 'building' AND name = $1")
+            .bind(format!("building {word}"))
+            .fetch_one(&pool)
+            .await?;
+        let private_npc: Uuid = sqlx::query_scalar("SELECT id FROM world_items WHERE kind = 'npc' AND region_id = $1")
+            .bind(region_ids[0])
+            .fetch_one(&pool)
+            .await?;
+        let public_npc: Uuid = sqlx::query_scalar("SELECT id FROM world_items WHERE kind = 'npc' AND region_id = $1")
+            .bind(region_ids[1])
+            .fetch_one(&pool)
+            .await?;
+        assert!(store.item_for_viewer(list_id, alice, org, false).await?.is_some());
+        assert!(store.item_for_viewer(list_id, bob, org, true).await?.is_none());
+        assert!(store.item_for_viewer(home_building, bob, org, false).await?.is_some());
+        assert!(store.item_for_viewer(private_npc, bob, org, false).await?.is_none());
+        assert!(store.item_for_viewer(private_npc, bob, org, true).await?.is_some());
+        assert!(store.item_for_viewer(public_npc, bob, org, false).await?.is_some());
+        store.update_item(made.id, None, None, Some("archived")).await?;
+        assert!(store.item_for_viewer(made.id, alice, org, false).await?.is_none());
         let elsewhere = store.search(alice, Role::Write, Uuid::new_v4(), &word, 20).await?;
-        assert!(elsewhere.schedules.is_empty() && elsewhere.regions.is_empty() && elsewhere.places.is_empty() && elsewhere.rules.is_empty());
+        assert!(elsewhere.lists.is_empty() && elsewhere.schedules.is_empty() && elsewhere.regions.is_empty() && elsewhere.places.is_empty() && elsewhere.rules.is_empty());
         assert!(elsewhere.kit.is_empty() && elsewhere.people.is_empty() && elsewhere.teams.is_empty());
+
+        store.archive_agent(public, None).await?;
+        for (viewer, role) in [(alice, Role::Write), (bob, Role::Admin)] {
+            let available = store.search(viewer, role, org, &word, 20).await?;
+            assert_eq!(available.schedules.iter().map(|s| s.agent_id).collect::<Vec<_>>(), vec![private]);
+            assert_eq!(available.feeds.iter().map(|f| f.agent_id).collect::<Vec<_>>(), vec![private]);
+            assert_eq!(available.kit.len(), 2);
+            for hit in available.kit {
+                let target = store.get_agent(hit.agent_id).await?.unwrap();
+                assert!(target.archived_at.is_none());
+                if role != Role::Admin {
+                    assert_eq!(target.id, private);
+                }
+            }
+        }
+        store.archive_agent(private, None).await?;
+        let archived = store.search(alice, Role::Write, org, &word, 20).await?;
+        assert!(archived.schedules.is_empty() && archived.feeds.is_empty() && archived.kit.is_empty());
+        let human_quest: Uuid = sqlx::query_scalar("INSERT INTO agent_tasks (user_id, assignee_user_id, title) VALUES ($1, $2, $3) RETURNING id")
+            .bind(alice)
+            .bind(bob)
+            .bind(format!("quest {word}"))
+            .fetch_one(&pool)
+            .await?;
+        let human_ref = format!("quest:{human_quest}");
+        assert!(store.search(bob, Role::Write, org, &human_ref, 20).await?.quests.is_empty());
+        assert_eq!(store.search(alice, Role::Write, org, &human_ref, 20).await?.quests.first().map(|q| q.id), Some(human_quest));
 
         sqlx::query("DELETE FROM agent_tasks WHERE title = $1").bind(format!("quest {word}")).execute(&pool).await?;
         sqlx::query("DELETE FROM world_skills WHERE id = $1").bind(skill).execute(&pool).await?;
-        sqlx::query("DELETE FROM world_mcp_servers WHERE name = $1").bind(format!("mcp-{word}")).execute(&pool).await?;
+        sqlx::query("DELETE FROM world_mcp_servers WHERE id = $1").bind(server).execute(&pool).await?;
         sqlx::query("DELETE FROM world_rules WHERE body LIKE $1").bind(format!("%{word}%")).execute(&pool).await?;
         sqlx::query("DELETE FROM world_items WHERE name LIKE $1").bind(format!("%{word}")).execute(&pool).await?;
         sqlx::query("DELETE FROM world_regions WHERE id = ANY($1)").bind(&region_ids).execute(&pool).await?;

@@ -196,6 +196,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/world/quick/{id}", get(routes::quick::read))
         .route("/world/quick/{id}/messages", post(routes::quick::send))
         .route("/world/quick/{id}/close", post(routes::quick::close))
+        .route("/world/quick/{id}/voice", post(routes::voice::start_quick))
+        .route("/world/quick/{id}/voice/greeting", get(routes::voice::greeting_quick))
+        .route("/world/quick/{id}/voice/status", get(routes::voice::status_quick))
+        .route("/world/quick/{id}/voice/lines", post(routes::voice::lines_quick))
         .route("/world/agents/{id}/direct", post(routes::world::start_direct))
         .route("/world/agents/{id}/voice", post(routes::voice::start))
         .route("/world/agents/{id}/voice/token", post(routes::voice::token))
@@ -328,7 +332,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/world/starter-team", get(routes::starter_team::plan).post(routes::starter_team::build))
         .route("/world/setup-scan", post(routes::setup_scan::offer))
         .route("/world/teams", get(routes::teams::list).post(routes::teams::create))
-        .route("/world/teams/{id}", patch(routes::teams::update).delete(routes::teams::delete))
+        .route("/world/teams/{id}", get(routes::teams::get).patch(routes::teams::update).delete(routes::teams::delete))
         .route("/world/teams/{id}/members", post(routes::teams::add_members))
         .route("/world/teams/{id}/members/{kind}/{member_id}", delete(routes::teams::remove_member))
         .route("/world/dms", post(routes::world::open_dm))
@@ -364,8 +368,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/world/tasks/{id}/milestones", get(routes::world::list_milestones).post(routes::world::add_milestones))
         .route("/world/tasks/{id}/milestones/check", post(routes::world::check_milestones))
         .route("/world/milestones/{id}", patch(routes::world::update_milestone).delete(routes::world::delete_milestone))
-        .route("/world/items", get(routes::world::list_items))
-        .route("/world/items/{id}", patch(routes::world::update_item))
+        .route("/world/items", get(routes::world::list_items).post(routes::world::create_list))
+        .route("/world/items/{id}", get(routes::world::get_item).patch(routes::world::update_item))
         .route("/world/regions", get(routes::loka::list_regions))
         .route("/world/regions/{id}", get(routes::loka::get_region))
         .route("/world/loka/presets", get(routes::loka::presets))
@@ -383,6 +387,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/world/reports/{id}", get(routes::reports::get).patch(routes::reports::update).delete(routes::reports::delete))
         .route("/world/reports/{id}/revisions", get(routes::reports::revisions))
         .route("/world/reports/{id}/canvas", post(routes::reports::change_canvas))
+        .route("/world/reports/{id}/practice", post(routes::reports::practice_this))
         .route("/world/reports/{id}/marks", post(routes::reports::add_mark))
         .route("/world/reports/{id}/marks/{mark}", patch(routes::reports::change_mark).delete(routes::reports::delete_mark))
         .route("/world/reports/{id}/revisions/{revision}", get(routes::reports::revision))
@@ -398,7 +403,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/world/todos", get(routes::todos::list).post(routes::todos::create))
         .route("/world/todos/order", post(routes::todos::reorder))
-        .route("/world/todos/{id}", patch(routes::todos::update))
+        .route("/world/todos/{id}", get(routes::todos::get).patch(routes::todos::update))
         .route("/world/todos/{id}/decide", post(routes::todos::decide))
         .route("/world/todos/{id}/proposals", delete(routes::todos::clear_proposals))
         .route("/world/events", get(routes::world::list_events))
@@ -432,6 +437,7 @@ async fn main() -> anyhow::Result<()> {
             post(routes::runners::complete),
         )
         .route("/leases/{lease_id}/mcp", post(routes::runners::mcp))
+        .route("/leases/{lease_id}/uploads/{upload_id}", get(routes::runners::lease_upload))
         .route(
             "/leases/{lease_id}/media",
             post(routes::runners::media).layer(axum::extract::DefaultBodyLimit::max(loka_shared::media::MAX_VIDEO + 4096)),
@@ -530,6 +536,27 @@ async fn sweep_runner_leases(state: AppState) {
         tokio::time::sleep(Duration::from_secs(15)).await;
         if last_stall_check.elapsed() >= Duration::from_secs(60) {
             last_stall_check = std::time::Instant::now();
+            match state.world.settle_merged_quests().await {
+                Ok(settled) if !settled.is_empty() => {
+                    tracing::info!(count = settled.len(), "settled quests whose pull request was already merged as done");
+                }
+                Ok(_) => {}
+                Err(error) => tracing::error!(%error, "settling merged quests failed"),
+            }
+            match state.world.settle_cancelled_reviews().await {
+                Ok(settled) if !settled.is_empty() => {
+                    tracing::info!(count = settled.len(), "moved quests whose review was cancelled back to review");
+                }
+                Ok(_) => {}
+                Err(error) => tracing::error!(%error, "settling cancelled reviews failed"),
+            }
+            match state.world.settle_cancelled_work().await {
+                Ok(settled) if !settled.is_empty() => {
+                    tracing::info!(count = settled.len(), "failed quests whose work run was cancelled so their agent can resume them");
+                }
+                Ok(_) => {}
+                Err(error) => tracing::error!(%error, "settling cancelled work failed"),
+            }
             match state.world.release_budget_pauses(None).await {
                 Ok(released) if !released.is_empty() => {
                     tracing::info!(count = released.len(), "resumed agents after their daily budget reset");

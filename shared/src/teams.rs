@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::FromRow;
+use sqlx::{FromRow, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::world::{emit_in, NewEvent, WorldAgent, WorldStore};
@@ -78,6 +78,14 @@ pub struct TeamEdit {
     pub rules: Option<String>,
     #[serde(default, deserialize_with = "double_option")]
     pub lead: Option<Option<Uuid>>,
+    #[serde(default)]
+    pub add_agent_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub remove_agent_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub add_user_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub remove_user_ids: Vec<Uuid>,
 }
 
 fn double_option<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<Uuid>>, D::Error> {
@@ -132,6 +140,35 @@ const MEMBER_SELECT: &str = "SELECT m.team_id, m.member_kind, m.member_id,
      LEFT JOIN agent_profiles a ON m.member_kind = 'agent' AND a.id = m.member_id
      LEFT JOIN users u ON m.member_kind = 'user' AND u.id = m.member_id";
 
+async fn locked_team(tx: &mut Transaction<'_, Postgres>, hint: &Team) -> Result<(Team, Uuid)> {
+    let org: Uuid = sqlx::query_scalar("SELECT org_id FROM channels WHERE id = $1")
+        .bind(hint.channel_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .flatten()
+        .ok_or_else(|| anyhow::anyhow!("team channel has no organization"))?;
+    crate::orgs::lock_org(tx, org).await?;
+    let team = sqlx::query_as::<_, Team>(&format!("{TEAM_SELECT} WHERE t.id = $1 FOR UPDATE OF t"))
+        .bind(hint.id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no such team"))?;
+    if team.channel_id != hint.channel_id {
+        bail!("team channel changed while saving");
+    }
+    Ok((team, org))
+}
+
+fn push_unique(ids: &mut Vec<Uuid>, id: Uuid) {
+    if !ids.contains(&id) {
+        ids.push(id);
+    }
+}
+
+pub(crate) fn team_updated_event(team_id: Uuid, org: Uuid, audience: Vec<Uuid>) -> NewEvent {
+    NewEvent::new("team.updated").payload(json!({ "team_id": team_id, "org_id": org, "audience": audience }))
+}
+
 impl WorldStore {
     pub async fn get_team(&self, id: Uuid) -> Result<Option<Team>> {
         Ok(sqlx::query_as::<_, Team>(&format!("{TEAM_SELECT} WHERE t.id = $1"))
@@ -160,6 +197,49 @@ impl WorldStore {
         .bind(user)
         .bind(admin)
         .fetch_all(self.pool())
+        .await?)
+    }
+
+    pub async fn team_visible_to(&self, user: Uuid, id: Uuid) -> Result<Option<Team>> {
+        Ok(sqlx::query_as::<_, Team>(&format!(
+            "{TEAM_SELECT} WHERE t.id = $2
+               AND EXISTS (SELECT 1 FROM channels tc WHERE tc.id = t.channel_id AND tc.org_id = world_active_org($1))
+               AND (t.owner_user_id = $1 OR EXISTS (
+                 SELECT 1 FROM agent_team_members m WHERE m.team_id = t.id AND m.member_kind = 'user' AND m.member_id = $1))"
+        ))
+        .bind(user)
+        .bind(id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+
+    pub async fn find_visible_team(&self, user: Uuid, org: Uuid, key: &str) -> Result<Option<Team>> {
+        let key = key.trim().trim_start_matches('#').trim_start_matches('@');
+        if key.is_empty() {
+            return Ok(None);
+        }
+        let visible = format!(
+            "{TEAM_SELECT} WHERE c.org_id = $2 AND (t.owner_user_id = $1 OR EXISTS (
+               SELECT 1 FROM agent_team_members m WHERE m.team_id = t.id AND m.member_kind = 'user' AND m.member_id = $1))"
+        );
+        if let Ok(id) = Uuid::parse_str(key) {
+            return Ok(sqlx::query_as::<_, Team>(&format!("{visible} AND t.id = $3"))
+                .bind(user)
+                .bind(org)
+                .bind(id)
+                .fetch_optional(self.pool())
+                .await?);
+        }
+        Ok(sqlx::query_as::<_, Team>(&format!(
+            "{visible} AND (t.slug = $4 OR lower(t.name) = lower($3) OR lower(c.name) = lower($3)
+                    OR (length($3) >= 6 AND t.id::text LIKE lower($3) || '%'))
+             ORDER BY (t.owner_user_id = $1) DESC, (t.slug = $4) DESC LIMIT 1"
+        ))
+        .bind(user)
+        .bind(org)
+        .bind(key)
+        .bind(slugify(key))
+        .fetch_optional(self.pool())
         .await?)
     }
 
@@ -298,7 +378,6 @@ impl WorldStore {
         }
         self.owned_agents(owner, &agents).await?;
         let purpose = clean(&new.purpose, 2000);
-        let mut tx = self.pool().begin().await?;
         let agents_org: Option<Uuid> = sqlx::query_scalar("SELECT org_id FROM agent_profiles WHERE id = ANY($1) ORDER BY id = $2 DESC LIMIT 1")
             .bind(&agents)
             .bind(new.lead)
@@ -325,14 +404,18 @@ impl WorldStore {
                 bail!("a team's agents must all be in the same organization");
             }
         }
+        let mut tx = self.pool().begin().await?;
+        if let Some(org) = org {
+            crate::orgs::lock_org(&mut tx, org).await?;
+        }
         let strangers: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM unnest($1::uuid[]) p
+            "SELECT COUNT(*) FROM unnest(array_append($1::uuid[], $3)) p
              WHERE NOT EXISTS (SELECT 1 FROM org_members m WHERE m.user_id = p AND m.org_id = COALESCE($2, world_active_org($3)))",
         )
         .bind(&new.people)
         .bind(org)
         .bind(owner)
-        .fetch_one(self.pool())
+        .fetch_one(&mut *tx)
         .await?;
         if strangers > 0 {
             bail!("team members must be in the team's organization");
@@ -388,11 +471,19 @@ impl WorldStore {
                     .await?;
             }
         }
+        let event_org: Uuid = sqlx::query_scalar("SELECT org_id FROM channels WHERE id = $1")
+            .bind(channel_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let mut audience = vec![owner];
+        for id in &new.people {
+            push_unique(&mut audience, *id);
+        }
         emit_in(
             &mut tx,
             &NewEvent::new("team.created")
                 .actor(Some(owner))
-                .payload(json!({ "team_id": id, "name": name, "channel_id": channel_id, "channel": channel_name, "owner_user_id": owner })),
+                .payload(json!({ "team_id": id, "name": name, "channel_id": channel_id, "channel": channel_name, "owner_user_id": owner, "org_id": event_org, "audience": audience })),
             None,
         )
         .await?;
@@ -443,20 +534,58 @@ impl WorldStore {
     }
 
     pub async fn update_team(&self, team_id: Uuid, edit: &TeamEdit) -> Result<Team> {
-        let team = self.get_team(team_id).await?.ok_or_else(|| anyhow::anyhow!("no such team"))?;
-        if let Some(Some(lead)) = edit.lead {
-            self.owned_agents(team.owner_user_id, &[lead]).await?;
-            let same_org: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM agent_profiles a JOIN channels c ON c.id = $2
-                  WHERE a.id = $1 AND a.org_id IS NOT DISTINCT FROM c.org_id)",
-            )
-            .bind(lead)
-            .bind(team.channel_id)
-            .fetch_one(self.pool())
+        let hint = self.get_team(team_id).await?.ok_or_else(|| anyhow::anyhow!("no such team"))?;
+        let mut tx = self.pool().begin().await?;
+        let (team, org) = locked_team(&mut tx, &hint).await?;
+        let owner_in_org: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM org_members WHERE org_id = $1 AND user_id = $2)")
+            .bind(org)
+            .bind(team.owner_user_id)
+            .fetch_one(&mut *tx)
             .await?;
-            if !same_org {
-                bail!("a team's lead must be in the team's organization");
+        if !owner_in_org {
+            bail!("the team owner must be in the team's organization");
+        }
+        let before = sqlx::query_as::<_, TeamMember>(&format!("{MEMBER_SELECT} WHERE m.team_id = $1 ORDER BY m.member_kind, m.added_at"))
+            .bind(team_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        let mut agents: Vec<Uuid> = before.iter().filter(|m| m.member_kind == "agent").map(|m| m.member_id).collect();
+        let mut people: Vec<Uuid> = before.iter().filter(|m| m.member_kind == "user").map(|m| m.member_id).collect();
+        agents.retain(|id| !edit.remove_agent_ids.contains(id));
+        people.retain(|id| !edit.remove_user_ids.contains(id));
+        for id in &edit.add_agent_ids {
+            push_unique(&mut agents, *id);
+        }
+        for id in &edit.add_user_ids {
+            push_unique(&mut people, *id);
+        }
+        let mut lead = edit.lead.unwrap_or(team.lead_agent_id);
+        if let Some(id) = lead {
+            if edit.lead.is_some() {
+                push_unique(&mut agents, id);
+            } else if !agents.contains(&id) {
+                lead = None;
             }
+        }
+        if agents.len() + people.len() > MAX_MEMBERS {
+            bail!("a team holds at most {MAX_MEMBERS} members");
+        }
+        let owned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_profiles WHERE id = ANY($1) AND owner_user_id = $2 AND org_id = $3")
+            .bind(&agents)
+            .bind(team.owner_user_id)
+            .bind(org)
+            .fetch_one(&mut *tx)
+            .await?;
+        if owned != agents.len() as i64 {
+            bail!("a team can only hold agents of the same person and organization");
+        }
+        let members: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM org_members WHERE org_id = $1 AND user_id = ANY($2)")
+            .bind(org)
+            .bind(&people)
+            .fetch_one(&mut *tx)
+            .await?;
+        if members != people.len() as i64 {
+            bail!("team members must be in the team's organization");
         }
         let name = edit.name.as_deref().map(|n| clean(n, 60)).filter(|n| !n.is_empty());
         let slug = name.as_deref().map(slugify);
@@ -471,9 +600,9 @@ impl WorldStore {
         .bind(&slug)
         .bind(edit.purpose.as_deref().map(|p| clean(p, 2000)))
         .bind(edit.rules.as_deref().map(|r| clean(r, 4000)))
-        .bind(edit.lead.is_some())
-        .bind(edit.lead.flatten())
-        .execute(self.pool())
+        .bind(edit.lead.is_some() || lead != team.lead_agent_id)
+        .bind(lead)
+        .execute(&mut *tx)
         .await;
         if let Err(sqlx::Error::Database(e)) = &result {
             if e.code().as_deref() == Some("23505") {
@@ -481,49 +610,94 @@ impl WorldStore {
             }
         }
         result?;
-        if let Some(Some(lead)) = edit.lead {
-            self.add_team_members(team_id, &[lead], &[]).await?;
+        let before_agents: Vec<Uuid> = before.iter().filter(|m| m.member_kind == "agent").map(|m| m.member_id).collect();
+        let before_people: Vec<Uuid> = before.iter().filter(|m| m.member_kind == "user").map(|m| m.member_id).collect();
+        for (kind, old, ids) in [("agent", &before_agents, &agents), ("user", &before_people, &people)] {
+            let removed: Vec<Uuid> = old.iter().filter(|id| !ids.contains(id)).copied().collect();
+            if !removed.is_empty() {
+                sqlx::query("DELETE FROM agent_team_members WHERE team_id = $1 AND member_kind = $2 AND member_id = ANY($3)")
+                    .bind(team_id)
+                    .bind(kind)
+                    .bind(&removed)
+                    .execute(&mut *tx)
+                    .await?;
+                if let Some(channel) = team.channel_id {
+                    sqlx::query("DELETE FROM channel_members WHERE channel_id = $1 AND member_kind = $2 AND member_id = ANY($3) AND NOT (member_kind = 'user' AND member_id = $4)")
+                        .bind(channel)
+                        .bind(kind)
+                        .bind(&removed)
+                        .bind(team.owner_user_id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
+            for member in ids.iter().filter(|id| !old.contains(id)) {
+                sqlx::query("INSERT INTO agent_team_members (team_id, member_kind, member_id) VALUES ($1, $2, $3)")
+                    .bind(team_id)
+                    .bind(kind)
+                    .bind(member)
+                    .execute(&mut *tx)
+                    .await?;
+                if let Some(channel) = team.channel_id {
+                    sqlx::query("INSERT INTO channel_members (channel_id, member_kind, member_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
+                        .bind(channel)
+                        .bind(kind)
+                        .bind(member)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
         }
         if let (Some(purpose), Some(channel)) = (edit.purpose.as_deref(), team.channel_id) {
             sqlx::query("UPDATE channels SET topic = $2 WHERE id = $1")
                 .bind(channel)
                 .bind(purpose.lines().next().map(|l| clean(l, 200)).filter(|l| !l.is_empty()))
-                .execute(self.pool())
+                .execute(&mut *tx)
                 .await?;
         }
-        self.emit(
-            NewEvent::new("team.updated").payload(json!({ "team_id": team_id, "owner_user_id": team.owner_user_id })),
-            None,
-        )
-        .await?;
+        let mut audience = vec![team.owner_user_id];
+        for id in before.iter().filter(|m| m.member_kind == "user").map(|m| m.member_id).chain(people.iter().copied()) {
+            push_unique(&mut audience, id);
+        }
+        emit_in(&mut tx, &team_updated_event(team_id, org, audience), None).await?;
+        tx.commit().await?;
         self.get_team(team_id).await?.ok_or_else(|| anyhow::anyhow!("no such team"))
     }
 
     pub async fn add_team_members(&self, team_id: Uuid, agents: &[Uuid], people: &[Uuid]) -> Result<Vec<TeamMember>> {
-        let team = self.get_team(team_id).await?.ok_or_else(|| anyhow::anyhow!("no such team"))?;
-        self.owned_agents(team.owner_user_id, agents).await?;
+        let hint = self.get_team(team_id).await?.ok_or_else(|| anyhow::anyhow!("no such team"))?;
+        let mut tx = self.pool().begin().await?;
+        let (team, org) = locked_team(&mut tx, &hint).await?;
         let outside: i64 = sqlx::query_scalar(
             "SELECT
-               (SELECT COUNT(*) FROM agent_profiles a WHERE a.id = ANY($2) AND a.org_id IS DISTINCT FROM c.org_id)
+               (SELECT COUNT(*) FROM unnest($2::uuid[]) a WHERE NOT EXISTS (
+                  SELECT 1 FROM agent_profiles p WHERE p.id = a AND p.owner_user_id = $5 AND p.org_id = c.org_id))
              + (SELECT COUNT(*) FROM unnest($3::uuid[]) p WHERE NOT EXISTS (SELECT 1 FROM org_members m WHERE m.org_id = c.org_id AND m.user_id = p))
+             + CASE WHEN c.org_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM org_members m WHERE m.org_id = c.org_id AND m.user_id = $4) THEN 1 ELSE 0 END
              FROM channels c WHERE c.id = $1",
         )
         .bind(team.channel_id)
         .bind(agents)
         .bind(people)
-        .fetch_optional(self.pool())
+        .bind(team.owner_user_id)
+        .bind(team.owner_user_id)
+        .fetch_optional(&mut *tx)
         .await?
         .unwrap_or(0);
         if outside > 0 {
             bail!("team members must be in the team's organization");
         }
-        let now = self.team_members(team_id).await?;
+        let now = sqlx::query_as::<_, TeamMember>(&format!(
+            "{MEMBER_SELECT} WHERE m.team_id = $1 ORDER BY m.member_kind, m.added_at"
+        ))
+        .bind(team_id)
+        .fetch_all(&mut *tx)
+        .await?;
         let fresh = agents.iter().filter(|a| !now.iter().any(|m| m.member_kind == "agent" && m.member_id == **a)).count()
             + people.iter().filter(|p| !now.iter().any(|m| m.member_kind == "user" && m.member_id == **p)).count();
         if now.len() + fresh > MAX_MEMBERS {
             bail!("a team holds at most {MAX_MEMBERS} members");
         }
-        let mut tx = self.pool().begin().await?;
         for (kind, ids) in [("agent", agents), ("user", people)] {
             for member in ids {
                 sqlx::query("INSERT INTO agent_team_members (team_id, member_kind, member_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
@@ -542,14 +716,31 @@ impl WorldStore {
                 }
             }
         }
-        emit_in(&mut tx, &NewEvent::new("team.updated").payload(json!({ "team_id": team_id, "owner_user_id": team.owner_user_id })), None).await?;
+        let mut audience = vec![team.owner_user_id];
+        for id in now.iter().filter(|m| m.member_kind == "user").map(|m| m.member_id).chain(people.iter().copied()) {
+            push_unique(&mut audience, id);
+        }
+        emit_in(&mut tx, &team_updated_event(team_id, org, audience), None).await?;
         tx.commit().await?;
         self.team_members(team_id).await
     }
 
     pub async fn remove_team_members(&self, team_id: Uuid, agents: &[Uuid], people: &[Uuid]) -> Result<Vec<TeamMember>> {
-        let team = self.get_team(team_id).await?.ok_or_else(|| anyhow::anyhow!("no such team"))?;
+        let hint = self.get_team(team_id).await?.ok_or_else(|| anyhow::anyhow!("no such team"))?;
         let mut tx = self.pool().begin().await?;
+        let (team, org) = locked_team(&mut tx, &hint).await?;
+        let owner_in_org: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM org_members WHERE org_id = $1 AND user_id = $2)")
+            .bind(org)
+            .bind(team.owner_user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if !owner_in_org {
+            bail!("the team owner must be in the team's organization");
+        }
+        let before = sqlx::query_as::<_, TeamMember>(&format!("{MEMBER_SELECT} WHERE m.team_id = $1 ORDER BY m.member_kind, m.added_at"))
+            .bind(team_id)
+            .fetch_all(&mut *tx)
+            .await?;
         for (kind, ids) in [("agent", agents), ("user", people)] {
             sqlx::query("DELETE FROM agent_team_members WHERE team_id = $1 AND member_kind = $2 AND member_id = ANY($3)")
                 .bind(team_id)
@@ -572,24 +763,32 @@ impl WorldStore {
             .bind(agents)
             .execute(&mut *tx)
             .await?;
-        emit_in(&mut tx, &NewEvent::new("team.updated").payload(json!({ "team_id": team_id, "owner_user_id": team.owner_user_id })), None).await?;
+        let mut audience = vec![team.owner_user_id];
+        for id in before.iter().filter(|m| m.member_kind == "user").map(|m| m.member_id) {
+            push_unique(&mut audience, id);
+        }
+        emit_in(&mut tx, &team_updated_event(team_id, org, audience), None).await?;
         tx.commit().await?;
         self.team_members(team_id).await
     }
 
     pub async fn delete_team(&self, team_id: Uuid) -> Result<bool> {
-        let Some(team) = self.get_team(team_id).await? else { return Ok(false) };
+        let Some(hint) = self.get_team(team_id).await? else { return Ok(false) };
         let mut tx = self.pool().begin().await?;
+        let (team, org) = locked_team(&mut tx, &hint).await?;
+        let people: Vec<Uuid> = sqlx::query_scalar("SELECT member_id FROM agent_team_members WHERE team_id = $1 AND member_kind = 'user'")
+            .bind(team_id)
+            .fetch_all(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM agent_teams WHERE id = $1").bind(team_id).execute(&mut *tx).await?;
         if let Some(channel) = team.channel_id {
             sqlx::query("DELETE FROM channels WHERE id = $1 AND kind = 'team'").bind(channel).execute(&mut *tx).await?;
         }
-        emit_in(
-            &mut tx,
-            &NewEvent::new("team.deleted").payload(json!({ "team_id": team_id, "name": team.name, "owner_user_id": team.owner_user_id })),
-            None,
-        )
-        .await?;
+        let mut audience = vec![team.owner_user_id];
+        for id in people {
+            push_unique(&mut audience, id);
+        }
+        emit_in(&mut tx, &NewEvent::new("team.deleted").payload(json!({ "team_id": team_id, "org_id": org, "audience": audience })), None).await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -780,6 +979,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn team_creation_works_with_one_connection() -> Result<()> {
+        let Ok(url) = std::env::var("TEAMS_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new().max_connections(1).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email) VALUES ($1) RETURNING id")
+            .bind(format!("{}@one-connection.test", Uuid::new_v4()))
+            .fetch_one(&pool)
+            .await?;
+        crate::orgs::join_default_for_tests(&pool, owner, None).await?;
+        let member = agent(&pool, owner, "Solo", &[]).await?;
+        let team = store
+            .create_team(owner, NewTeam { name: format!("One {}", &Uuid::new_v4().simple().to_string()[..6]), agents: vec![member], ..Default::default() })
+            .await?;
+        assert!(store.is_member(team.channel_id.unwrap(), "agent", member).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn team_quests_close_when_every_part_is_done() -> Result<()> {
         let Ok(url) = std::env::var("TEAMS_TEST_DATABASE_URL") else {
             return Ok(());
@@ -790,6 +1009,7 @@ mod tests {
             .bind(format!("{}@parts.test", Uuid::new_v4()))
             .fetch_one(&pool)
             .await?;
+        crate::orgs::join_default_for_tests(&pool, owner, None).await?;
         let lead = agent(&pool, owner, "Boss", &[]).await?;
         let scout = agent(&pool, owner, "Scout", &[]).await?;
         let team = store
@@ -922,7 +1142,7 @@ mod tests {
         let Ok(url) = std::env::var("TEAMS_TEST_DATABASE_URL") else {
             return Ok(());
         };
-        let pool = PgPoolOptions::new().max_connections(4).connect(&url).await?;
+        let pool = PgPoolOptions::new().max_connections(1).connect(&url).await?;
         let store = WorldStore::new(pool.clone());
         let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email) VALUES ($1) RETURNING id")
             .bind(format!("{}@teams.test", Uuid::new_v4()))
@@ -932,6 +1152,17 @@ mod tests {
             .bind(format!("{}@teams.test", Uuid::new_v4()))
             .fetch_one(&pool)
             .await?;
+        let teammate: Uuid = sqlx::query_scalar("INSERT INTO users (email) VALUES ($1) RETURNING id")
+            .bind(format!("{}@teams.test", Uuid::new_v4()))
+            .fetch_one(&pool)
+            .await?;
+        let replacement: Uuid = sqlx::query_scalar("INSERT INTO users (email) VALUES ($1) RETURNING id")
+            .bind(format!("{}@teams.test", Uuid::new_v4()))
+            .fetch_one(&pool)
+            .await?;
+        crate::orgs::join_default_for_tests(&pool, owner, None).await?;
+        crate::orgs::join_default_for_tests(&pool, teammate, None).await?;
+        crate::orgs::join_default_for_tests(&pool, replacement, None).await?;
         let lead = agent(&pool, owner, "Lead", &["research"]).await?;
         let scout = agent(&pool, owner, "Scout", &["caching"]).await?;
         let foreign = agent(&pool, stranger, "Other", &[]).await?;
@@ -949,6 +1180,7 @@ mod tests {
                     purpose: "Dig into caching".into(),
                     lead: Some(lead),
                     agents: vec![scout],
+                    people: vec![teammate],
                     ..Default::default()
                 },
             )
@@ -958,7 +1190,92 @@ mod tests {
         assert_eq!(channel.kind, "team");
         let team_org = channel.org_id;
         assert!(store.is_member(channel.id, "user", owner).await?);
+        assert!(store.is_member(channel.id, "user", teammate).await?);
         assert!(store.is_member(channel.id, "agent", scout).await?);
+        assert!(store.team_visible_to(owner, team.id).await?.is_some());
+        assert!(store.team_visible_to(teammate, team.id).await?.is_some());
+        assert!(store.team_visible_to(stranger, team.id).await?.is_none());
+        assert!(store.find_visible_team(teammate, crate::orgs::DEFAULT_ORG, &team.slug).await?.is_some());
+        let key = team.id.to_string();
+        let shadow = store.create_team(teammate, NewTeam { name: key.clone(), ..Default::default() }).await?;
+        assert_eq!(shadow.slug, key);
+        for reference in [key.clone(), key.to_uppercase()] {
+            assert_eq!(store.find_visible_team(teammate, crate::orgs::DEFAULT_ORG, &reference).await?.map(|found| found.id), Some(team.id));
+        }
+        assert!(store.find_visible_team(teammate, Uuid::new_v4(), &key).await?.is_none());
+        let created: crate::world::WorldEvent = sqlx::query_as("SELECT * FROM world_events WHERE type = 'team.created' AND payload->>'team_id' = $1::text ORDER BY seq DESC LIMIT 1")
+            .bind(team.id)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(created.org_id, team_org);
+        assert!(created.payload["audience"].as_array().is_some_and(|ids| ids.contains(&json!(teammate))));
+        let duplicate = store.create_team(owner, NewTeam { name: format!("Duplicate {}", team_org.unwrap()), ..Default::default() }).await?;
+        let refused = store
+            .update_team(
+                team.id,
+                &TeamEdit {
+                    name: Some(duplicate.name),
+                    purpose: Some("Changed purpose".into()),
+                    rules: Some("Changed rules".into()),
+                    lead: Some(Some(scout)),
+                    add_user_ids: vec![replacement],
+                    remove_agent_ids: vec![lead],
+                    remove_user_ids: vec![teammate],
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(refused.is_err());
+        let unchanged = store.get_team(team.id).await?.unwrap();
+        assert_eq!(unchanged.purpose, "Dig into caching");
+        assert_eq!(unchanged.rules, "");
+        assert_eq!(unchanged.lead_agent_id, Some(lead));
+        let unchanged_members = store.team_members(team.id).await?;
+        assert!(unchanged_members.iter().any(|member| member.member_id == lead));
+        assert!(unchanged_members.iter().any(|member| member.member_id == teammate));
+        assert!(!unchanged_members.iter().any(|member| member.member_id == replacement));
+        assert!(store.is_member(channel.id, "user", teammate).await?);
+        assert!(!store.is_member(channel.id, "user", replacement).await?);
+        assert_eq!(store.get_channel(channel.id).await?.unwrap().topic.as_deref(), Some("Dig into caching"));
+        assert!(store.add_team_members(team.id, &[], &[stranger]).await.is_err());
+        assert!(!store.is_member(channel.id, "user", stranger).await?);
+        let removed_after: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM world_events").fetch_one(&pool).await?;
+        let removed = store.remove_team_members(team.id, &[], &[teammate]).await?;
+        assert!(!removed.iter().any(|member| member.member_id == teammate));
+        assert!(!store.is_member(channel.id, "user", teammate).await?);
+        assert!(store.is_member(channel.id, "user", owner).await?);
+        assert!(store.team_visible_to(teammate, team.id).await?.is_none());
+        assert!(store.find_visible_team(teammate, crate::orgs::DEFAULT_ORG, &key).await?.is_none());
+        assert!(store.delete_team(shadow.id).await?);
+        let removed_event: crate::world::WorldEvent = sqlx::query_as(
+            "SELECT * FROM world_events WHERE seq > $1 AND type = 'team.updated' AND payload->>'team_id' = $2::text ORDER BY seq LIMIT 1",
+        )
+        .bind(removed_after)
+        .bind(team.id)
+        .fetch_one(&pool)
+        .await?;
+        assert!(removed_event.payload.get("owner_user_id").is_none());
+        assert!(removed_event.payload.get("channel_id").is_none());
+        assert!(!crate::event_scope::private_from(&removed_event, teammate, &std::collections::HashSet::new()));
+        assert!(crate::event_scope::private_from(&removed_event, stranger, &std::collections::HashSet::new()));
+        assert!(!crate::loka::hidden_from(&removed_event, teammate));
+        assert!(crate::loka::hidden_from(&removed_event, stranger));
+        let added_after: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM world_events").fetch_one(&pool).await?;
+        let added = store.add_team_members(team.id, &[], &[teammate]).await?;
+        assert!(added.iter().any(|member| member.member_kind == "user" && member.member_id == teammate));
+        assert!(store.is_member(channel.id, "user", teammate).await?);
+        assert!(store.team_visible_to(teammate, team.id).await?.is_some());
+        let added_event: crate::world::WorldEvent = sqlx::query_as(
+            "SELECT * FROM world_events WHERE seq > $1 AND type = 'team.updated' AND payload->>'team_id' = $2::text ORDER BY seq LIMIT 1",
+        )
+        .bind(added_after)
+        .bind(team.id)
+        .fetch_one(&pool)
+        .await?;
+        assert!(!crate::event_scope::private_from(&added_event, teammate, &std::collections::HashSet::new()));
+        assert!(crate::event_scope::private_from(&added_event, stranger, &std::collections::HashSet::new()));
+        assert!(!crate::loka::hidden_from(&added_event, teammate));
+        assert!(crate::loka::hidden_from(&added_event, stranger));
         assert!(store.hidden_channels(Some(stranger), None).await?.contains(&channel.id));
         assert!(!store.hidden_channels(Some(owner), None).await?.contains(&channel.id));
         assert!(store.find_team(owner, team_org, &team.slug).await?.is_some());

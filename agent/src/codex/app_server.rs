@@ -161,7 +161,7 @@ impl AppServer {
                 continue;
             }
             let params = message.get("params").cloned().unwrap_or(Value::Null);
-            if params.get("threadId").and_then(Value::as_str).is_some_and(|id| id != thread_id) {
+            if from_other_thread(&params, thread_id) {
                 continue;
             }
             match message.get("method").and_then(Value::as_str).unwrap_or("") {
@@ -374,6 +374,9 @@ impl AppServer {
                         continue;
                     }
                     let params = message.get("params").cloned().unwrap_or(Value::Null);
+                    if from_other_thread(&params, &thread_id) {
+                        continue;
+                    }
                     match message.get("method").and_then(Value::as_str).unwrap_or("") {
                         "turn/started" => {
                             timing.init_ms.get_or_insert(elapsed(started));
@@ -580,6 +583,9 @@ impl AppServer {
                 continue;
             }
             let params = message.get("params").cloned().unwrap_or(Value::Null);
+            if from_other_thread(&params, &thread_id) {
+                continue;
+            }
             match message.get("method").and_then(Value::as_str).unwrap_or("") {
                 "turn/started" => {
                     timing.init_ms.get_or_insert(elapsed(started));
@@ -833,8 +839,12 @@ pub(crate) fn sandbox_for(lean: bool, approval: Approval, mode: crate::claude::s
     }
 }
 
+fn from_other_thread(params: &Value, thread_id: &str) -> bool {
+    params.get("threadId").and_then(Value::as_str).is_some_and(|id| id != thread_id)
+}
+
 fn thread_usage(params: &Value, thread_id: &str) -> Option<Usage> {
-    if params.get("threadId").and_then(Value::as_str).is_some_and(|id| id != thread_id) {
+    if from_other_thread(params, thread_id) {
         return None;
     }
     let total = params.pointer("/tokenUsage/total")?;
@@ -851,6 +861,7 @@ fn thread_usage(params: &Value, thread_id: &str) -> Option<Usage> {
 mod tests {
     use super::thread_usage;
     use serde_json::json;
+    use tokio::io::AsyncBufReadExt;
 
     fn update(thread: &str, input: u64, cached: u64, output: u64) -> serde_json::Value {
         json!({
@@ -939,6 +950,84 @@ mod tests {
         assert!(app_delta.output_tokens > 0 && app_delta.input_tokens + app_delta.cached_input_tokens > 0);
         let (a, e) = (app_delta.input_tokens + app_delta.cached_input_tokens, exec_delta.input_tokens + exec_delta.cached_input_tokens);
         assert!(a * 2 > e && e * 2 > a, "app-server delta {a} and exec delta {e} should be the same order");
+    }
+
+    fn fake_server(opens_thread: bool, notifications: &[serde_json::Value]) -> super::AppServer {
+        let mut script = String::new();
+        let mut turn_id = 1;
+        if opens_thread {
+            script.push_str("read thread_start; printf '%s\\n' '{\"id\":1,\"result\":{\"thread\":{\"id\":\"parent\"}}}'; ");
+            turn_id = 2;
+        }
+        script.push_str(&format!("read turn_start; printf '%s\\n' '{{\"id\":{turn_id},\"result\":{{}}}}'; "));
+        for notification in notifications {
+            script.push_str(&format!("printf '%s\\n' '{}'; ", notification.to_string().replace('\'', "'\\''")));
+        }
+        script.push_str("cat >/dev/null");
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg(script);
+        command.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        command.kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        let stderr = crate::cli::stderr_tail(child.stderr.take());
+        super::AppServer { child, stdin, stdout, stderr, secrets: Vec::new(), next_id: 0, thread_id: None }
+    }
+
+    fn message_done(thread: &str, text: &str) -> serde_json::Value {
+        json!({ "method": "item/completed", "params": { "threadId": thread, "turnId": "t", "item": { "id": "m", "type": "agentMessage", "text": text, "phase": "final_answer" } } })
+    }
+
+    fn turn_done(thread: &str, status: &str) -> serde_json::Value {
+        json!({ "method": "turn/completed", "params": { "threadId": thread, "turn": { "id": "t", "status": status } } })
+    }
+
+    const PARENT_REPORT: &str = "All done.\n<!-- report\n{\"status\": \"done\", \"summary\": \"fixed\"}\nreport -->";
+
+    #[tokio::test]
+    async fn a_child_agent_hand_off_never_replaces_the_parent_report() {
+        let notifications = [
+            json!({ "method": "turn/started", "params": { "threadId": "parent", "turn": { "id": "t" } } }),
+            json!({ "method": "turn/started", "params": { "threadId": "explorer", "turn": { "id": "c" } } }),
+            message_done("explorer", "Exploration delivered to the parent"),
+            turn_done("explorer", "completed"),
+            turn_done("executor", "failed"),
+            message_done("parent", PARENT_REPORT),
+            turn_done("parent", "completed"),
+        ];
+        let mut server = fake_server(true, &notifications);
+        let dir = std::env::temp_dir();
+        let opts = options(&dir, "model", "do the quest", None);
+        let (_sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (result, _) = server.work(&opts, std::time::Instant::now(), receiver).await.unwrap();
+        assert_eq!(result.output, PARENT_REPORT);
+        assert_eq!(result.session_id.as_deref(), Some("parent"));
+        let (_, body) = crate::world::prompts::block_body(&result.output, "report").unwrap();
+        assert!(body.contains("\"done\""));
+    }
+
+    #[tokio::test]
+    async fn a_child_agent_turn_never_ends_a_warm_ask() {
+        let notifications = [
+            message_done("explorer", "Exploration delivered to the parent"),
+            turn_done("explorer", "completed"),
+            message_done("parent", "parent answer"),
+            turn_done("parent", "completed"),
+        ];
+        let mut server = fake_server(false, &notifications);
+        server.thread_id = Some("parent".to_string());
+        let dir = std::env::temp_dir();
+        let opts = options(&dir, "model", "question", None);
+        let (result, _) = server.ask(&opts, std::time::Instant::now()).await.unwrap();
+        assert_eq!(result.output, "parent answer");
+    }
+
+    #[test]
+    fn notifications_without_a_thread_belong_to_the_work_thread() {
+        assert!(super::from_other_thread(&json!({ "threadId": "explorer" }), "parent"));
+        assert!(!super::from_other_thread(&json!({ "threadId": "parent" }), "parent"));
+        assert!(!super::from_other_thread(&json!({}), "parent"));
     }
 
     #[test]

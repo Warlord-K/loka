@@ -55,7 +55,7 @@ Everything your agents learn stays with you, on your Mac, whichever model you us
 - **Kit.** Give agents MCP servers and skills. Keys you save are encrypted, granted per agent and never shown back.
 - **Your Mac as the workshop.** A terminal, a file workbench, folder sessions in any folder you share, a browser for agents, and Slack capture whose tokens never leave the Mac.
 - **Budgets and usage.** Daily dollar and token budgets per agent, cost per run, and a usage report agents can read to suggest cheaper models.
-- **Connect other tools.** Talk to your agents from Claude Code, Cursor or any MCP client through Loka's MCP endpoint, with a token from You > Connect other tools.
+- **Connect other tools.** Talk to your agents from Claude Code, Cursor or any MCP client through Loka's MCP endpoint, with a token from Settings > Connect other tools.
 - **GitHub and Slack, as they happen.** Your GitHub notifications reach the agents that watch them, using the gh login on your Mac, and agents can watch one pull request, Slack channel or thread instead of polling.
 - **Threads, typing and read receipts** in agent chats and channels, and a microphone in every message box.
 - **Linear and ClickUp webhooks** that turn issues into quests.

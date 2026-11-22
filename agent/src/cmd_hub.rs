@@ -335,7 +335,7 @@ fn enforce_rules(args: &[String]) {
         None => Err(loka_shared::command_rules::Blocked { command: args.join(" ").chars().take(80).collect(), reason: "could not be checked because the command rules are unreadable" }),
     };
     if let Err(blocked) = verdict {
-        eprintln!("Loka blocked this command: {blocked}. Your owner sets command rules in You > Keys or by asking their main agent.");
+        eprintln!("Loka blocked this command: {blocked}. Your owner sets command rules in Settings > Keys or by asking their main agent.");
         std::process::exit(126);
     }
 }

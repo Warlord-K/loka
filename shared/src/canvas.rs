@@ -851,7 +851,7 @@ impl WorldStore {
         }
         self.check_canvas_uploads(current.owner_user_id, current.org_id, &canvas, &before).await?;
         let body = canvas.summary();
-        let links = self.resolve_report_links(current.owner_user_id, current.org_id, &body, Some(id)).await?;
+        let links = self.resolve_report_links(&mut *tx, current.owner_user_id, current.org_id, &body, Some(id)).await?;
         let value = canvas.to_value();
         let (revision, merged) = self
             .record_revision(&mut tx, &current, by, (&current.title, &body, &current.folder, &current.tags), Some(&value))

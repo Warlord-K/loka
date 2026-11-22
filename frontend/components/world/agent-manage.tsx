@@ -13,7 +13,7 @@ import { ConfirmDelete, WCombobox, WSelect } from "./controls";
 import { VoiceField } from "./voice-ui";
 import { SlackMark } from "./panels";
 import { modelName } from "@/lib/model-names";
-import { EmptyState } from "./settings-shell";
+import { EmptyState, SEARCH_ROW_FOCUS, SEARCH_ROW_RING } from "./settings-shell";
 import { CornerCopy } from "./chat-kit";
 
 const LABEL = "mb-1.5 block text-w-sm font-medium text-w-text2";
@@ -814,7 +814,7 @@ function FeedRanges({ agentId, feed, canChange, onSaved }: { agentId: string; fe
   );
 }
 
-export function FeedsSection({ agentId, agentName, canChange }: { agentId: string; agentName: string; canChange: boolean }) {
+export function FeedsSection({ agentId, agentName, canChange, focusId }: { agentId: string; agentName: string; canChange: boolean; focusId?: string }) {
   const queryClient = useQueryClient();
   const feedsQuery = useQuery({ queryKey: qk.agent.feeds(agentId), queryFn: () => worldApi.feeds(agentId) });
   const feeds: AgentFeed[] | null = feedsQuery.data ?? (feedsQuery.isError ? EMPTY_FEEDS : null);
@@ -872,7 +872,7 @@ export function FeedsSection({ agentId, agentName, canChange }: { agentId: strin
         {feeds.map((f) => {
           const auth = feedAuthLine(f);
           return (
-            <li key={f.id} className={cn("flex items-start gap-2 rounded-md border border-w-line bg-w-field/70 px-2.5 py-1.5", f.paused && "opacity-60")}>
+            <li key={f.id} {...(focusId === f.id ? SEARCH_ROW_FOCUS : {})} className={cn("flex items-start gap-2 rounded-md border border-w-line bg-w-field/70 px-2.5 py-1.5", f.paused && "opacity-60", SEARCH_ROW_RING)}>
               <span className="min-w-0 flex-1 space-y-0.5">
                 <span className="flex items-center gap-1.5">
                   <span className="rounded-md border border-w-line2 px-1 text-w-3xs text-w-muted">{f.kind === "rss" ? "RSS" : "Webhook"}</span>
@@ -1080,7 +1080,7 @@ const BEATS = [
   { value: "0 9-18 * * 1-5", label: "Hourly, weekday work hours" },
 ];
 
-function HeartbeatPanel({ agentId, agentName, beat, onChanged }: { agentId: string; agentName: string; beat: AgentSchedule | undefined; onChanged: () => void }) {
+function HeartbeatPanel({ agentId, agentName, beat, onChanged, focused }: { agentId: string; agentName: string; beat: AgentSchedule | undefined; onChanged: () => void; focused: boolean }) {
   const [checklist, setChecklist] = useState(beat?.prompt ?? "");
   const [every, setEvery] = useState(beat?.cron_expression ?? BEATS[1].value);
   const [busy, setBusy] = useState(false);
@@ -1108,7 +1108,7 @@ function HeartbeatPanel({ agentId, agentName, beat, onChanged }: { agentId: stri
   };
 
   return (
-    <div className={cn("space-y-2 rounded-md border border-w-line bg-w-field/70 px-2.5 py-2", beat && !beat.enabled && "opacity-70")}>
+    <div {...(focused ? SEARCH_ROW_FOCUS : {})} className={cn("space-y-2 rounded-md border border-w-line bg-w-field/70 px-2.5 py-2", beat && !beat.enabled && "opacity-70", SEARCH_ROW_RING)}>
       <div className="flex items-center gap-2">
         <span className="min-w-0 flex-1">
           <span className="block font-medium">Heartbeat</span>
@@ -1153,7 +1153,7 @@ function HeartbeatPanel({ agentId, agentName, beat, onChanged }: { agentId: stri
   );
 }
 
-export function SchedulesSection({ agentId, agentName }: { agentId: string; agentName: string }) {
+export function SchedulesSection({ agentId, agentName, focusId }: { agentId: string; agentName: string; focusId?: string }) {
   const queryClient = useQueryClient();
   const list: AgentSchedule[] = useQuery({ queryKey: qk.agent.schedules(agentId), queryFn: () => worldApi.schedules(agentId) }).data ?? EMPTY_SCHEDULES;
   const [name, setName] = useState("");
@@ -1184,12 +1184,13 @@ export function SchedulesSection({ agentId, agentName }: { agentId: string; agen
   };
 
   const routines = list.filter((s) => s.kind !== "heartbeat");
+  const beat = list.find((s) => s.kind === "heartbeat");
   const ready = name.trim() && prompt.trim() && (repeat === "once" ? Boolean(at) : repeat !== "custom" || cron.trim());
 
   return (
     <section className={SECTION}>
       <p className="text-w-sm font-semibold text-w-strong">Routines</p>
-      <HeartbeatPanel agentId={agentId} agentName={agentName} beat={list.find((s) => s.kind === "heartbeat")} onChanged={refresh} />
+      <HeartbeatPanel agentId={agentId} agentName={agentName} beat={beat} onChanged={refresh} focused={Boolean(beat && beat.id === focusId)} />
       <p className="text-w-xs text-w-muted">{agentName} wakes up on these and does the prompt on their own.</p>
       <ul className="space-y-1.5">
         {routines.length === 0 && (
@@ -1198,7 +1199,7 @@ export function SchedulesSection({ agentId, agentName }: { agentId: string; agen
           </li>
         )}
         {routines.map((s) => (
-          <li key={s.id} className={cn("flex items-start gap-2 rounded-md border border-w-line bg-w-field/70 px-2.5 py-1.5", !s.enabled && "opacity-60")}>
+          <li key={s.id} {...(focusId === s.id ? SEARCH_ROW_FOCUS : {})} className={cn("flex items-start gap-2 rounded-md border border-w-line bg-w-field/70 px-2.5 py-1.5", !s.enabled && "opacity-60", SEARCH_ROW_RING)}>
             <span className="min-w-0 flex-1">
               <span className="block font-medium">{s.name}</span>
               <span className="block text-w-xs text-w-muted">
@@ -1345,7 +1346,7 @@ function describeServer(s: McpServer): string {
   return `${typeof d.command === "string" ? d.command : ""} ${args}`.trim();
 }
 
-export function KitSection({ agentId, agentName, canInstall }: { agentId: string; agentName: string; canInstall: boolean }) {
+export function KitSection({ agentId, agentName, canInstall, focus }: { agentId: string; agentName: string; canInstall: boolean; focus?: { id: string; kind: "skill" | "mcp" } }) {
   const queryClient = useQueryClient();
   const kit: { mcp_servers: McpServer[]; skills: Skill[] } = useQuery({ queryKey: qk.agent.kit(agentId), queryFn: () => worldApi.kit(agentId) }).data ?? EMPTY_KIT;
   const servers: McpServer[] = useQuery({ queryKey: qk.mcpLibrary(), queryFn: () => worldApi.mcpLibrary() }).data ?? EMPTY_SERVERS;
@@ -1397,8 +1398,8 @@ export function KitSection({ agentId, agentName, canInstall }: { agentId: string
     }
   };
 
-  const row = (on: boolean, global: boolean, title: string, sub: string, onToggle: () => void, key: string) => (
-    <li key={key} className="flex items-center gap-2 rounded-md border border-w-line bg-w-field/70 px-2.5 py-1.5">
+  const row = (on: boolean, global: boolean, title: string, sub: string, onToggle: () => void, key: string, kind: "skill" | "mcp") => (
+    <li key={key} {...(focus?.kind === kind && focus.id === key ? SEARCH_ROW_FOCUS : {})} className={cn("flex items-center gap-2 rounded-md border border-w-line bg-w-field/70 px-2.5 py-1.5", SEARCH_ROW_RING)}>
       <span className="min-w-0 flex-1">
         <span className="block font-medium">{title}</span>
         <span className="block truncate font-mono text-w-2xs text-w-muted">{sub}</span>
@@ -1431,7 +1432,7 @@ export function KitSection({ agentId, agentName, canInstall }: { agentId: string
             <EmptyState icon={Plugs} title="No MCP servers" description="Install one to give this agent new tools." />
           </li>
         )}
-        {servers.map((s) => row(hasServer.has(s.id), s.scope === "global", s.name, s.duplicate_of ? `Same as ${s.duplicate_of}, so agents get it once. Remove one.` : describeServer(s), () => void toggle("mcp-servers", s.id, !hasServer.has(s.id)), s.id))}
+        {servers.map((s) => row(hasServer.has(s.id), s.scope === "global", s.name, s.duplicate_of ? `Same as ${s.duplicate_of}, so agents get it once. Remove one.` : describeServer(s), () => void toggle("mcp-servers", s.id, !hasServer.has(s.id)), s.id, "mcp"))}
       </ul>
       <p className={LABEL}>Skills</p>
       <ul className="space-y-1.5">
@@ -1440,7 +1441,7 @@ export function KitSection({ agentId, agentName, canInstall }: { agentId: string
             <EmptyState icon={BookOpen} title="No skills" description="Skills teach this agent how you like things done." />
           </li>
         )}
-        {skills.map((s) => row(hasSkill.has(s.id), s.scope === "global", s.name, s.description || s.source_url || "", () => void toggle("skills", s.id, !hasSkill.has(s.id)), s.id))}
+        {skills.map((s) => row(hasSkill.has(s.id), s.scope === "global", s.name, s.description || s.source_url || "", () => void toggle("skills", s.id, !hasSkill.has(s.id)), s.id, "skill"))}
       </ul>
       {canInstall && (
         <div className="space-y-2 border-t-2 border-dashed border-w-line pt-3">

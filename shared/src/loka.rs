@@ -134,6 +134,9 @@ pub fn hidden_from(event: &WorldEvent, viewer: Uuid) -> bool {
     if !foreign {
         return false;
     }
+    if event.event_type.starts_with("team.") && crate::event_scope::addressed_to(event, viewer) {
+        return false;
+    }
     let public = event.payload.get("visibility").and_then(Value::as_str) == Some("public");
     if PRIVATE_PREFIXES.iter().any(|p| event.event_type.starts_with(p)) {
         return !((event.event_type.starts_with("region.") || event.event_type.starts_with("report.")) && public);
@@ -817,12 +820,17 @@ mod tests {
         let graded = event("challenge.graded", json!({ "owner_user_id": other }));
         let hidden_item = event("item.created", json!({ "owner_user_id": other, "private": true }));
         let open_item = event("item.created", json!({ "owner_user_id": other, "private": false }));
+        let team = event("team.updated", json!({ "audience": [me] }));
+        let owner_only_team = event("team.updated", json!({ "owner_user_id": other }));
         assert!(hidden_from(&private, me));
         assert!(!hidden_from(&private, other));
         assert!(!hidden_from(&public, me));
         assert!(hidden_from(&graded, me));
         assert!(hidden_from(&hidden_item, me));
         assert!(!hidden_from(&open_item, me));
+        assert!(!hidden_from(&team, me));
+        assert!(hidden_from(&team, other));
+        assert!(hidden_from(&owner_only_team, me));
         assert!(!hidden_from(&event("task.finished", json!({})), me));
     }
 
@@ -982,7 +990,7 @@ mod tests {
         assert_eq!(history.last().and_then(|l| l.reply.as_deref()), Some("Three trawlers, lad."));
 
         let (challenge, _) = store
-            .create_challenge(me, Some(main), &json!({ "title": "Mooring knots", "type": "puzzle", "prompt": "Which knot?", "skill": "logic", "rubric": "bowline" }), Some(docks.id))
+            .create_challenge(me, crate::orgs::DEFAULT_ORG, Some(main), &json!({ "title": "Mooring knots", "type": "puzzle", "prompt": "Which knot?", "skill": "logic", "rubric": "bowline" }), Some(docks.id))
             .await?;
         let attempt = store.submit_attempt(me, challenge.id, "A bowline").await.map_err(|e| anyhow!("{e:?}"))?;
         assert_eq!(attempt.status, "pending");

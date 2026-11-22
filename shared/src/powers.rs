@@ -19,7 +19,7 @@ pub const ALL: &[(&str, &str)] = &[
     (MANAGE_QUESTS, "cancel or delete quests that are stuck or no longer needed, several at once, stopping their running work; other agents' quests also need oversee"),
     (FEEDS, "watch RSS or Atom feeds and receive webhooks such as Alertmanager alerts, which wake an agent when something new arrives"),
     (TEAMS, "group your person's agents into teams that share a channel, change or remove those teams, and give quests to a team"),
-    (WORLDBUILD, "grow your person's Loka with regions, portals, characters and ambience, and set Academy challenges and adventures for them"),
+    (WORLDBUILD, "grow your person's Loka with regions, portals, characters and ambience"),
     (GOVERN, "pause and resume your person's agents and set their daily budgets and approval modes, when your person asks"),
     (MANAGE_POWERS, "grant or revoke powers for other agents, change your owner's rules, and share environment keys between their agents"),
 ];

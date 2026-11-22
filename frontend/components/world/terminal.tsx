@@ -1,11 +1,12 @@
 "use client";
 
 import { bindTerminalKeys } from "@/lib/terminal-keys";
-import { useCallback, useEffect, useRef, useState } from "react";
+import type { TerminalQuote } from "@/lib/terminal-context";
+import { useCallback, useEffect, useRef, useState, type MutableRefObject, type ReactNode } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
-import { Monitor, Skull, TerminalWindow } from "@phosphor-icons/react";
+import { Monitor, Skull, TerminalWindow, X } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
 import { ConnectionMark } from "./connection-mark";
 import { WindowHeader } from "./settings-shell";
@@ -13,35 +14,14 @@ import { Shimmer } from "./work-ui";
 import { worldApi, type RunnerView } from "@/lib/world";
 import { desktopApi, isDesktopApp } from "@/lib/desktop";
 import { wb } from "./workbench/bridge";
-import { BTN_SECONDARY, FOCUS, PANEL, BTN_SECONDARY_DANGER } from "./styles";
+import { BTN_PRIMARY_SM, BTN_SECONDARY_SM, FOCUS, ICON_BTN, PANEL, BTN_SECONDARY_DANGER } from "./styles";
 import { SetupHint, useFeature } from "./setup-hint";
 import { escapeTaken } from "@/lib/escape";
+import { MAIN_TARGET, QuoteButton, sendQuote } from "./quote";
+import { TERMINAL_THEME, readTerminal as readFrom, selectionSpot, typeCommand } from "./terminal-surface";
+import { planRequest, planSwitch, typedReport, type ShellPhase, type TypedReport } from "@/lib/terminal-type";
 
-type Phase = "idle" | "starting" | "connecting" | "live" | "ended" | "error";
-
-const THEME = {
-  background: "#120c15",
-  foreground: "#e9dcc6",
-  cursor: "#e8b64a",
-  cursorAccent: "#120c15",
-  selectionBackground: "#3d2f4a",
-  black: "#1d1422",
-  red: "#e07a5f",
-  green: "#7be06b",
-  yellow: "#e8b64a",
-  blue: "#6bc7e8",
-  magenta: "#c39bff",
-  cyan: "#19b8b8",
-  white: "#e9dcc6",
-  brightBlack: "#5f4f60",
-  brightRed: "#ff8fa8",
-  brightGreen: "#9bf08b",
-  brightYellow: "#f2c66a",
-  brightBlue: "#9fdcff",
-  brightMagenta: "#d9bfff",
-  brightCyan: "#6be0e0",
-  brightWhite: "#fff8ea",
-};
+type Phase = ShellPhase;
 
 function b64ToBytes(data: string): Uint8Array {
   const raw = atob(data);
@@ -69,7 +49,29 @@ function closeLabel(reason: string): string {
 
 let homeTermId: string | null = null;
 
-export function TerminalPanel({ meId, onClose }: { meId: string | null; onClose: () => void }) {
+export type TerminalReader = () => TerminalQuote | null;
+
+export type TerminalRequest = { id: number; command: string; runnerId: string | null };
+
+export function TerminalPanel({
+  meId,
+  onClose,
+  sideToggle,
+  readerRef,
+  front = true,
+  request = null,
+  notice,
+  onTyped,
+}: {
+  meId: string | null;
+  onClose: () => void;
+  sideToggle?: ReactNode;
+  readerRef?: MutableRefObject<TerminalReader | null>;
+  front?: boolean;
+  request?: TerminalRequest | null;
+  notice?: ReactNode;
+  onTyped?: (request: number, report: TypedReport | null) => void;
+}) {
   const [devices, setDevices] = useState<RunnerView[] | null>(null);
   const [device, setDevice] = useState<string | null>(null);
   const [phase, setPhase] = useState<Phase>("idle");
@@ -79,7 +81,22 @@ export function TerminalPanel({ meId, onClose }: { meId: string | null; onClose:
   const socket = useRef<WebSocket | null>(null);
   const native = useRef<string | null>(null);
   const [localRunner, setLocalRunner] = useState<string | null>(null);
+  const [localChecked, setLocalChecked] = useState(() => !isDesktopApp());
+  const generation = useRef(0);
+  const phaseRef = useRef<Phase>("idle");
+  phaseRef.current = phase;
+  const liveSince = useRef(0);
+  const deviceRef = useRef<string | null>(null);
+  const typing = useRef(0);
+  const waiting = useRef<{ command: string; generation: number; request: number } | null>(null);
+  const handled = useRef<number | null>(null);
+  const [switchAsk, setSwitchAsk] = useState<{ command: string; target: string; request: number } | null>(null);
+  const onTypedRef = useRef(onTyped);
+  onTypedRef.current = onTyped;
+  const [typedNote, setTypedNote] = useState<string | null>(null);
   const readiness = useFeature("terminal");
+  const [quoteSpot, setQuoteSpot] = useState<{ x: number; y: number } | null>(null);
+  const placeRef = useRef("device");
 
   useEffect(() => {
     if (!isDesktopApp()) return;
@@ -89,7 +106,10 @@ export function TerminalPanel({ meId, onClose }: { meId: string | null; onClose:
       .then((status) => {
         if (!gone && status.features?.includes("home_terminal")) setLocalRunner(status.runner_id);
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        if (!gone) setLocalChecked(true);
+      });
     return () => {
       gone = true;
     };
@@ -110,9 +130,20 @@ export function TerminalPanel({ meId, onClose }: { meId: string | null; onClose:
     };
   }, [meId]);
 
+  function sendInput(data: string) {
+    if (native.current) {
+      void wb.termWrite(native.current, data).catch(() => {});
+      return;
+    }
+    const ws = socket.current;
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "in", data }));
+    }
+  }
+
   useEffect(() => {
     if (!host.current || term.current) return;
-    const t = new Terminal({ fontFamily: "var(--font-geist-mono), monospace", fontSize: 13, theme: THEME, cursorBlink: true });
+    const t = new Terminal({ fontFamily: "var(--font-geist-mono), monospace", fontSize: 13, theme: TERMINAL_THEME, cursorBlink: true });
     const fit = new FitAddon();
     t.loadAddon(fit);
     bindTerminalKeys(t);
@@ -136,26 +167,29 @@ export function TerminalPanel({ meId, onClose }: { meId: string | null; onClose:
     resize();
     const observer = new ResizeObserver(resize);
     observer.observe(host.current);
-    const typing = t.onData((data) => {
-      if (native.current) {
-        void wb.termWrite(native.current, data).catch(() => {});
-        return;
-      }
-      const ws = socket.current;
-      if (ws?.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "in", data }));
-      }
-    });
+    const placeQuote = () => setQuoteSpot(t.hasSelection() && t.getSelection().trim() ? selectionSpot(t, host.current?.querySelector(".xterm-screen")) : null);
+    const selecting = t.onSelectionChange(placeQuote);
+    const scrolling = t.onScroll(placeQuote);
+    const typing = t.onData(sendInput);
     return () => {
       observer.disconnect();
+      selecting.dispose();
+      scrolling.dispose();
       typing.dispose();
       t.dispose();
       term.current = null;
     };
   }, []);
 
+  useEffect(() => {
+    if (phase === "live") liveSince.current = Date.now();
+  }, [phase]);
+
   useEffect(
     () => () => {
+      generation.current += 1;
+      typing.current += 1;
+      waiting.current = null;
       socket.current?.close();
       socket.current = null;
       native.current = null;
@@ -166,9 +200,14 @@ export function TerminalPanel({ meId, onClose }: { meId: string | null; onClose:
   const open = useCallback(async (id: string) => {
     const t = term.current;
     if (!t) return;
+    generation.current += 1;
+    phaseRef.current = "starting";
+    deviceRef.current = id;
     socket.current?.close();
     socket.current = null;
     native.current = null;
+    setSwitchAsk(null);
+    setTypedNote(null);
     setDevice(id);
     setPhase("starting");
     setDetail("");
@@ -250,6 +289,9 @@ export function TerminalPanel({ meId, onClose }: { meId: string | null; onClose:
   }, [localRunner]);
 
   const kill = useCallback(() => {
+    generation.current += 1;
+    waiting.current = null;
+    setSwitchAsk(null);
     if (native.current) {
       void wb.termClose(native.current).catch(() => {});
       homeTermId = null;
@@ -270,19 +312,106 @@ export function TerminalPanel({ meId, onClose }: { meId: string | null; onClose:
     if (localRunner && homeTermId && phase === "idle") void open(localRunner);
   }, [localRunner, open, phase]);
 
+  const readTerminal = useCallback((selectionOnly: boolean): TerminalQuote | null => (term.current ? readFrom(term.current, selectionOnly, placeRef.current) : null), []);
+
+  const names = useRef({ devices, localRunner });
+  names.current = { devices, localRunner };
+
+  const typeNow = useCallback((command: string, request: number) => {
+    const t = term.current;
+    if (!t) return;
+    const mine = generation.current;
+    const turn = (typing.current += 1);
+    const current = () => generation.current === mine && typing.current === turn;
+    const id = deviceRef.current;
+    const device = names.current.devices?.find((d) => d.id === id)?.name ?? (id && id === names.current.localRunner ? "this Mac" : "this device");
+    setTypedNote(null);
+    void typeCommand(t, sendInput, command, { liveSince: liveSince.current, alive: () => current() && phaseRef.current === "live" }).then((result) => {
+      if (!current()) return;
+      const report = typedReport(result, device);
+      setTypedNote(report?.note ?? null);
+      onTypedRef.current?.(request, report);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!request || handled.current === request.id) return;
+    if (devices === null || !localChecked || !term.current) return;
+    handled.current = request.id;
+    const phaseNow = phaseRef.current;
+    const live = phaseNow === "live" || phaseNow === "connecting" || phaseNow === "starting";
+    const current = live ? deviceRef.current : null;
+    const target = request.runnerId ?? current ?? localRunner ?? devices[0]?.id ?? null;
+    typing.current += 1;
+    waiting.current = null;
+    setSwitchAsk(null);
+    const plan = planRequest({ phase: phaseNow, current, target });
+    if (plan === "none" || !target) {
+      setTypedNote("No device is online to type it on. Pair or wake one in Devices.");
+      onTypedRef.current?.(request.id, null);
+      return;
+    }
+    if (plan === "type") return typeNow(request.command, request.id);
+    if (plan === "ask") {
+      setSwitchAsk({ command: request.command, target, request: request.id });
+      return;
+    }
+    if (plan === "open") void open(target);
+    waiting.current = { command: request.command, generation: generation.current, request: request.id };
+  }, [request, devices, localChecked, localRunner, open, typeNow]);
+
+  useEffect(() => {
+    if (phase !== "live") return;
+    const queued = waiting.current;
+    if (!queued) return;
+    waiting.current = null;
+    if (queued.generation === generation.current) typeNow(queued.command, queued.request);
+  }, [phase, typeNow]);
+
+  const switchTo = (ask: { command: string; target: string; request: number }, go: boolean) => {
+    setSwitchAsk(null);
+    typing.current += 1;
+    waiting.current = null;
+    const { plan, device: id } = planSwitch({ go, phase: phaseRef.current, current: deviceRef.current, target: ask.target });
+    if (plan === "none" || !id) {
+      onTypedRef.current?.(ask.request, null);
+      return;
+    }
+    if (plan === "type") return typeNow(ask.command, ask.request);
+    if (plan === "open") void open(id);
+    waiting.current = { command: ask.command, generation: generation.current, request: ask.request };
+  };
+
+  useEffect(() => {
+    if (!readerRef) return;
+    readerRef.current = () => readTerminal(false);
+    return () => {
+      readerRef.current = null;
+    };
+  }, [readerRef, readTerminal]);
+
+  const quoteSelection = () => {
+    const quote = readTerminal(true);
+    setQuoteSpot(null);
+    if (!quote) return;
+    term.current?.clearSelection();
+    sendQuote(MAIN_TARGET, quote);
+  };
+
   const busy = phase === "starting" || phase === "connecting" || phase === "live";
 
   useEffect(() => {
-    if (busy) return;
+    if (busy || !front) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape" || escapeTaken(e)) return;
       onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [busy, onClose]);
+  }, [busy, front, onClose]);
   const blocked = devices !== null && devices.length === 0 && !localRunner && readiness && readiness.state !== "ready" ? readiness : null;
   const deviceName = (id: string | null) => devices?.find((d) => d.id === id)?.name ?? "device";
+  placeRef.current = device && device === localRunner ? "this Mac" : deviceName(device);
 
   return (
     <div role="dialog" aria-modal="true" aria-label="Terminal" className={cn(PANEL, "pointer-events-auto flex h-full w-full flex-col overflow-hidden")}>
@@ -310,11 +439,16 @@ export function TerminalPanel({ meId, onClose }: { meId: string | null; onClose:
         }
         onClose={onClose}
         actions={
-          busy && (
-            <button type="button" onClick={kill} className={BTN_SECONDARY_DANGER}>
-              <Skull size={14} weight="bold" />
-              <span className="hidden sm:inline">Kill</span>
-            </button>
+          (sideToggle || busy) && (
+            <>
+              {sideToggle}
+              {busy && (
+                <button type="button" onClick={kill} className={BTN_SECONDARY_DANGER}>
+                  <Skull size={14} weight="bold" />
+                  <span className="hidden sm:inline">Kill</span>
+                </button>
+              )}
+            </>
           )
         }
       />
@@ -344,8 +478,42 @@ export function TerminalPanel({ meId, onClose }: { meId: string | null; onClose:
           })}
         </div>
       )}
+      {switchAsk ? (
+        <div role="group" aria-label="Switch device" className="flex shrink-0 flex-wrap items-center gap-2 border-b-2 border-dashed border-w-line2 bg-w-sand px-4 py-2 text-w-sm sm:px-5">
+          <span className="min-w-0 flex-1 text-w-text2">
+            Switch to {deviceName(switchAsk.target)}? That ends the shell on {deviceName(device)}.
+          </span>
+          <button type="button" onClick={() => switchTo(switchAsk, true)} className={BTN_PRIMARY_SM}>
+            Switch
+          </button>
+          <button type="button" onClick={() => switchTo(switchAsk, false)} className={BTN_SECONDARY_SM}>
+            Type on {deviceName(device)}
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setSwitchAsk(null);
+              onTypedRef.current?.(switchAsk.request, null);
+            }}
+            className={BTN_SECONDARY_SM}
+          >
+            Cancel
+          </button>
+        </div>
+      ) : (
+        (typedNote || notice) && (
+          <div role="status" className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b-2 border-dashed border-w-line2 bg-w-sand px-4 py-2 text-w-sm text-w-text2 sm:px-5">
+            {typedNote && <span className="min-w-0 flex-1">{typedNote}</span>}
+            {notice}
+            <button type="button" onClick={() => setTypedNote(null)} aria-label="Dismiss" title="Dismiss" className={cn(ICON_BTN, !typedNote && "hidden")}>
+              <X size={14} weight="bold" />
+            </button>
+          </div>
+        )
+      )}
       <div className="relative min-h-0 flex-1 bg-[#120c15]">
         <div ref={host} className="absolute inset-0 px-2 py-1.5" />
+        <QuoteButton spot={front ? quoteSpot : null} onQuote={quoteSelection} />
         {blocked ? (
           <div className="absolute inset-0 flex items-center justify-center p-6">
             <SetupHint feature={blocked} tone="dark" className="max-w-lg" />

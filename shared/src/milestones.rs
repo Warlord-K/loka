@@ -295,6 +295,15 @@ impl MilestoneStore {
         Ok(())
     }
 
+    pub async fn merge_done(&self, task_id: Uuid) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM task_milestones WHERE task_id = $1 AND kind = 'merge' AND status = 'done')",
+        )
+        .bind(task_id)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     pub async fn open_count(&self, task_id: Uuid) -> Result<i64> {
         Ok(sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM task_milestones WHERE task_id = $1 AND status IN ('pending', 'active')",
@@ -414,6 +423,18 @@ impl MilestoneStore {
     }
 }
 
+pub fn finished_status(failed: bool, merged: bool, has_pr: bool, changes_requested: bool) -> &'static str {
+    if failed {
+        "failed"
+    } else if merged {
+        "done"
+    } else if has_pr || changes_requested {
+        "review"
+    } else {
+        "done"
+    }
+}
+
 pub fn prompt_block(milestones: &[Milestone]) -> String {
     let work: Vec<&Milestone> = milestones.iter().filter(|m| m.kind == "work").collect();
     let merge = milestones.iter().any(|m| m.kind == "merge" && m.status != "skipped");
@@ -438,6 +459,17 @@ pub fn prompt_block(milestones: &[Milestone]) -> String {
 mod tests {
     use super::*;
     use sqlx::postgres::PgPoolOptions;
+
+    #[test]
+    fn a_merged_quest_never_goes_back_to_review() {
+        assert_eq!(finished_status(false, false, true, false), "review");
+        assert_eq!(finished_status(false, false, false, true), "review");
+        assert_eq!(finished_status(false, false, false, false), "done");
+        assert_eq!(finished_status(true, false, true, false), "failed");
+        assert_eq!(finished_status(true, true, true, true), "failed");
+        assert_eq!(finished_status(false, true, true, false), "done");
+        assert_eq!(finished_status(false, true, false, true), "done");
+    }
 
     #[tokio::test]
     async fn merge_watch_lifecycle() -> Result<()> {
@@ -499,8 +531,10 @@ mod tests {
         sqlx::query("UPDATE session_runs SET status = 'completed' WHERE id = $1").bind(run).execute(&pool).await?;
         assert!(store.arm_merge(task, true).await?);
         assert_eq!(store.open_count(task).await?, 1);
+        assert!(!store.merge_done(task).await?);
         store.note(mine.id, "done", "Merged", serde_json::json!({})).await?;
         assert_eq!(store.open_count(task).await?, 0);
+        assert!(store.merge_done(task).await?);
         sqlx::query("DELETE FROM agent_tasks WHERE id = $1").bind(task).execute(&pool).await?;
         sqlx::query("DELETE FROM agent_sessions WHERE id = $1").bind(session).execute(&pool).await?;
         Ok(())

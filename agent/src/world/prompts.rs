@@ -202,6 +202,38 @@ pub fn is_image(mime: &str) -> bool {
     matches!(mime, "image/png" | "image/jpeg" | "image/gif" | "image/webp")
 }
 
+#[derive(Debug, Default, PartialEq)]
+pub struct AttachedIds {
+    pub images: Vec<Uuid>,
+    pub files: Vec<(Uuid, String)>,
+}
+
+pub fn attached_ids<'a>(payloads: impl IntoIterator<Item = &'a Value>) -> AttachedIds {
+    let mut found = AttachedIds::default();
+    for attachment in payloads.into_iter().filter_map(|p| p.get("attachments").and_then(Value::as_array)).flatten() {
+        let Some(id) = attachment.get("id").and_then(Value::as_str).and_then(|s| s.parse::<Uuid>().ok()) else {
+            continue;
+        };
+        if found.images.contains(&id) || found.files.iter().any(|(seen, _)| *seen == id) {
+            continue;
+        }
+        match attachment.get("mime").and_then(Value::as_str) {
+            Some(mime) if !is_image(mime) => {
+                if found.files.len() < loka_shared::media::MAX_ATTACHED_FILES {
+                    let name = attachment.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                    found.files.push((id, name));
+                }
+            }
+            _ => {
+                if found.images.len() < 8 {
+                    found.images.push(id);
+                }
+            }
+        }
+    }
+    found
+}
+
 fn attached(p: &Value) -> String {
     let images = p
         .get("attachments")
@@ -221,9 +253,12 @@ fn attached(p: &Value) -> String {
                 let cut = if file.get("truncated").and_then(Value::as_bool) == Some(true) { " (cut short)" } else { "" };
                 out.push_str(&format!("\n[attached file {name}{cut}]\n```\n{text}\n```"));
             }
-            None => out.push_str(&format!(
-                "\n(attached file {name}, {mime}: you cannot open it in this conversation; say so if you need its contents as text)"
-            )),
+            None => {
+                let id = file.get("id").and_then(Value::as_str).map(|id| format!(", upload {id}")).unwrap_or_default();
+                out.push_str(&format!(
+                    "\n(attached file {name}, {mime}{id}: its path on disk is listed below when it was saved, but only a quest session can open it: hand the work to a quest and give it this upload id for get_upload)"
+                ));
+            }
         }
     }
     out
@@ -292,7 +327,7 @@ fn failure_hint(failure: &str, task_id: &str) -> &'static str {
             "\nThis needs your person: the CLI's sign-in, key or billing must be fixed on their side. Tell them briefly what to fix; do not retry until they say it is done."
         }
         "disk_full" => {
-            "\nThe device ran out of disk space. Tell your person briefly that the device needs free space (closed quest workspaces can be cleared under You > Storage); do not retry until they say there is room."
+            "\nThe device ran out of disk space. Tell your person briefly that the device needs free space (closed quest workspaces can be cleared under Settings > Storage); do not retry until they say there is room."
         }
         "context_too_long" if quest => {
             "\nThe quest session ran out of context. Start the quest again with a short brief that lists what is already done instead of resuming it."
@@ -335,6 +370,9 @@ fn cause_note(p: &Value) -> String {
         ),
         "timed_out" => format!(
             "\nIt ran out of time; the work so far is kept. Resume it with start_task on task_id {task_id}, and raise its time limit if it needs longer."
+        ),
+        "cancelled" => format!(
+            "\nThe run was cancelled before it finished, for example because the agent was paused for a budget, the organization was suspended or the owner was removed, and nothing is wrong with the work. Once that is cleared, resume the same quest with start_task on task_id {task_id}; the session and worktree are kept. Do not hand it to another agent."
         ),
         "stopped" => "\nSomeone stopped it on purpose. Do not restart it unless they ask.".to_string(),
         _ => String::new(),
@@ -628,7 +666,7 @@ fn render_event(item: &InboxItem, tasks: &[AgentTask]) -> String {
             s("mark_id")
         ),
         "practice.ready" => format!(
-            "[event] practice.ready: {} pressed Ready on attempt {} of their {} practice canvas report:{} \"{}\" and you are their coach.\nattempt: {}\nThe drawing is attached as an image.{}\n\nStrokes, in the order drawn:\n{}\n\nEarlier attempts, newest first:\n{}\n\nLook at the image and the stroke order (count, order and direction matter for kanji), compare with the earlier attempts, then call practice_check with attempt set to {} and a specific right, fix and next (score 0 to 100 is optional). practice_check posts your answer in their chat, so end this turn with an empty actions list and no reply. read_practice with strokes true has the full stroke data.",
+            "[event] practice.ready: {} pressed Ready on attempt {} of their {} canvas lesson report:{} \"{}\" in the Academy and you are their coach.\nattempt: {}\nThe drawing is attached as an image.{}\n\nStrokes, in the order drawn:\n{}\n\nEarlier attempts, newest first:\n{}\n\nLook at the image and the stroke order (count, order and direction matter for kanji), compare with the earlier attempts, then call grade_attempt with attempt set to {} and a specific right, fix and next (score 0 to 100 is optional; 60 or more passes, or set passed). A pass earns them xp the first time. grade_attempt posts your answer in their chat, so end this turn with an empty actions list and no reply. list_challenges with attempt and strokes true has the full stroke data.",
             sender(p),
             p.get("n").and_then(Value::as_i64).unwrap_or(0),
             one_line(&s("subject"), 40),
@@ -639,6 +677,14 @@ fn render_event(item: &InboxItem, tasks: &[AgentTask]) -> String {
             s("strokes_summary"),
             practice_history(p),
             s("attempt_id")
+        ),
+        "course.next" => format!(
+            "[event] course.next: {} finished every lesson of their Academy course \"{}\" ({} lessons, last one \"{}\") and you coach it. Look at how they did with list_challenges course \"{}\", then in one short reply congratulate them and offer what comes next: harder lessons in the same course with create_challenge course, or a new course with create_course. Ask before building more than one lesson.",
+            sender(p),
+            one_line(&s("title"), 120),
+            p.get("lessons").and_then(Value::as_i64).unwrap_or(0),
+            one_line(&s("last_lesson"), 120),
+            one_line(&s("title"), 120)
         ),
         "todo.dismissed" => format!(
             "[event] {} dismissed \"{}\" from their To do list without taking any of the actions you suggested ({} after you added it). Mark it dismissed in your notes with update_my_notes so you do not suggest it again. Then end with an empty actions list and say nothing.",
@@ -651,6 +697,11 @@ fn render_event(item: &InboxItem, tasks: &[AgentTask]) -> String {
             short_id(&s("session_id")),
             or(&s("task_id"), "(none)"),
             s("reply")
+        ),
+        "review.finished" if p.get("cancelled").and_then(Value::as_bool) == Some(true) => format!(
+            "[event] review.finished: the independent review of your quest was cancelled before it gave a verdict.\ntask_id: {}\nreason: {}\nThe quest is back in review and its work has not been published. Message its task session to carry on, or ask for another review with request_review.",
+            or(&s("task_id"), "(none)"),
+            p.get("review").and_then(|r| r.get("summary")).and_then(Value::as_str).unwrap_or("(none)")
         ),
         "review.finished" => format!(
             "[event] review.finished: the review you asked for is done{}.\ntask_id: {}\nverdict:\n{}",
@@ -1839,6 +1890,38 @@ fn answered_quote(p: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn attachments_split_into_images_and_files() {
+        let (a, b, c, d) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let message = json!({ "attachments": [
+            { "id": a, "mime": "image/png", "name": "a.png" },
+            { "id": b, "mime": "audio/x-m4a", "name": "New Recording.m4a" },
+            { "id": b, "mime": "audio/x-m4a", "name": "New Recording.m4a" },
+            { "id": c, "name": "no-mime" },
+            { "id": "not-a-uuid", "mime": "audio/mpeg" },
+            { "mime": "audio/mpeg" },
+        ] });
+        let other = json!({ "attachments": [{ "id": d, "mime": "video/quicktime", "name": "clip.mov" }, { "id": a, "mime": "image/png" }] });
+        let found = attached_ids([&message, &other, &json!({ "body": "hi" })]);
+        assert_eq!(found.images, vec![a, c]);
+        assert_eq!(found.files, vec![(b, "New Recording.m4a".to_string()), (d, "clip.mov".to_string())]);
+    }
+
+    #[test]
+    fn attachment_files_are_capped_per_message() {
+        let many = json!({ "attachments": (0..20).map(|_| json!({ "id": Uuid::new_v4(), "mime": "audio/wav" })).collect::<Vec<_>>() });
+        assert_eq!(attached_ids([&many]).files.len(), loka_shared::media::MAX_ATTACHED_FILES);
+    }
+
+    #[test]
+    fn an_unreadable_attachment_names_its_upload_and_get_upload() {
+        let id = Uuid::new_v4();
+        let text = attached(&json!({ "files": [{ "name": "New Recording.m4a", "mime": "audio/x-m4a", "id": id }] }));
+        assert!(text.contains("New Recording.m4a") && text.contains(&id.to_string()) && text.contains("get_upload"), "{text}");
+        assert!(!text.contains("you cannot open it"));
+    }
 
     #[test]
     fn quests_without_a_repo_are_told_their_folder_is_not_a_checkout() {
@@ -1848,6 +1931,16 @@ mod tests {
         assert!(!none.contains('\u{2014}'));
         for template in [TASK, QUICK_TASK] {
             assert!(template.contains("{repo_line}"));
+        }
+    }
+
+    #[test]
+    fn quest_templates_merge_without_delete_branch() {
+        for template in [TASK, QUICK_TASK] {
+            assert!(template.contains("--match-head-commit"));
+            assert!(template.contains("git/refs/heads/"));
+            assert!(template.contains("never add `--delete-branch`"));
+            assert!(!template.contains('\u{2014}'));
         }
     }
 
@@ -1873,9 +1966,27 @@ mod tests {
             "task_id": "t3", "status": "failed", "report": { "status": "blocked", "summary": "needs a key" }
         })), &[]);
         assert!(blocked.contains("reported itself blocked"));
-        for text in [never, silent, blocked] {
+        let cancelled = render_item(&inbox(4, "run.failed", serde_json::json!({
+            "task_id": "t4", "error": "The task run was cancelled, so the quest stopped.", "cause": "cancelled",
+            "reason": "It was cancelled: Organization suspended", "stage": "queue", "run_kind": "task"
+        })), &[]);
+        assert!(cancelled.contains("what happened: cancelled at the queue stage") && cancelled.contains("start_task on task_id t4"));
+        for text in [never, silent, blocked, cancelled] {
             assert!(!text.contains('\u{2014}'));
         }
+    }
+
+    #[test]
+    fn a_cancelled_review_tells_the_agent_the_quest_is_back_in_review() {
+        let cancelled = render_item(&inbox(1, "review.finished", serde_json::json!({
+            "task_id": "t9", "cancelled": true,
+            "review": { "verdict": "review cancelled", "summary": "Organization suspended" }
+        })), &[]);
+        assert!(cancelled.contains("was cancelled before it gave a verdict") && cancelled.contains("t9"));
+        assert!(cancelled.contains("Organization suspended") && cancelled.contains("request_review"));
+        assert!(!cancelled.contains('\u{2014}'));
+        let finished = render_item(&inbox(2, "review.finished", serde_json::json!({ "task_id": "t9", "review": { "verdict": "approve" } })), &[]);
+        assert!(finished.contains("the review you asked for is done"));
     }
 
     #[test]
@@ -1902,8 +2013,10 @@ mod tests {
     #[test]
     fn practice_ready_tells_the_coach_how_to_answer() {
         let practice = render_item(&inbox(1, "practice.ready", serde_json::json!({ "author": "Ada", "from_owner": true, "n": 3, "subject": "japanese", "report_id": "r1", "title": "Kanji", "attempt_id": "a3", "note": "stroke 2 felt off", "strokes_summary": "1 strokes on a 100x100 canvas", "history": [{ "line": "#2 checked: right: x; fix: y; next: z" }] })), &[]);
-        assert!(practice.starts_with("[event] practice.ready: Ada [your owner, verified] pressed Ready on attempt 3 of their japanese practice canvas report:r1 \"Kanji\""));
-        assert!(practice.contains("\nTheir note: stroke 2 felt off") && practice.contains("- #2 checked: right: x") && practice.contains("practice_check with attempt set to a3"));
+        assert!(practice.starts_with("[event] practice.ready: Ada [your owner, verified] pressed Ready on attempt 3 of their japanese canvas lesson report:r1 \"Kanji\" in the Academy"));
+        assert!(practice.contains("\nTheir note: stroke 2 felt off") && practice.contains("- #2 checked: right: x") && practice.contains("grade_attempt with attempt set to a3"));
+        let next = render_item(&inbox(2, "course.next", serde_json::json!({ "author": "Ada", "from_owner": true, "title": "Japanese", "lessons": 3, "last_lesson": "Kana" })), &[]);
+        assert!(next.starts_with("[event] course.next: Ada [your owner, verified] finished every lesson of their Academy course \"Japanese\" (3 lessons") && next.contains("create_challenge course"));
         let first = render_item(&inbox(1, "practice.ready", serde_json::json!({ "author": "Ada", "n": 1, "attempt_id": "a1" })), &[]);
         assert!(first.contains("(none, this is the first attempt)") && !first.contains("Their note"));
     }
@@ -2286,6 +2399,16 @@ mod tests {
             assert!(!lean.contains("actions block"), "lean starts never mention main-session instructions");
             assert!(lean.contains(UNFORKED_LINE));
             assert!(lean.starts_with("[task session"));
+        }
+    }
+
+    #[test]
+    fn both_quest_templates_tell_agents_to_keep_build_output_off_the_shared_disk() {
+        assert!(REVIEW.contains("CARGO_TARGET_DIR") && REVIEW.contains("do not clone the repository"));
+        for prompt in [TASK, QUICK_TASK] {
+            assert!(prompt.contains("CARGO_TARGET_DIR") && prompt.contains("TMPDIR") && prompt.contains("/tmp"), "{prompt}");
+            assert!(prompt.contains("private to this quest"));
+            assert!(!prompt.contains('\u{2014}'));
         }
     }
 

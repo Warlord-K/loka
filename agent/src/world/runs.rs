@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use loka_shared::milestones::MilestoneStore;
+use loka_shared::milestones::{finished_status, MilestoneStore};
 use loka_shared::models::AgentTask;
 use loka_shared::runners::RunnerUsage;
 use loka_shared::world::{
@@ -139,6 +139,9 @@ pub async fn start_task(
                 "it is already being worked on in session {session_id}; use message_session to steer that session instead of starting it again"
             ))
         }
+        TaskResume::AwaitingPlan(session_id) => {
+            return Err(anyhow!("session {session_id} has a plan that {}", loka_shared::quests::PLAN_WAITING))
+        }
         TaskResume::Resumed { session_id, run_id } => {
             ctx.db.update_status(task.id, "in_progress").await?;
             ctx.store
@@ -210,6 +213,7 @@ async fn prepare_workspace(ctx: &Ctx, task: &AgentTask, attempt: i16) -> Result<
                 Err(_) => workspace::unused_branch_name(&repo_path, &task.agent_branch_name()).await,
             };
             workspace::create_worktree(&repo_path, &path, &branch, &base).await?;
+            workspace::pin_signing(&path).await;
             Ok(path)
         }
         None => {
@@ -709,6 +713,18 @@ async fn handle_failure(
                         .get_agent(run.agent_id)
                         .await?
                         .ok_or_else(|| anyhow!("agent missing"))?;
+                    if let Some(url) = merged_pr_url(ctx, &task_session).await? {
+                        return super::watch::settle_merged(&ctx.store, &ctx.db, &task_session, &url).await;
+                    }
+                    let stopped = diagnosis.as_ref().is_some_and(|d| d.cause == loka_shared::run_causes::Cause::Stopped);
+                    let published = match task_session.task_id {
+                        Some(task_id) => ctx.db.get_task(task_id).await?.is_some_and(|task| task.repo.is_some() && task.pr_url.is_some()),
+                        None => false,
+                    };
+                    if stopped && published {
+                        let verdict = json!({ "verdict": prompts::NO_VERDICT, "summary": error });
+                        return finalize(ctx, &agent, &task_session, Some(verdict)).await;
+                    }
                     let verdict = json!({ "verdict": "review failed", "summary": error });
                     return finalize(ctx, &agent, &task_session, Some(verdict)).await;
                 }
@@ -791,7 +807,7 @@ async fn after_task(
         return Ok(());
     }
     let done = report.and_then(|r| r.status.as_deref()) == Some("done");
-    advance_task(ctx, agent, session, run.task_id, done).await
+    advance_task(ctx, agent, session, run.task_id, done, true).await
 }
 
 async fn missing_report(ctx: &Ctx, session: &AgentSession, run: &SessionRun, output: &str) -> Result<bool> {
@@ -823,6 +839,7 @@ async fn advance_task(
     session: &AgentSession,
     task_id: Option<Uuid>,
     done: bool,
+    review: bool,
 ) -> Result<()> {
     let task = match task_id {
         Some(id) => ctx.db.get_task(id).await?,
@@ -831,7 +848,7 @@ async fn advance_task(
     if session.racing() {
         return attempt_done(ctx, agent, session, done).await;
     }
-    if let (true, true, Some(task)) = (ctx.reviews_enabled && session.wants_review(), done, task) {
+    if let (true, true, Some(task)) = (review && ctx.reviews_enabled && session.wants_review(), done, task) {
         return queue_review(ctx, agent, session, &task).await;
     }
     finalize(ctx, agent, session, None).await
@@ -873,6 +890,9 @@ async fn after_compare(ctx: &Ctx, agent: &WorldAgent, review: &AgentSession, ids
 }
 
 async fn queue_review(ctx: &Ctx, agent: &WorldAgent, session: &AgentSession, task: &AgentTask) -> Result<()> {
+    if let Some(url) = ctx.store.quest_merged_pr(task.id).await? {
+        return super::watch::settle_merged(&ctx.store, &ctx.db, session, &url).await;
+    }
     let (backend, model) = session.review_target(agent.reviewer.as_ref());
     let review = ctx
         .store
@@ -1011,9 +1031,50 @@ async fn after_followup(
             .and_then(|report| report.status)
             .as_deref()
             == Some("done");
-        advance_task(ctx, agent, &session, run.task_id, done).await?;
+        let sync = followup_pr_sync(ctx, &session, run, done).await;
+        if sync == loka_shared::runners::PrSync::Merged && !session.racing() {
+            if let Some(url) = quest_pr_url(ctx, run.task_id).await? {
+                return super::watch::settle_merged(&ctx.store, &ctx.db, &session, &url).await;
+            }
+        }
+        advance_task(ctx, agent, &session, run.task_id, done, sync.needs_review()).await?;
     }
     Ok(())
+}
+
+async fn followup_pr_sync(ctx: &Ctx, session: &AgentSession, run: &SessionRun, done: bool) -> loka_shared::runners::PrSync {
+    let Some(wd) = session.working_dir.as_deref().filter(|_| done) else {
+        return loka_shared::runners::PrSync::Changed;
+    };
+    let has_repo = match run.task_id {
+        Some(id) => ctx.db.get_task(id).await.ok().flatten().is_some_and(|task| task.repo.is_some()),
+        None => false,
+    };
+    if !has_repo {
+        return loka_shared::runners::PrSync::Changed;
+    }
+    github::pr_sync(Path::new(wd), std::time::SystemTime::from(run.created_at)).await
+}
+
+async fn merged_pr_url(ctx: &Ctx, task_session: &AgentSession) -> Result<Option<String>> {
+    let Some(task_id) = task_session.task_id else {
+        return Ok(None);
+    };
+    if let Some(url) = ctx.store.quest_merged_pr(task_id).await? {
+        return Ok(Some(url));
+    }
+    let (Some(wd), Some(url)) = (task_session.working_dir.as_deref(), quest_pr_url(ctx, Some(task_id)).await?) else {
+        return Ok(None);
+    };
+    let merged = github::pr_sync(Path::new(wd), std::time::SystemTime::now()).await == loka_shared::runners::PrSync::Merged;
+    Ok(merged.then_some(url))
+}
+
+async fn quest_pr_url(ctx: &Ctx, task_id: Option<Uuid>) -> Result<Option<String>> {
+    match task_id {
+        Some(id) => Ok(ctx.db.get_task(id).await?.and_then(|task| task.pr_url)),
+        None => Ok(None),
+    }
 }
 
 async fn after_review(
@@ -1190,12 +1251,8 @@ async fn finalize(
         }
         let review_wants_changes = verdict.as_ref().and_then(|v| v.get("verdict")).and_then(Value::as_str) == Some("changes");
         changes_requested = review_wants_changes;
-        task_status = match (&pr_url, &error) {
-            (_, Some(_)) => "failed",
-            (Some(_), None) => "review",
-            (None, None) if review_wants_changes => "review",
-            (None, None) => "done",
-        };
+        let already_merged = error.is_none() && milestones.merge_done(task.id).await?;
+        task_status = finished_status(error.is_some(), already_merged, pr_url.is_some(), review_wants_changes);
         if let Some(err) = &error {
             ctx.db.set_error(task.id, err).await?;
         } else {
@@ -1324,6 +1381,7 @@ async fn open_pr(
 ) -> Result<Option<String>> {
     let base = base_branch(ctx, task);
     let task_branch = task.branch.clone().unwrap_or_else(|| task.agent_branch_name());
+    let target = workspace::PublishTarget { repo, base: &base, onto: &base, quest_branch: &task_branch };
     if let Some(url) = task.pr_url.clone() {
         if let Some(number) = task.pr_number {
             if let Some(state) = github::pr_state(wd, repo, i64::from(number)).await? {
@@ -1333,26 +1391,32 @@ async fn open_pr(
             }
         }
         let message = report.commit_message.clone().unwrap_or_else(|| format!("fix: address review for {}", task.title));
-        workspace::commit_signed(wd, &message).await?;
+        let committed = workspace::commit_for_publish(wd, repo, &message).await?;
         if !workspace::ahead_of_fresh_base(wd, &base).await? {
             return Ok(Some(url));
         }
-        workspace::ensure_signed_commits(wd, &base).await?;
-        let head = match github::open_pr_containing_head(wd, repo, &base, &task_branch).await? {
+        let parent_pr = loka_agent::runner_server::parent_quest_pr(&ctx.db, task).await;
+        let head = match github::open_pr_containing_head(wd, repo, &base, &task_branch, parent_pr).await? {
             github::HeadPr::Own(_, head) => head,
             github::HeadPr::Elsewhere(_) => return Ok(Some(url)),
-            github::HeadPr::Missing => workspace::publish_branch(wd, Some(&task_branch)).await?,
+            github::HeadPr::Extends(pr, head_ref) if github::extends_recorded_pr(task.pr_number.map(i64::from), pr.number) => {
+                let extending = workspace::PublishTarget { quest_branch: &head_ref, ..target };
+                workspace::publish_commits(wd, &committed, &extending, &head_ref).await.context("push failed")?;
+                return Ok(Some(url));
+            }
+            github::HeadPr::Extends(..) | github::HeadPr::Missing => workspace::publish_branch(wd, Some(&task_branch)).await?,
         };
-        workspace::push_quest_branch(wd, &head, &task_branch).await?;
+        workspace::publish_commits(wd, &committed, &target, &head).await?;
         return Ok(Some(url));
     }
     let message = report
         .commit_message
         .clone()
         .unwrap_or_else(|| format!("feat: {}", task.title));
-    workspace::commit_signed(wd, &message).await?;
+    let committed = workspace::commit_for_publish(wd, repo, &message).await?;
+    let parent_pr = loka_agent::runner_server::parent_quest_pr(&ctx.db, task).await;
     let found = if workspace::ahead_of_fresh_base(wd, &base).await? {
-        Some(github::open_pr_containing_head(wd, repo, &base, &task_branch).await?)
+        Some(github::open_pr_containing_head(wd, repo, &base, &task_branch, parent_pr).await?)
     } else {
         None
     };
@@ -1365,14 +1429,18 @@ async fn open_pr(
             return Ok(Some(url));
         }
         Some(github::HeadPr::Own(pr, head)) => {
-            workspace::ensure_signed_commits(wd, &base).await?;
-            workspace::push_quest_branch(wd, &head, &task_branch).await.context("push failed")?;
+            workspace::publish_commits(wd, &committed, &target, &head).await.context("push failed")?;
+            ctx.db.set_pr(task.id, &pr.url, pr.number).await?;
+            return Ok(Some(pr.url));
+        }
+        Some(github::HeadPr::Extends(pr, head_ref)) => {
+            let extending = workspace::PublishTarget { quest_branch: &head_ref, ..target };
+            workspace::publish_commits(wd, &committed, &extending, &head_ref).await.context("push failed")?;
             ctx.db.set_pr(task.id, &pr.url, pr.number).await?;
             return Ok(Some(pr.url));
         }
         Some(github::HeadPr::Missing) => {}
     }
-    workspace::ensure_signed_commits(wd, &base).await?;
     if !workspace::ahead_of_fresh_base(wd, &base).await? {
         return Ok(None);
     }
@@ -1380,10 +1448,11 @@ async fn open_pr(
     if branch == base {
         return Err(anyhow!("workspace is on the base branch {base}"));
     }
-    workspace::push_quest_branch(wd, &branch, &task_branch).await.context("push failed")?;
+    let into = github::stack_base(wd, repo, &base, &task_branch, parent_pr).await;
+    let target = workspace::PublishTarget { onto: &into, ..target };
+    workspace::publish_commits(wd, &committed, &target, &branch).await.context("push failed")?;
     let title = report.pr_title.clone().unwrap_or_else(|| task.title.clone());
     let body = report.pr_body.clone().or_else(|| report.summary.clone()).unwrap_or_default();
-    let into = github::stack_base(wd, repo, &base, &task_branch, loka_agent::runner_server::parent_quest_pr(&ctx.db, task).await).await;
     let Some(pr) = github::create_pr(wd, repo, &branch, &into, &title, &body).await? else {
         return Ok(None);
     };

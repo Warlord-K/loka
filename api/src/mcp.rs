@@ -408,7 +408,7 @@ impl Ctx<'_> {
                 let outcome = if self.may_call(def) {
                     self.call(name, &args).await
                 } else {
-                    Err("This token is read only. Create a write token in Loka (You, API tokens) to use this tool.".into())
+                    Err("This token is read only. Create a write token in Loka (Settings > API tokens) to use this tool.".into())
                 };
                 rpc_result(
                     id,

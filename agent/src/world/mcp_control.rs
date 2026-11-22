@@ -124,8 +124,8 @@ impl Server {
             }), &["agent", "key"]));
         }
         if self.caller.is_main && self.caller.owner_user_id.is_some() {
-            tools.push(tool("storage", "See how much space your person's agents take in Loka (chats, run history, run step logs, activity), per agent, with when each was last active and past cleanups, plus the disk their devices spend on quest workspaces and quest temp folders (total, how much of it is temp build output, free space, and how much belongs to closed quests). Read only. Use it when they ask what is using space or want to tidy up, then suggest a clean_up.", json!({}), &[]));
-            tools.push(tool("clean_up", &format!("Permanently delete old data of your person's agents to free space. Kinds: run_logs (step logs, prompts and raw output of finished runs; cost and run list stay), chats (chat messages older than the cutoff), quests (closed quests with their sessions, runs and logs; lifetime cost stays), activity (old activity feed events and cleared bell items), workspaces (checkouts, build output, private temp folders and scratch files of closed quests on your person's devices, oldest first; branches, commits and pull requests stay, older_than_days and agent do not apply). Without confirm it only previews what would go and how much space it frees: always preview first, tell your person exactly what will be deleted, and that it cannot be undone. Pass confirm true {OWNER_ONLY}, after they agreed to that exact cleanup."), json!({
+            tools.push(tool("storage", "See how much space your person's agents take in Loka (chats, run history, run step logs, activity), per agent, with when each was last active and past cleanups, plus the disk their devices spend on quest workspaces and quest temp folders (total, how much of it is temp build output, free space, and how much belongs to closed quests or idle open quests' build folders). Read only. Use it when they ask what is using space or want to tidy up, then suggest a clean_up.", json!({}), &[]));
+            tools.push(tool("clean_up", &format!("Permanently delete old data of your person's agents to free space. Kinds: run_logs (step logs, prompts and raw output of finished runs; cost and run list stay), chats (chat messages older than the cutoff), quests (closed quests with their sessions, runs and logs; lifetime cost stays), activity (old activity feed events and cleared bell items), workspaces (checkouts, build output, private temp folders and scratch files of closed quests on your person's devices, oldest first, plus the node_modules, .next and cargo target folders of idle open quests; branches, commits and pull requests stay, older_than_days and agent do not apply). Without confirm it only previews what would go and how much space it frees: always preview first, tell your person exactly what will be deleted, and that it cannot be undone. Pass confirm true {OWNER_ONLY}, after they agreed to that exact cleanup."), json!({
                 "kind": s("run_logs, chats, quests, activity or workspaces"),
                 "older_than_days": { "type": "integer", "description": "Only data older than this many days, 7 to 3650 (not used for workspaces)" },
                 "agent": s("Agent name or slug, optional, defaults to all of your person's agents"),
@@ -658,7 +658,7 @@ impl Server {
                         )
                     })?;
                 let Some(value) = self.store.environment_value(owner, provider.env).await? else {
-                    return Ok(format!("{} ({}) is not saved for your person. They add it in You > Environment.", provider.label, provider.env));
+                    return Ok(format!("{} ({}) is not saved for your person. They add it in Settings > Keys.", provider.label, provider.env));
                 };
                 let format = match loka_shared::providers::format_problem(provider, &value) {
                     Some(problem) => format!("Format problem: {problem}."),
@@ -714,13 +714,15 @@ impl Server {
                     }
                     for w in &report.workspaces {
                         lines.push(format!(
-                            "- Quest workspaces and temp folders on {}{}: {} in {} folders ({} of it quest temp: build output and test databases), {} of it from closed quests that a cleanup would remove{}",
+                            "- Quest workspaces and temp folders on {}{}: {} in {} folders ({} of it quest temp: build output and test databases), {} of it from closed quests that a cleanup would remove; build output (cargo targets, node_modules, .next) {} in all, {} of it from idle open quests that a cleanup would also clear{}",
                             w.name,
                             if w.online { "" } else { " (offline)" },
                             size(w.bytes),
                             w.tasks,
                             size(w.temp_bytes),
                             size(w.reclaimable_bytes),
+                            size(w.build_bytes),
+                            size(w.reclaimable_build_bytes),
                             match (w.free_gb, w.low) {
                                 (Some(free), true) => format!(" | only {free} GB of disk free, closed quest folders are cleared automatically below 5 GB and new quest runs are refused until there is room"),
                                 (Some(free), false) => format!(" | {free} GB of disk free"),
@@ -765,13 +767,13 @@ impl Server {
                     )
                     .await?;
                 if result.kind == loka_shared::cleanup::CleanupKind::Workspaces {
-                    return Ok(if result.rows == 0 {
-                        "Nothing to clean: no closed quest workspaces or temp folders on your person's devices (open quests are never touched, and a quest's folders stay an hour after its last run).".to_string()
+                    return Ok(if result.rows == 0 && result.bytes == 0 {
+                        "Nothing to clean: no closed quest workspaces, temp folders or idle build folders on your person's devices (open quests keep their checkouts, and a quest's folders stay an hour after its last run).".to_string()
                     } else if result.applied {
-                        format!("Asked the devices to remove the workspaces and temp folders of {} closed quests, about {}. They do it within a minute; branches, commits and pull requests stay. This cannot be undone.", result.rows, size(result.bytes))
+                        format!("Asked the devices to remove the workspaces and temp folders of {} closed quests, the node_modules, .next and cargo target folders of idle open quests, about {} in all. They do it within a minute; branches, commits and pull requests stay, and builds rerun from scratch. This cannot be undone.", result.rows, size(result.bytes))
                     } else {
                         format!(
-                            "Preview: workspaces and temp folders of {} closed quests, about {}, on your person's devices. Nothing removed yet. Tell your person that open quests are kept and that this is permanent for those folders; call again with confirm true only after they agree.",
+                            "Preview: workspaces and temp folders of {} closed quests plus the build folders (cargo target, node_modules, .next) of idle open quests, about {}, on your person's devices. Nothing removed yet. Tell your person that open quests keep their checkouts, that the next build will be slower, and that this is permanent for those folders; call again with confirm true only after they agree.",
                             result.rows,
                             size(result.bytes)
                         )

@@ -2,6 +2,7 @@ export const qk = {
   tokens: () => ["world", "tokens"] as const,
   flags: () => ["world", "flags"] as const,
   agents: () => ["world", "agents"] as const,
+  people: () => ["world", "people"] as const,
   environment: (ownerId: string) => ["world", "environment", ownerId] as const,
   commandRules: (ownerId: string) => ["world", "command-rules", ownerId] as const,
   sharedKeys: () => ["world", "shared-keys"] as const,
