@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SHIPPED = ROOT / "public" / "sprites" / "style-a"
 WORLD = ROOT / "sprites" / "style-a"
 CAST = ROOT / "sprites" / "cast"
+PROPS = ROOT / "sprites" / "props"
 MAX_W = 1024
 GAP = 2
 SWAP_ROLES = {"skin", "hair", "shirt", "pants", "suit", "tie"}
@@ -148,11 +149,12 @@ class Shelf:
 
 
 def thing_spec(export, item, shelf):
-    img = Image.open(export / item["file"]).convert("RGBA")
+    imgs = [Image.open(export / name).convert("RGBA") for name in item.get("frames") or [item["file"]]]
+    img = imgs[0]
     spec = {
         "density": item["density"],
         "anchor": [item["anchor"]["x"], item["anchor"]["y"]],
-        "frames": [shelf.place(img) + [img.width, img.height]],
+        "frames": [shelf.place(frame) + [frame.width, frame.height] for frame in imgs],
     }
     points = scaled_points(item, img)
     sign = item.get("sign")
@@ -271,15 +273,18 @@ def pack_cast(cast_dir, out):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Pack the world export and the cast export into the style A atlas and manifest the engine loads.")
+    parser = argparse.ArgumentParser(description="Pack the world export, the cast export and the props export into the style A atlas and manifest the engine loads.")
     parser.add_argument("--world", type=Path, default=WORLD, help="world export: manifest.json, sprites/ and variants/ (default: frontend/sprites/style-a)")
     parser.add_argument("--cast", type=Path, default=CAST, help="cast export: manifest.json, bodies/ and accessories/ (default: frontend/sprites/cast)")
+    parser.add_argument("--props", type=Path, default=PROPS, help="action and activity props export: manifest.json and sprites/ (default: frontend/sprites/props)")
     parser.add_argument("--out", type=Path, default=SHIPPED, help="folder the engine loads, rewritten in place")
     args = parser.parse_args()
 
     world = json.loads((args.world / "manifest.json").read_text())
     shelf = Shelf(0)
     things = {item["name"]: thing_spec(args.world, item, shelf) for item in world["items"]}
+    props = json.loads((args.props / "manifest.json").read_text()) if (args.props / "manifest.json").exists() else {"items": []}
+    things.update({item["name"]: thing_spec(args.props, item, shelf) for item in props["items"]})
     packed = Image.new("RGBA", (MAX_W, shelf.bottom()), (0, 0, 0, 0))
     for im, at in shelf.parts:
         packed.alpha_composite(im, tuple(at))
@@ -287,7 +292,7 @@ def main():
     packed.save(args.out / "atlas.png", optimize=True)
 
     bodies, accessories, cast_sources = pack_cast(args.cast, args.out)
-    sources = {k: v for k, v in (("world", world.get("sources_url")), ("cast", cast_sources)) if isinstance(v, str)}
+    sources = {k: v for k, v in (("world", world.get("sources_url")), ("cast", cast_sources), ("props", props.get("sources_url"))) if isinstance(v, str)}
     manifest = {"version": 1, "atlas": "atlas.png", "sources": sources, "bodies": bodies, "accessories": accessories, "things": things}
     (args.out / "manifest.json").write_text(json.dumps(manifest, separators=(",", ":")))
     print(f"atlas {packed.size[0]}x{packed.size[1]}, {len(things)} things, {len(bodies)} bodies, {len(accessories)} accessories")

@@ -5,6 +5,7 @@ pub mod github;
 pub mod omp_config;
 pub mod onboarding;
 pub mod readiness;
+pub mod practice;
 pub mod reports;
 pub mod loka;
 pub mod runners;

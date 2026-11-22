@@ -2099,6 +2099,506 @@
    "final": "finals/boulder_final.png",
    "fal_source": "boulder.png",
    "points": {}
+  },
+  {
+   "name": "critter_duck",
+   "kind": "critter",
+   "file": "sprites/critter_duck_0.png",
+   "w": 72,
+   "h": 58,
+   "density": 4,
+   "anchor": {
+    "x": 36,
+    "y": 58
+   },
+   "glow": null,
+   "bytes": 6310,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {},
+   "frames": [
+    "sprites/critter_duck_0.png",
+    "sprites/critter_duck_1.png",
+    "sprites/critter_duck_2.png"
+   ]
+  },
+  {
+   "name": "critter_duckling",
+   "kind": "critter",
+   "file": "sprites/critter_duckling.png",
+   "w": 36,
+   "h": 34,
+   "density": 4,
+   "anchor": {
+    "x": 18,
+    "y": 34
+   },
+   "glow": null,
+   "bytes": 813,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {}
+  },
+  {
+   "name": "critter_sparrow",
+   "kind": "critter",
+   "file": "sprites/critter_sparrow_0.png",
+   "w": 35,
+   "h": 31,
+   "density": 4,
+   "anchor": {
+    "x": 17,
+    "y": 31
+   },
+   "glow": null,
+   "bytes": 3920,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {},
+   "frames": [
+    "sprites/critter_sparrow_0.png",
+    "sprites/critter_sparrow_1.png",
+    "sprites/critter_sparrow_2.png",
+    "sprites/critter_sparrow_3.png"
+   ]
+  },
+  {
+   "name": "critter_cat",
+   "kind": "critter",
+   "file": "sprites/critter_cat_0.png",
+   "w": 66,
+   "h": 62,
+   "density": 4,
+   "anchor": {
+    "x": 33,
+    "y": 62
+   },
+   "glow": null,
+   "bytes": 6500,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {},
+   "frames": [
+    "sprites/critter_cat_0.png",
+    "sprites/critter_cat_1.png"
+   ]
+  },
+  {
+   "name": "critter_koi",
+   "kind": "critter",
+   "file": "sprites/critter_koi.png",
+   "w": 30,
+   "h": 39,
+   "density": 4,
+   "anchor": {
+    "x": 15,
+    "y": 39
+   },
+   "glow": null,
+   "bytes": 2198,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {},
+   "frames": [
+    "sprites/critter_koi.png",
+    "sprites/critter_koi_fall.png"
+   ]
+  },
+  {
+   "name": "critter_peacock",
+   "kind": "critter",
+   "file": "sprites/critter_peacock.png",
+   "w": 156,
+   "h": 121,
+   "density": 4,
+   "anchor": {
+    "x": 122,
+    "y": 119
+   },
+   "glow": null,
+   "bytes": 5539,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {}
+  },
+  {
+   "name": "critter_peacock_fan",
+   "kind": "critter",
+   "file": "sprites/critter_peacock_fan.png",
+   "w": 220,
+   "h": 157,
+   "density": 4,
+   "anchor": {
+    "x": 110,
+    "y": 157
+   },
+   "glow": null,
+   "bytes": 15998,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {}
+  },
+  {
+   "name": "critter_cat_grey",
+   "kind": "critter",
+   "file": "sprites/critter_cat_grey_0.png",
+   "w": 66,
+   "h": 62,
+   "density": 4,
+   "anchor": {
+    "x": 33,
+    "y": 62
+   },
+   "glow": null,
+   "bytes": 5938,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {},
+   "frames": [
+    "sprites/critter_cat_grey_0.png",
+    "sprites/critter_cat_grey_1.png"
+   ]
+  },
+  {
+   "name": "room_drum",
+   "kind": "furniture",
+   "file": "sprites/room_drum.png",
+   "w": 32,
+   "h": 39,
+   "density": 2,
+   "anchor": {
+    "x": 16,
+    "y": 39
+   },
+   "glow": null,
+   "bytes": 1497,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {}
+  },
+  {
+   "name": "room_desk",
+   "kind": "furniture",
+   "file": "sprites/room_desk.png",
+   "w": 49,
+   "h": 55,
+   "density": 2,
+   "anchor": {
+    "x": 24,
+    "y": 55
+   },
+   "glow": null,
+   "bytes": 1744,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {}
+  },
+  {
+   "name": "room_shelf",
+   "kind": "furniture",
+   "file": "sprites/room_shelf.png",
+   "w": 96,
+   "h": 90,
+   "density": 2,
+   "anchor": {
+    "x": 48,
+    "y": 90
+   },
+   "glow": null,
+   "bytes": 4397,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {}
+  },
+  {
+   "name": "room_clock",
+   "kind": "furniture",
+   "file": "sprites/room_clock.png",
+   "w": 32,
+   "h": 82,
+   "density": 2,
+   "anchor": {
+    "x": 16,
+    "y": 82
+   },
+   "glow": null,
+   "bytes": 2872,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {}
+  },
+  {
+   "name": "room_chest",
+   "kind": "furniture",
+   "file": "sprites/room_chest.png",
+   "w": 32,
+   "h": 34,
+   "density": 2,
+   "anchor": {
+    "x": 16,
+    "y": 34
+   },
+   "glow": null,
+   "bytes": 1952,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {}
+  },
+  {
+   "name": "room_chart",
+   "kind": "furniture",
+   "file": "sprites/room_chart.png",
+   "w": 54,
+   "h": 75,
+   "density": 2,
+   "anchor": {
+    "x": 27,
+    "y": 75
+   },
+   "glow": null,
+   "bytes": 3443,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {}
+  },
+  {
+   "name": "room_counter",
+   "kind": "furniture",
+   "file": "sprites/room_counter.png",
+   "w": 96,
+   "h": 50,
+   "density": 2,
+   "anchor": {
+    "x": 48,
+    "y": 50
+   },
+   "glow": null,
+   "bytes": 2763,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {}
+  },
+  {
+   "name": "room_mailbox",
+   "kind": "furniture",
+   "file": "sprites/room_mailbox.png",
+   "w": 96,
+   "h": 67,
+   "density": 2,
+   "anchor": {
+    "x": 48,
+    "y": 67
+   },
+   "glow": null,
+   "bytes": 3878,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {}
+  },
+  {
+   "name": "room_scale",
+   "kind": "furniture",
+   "file": "sprites/room_scale.png",
+   "w": 32,
+   "h": 42,
+   "density": 2,
+   "anchor": {
+    "x": 16,
+    "y": 42
+   },
+   "glow": null,
+   "bytes": 1378,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {}
+  },
+  {
+   "name": "room_lamp",
+   "kind": "furniture",
+   "file": "sprites/room_lamp.png",
+   "w": 32,
+   "h": 72,
+   "density": 2,
+   "anchor": {
+    "x": 16,
+    "y": 72
+   },
+   "glow": null,
+   "bytes": 1305,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {}
+  },
+  {
+   "name": "room_bell",
+   "kind": "furniture",
+   "file": "sprites/room_bell.png",
+   "w": 32,
+   "h": 43,
+   "density": 2,
+   "anchor": {
+    "x": 16,
+    "y": 43
+   },
+   "glow": null,
+   "bytes": 1226,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {}
+  },
+  {
+   "name": "room_plant",
+   "kind": "furniture",
+   "file": "sprites/room_plant.png",
+   "w": 32,
+   "h": 45,
+   "density": 2,
+   "anchor": {
+    "x": 16,
+    "y": 45
+   },
+   "glow": null,
+   "bytes": 1606,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {}
+  },
+  {
+   "name": "room_machine",
+   "kind": "furniture",
+   "file": "sprites/room_machine.png",
+   "w": 32,
+   "h": 40,
+   "density": 2,
+   "anchor": {
+    "x": 16,
+    "y": 40
+   },
+   "glow": null,
+   "bytes": 1360,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {},
+   "masks": {
+    "led": "variants/room_machine_led_mask.png",
+    "tint": "variants/room_machine_tint_mask.png"
+   }
+  },
+  {
+   "name": "room_anvil",
+   "kind": "furniture",
+   "file": "sprites/room_anvil.png",
+   "w": 32,
+   "h": 31,
+   "density": 2,
+   "anchor": {
+    "x": 16,
+    "y": 31
+   },
+   "glow": null,
+   "bytes": 1232,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {}
+  },
+  {
+   "name": "room_hearth",
+   "kind": "furniture",
+   "file": "sprites/room_hearth.png",
+   "w": 64,
+   "h": 50,
+   "density": 2,
+   "anchor": {
+    "x": 32,
+    "y": 50
+   },
+   "glow": null,
+   "bytes": 1986,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {}
+  },
+  {
+   "name": "room_telescope",
+   "kind": "furniture",
+   "file": "sprites/room_telescope.png",
+   "w": 64,
+   "h": 87,
+   "density": 2,
+   "anchor": {
+    "x": 32,
+    "y": 87
+   },
+   "glow": null,
+   "bytes": 2759,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {}
+  },
+  {
+   "name": "room_rug",
+   "kind": "furniture",
+   "file": "sprites/room_rug.png",
+   "w": 96,
+   "h": 44,
+   "density": 2,
+   "anchor": {
+    "x": 48,
+    "y": 44
+   },
+   "glow": null,
+   "bytes": 2522,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {},
+   "masks": {
+    "tint": "variants/room_rug_tint_mask.png"
+   }
+  },
+  {
+   "name": "room_doorway",
+   "kind": "furniture",
+   "file": "sprites/room_doorway.png",
+   "w": 40,
+   "h": 85,
+   "density": 2,
+   "anchor": {
+    "x": 20,
+    "y": 85
+   },
+   "glow": null,
+   "bytes": 1274,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {}
+  },
+  {
+   "name": "room_bed",
+   "kind": "furniture",
+   "file": "sprites/room_bed.png",
+   "w": 64,
+   "h": 79,
+   "density": 2,
+   "anchor": {
+    "x": 32,
+    "y": 79
+   },
+   "glow": null,
+   "bytes": 2823,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {},
+   "masks": {
+    "tint": "variants/room_bed_tint_mask.png"
+   }
+  },
+  {
+   "name": "room_terminal",
+   "kind": "furniture",
+   "file": "sprites/room_terminal.png",
+   "w": 64,
+   "h": 62,
+   "density": 2,
+   "anchor": {
+    "x": 32,
+    "y": 62
+   },
+   "glow": null,
+   "bytes": 1732,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {},
+   "masks": {
+    "led": "variants/room_terminal_led_mask.png"
+   }
+  },
+  {
+   "name": "room_workbench",
+   "kind": "furniture",
+   "file": "sprites/room_workbench.png",
+   "w": 64,
+   "h": 38,
+   "density": 2,
+   "anchor": {
+    "x": 32,
+    "y": 38
+   },
+   "glow": null,
+   "bytes": 1894,
+   "fal_source": "style-a follow-ups 3 sheets",
+   "points": {}
   }
  ],
  "changed": [

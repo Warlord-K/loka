@@ -18,6 +18,7 @@ export interface ReportBrief {
   kind: ReportKind;
   open_marks: number;
   item_count: number;
+  practice?: { subject: string; coach_agent_id?: string | null } | null;
 }
 
 export type ReportKind = "doc" | "canvas";

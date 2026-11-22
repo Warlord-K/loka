@@ -423,13 +423,14 @@ async fn take_turn(ctx: &Ctx, agent: &WorldAgent, items: &[InboxItem]) -> Result
     let main = ctx.store.get_session(main.id).await?.unwrap_or(main);
 
     let (text, actions) = prompts::split_actions(&result.output);
+    let problems = prompts::action_problems(&result.output);
     let text = redact_secrets(&text, environment.values());
     let actions = actions
         .into_iter()
         .map(|action| redact_action(action, &environment))
         .collect::<Vec<_>>();
     info!(agent = %agent.slug, events = items.len(), actions = actions.len(), cost = acc.cost_usd, "Turn complete");
-    apply_actions(ctx, agent, &main, run.id, items, &text, actions).await?;
+    apply_actions(ctx, agent, &main, run.id, items, &text, actions, problems).await?;
     log_timing(agent, &main.backend, prep_ms, cli_ms, post_started.elapsed().as_millis() as u64, turn_started, timing.as_ref());
     let used = if main.backend == "claude" { runs::context_tokens(&result.usage) } else { result.usage.context_tokens as i64 };
     if let Some(limit) = prompts::compact_threshold().filter(|limit| prompts::compacts(&main.backend) && used > *limit) {
@@ -629,6 +630,7 @@ async fn compact(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_actions(
     ctx: &Ctx,
     agent: &WorldAgent,
@@ -637,6 +639,7 @@ async fn apply_actions(
     items: &[InboxItem],
     text: &str,
     actions: Vec<Action>,
+    mut problems: Vec<String>,
 ) -> Result<()> {
     let mut replied = false;
     let mut started: Vec<Uuid> = Vec::new();
@@ -648,10 +651,10 @@ async fn apply_actions(
                 reply(ctx, agent, main, run_id, text, next, thread, root).await?;
                 replied = true;
             }
-            Action::StartTask { task_id, brief, review, reviewer, time_limit_minutes, milestones, quest } => match task_id.parse::<Uuid>() {
-                Ok(id) if !started.contains(&id) && !super::quests::assigned_elsewhere(&ctx.store, id, agent.id).await => {
+            Action::StartTask { task_id, brief, review, reviewer, time_limit_minutes, milestones, quest } => match super::quests::start_target(&ctx.store, agent, task_id).await {
+                Ok(id) if !started.contains(&id) => {
                     if let Err(e) = super::quests::apply_choice(&ctx.store, id, quest).await {
-                        system_note(ctx, agent, &format!("Could not set the quest options on task {id}: {e}")).await?;
+                        problems.push(format!("Could not set the quest options on task {id}: {e}"));
                         continue;
                     }
                     super::quests::seed_milestones(&ctx.store, agent.id, id, milestones).await;
@@ -661,17 +664,18 @@ async fn apply_actions(
                             started.push(id);
                             if let Some(minutes) = time_limit_minutes {
                                 if let Err(e) = ctx.store.set_task_time_limit(id, Some(*minutes)).await {
-                                    system_note(ctx, agent, &format!("Could not set the time limit on task {id}: {e}")).await?;
+                                    problems.push(format!("Could not set the time limit on task {id}: {e}"));
                                 }
                             }
                         }
                         Err(e) => {
                             warn!(agent = %agent.slug, task = %id, error = %e, "Could not start task");
-                            system_note(ctx, agent, &format!("Could not start task {id}: {e}")).await?;
+                            problems.push(format!("Could not start task {id}: {e}"));
                         }
                     }
                 }
-                _ => {}
+                Ok(_) => {}
+                Err(problem) => problems.push(problem),
             },
             Action::Escalate { text } | Action::Ask { text, .. } | Action::Drafts { text, .. } if !text.trim().is_empty() => {
                 let drafts = match action {
@@ -758,10 +762,10 @@ async fn apply_actions(
         let brief = (!text.trim().is_empty()).then_some(text);
         if let Err(e) = runs::start_task(ctx, agent, main, id, brief, false, None).await {
             warn!(agent = %agent.slug, task = %id, error = %e, "Could not auto-start task");
-            system_note(ctx, agent, &format!("Could not start task {id}: {e}")).await?;
+            problems.push(format!("Could not start task {id}: {e}"));
         }
     }
-    Ok(())
+    super::quests::tell_agent(&ctx.store, agent, run_id, items, &problems).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1065,27 +1069,6 @@ fn truncate(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::redact_action;
-    use crate::world::prompts::{self, Action};
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn preserves_action_type_when_secret_matches_control_value() {
-        let environment = BTreeMap::from([("TOKEN".to_string(), "start_task".to_string())]);
-        let (_, actions) = prompts::split_actions(
-            r#"<!-- actions [{"type":"start_task","task_id":"abc","brief":"start_task"}] actions -->"#,
-        );
-        let action = redact_action(actions.into_iter().next().unwrap(), &environment);
-        assert!(matches!(
-            action,
-            Action::StartTask { task_id, brief, .. }
-                if task_id == "abc" && brief.as_deref() == Some("[REDACTED]")
-        ));
-    }
-}
-
 fn spawn_progress(
     store: loka_shared::world::WorldStore,
     agent_id: Uuid,
@@ -1107,4 +1090,25 @@ fn spawn_progress(
         }
     });
     (tx, task)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_action;
+    use crate::world::prompts::{self, Action};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn preserves_action_type_when_secret_matches_control_value() {
+        let environment = BTreeMap::from([("TOKEN".to_string(), "start_task".to_string())]);
+        let (_, actions) = prompts::split_actions(
+            r#"<!-- actions [{"type":"start_task","task_id":"abc","brief":"start_task"}] actions -->"#,
+        );
+        let action = redact_action(actions.into_iter().next().unwrap(), &environment);
+        assert!(matches!(
+            action,
+            Action::StartTask { task_id, brief, .. }
+                if task_id == "abc" && brief.as_deref() == Some("[REDACTED]")
+        ));
+    }
 }

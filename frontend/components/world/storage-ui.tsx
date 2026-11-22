@@ -47,6 +47,8 @@ type WorkspaceUse = {
   low: boolean;
   reclaimable_bytes: number;
   reclaimable_tasks: number;
+  temp_bytes: number;
+  reclaimable_temp_bytes: number;
 };
 
 type Report = { agents: AgentStorage[]; total_bytes: number; cleanups: PastCleanup[]; workspaces: WorkspaceUse[] };
@@ -60,8 +62,8 @@ const KINDS: { kind: CleanupKind; title: string; description: string; scoped?: b
   { kind: "activity", title: "Old activity", description: "The activity feed behind quest rooms and the bell, including cleared bell items." },
   {
     kind: "workspaces",
-    title: "Closed quest workspaces",
-    description: "Checkouts, build output and scratch files of closed quests on your devices, oldest first. Open quests are never touched. Branches, commits and pull requests stay.",
+    title: "Closed quest workspaces and temp folders",
+    description: "Checkouts, build output, test databases and scratch files of closed quests on your devices, oldest first. Open quests are never touched. Branches, commits and pull requests stay.",
     scoped: false,
   },
 ];
@@ -73,7 +75,7 @@ const AGES = [
   { value: "365", label: "Older than a year" },
 ];
 
-const LABEL: Record<CleanupKind, string> = { run_logs: "Run step logs", quests: "Closed quests", chats: "Chat messages", activity: "Activity", workspaces: "Quest workspaces" };
+const LABEL: Record<CleanupKind, string> = { run_logs: "Run step logs", quests: "Closed quests", chats: "Chat messages", activity: "Activity", workspaces: "Quest workspaces and temp folders" };
 
 function size(bytes: number): string {
   if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
@@ -129,7 +131,7 @@ function Cleanup({
             ? "Nothing was left to delete."
             : scoped
               ? `Deleted ${result.rows.toLocaleString()} items, about ${size(result.bytes)} freed.`
-              : `Asked your devices to remove ${result.rows.toLocaleString()} workspaces, about ${size(result.bytes)}. They finish within a minute or two.`,
+              : `Asked your devices to remove the workspaces and temp folders of ${result.rows.toLocaleString()} closed quests, about ${size(result.bytes)}. They finish within a minute or two.`,
         );
         onDone();
       } else {
@@ -164,11 +166,11 @@ function Cleanup({
       {preview && (
         <div className="mt-3 rounded-lg border-2 border-dashed border-w-line2 px-3 py-2.5">
           {preview.rows === 0 ? (
-            <p className="text-w-sm text-w-muted">{scoped ? "Nothing that old. There is nothing to delete here." : "No closed quest workspaces to remove right now."}</p>
+            <p className="text-w-sm text-w-muted">{scoped ? "Nothing that old. There is nothing to delete here." : "No closed quest workspaces or temp folders to remove right now."}</p>
           ) : (
             <>
               <p className="text-w-sm text-w-text">
-                {preview.rows.toLocaleString()} {scoped ? "items" : "workspaces"}, about <span className="font-semibold">{size(preview.bytes)}</span>. Deleting them is permanent and cannot be undone.
+                {preview.rows.toLocaleString()} {scoped ? "items" : "closed quests"}, about <span className="font-semibold">{size(preview.bytes)}</span>. Deleting them is permanent and cannot be undone.
               </p>
               <div className="mt-2.5 flex flex-wrap gap-2">
                 <button type="button" className={BTN_DANGER} onClick={() => void run(true)} disabled={busy}>
@@ -239,7 +241,7 @@ export function StorageSection() {
       {report && report.workspaces.length > 0 && (
         <SettingsGroup
           title="Quest workspaces on your devices"
-          description="Each quest works in its own checkout on the device that runs it. Loka removes it 3 days after a quest is done (7 days when it failed) and sooner when the disk runs low."
+          description="Each quest works in its own checkout and its own temp folder (build output and test databases) on the device that runs it. Loka clears the temp folder an hour after a quest closes, the checkout 3 days after it is done (7 days when it failed), and both sooner when the disk runs low."
         >
           <SettingsCard rows>
             {report.workspaces.map((w) => (
@@ -250,12 +252,12 @@ export function StorageSection() {
                 </span>
                 <span className="text-w-sm font-semibold tabular-nums text-w-strong">{size(w.bytes)}</span>
                 <span className="basis-full text-w-xs leading-relaxed text-w-muted">
-                  {w.tasks.toLocaleString()} folders, {size(w.reclaimable_bytes)} from closed quests ({w.reclaimable_tasks.toLocaleString()}).
+                  {w.tasks.toLocaleString()} folders{w.temp_bytes > 0 ? `, ${size(w.temp_bytes)} of it temp build output and test databases` : ""}, {size(w.reclaimable_bytes)} from closed quests ({w.reclaimable_tasks.toLocaleString()}){w.reclaimable_temp_bytes > 0 ? `, ${size(w.reclaimable_temp_bytes)} of that temp` : ""}.
                   {w.free_gb !== null && (
                     <>
                       {" "}
                       <span className={w.low ? "font-semibold text-w-alert" : undefined}>
-                        {w.free_gb.toLocaleString()} GB{w.total_gb ? ` of ${w.total_gb.toLocaleString()} GB` : ""} of disk free{w.low ? ", closed workspaces are being cleared" : ""}.
+                        {w.free_gb.toLocaleString()} GB{w.total_gb ? ` of ${w.total_gb.toLocaleString()} GB` : ""} of disk free{w.low ? ", closed quest folders are being cleared and new quest runs wait for room" : ""}.
                       </span>
                     </>
                   )}

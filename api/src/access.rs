@@ -38,6 +38,8 @@ pub fn min_role(method: &Method, path: &str) -> Role {
         ["world", "todos", ..] => Role::View,
         ["world", "reports", ..] if get => Role::View,
         ["world", "reports", ..] => Role::Write,
+        ["world", "practice", ..] if get => Role::View,
+        ["world", "practice", ..] => Role::Write,
         ["world", "search"] => Role::View,
         ["world", "readiness"] => Role::View,
         ["world", "notifications"] | ["world", "notifications", "seen"] => Role::View,

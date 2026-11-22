@@ -2,6 +2,7 @@ import type { Sprite } from "./art";
 import { buildSheet } from "./characters";
 import type { LokaLook } from "./types";
 import { context, disc, ellipse, makeCanvas, rect, rng, shade, type Ctx } from "./pixels";
+import { rememberThing, thingOf } from "./sprites";
 
 const T = 16;
 
@@ -68,6 +69,8 @@ export interface RoomGlow {
   y: number;
   color: [number, number, number];
   pulse: boolean;
+  source?: Sprite;
+  floor?: number;
 }
 
 export interface Room {
@@ -115,6 +118,12 @@ const STATE_COLOR: Record<FurnitureState, string> = {
   alarm: "#ff5a4a",
 };
 
+const GLOW_COLOR: Record<Exclude<FurnitureState, "off">, [number, number, number]> = {
+  on: [110, 230, 150],
+  busy: [255, 200, 90],
+  alarm: [255, 90, 74],
+};
+
 function sprite(w: number, h: number, draw: (ctx: Ctx, w: number, h: number) => void): Sprite {
   const c = makeCanvas(w, h);
   const ctx = context(c);
@@ -125,6 +134,12 @@ function sprite(w: number, h: number, draw: (ctx: Ctx, w: number, h: number) => 
 function legs(ctx: Ctx, w: number, h: number, top: number, color: string): void {
   rect(ctx, 2, top, 2, h - top - 1, color);
   rect(ctx, w - 4, top, 2, h - top - 1, color);
+}
+
+function artColours(f: Furniture): Record<string, string> {
+  if (f.kind === "terminal") return { led: STATE_COLOR[f.state ?? "on"] };
+  if (f.kind === "machine") return { led: STATE_COLOR[f.state ?? "on"], ...(f.tint ? { tint: f.tint } : {}) };
+  return (f.kind === "rug" || f.kind === "bed") && f.tint ? { tint: f.tint } : {};
 }
 
 function drawFurniture(f: Furniture, fw: number): Sprite {
@@ -422,10 +437,11 @@ export function buildRoom(spec: RoomSpec): Room {
   for (const f of placed) {
     const [fw, fh] = FOOT[f.kind];
     const s = drawFurniture(f, fw);
+    if (f.kind !== "mentor") rememberThing(s, `room_${f.kind}`, artColours(f));
     const base = (f.y + fh) * T;
-    objects.push({ x: f.x * T, y: f.kind === "rug" ? f.y * T + 1 : base - 1, sprite: s });
+    objects.push({ x: f.x * T, y: f.kind === "rug" ? f.y * T : base - 1, sprite: s });
     if ((f.kind === "machine" || f.kind === "terminal") && f.state && f.state !== "off") {
-      glows.push({ x: f.x * T + fw * 8, y: base - 14, color: f.state === "busy" ? [255, 200, 90] : [110, 230, 150], pulse: f.state === "busy" });
+      glows.push({ x: f.x * T + fw * 8, y: base - 14, color: GLOW_COLOR[f.state], pulse: f.state === "busy", source: s, floor: base });
     }
     if (f.kind === "lamp" && f.state === "alarm") glows.push({ x: f.x * T + 8, y: base - 24, color: [255, 80, 70], pulse: true });
     if (f.kind === "hearth") glows.push({ x: f.x * T + 16, y: base - 8, color: [255, 160, 80], pulse: true });
@@ -440,7 +456,9 @@ export function buildRoom(spec: RoomSpec): Room {
         if (x > 0 && x < w - 1 && y > 1 && y < h - 1 && !solid[y * w + x]) goals.push(y * w + x);
       }
     }
-    things.push({ id: f.id, label: f.label, x: f.x * T + (fw * T) / 2, y: base + 6, lift: s.img.height + 4, goals });
+    const art = thingOf(s, 0);
+    const tall = art ? Math.max(s.img.height, art.img.height / art.density) : s.img.height;
+    things.push({ id: f.id, label: f.label, x: f.x * T + (fw * T) / 2, y: base + 6, lift: Math.ceil(tall) + 4, goals });
   }
   return {
     spec: fixed,

@@ -608,6 +608,7 @@ pub async fn run() -> Result<()> {
     health::spawn_self_ping()?;
     crate::model_catalog::spawn_refresh();
     crate::tools_check::spawn_refresh();
+    crate::git::workspace::ensure_loka_key();
     let api = RunnerApi {
         client: Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -1236,22 +1237,23 @@ async fn execute_job(
     let delivered: Arc<Mutex<Vec<Uuid>>> = Arc::new(Mutex::new(Vec::new()));
     let mut inflight: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     let mut acked: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-    let mut execution = Box::pin(execute_job_inner(
-        root,
-        &job,
-        storage,
-        warm,
-        JobState {
-            state_may_change: state_may_change.clone(),
-            checkpointed: checkpointed.clone(),
-            started_session_id: started_session_id.clone(),
-            pids: pids.clone(),
-            steer: steer_receiver,
-            stages,
-            keys_changed: keys_changed.clone(),
-            events,
-        },
-    ));
+    let job_ref = &job;
+    let job_state = JobState {
+        state_may_change: state_may_change.clone(),
+        checkpointed: checkpointed.clone(),
+        started_session_id: started_session_id.clone(),
+        pids: pids.clone(),
+        steer: steer_receiver,
+        stages,
+        keys_changed: keys_changed.clone(),
+        events,
+    };
+    let mut execution = Box::pin(async move {
+        if WORK_KINDS.contains(&job_ref.kind.as_str()) {
+            workspaces::guard(api, root).await?;
+        }
+        execute_job_inner(root, job_ref, storage, warm, job_state).await
+    });
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     heartbeat.tick().await;
@@ -2714,6 +2716,7 @@ fn capabilities() -> Value {
         "slack_capture": slack_capture_view(),
         "models": crate::model_catalog::snapshot(),
         "tools": crate::tools_check::snapshot(),
+        "signing": crate::git::workspace::signing_view(),
         "workspaces": workspaces::view()
     })
 }

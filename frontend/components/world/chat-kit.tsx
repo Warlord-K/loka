@@ -313,7 +313,7 @@ export function RichText({
         const embed = embedFromHref(href);
         if (embed) {
           const label = textOf(children).trim();
-          const bare = !label || label === href || /^(msg|todo|quest|report):/i.test(label) || /^https?:\/\//i.test(label);
+          const bare = !label || label === href || /^(msg|todo|quest|report|practice):/i.test(label) || /^https?:\/\//i.test(label);
           return <EmbedView embed={embed} label={bare ? undefined : label} card={title === "card"} />;
         }
         const pathOwner = pathRef.current;

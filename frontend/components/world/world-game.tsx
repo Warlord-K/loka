@@ -64,6 +64,7 @@ import { TeamsView } from "./teams-ui";
 import { StarterTeamCard } from "./starter-team-ui";
 import { useTeams } from "@/lib/teams";
 import { REPORTS_STALE } from "@/lib/reports";
+import { ATTEMPT_ID, openPractice, practiceApi, PRACTICE_VOICE } from "@/lib/practice";
 import { OPEN_CHANGELOG, primeChangelog, unseenChangelog } from "@/lib/changelog";
 import { everyoneNow, ownsAgent, ScopeToggle, useEveryone } from "./scope";
 import { playSound, unlockSounds, type SoundKind } from "./sounds";
@@ -2378,6 +2379,18 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     const linkedReport = params.get("report");
     const linkedTodo = params.get("todo");
     const linkedItem = params.get("item");
+    const linkedAttempt = params.get("practice");
+    if (linkedAttempt) {
+      params.delete("practice");
+      const rest = params.toString();
+      window.history.replaceState(null, "", `${window.location.pathname}${rest ? `?${rest}` : ""}${window.location.hash}`);
+    }
+    if (linkedAttempt && ATTEMPT_ID.test(linkedAttempt)) {
+      void practiceApi
+        .attempt(linkedAttempt.toLowerCase())
+        .then((a) => openPractice(a.report_id, a.id))
+        .catch(() => pushToast({ id: Date.now(), text: "That practice attempt was not found." }));
+    }
     if (linkedReport || linkedTodo) {
       params.delete("report");
       params.delete("item");
@@ -2801,6 +2814,18 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       if (ev.type === "report.created" && ev.agent_id && !ev.payload.quiet && ev.payload.owner_user_id === meRef.current?.id) {
         const id = String(ev.payload.report_id ?? "");
         pushToast({ id: ev.seq, kind: "report.created", target: "reports", bell: true, text: `New report: ${String(ev.payload.title ?? "")}`, onClick: () => setReports({ id }) });
+      }
+      if (ev.type === "practice.checked" && ev.payload.owner_user_id === meRef.current?.id && typeof ev.payload.attempt_id === "string") {
+        const reportId = String(ev.payload.report_id ?? "");
+        const attemptId = ev.payload.attempt_id;
+        const coach = agentsRef.current.find((a) => a.id === ev.payload.coach_agent_id);
+        pushToast({
+          id: ev.seq,
+          kind: "practice.checked",
+          target: "reports",
+          text: `${coach ? coach.name : "Your coach"} checked attempt ${String(ev.payload.n ?? "")} of ${String(ev.payload.title ?? "your practice")}`,
+          onClick: () => openPractice(reportId, attemptId),
+        });
       }
       if (ev.type === "todo.nudge" && ev.payload.owner_user_id === meRef.current?.id) {
         playSound("timer");
@@ -3419,6 +3444,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
   };
   const [injected, setInjected] = useState<{ text: string; nonce: number; agentId: string } | null>(null);
   const talk = useHoldToTalk((text) => {
+    if (!window.dispatchEvent(new CustomEvent(PRACTICE_VOICE, { detail: { text }, cancelable: true }))) return;
     const target = talkTarget();
     if (!target) {
       pushToast({ id: Date.now(), text: "Walk up to someone, or summon your main agent, before talking." });

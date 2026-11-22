@@ -1,3 +1,6 @@
+import { placed } from "@/lib/sprite-manifest";
+import { context, makeCanvas, rgbOf } from "./pixels";
+import { propOf, type ThingImage } from "./sprites";
 import type { Trade } from "./types";
 
 type Ctx = CanvasRenderingContext2D;
@@ -204,4 +207,227 @@ export function drawPips(ctx: Ctx, jobs: string[], x: number, y: number, t: numb
     if (i === lit) px(ctx, "#261822", left + 2 + i * 3, top + 3, 2, 1);
   }
   if (jobs.length > n) px(ctx, "#fbf3e0", left + w, top + 2, 1, 1);
+}
+
+const ART_FPS = 7.5;
+const SLIME_FPS = 12;
+const STATION_GLOW_REACH = 6;
+const STATION_GLOW_BASE = 0.12;
+const STATION_GLOW_GAIN = 0.38;
+const ART_SHADOW = "rgba(38,24,34,0.22)";
+const DOTS = 3;
+const ART_INK = "#411334";
+const INK_RGB = [0x41, 0x13, 0x34];
+const whitened = new WeakMap<HTMLCanvasElement, HTMLCanvasElement>();
+const tints = new WeakMap<HTMLCanvasElement, Map<string, HTMLCanvasElement>>();
+const TINT_BASE = 0.9;
+const GLOW_EDGE = 0.72;
+const GLOWING = ["spark", "flare", "hit"];
+const stretched = new WeakMap<HTMLCanvasElement, Map<number, HTMLCanvasElement>>();
+
+function blit(ctx: Ctx, art: ThingImage, x: number, y: number, img: HTMLCanvasElement = art.img): void {
+  const d = art.density;
+  const [left, top] = placed([art.ax, art.ay], d, x, y);
+  ctx.drawImage(img, left, top, img.width / d, img.height / d);
+}
+
+function white(img: HTMLCanvasElement): HTMLCanvasElement {
+  const hit = whitened.get(img);
+  if (hit) return hit;
+  const c = makeCanvas(img.width, img.height);
+  const g = context(c, { willReadFrequently: true });
+  g.drawImage(img, 0, 0);
+  const data = g.getImageData(0, 0, c.width, c.height);
+  const d = data.data;
+  for (let i = 0; i < d.length; i += 4) {
+    if (!d[i + 3] || (d[i] === INK_RGB[0] && d[i + 1] === INK_RGB[1] && d[i + 2] === INK_RGB[2])) continue;
+    d[i] = d[i + 1] = d[i + 2] = 255;
+  }
+  g.putImageData(data, 0, 0);
+  whitened.set(img, c);
+  return c;
+}
+
+function widened(art: ThingImage, extra: number): HTMLCanvasElement {
+  const tail = art.points.tail;
+  if (!tail || extra <= 0) return art.img;
+  const sized = stretched.get(art.img) ?? new Map<number, HTMLCanvasElement>();
+  stretched.set(art.img, sized);
+  const hit = sized.get(extra);
+  if (hit) return hit;
+  const [x0, x1] = [tail[0][0], tail[1][0]];
+  const left = Math.ceil(extra / 2);
+  const right = extra - left;
+  const { width: w, height: h } = art.img;
+  const c = makeCanvas(w + extra, h);
+  const g = context(c);
+  g.drawImage(art.img, 0, 0, x0, h, 0, 0, x0, h);
+  for (let i = 0; i < left; i++) g.drawImage(art.img, x0 - 1, 0, 1, h, x0 + i, 0, 1, h);
+  g.drawImage(art.img, x0, 0, x1 - x0, h, x0 + left, 0, x1 - x0, h);
+  for (let i = 0; i < right; i++) g.drawImage(art.img, x1, 0, 1, h, x1 + left + i, 0, 1, h);
+  g.drawImage(art.img, x1, 0, w - x1, h, x1 + extra, 0, w - x1, h);
+  sized.set(extra, c);
+  return c;
+}
+
+export function slimeArtAt(sx: number, sy: number, i: number): { x: number; y: number } {
+  return { x: sx - 2 - i * 13, y: sy + (i % 2 ? -5 : 1) };
+}
+
+export function drawStationArt(ctx: Ctx, trade: Trade, sx: number, sy: number, t: number, glow: number): boolean {
+  const art = propOf(`station_${trade}`, t * ART_FPS);
+  if (!art) return false;
+  blit(ctx, art, sx, sy);
+  const spot = art.points.glow?.[0];
+  const light = WORK_LIGHT[trade];
+  if (!spot || !light) return true;
+  const [left, top] = placed([art.ax, art.ay], art.density, sx, sy);
+  const gx = left + spot[0] / art.density;
+  const gy = top + spot[1] / art.density;
+  const grad = ctx.createRadialGradient(gx, gy, 0, gx, gy, STATION_GLOW_REACH);
+  grad.addColorStop(0, `rgba(${light[0]},${light[1]},${light[2]},${STATION_GLOW_BASE + glow * STATION_GLOW_GAIN})`);
+  grad.addColorStop(1, `rgba(${light[0]},${light[1]},${light[2]},0)`);
+  ctx.save();
+  ctx.globalCompositeOperation = "lighter";
+  ctx.fillStyle = grad;
+  ctx.fillRect(gx - STATION_GLOW_REACH, gy - STATION_GLOW_REACH, STATION_GLOW_REACH * 2, STATION_GLOW_REACH * 2);
+  ctx.restore();
+  return true;
+}
+
+export function drawSlimeArt(ctx: Ctx, kind: string, x: number, y: number, t: number, i: number, flash: number): boolean {
+  const art = propOf(`slime_${Object.hasOwn(SLIME_COLOR, kind) ? kind : "task"}`, t * SLIME_FPS + i * 3);
+  if (!art) return false;
+  ctx.fillStyle = ART_SHADOW;
+  ctx.beginPath();
+  ctx.ellipse(x, y, art.img.width / art.density * 0.32, 1.6, 0, 0, Math.PI * 2);
+  ctx.fill();
+  blit(ctx, art, x, y, flash > 0 ? white(art.img) : art.img);
+  return true;
+}
+
+export function drawToolArt(ctx: Ctx, trade: Trade, x: number, y: number, struck: boolean): boolean {
+  const art = propOf(`tool_${trade}`);
+  if (!art) return false;
+  const d = art.density;
+  const [gx, gy] = art.points.grip?.[0] ?? [art.ax, art.ay];
+  ctx.save();
+  ctx.translate(Math.round(x * d) / d, Math.round(y * d) / d);
+  if (struck) ctx.rotate(-Math.PI / 2);
+  ctx.drawImage(art.img, -gx / d, -gy / d, art.img.width / d, art.img.height / d);
+  ctx.restore();
+  return true;
+}
+
+export function drawHeldArt(ctx: Ctx, gear: string, x: number, y: number): boolean {
+  const art = propOf(`gear_${gear}`);
+  if (!art) return false;
+  const d = art.density;
+  const [gx, gy] = art.points.grip?.[0] ?? [art.ax, art.ay];
+  ctx.drawImage(art.img, Math.round(x * d - gx) / d, Math.round(y * d - gy) / d, art.img.width / d, art.img.height / d);
+  return true;
+}
+
+function tinted(img: HTMLCanvasElement, colour: string, glow: boolean): HTMLCanvasElement {
+  const sized = tints.get(img) ?? new Map<string, HTMLCanvasElement>();
+  tints.set(img, sized);
+  const key = glow ? `${colour}:glow` : colour;
+  const hit = sized.get(key);
+  if (hit) return hit;
+  const to = rgbOf(colour);
+  const c = makeCanvas(img.width, img.height);
+  const g = context(c, { willReadFrequently: true });
+  g.drawImage(img, 0, 0);
+  const data = g.getImageData(0, 0, c.width, c.height);
+  const d = data.data;
+  for (let i = 0; i < d.length; i += 4) {
+    if (!d[i + 3]) continue;
+    if (d[i] === INK_RGB[0] && d[i + 1] === INK_RGB[1] && d[i + 2] === INK_RGB[2]) {
+      if (glow) for (let k = 0; k < 3; k++) d[i + k] = to[k] * GLOW_EDGE;
+      continue;
+    }
+    const v = (d[i] * 0.3 + d[i + 1] * 0.59 + d[i + 2] * 0.11) / 255 / TINT_BASE;
+    for (let k = 0; k < 3; k++) d[i + k] = v <= 1 ? to[k] * v : to[k] + (255 - to[k]) * Math.min(1, (v - 1) / (1 / TINT_BASE - 1));
+  }
+  g.putImageData(data, 0, 0);
+  sized.set(key, c);
+  return c;
+}
+
+export function drawParticleArt(ctx: Ctx, key: string, x: number, y: number, colour: string, alpha = 1, turn = false): boolean {
+  const glow = GLOWING.some((g) => key.startsWith(g));
+  const art = propOf(`particle_${key}`);
+  if (!art) return false;
+  const d = art.density;
+  const img = /^#[0-9a-f]{6}$/i.test(colour) ? tinted(art.img, colour, glow) : art.img;
+  const w = img.width / d;
+  const h = img.height / d;
+  ctx.globalAlpha = alpha;
+  ctx.save();
+  ctx.translate(Math.round(x * d) / d, Math.round(y * d) / d);
+  if (turn) ctx.rotate(Math.PI / 2);
+  ctx.drawImage(img, -Math.round(w * d / 2) / d, -Math.round(h * d / 2) / d, w, h);
+  ctx.restore();
+  ctx.globalAlpha = 1;
+  return true;
+}
+
+export function drawBookArt(ctx: Ctx, x: number, y: number): boolean {
+  const art = propOf("prop_book");
+  if (!art) return false;
+  blit(ctx, art, x, y);
+  return true;
+}
+
+export function drawIconArt(ctx: Ctx, icon: string, x: number, y: number, alpha = 1): boolean {
+  const art = propOf(`icon_${icon}`);
+  if (!art) return false;
+  ctx.globalAlpha = alpha;
+  blit(ctx, art, x, y);
+  ctx.globalAlpha = 1;
+  return true;
+}
+
+export function drawPipsArt(ctx: Ctx, jobs: string[], x: number, tipY: number, t: number): boolean {
+  const n = Math.min(jobs.length, 5);
+  const bubble = propOf("bubble_speech");
+  const gem = propOf("pip_task");
+  if (!bubble || !gem) return false;
+  if (!n) return true;
+  const d = bubble.density;
+  const step = gem.img.width + 2;
+  const more = jobs.length > n ? 4 : 0;
+  const extra = Math.max(0, n * step + more + 10 - bubble.img.width);
+  const img = widened(bubble, extra);
+  const [left, top] = placed([bubble.ax + Math.ceil(extra / 2), bubble.ay], d, x, tipY);
+  ctx.drawImage(img, left, top, img.width / d, img.height / d);
+  const cy = top + (bubble.points.centre?.[0][1] ?? bubble.img.height / 2) / d;
+  const x0 = left + (img.width - n * step + 2 - more) / 2 / d;
+  const lit = Math.floor(t * 1.6) % n;
+  for (let i = 0; i < n; i++) {
+    const art = propOf(`pip_${Object.hasOwn(JOB_COLOR, jobs[i]) ? jobs[i] : "task"}`) ?? gem;
+    ctx.globalAlpha = i === lit ? 1 : 0.6;
+    blit(ctx, art, x0 + (i * step + art.ax) / d, cy - (i === lit ? 1 / d : 0));
+    ctx.globalAlpha = 1;
+  }
+  if (jobs.length > n) {
+    ctx.fillStyle = ART_INK;
+    ctx.fillRect(x0 + (n * step) / d, cy, 2 / d, 2 / d);
+  }
+  return true;
+}
+
+export function drawStatusArt(ctx: Ctx, kind: "dots" | "alert" | "error", x: number, tipY: number, t: number): boolean {
+  const bubble = propOf("bubble_thought");
+  if (!bubble || !propOf(kind === "dots" ? "icon_dot_on" : `icon_${kind}`)) return false;
+  const d = bubble.density;
+  const [left, top] = placed([bubble.ax, bubble.ay], d, x, tipY);
+  ctx.drawImage(bubble.img, left, top, bubble.img.width / d, bubble.img.height / d);
+  const [cx, cy] = bubble.points.centre?.[0] ?? [bubble.ax, bubble.img.height / 2];
+  const mx = left + cx / d;
+  const my = top + cy / d;
+  if (kind !== "dots") return drawIconArt(ctx, kind, mx, my);
+  const lit = Math.floor(t * 3) % (DOTS + 1);
+  for (let i = 0; i < DOTS; i++) drawIconArt(ctx, i < lit ? "dot_on" : "dot_off", mx + (i - 1) * 2.75, my);
+  return true;
 }

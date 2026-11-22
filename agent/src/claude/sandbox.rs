@@ -178,7 +178,7 @@ pub(crate) fn user_temp_dirs() -> Vec<PathBuf> {
 
 pub(crate) fn owner_temp_patterns(dirs: &[PathBuf]) -> Vec<String> {
     dirs.iter()
-        .flat_map(|dir| OWNER_TEMP_NAMES.iter().flat_map(move |name| [format!("{}/{name}", dir.display()), format!("{}/{name}/**", dir.display())]))
+        .flat_map(|dir| OWNER_TEMP_NAMES.iter().flat_map(move |name| [format!("{}/{name}", dir.display()), format!("{}/{name}/**/*", dir.display())]))
         .collect()
 }
 
@@ -346,12 +346,21 @@ pub(crate) const OWNER_SSH: &str = ".ssh";
 
 pub(crate) const OWNER_WRITABLE_HOME: &[&str] = &[".tsh", ".ssh/known_hosts"];
 
-pub(crate) const OWNER_SIGNING_KEYS: &[&str] = &[
-    ".ssh/karna_signing",
-    ".ssh/karna_signing.pub",
-    ".ssh/loka_signing",
-    ".ssh/loka_signing.pub",
-];
+pub(crate) const OWNER_SIGNING_KEYS: &[&str] = &[".ssh/loka_signing", ".ssh/loka_signing.pub"];
+
+const LEGACY_SIGNING_KEY: &str = ".ssh/karna_signing";
+
+fn owner_signing_keys(configured: Option<&str>) -> Vec<String> {
+    let mut keys: Vec<String> = OWNER_SIGNING_KEYS.iter().map(|key| key.to_string()).collect();
+    let legacy_configured = configured
+        .map(|key| key.trim().trim_end_matches(".pub"))
+        .is_some_and(|key| key == format!("~/{LEGACY_SIGNING_KEY}") || key.ends_with(&format!("/{LEGACY_SIGNING_KEY}")));
+    if legacy_configured {
+        keys.push(LEGACY_SIGNING_KEY.to_string());
+        keys.push(format!("{LEGACY_SIGNING_KEY}.pub"));
+    }
+    keys
+}
 
 pub(crate) const PACKAGE_HOSTS: &[&str] = &[
     "crates.io",
@@ -371,11 +380,17 @@ pub(crate) fn owner_ssh_readable(home: Option<&Path>) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> =
         ssh_exceptions(home.and_then(Path::to_str)).into_iter().map(PathBuf::from).collect();
     if let Some(home) = home {
-        paths.extend(OWNER_SIGNING_KEYS.iter().map(|rel| home.join(rel)));
+        paths.extend(owner_signing_keys(signing_key()).iter().map(|rel| home.join(rel)));
     }
     paths.sort();
     paths.dedup();
     paths
+}
+
+pub(crate) const OWNER_GIT_CONFIG: [(&str, &str); 1] = [("branch.autoSetupMerge", "false")];
+
+pub(crate) fn owner_git_env(command: &mut tokio::process::Command) {
+    crate::git::workspace::append_git_config(command, &OWNER_GIT_CONFIG);
 }
 
 pub fn open_for_owner(settings: &mut Value) {
@@ -389,7 +404,7 @@ pub fn open_for_owner(settings: &mut Value) {
         domains.extend(PACKAGE_HOSTS.iter().map(|host| Value::String(host.to_string())));
     }
     if let Some(read) = sandbox["filesystem"]["allowRead"].as_array_mut() {
-        for rel in OWNER_SIGNING_KEYS {
+        for rel in owner_signing_keys(signing_key()) {
             let path = Value::String(format!("~/{rel}"));
             if !read.contains(&path) {
                 read.push(path);
@@ -399,6 +414,15 @@ pub fn open_for_owner(settings: &mut Value) {
     if let Some(write) = sandbox["filesystem"]["allowWrite"].as_array_mut() {
         write.extend(OWNER_WRITABLE_HOME.iter().map(|rel| Value::String(format!("~/{rel}"))));
         write.extend(owner_temp_patterns(&user_temp_dirs()).into_iter().map(Value::String));
+    }
+}
+
+pub(crate) fn allow_write(settings: &mut Value, dir: &Path) {
+    if let Some(write) = settings["sandbox"]["filesystem"]["allowWrite"].as_array_mut() {
+        write.push(Value::String(dir.display().to_string()));
+        if let Some(real) = std::fs::canonicalize(dir).ok().filter(|real| real != dir) {
+            write.push(Value::String(real.display().to_string()));
+        }
     }
 }
 
@@ -418,8 +442,11 @@ mod tests {
         assert!(denies(&owner, "~/.ssh/id_ed25519"));
         assert!(denies(&owner, "~/.aws/credentials"));
         let read = owner["sandbox"]["filesystem"]["allowRead"].as_array().unwrap();
-        assert!(read.iter().any(|p| p == "~/.ssh/karna_signing"));
-        assert!(read.iter().any(|p| p == "~/.ssh/karna_signing.pub"));
+        assert!(read.iter().any(|p| p == "~/.ssh/loka_signing"));
+        assert!(read.iter().any(|p| p == "~/.ssh/loka_signing.pub"));
+        if signing_key().is_none() {
+            assert!(!read.iter().any(|p| p == "~/.ssh/karna_signing"), "another project's key must stay hidden");
+        }
         assert!(!read.iter().any(|p| p == "~/.ssh/id_ed25519" || p == "~/.ssh"));
         let write = owner["sandbox"]["filesystem"]["allowWrite"].as_array().unwrap();
         assert!(write.iter().any(|p| p == "~/.tsh"));
@@ -448,8 +475,10 @@ mod tests {
         assert!(!guest_write.iter().any(|p| p.contains("TemporaryDirectory")));
         let temp = owner_temp_patterns(&[PathBuf::from("/var/folders/ab/cd/T")]);
         assert!(temp.contains(&"/var/folders/ab/cd/T/xcrun_db*".to_string()));
-        assert!(temp.contains(&"/var/folders/ab/cd/T/TemporaryDirectory.*/**".to_string()));
-        assert!(!temp.iter().any(|p| p == "/var/folders/ab/cd/T" || p.ends_with("/T/**") || p.contains("loka-")));
+        assert!(temp.contains(&"/var/folders/ab/cd/T/TemporaryDirectory.*".to_string()));
+        assert!(temp.contains(&"/var/folders/ab/cd/T/TemporaryDirectory.*/**/*".to_string()));
+        assert!(!temp.iter().any(|p| p.ends_with("/**")), "a trailing /** is stripped by the sandbox, leaving a glob that matches only the folder");
+        assert!(!temp.iter().any(|p| p == "/var/folders/ab/cd/T" || p.ends_with("/T/**") || p.ends_with("/T/**/*") || p.contains("loka-")));
         if cfg!(target_os = "macos") {
             let dirs = user_temp_dirs();
             assert!(!dirs.is_empty());
@@ -477,11 +506,25 @@ mod tests {
     fn owner_ssh_readable_lists_only_config_known_hosts_and_signing_keys() {
         let home = Path::new("/Users/someone");
         let paths = owner_ssh_readable(Some(home));
-        assert!(paths.contains(&home.join(".ssh/karna_signing")));
+        assert!(paths.contains(&home.join(".ssh/loka_signing")));
+        assert!(paths.contains(&home.join(".ssh/loka_signing.pub")));
         assert!(paths.contains(&home.join(".ssh/known_hosts")));
         assert!(paths.contains(&home.join(".ssh/config")));
         assert!(!paths.contains(&home.join(".ssh/id_ed25519")));
         assert!(!paths.contains(&home.join(".ssh")));
+    }
+
+    #[test]
+    fn only_the_loka_key_or_the_configured_legacy_key_is_readable_for_signing() {
+        let plain = owner_signing_keys(None);
+        assert_eq!(plain, vec![".ssh/loka_signing".to_string(), ".ssh/loka_signing.pub".to_string()]);
+        assert_eq!(owner_signing_keys(Some("~/.ssh/id_ed25519")), plain);
+        assert_eq!(owner_signing_keys(Some("/Users/someone/.ssh/other_signing.pub")), plain);
+        for configured in ["~/.ssh/karna_signing", "/Users/someone/.ssh/karna_signing.pub"] {
+            let keys = owner_signing_keys(Some(configured));
+            assert!(keys.contains(&".ssh/karna_signing".to_string()), "{configured}");
+            assert!(keys.contains(&".ssh/karna_signing.pub".to_string()), "{configured}");
+        }
     }
 
     #[test]
@@ -773,5 +816,65 @@ mod live_tests {
 
     fn dirs_cache() -> std::path::PathBuf {
         std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".cache")
+    }
+
+    fn owner_git(dir: &Path, global: &Path, args: &[&str]) -> std::process::Output {
+        let mut command = tokio::process::Command::new("git");
+        command.args(args).current_dir(dir);
+        owner_git_env(&mut command);
+        let mut command = command.into_std();
+        command
+            .env("GIT_CONFIG_GLOBAL", global)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn owner_git_env_appends_after_existing_config_entries() {
+        let mut command = tokio::process::Command::new("git");
+        command.env("GIT_CONFIG_COUNT", "1").env("GIT_CONFIG_KEY_0", "safe.directory").env("GIT_CONFIG_VALUE_0", "*");
+        owner_git_env(&mut command);
+        let env: BTreeMap<String, String> = command
+            .as_std()
+            .get_envs()
+            .filter_map(|(name, value)| Some((name.to_string_lossy().into_owned(), value?.to_string_lossy().into_owned())))
+            .collect();
+        assert_eq!(env["GIT_CONFIG_COUNT"], "2");
+        assert_eq!(env["GIT_CONFIG_KEY_0"], "safe.directory");
+        assert_eq!(env["GIT_CONFIG_KEY_1"], "branch.autoSetupMerge");
+        assert_eq!(env["GIT_CONFIG_VALUE_1"], "false");
+    }
+
+    #[test]
+    fn owner_quest_branches_off_a_remote_branch_never_write_tracking_to_the_shared_config() {
+        let base = std::env::temp_dir().join(format!("sandbox-track-{}", uuid::Uuid::new_v4().simple()));
+        let origin = base.join("origin");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&origin).unwrap();
+        let global = base.join("gitconfig");
+        std::fs::write(&global, "[user]\n\tname = t\n\temail = t@example.com\n[commit]\n\tgpgsign = false\n").unwrap();
+        for args in [vec!["init", "-q", "-b", "main"], vec!["commit", "-q", "--allow-empty", "-m", "base"]] {
+            assert!(owner_git(&origin, &global, &args).status.success());
+        }
+        let clone = owner_git(&base, &global, &["clone", "-q", origin.to_str().unwrap(), repo.to_str().unwrap()]);
+        assert!(clone.status.success(), "{}", String::from_utf8_lossy(&clone.stderr));
+        let checkout = owner_git(&repo, &global, &["checkout", "-q", "-b", "quest", "origin/main"]);
+        assert!(checkout.status.success(), "{}", String::from_utf8_lossy(&checkout.stderr));
+        let config = std::fs::read_to_string(repo.join(".git/config")).unwrap();
+        assert!(!config.contains("[branch \"quest\"]"), "tracking was written:\n{config}");
+
+        let tracked = std::process::Command::new("git")
+            .args(["checkout", "-q", "-b", "tracked", "origin/main"])
+            .current_dir(&repo)
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap();
+        assert!(tracked.success());
+        assert!(std::fs::read_to_string(repo.join(".git/config")).unwrap().contains("[branch \"tracked\"]"), "plain git must track, so the test sees the difference");
+        std::fs::remove_dir_all(&base).ok();
     }
 }

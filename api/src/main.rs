@@ -387,6 +387,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/world/reports/{id}/marks/{mark}", patch(routes::reports::change_mark).delete(routes::reports::delete_mark))
         .route("/world/reports/{id}/revisions/{revision}", get(routes::reports::revision))
         .route("/world/reports/{id}/revisions/{revision}/restore", post(routes::reports::restore))
+        .route("/world/practice", get(routes::practice::list).post(routes::practice::create))
+        .route("/world/practice/coaches", get(routes::practice::coaches))
+        .route("/world/practice/attempts/{id}", get(routes::practice::attempt))
+        .route("/world/practice/attempts/{id}/resend", post(routes::practice::resend))
+        .route("/world/practice/{id}", get(routes::practice::get).patch(routes::practice::update))
+        .route(
+            "/world/practice/{id}/ready",
+            post(routes::practice::ready).layer(axum::extract::DefaultBodyLimit::max(routes::practice::MAX_READY_BYTES)),
+        )
         .route("/world/todos", get(routes::todos::list).post(routes::todos::create))
         .route("/world/todos/order", post(routes::todos::reorder))
         .route("/world/todos/{id}", patch(routes::todos::update))

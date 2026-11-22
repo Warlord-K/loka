@@ -872,7 +872,7 @@ export interface RunnerView {
 
 export type ReadinessState = "ready" | "needs_setup" | "unavailable";
 export type SetupAction = "devices" | "keys" | "github";
-export type FeatureKey = "devices" | "clis" | "terminal" | "workshop" | "browser" | "screen" | "apps" | "slack" | "github_feed" | "live_voice" | "keys" | "opencode";
+export type FeatureKey = "devices" | "clis" | "signing" | "terminal" | "workshop" | "browser" | "screen" | "apps" | "slack" | "github_feed" | "live_voice" | "keys" | "opencode";
 
 export interface FeatureReadiness {
   key: FeatureKey;
@@ -1070,6 +1070,7 @@ export interface SearchResults {
     updated_at: string;
     kind?: "doc" | "canvas";
     items?: { id: string; kind: string; label: string }[];
+    practice?: { subject: string; coach_agent_id?: string | null } | null;
   }[];
   quests: { id: string; title: string; status: string; assigned_agent_id: string | null; updated_at: string | null }[];
   todos: { id: string; text: string; status: string; priority: number; added_at: string }[];

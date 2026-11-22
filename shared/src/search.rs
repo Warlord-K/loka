@@ -77,6 +77,8 @@ pub struct ReportHit {
     pub updated_at: DateTime<Utc>,
     pub kind: String,
     pub items: serde_json::Value,
+    #[sqlx(default)]
+    pub practice: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]
@@ -345,7 +347,7 @@ impl WorldStore {
             let mut reports = sqlx::query_as::<_, ReportHit>(&format!(
                 "SELECT r.id, r.title, r.folder, r.visibility, r.author_agent_id, r.updated_at,
                         substr(r.body, greatest(1, strpos(lower(r.body), lower($3)) - 300), 1200) AS excerpt,
-                        r.kind, {items} AS items
+                        r.kind, {items} AS items, r.practice
                  FROM world_reports r
                  WHERE r.org_id = $5 AND (r.owner_user_id = $1 OR r.visibility = 'public')
                    AND ({report_title} ILIKE $2 OR {report_body} ILIKE $2 OR r.tags @> ARRAY[lower($3)])

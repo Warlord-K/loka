@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { HATS, LOOK_ACCESSORIES, SPECIES_OPTIONS, declaredAccessories, gearAccessories, humanBodyFor, lookFor, speciesFor, unknownAccessories, withGear, withoutHats } from "./looks.ts";
+import { HEADWEAR, LOOK_ACCESSORIES, SPECIES_OPTIONS, declaredAccessories, gearAccessories, humanBodyFor, lookFor, speciesFor, unknownAccessories, withGear, withoutHeadwear } from "./looks.ts";
 
 const agent = (look, persona = "") => ({ slug: "test-agent", persona, look });
 
@@ -104,18 +104,18 @@ test("ducks and penguins from persona or look words keep their old colours", () 
   assert.notEqual(lookFor(agent({ archetype: "penguin", palette: "icy blue" })).skin, "#57b65a");
 });
 
-test("the new art draws no hats but keeps every other accessory", () => {
-  for (const hat of HATS) {
+test("the new art draws no headwear but keeps every other accessory", () => {
+  for (const hat of HEADWEAR.filter((a) => LOOK_ACCESSORIES.includes(a))) {
     const look = lookFor(agent({ species: "human", accessories: [hat, "glasses", "scarf"] }));
     assert.ok(look.accessories.includes(hat), hat);
-    assert.deepEqual(withoutHats(look).accessories, ["glasses", "scarf"], hat);
+    assert.deepEqual(withoutHeadwear(look).accessories, ["glasses", "scarf"], hat);
   }
   const suit = lookFor(agent({ species: "businessman", accessories: ["crown", "briefcase"] }));
-  assert.deepEqual(withoutHats(suit).accessories, ["briefcase"]);
-  const geared = { ...lookFor(agent({ species: "fox" })), accessories: withGear(lookFor(agent({ species: "fox" })).accessories, ["wizard"]) };
-  assert.deepEqual(withoutHats(geared).accessories, ["ears-pointed", "snout"]);
+  assert.deepEqual(withoutHeadwear(suit).accessories, ["briefcase"]);
+  const geared = { ...lookFor(agent({ species: "fox" })), accessories: withGear(lookFor(agent({ species: "fox" })).accessories, ["wizard", "horns", "headphones"]) };
+  assert.deepEqual(withoutHeadwear(geared).accessories, ["ears-pointed", "snout"]);
   const bare = lookFor(agent({ species: "human", accessories: ["glasses"] }));
-  assert.equal(withoutHats(bare), bare);
+  assert.equal(withoutHeadwear(bare), bare);
 });
 
 test("the new species and business bodies come only from a declared species, never persona words", () => {

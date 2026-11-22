@@ -83,6 +83,11 @@ const config: Config = {
           scrim: "rgb(var(--w-scrim) / <alpha-value>)",
           onscrim: "rgb(var(--w-onscrim) / <alpha-value>)",
           quiet: "rgb(var(--w-quiet) / <alpha-value>)",
+          "chart-1": "rgb(var(--w-chart-1) / <alpha-value>)",
+          "chart-2": "rgb(var(--w-chart-2) / <alpha-value>)",
+          "chart-3": "rgb(var(--w-chart-3) / <alpha-value>)",
+          "chart-4": "rgb(var(--w-chart-4) / <alpha-value>)",
+          "chart-5": "rgb(var(--w-chart-5) / <alpha-value>)",
           wood: "rgb(var(--w-wood) / <alpha-value>)",
         },
         gray: {

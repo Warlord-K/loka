@@ -880,6 +880,7 @@ pub async fn post_message(
     let mut quote = loka_shared::quotes::clean(body.quote.as_ref());
     if let (Some(q), Some(org)) = (quote.as_mut(), viewer.org) {
         state.world.expand_canvas_quote(user.0, org, q, loka_shared::canvas::QuoteCards::Resolved).await.map_err(internal)?;
+        state.world.expand_practice_quote(user.0, viewer.role, org, q).await.map_err(internal)?;
     }
     let setup_card = match text.is_empty() {
         true => None,
@@ -2431,6 +2432,7 @@ pub async fn post_channel(
                 if let Some(mut quote) = loka_shared::quotes::clean(body.quote.as_ref()) {
                     if let Some(org) = viewer.org {
                         state.world.expand_canvas_quote(user.0, org, &mut quote, loka_shared::canvas::QuoteCards::RefsOnly).await.map_err(internal)?;
+                        state.world.expand_practice_quote(user.0, loka_shared::access::Role::Write, org, &mut quote).await.map_err(internal)?;
                     }
                     meta["quote"] = quote;
                 }

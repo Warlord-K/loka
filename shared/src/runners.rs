@@ -47,11 +47,19 @@ pub struct ClosedTask {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiskFolder {
+    pub name: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiskNotice {
     pub free_bytes: u64,
     pub freed_bytes: u64,
     pub removed: usize,
     pub still_low: bool,
+    #[serde(default)]
+    pub folders: Vec<DiskFolder>,
 }
 
 impl DiskNotice {
@@ -62,8 +70,14 @@ impl DiskNotice {
         } else {
             String::new()
         };
+        let biggest = if self.folders.is_empty() {
+            String::new()
+        } else {
+            let names: Vec<String> = self.folders.iter().map(|folder| format!("{} ({})", folder.name, gb(folder.bytes))).collect();
+            format!(" Biggest folders: {}.", names.join(", "))
+        };
         if self.still_low {
-            format!("{device} has only {} of disk space left.{freed} Free up space on that device, or quests will start failing with a full disk.", gb(self.free_bytes))
+            format!("{device} has only {} of disk space left.{freed}{biggest} New quest runs are paused there until space is free: delete what is listed, or clean up closed quests under You > Storage.", gb(self.free_bytes))
         } else {
             format!("{device} was running low on disk space ({} free now).{freed}", gb(self.free_bytes))
         }
@@ -1290,6 +1304,7 @@ impl RunnerStore {
                 "freed_bytes": notice.freed_bytes,
                 "removed": notice.removed,
                 "still_low": notice.still_low,
+                "folders": notice.folders,
                 "message": message,
             })),
             None,
@@ -3217,11 +3232,11 @@ mod tests {
             _ => panic!("exactly one claim must win"),
         };
         assert_eq!(claim.run_id, expected_run);
-        assert!(!store
+        assert!(store
             .heartbeat_lease(Uuid::new_v4(), claim.lease_id)
             .await
             .unwrap()
-            .is_some());
+            .is_none());
         assert!(store.heartbeat_lease(runner, claim.lease_id).await.unwrap().is_some());
         let active = store.lease_for_mcp(mcp_token).await.unwrap();
         assert!(active.is_some());
@@ -3542,7 +3557,7 @@ mod tests {
         assert!(store.take_workspace_cleanup(runner).await.unwrap());
         assert!(!store.take_workspace_cleanup(runner).await.unwrap(), "a request is delivered once");
 
-        let notice = DiskNotice { free_bytes: 3_000_000_000, freed_bytes: 40_000_000_000, removed: 12, still_low: false };
+        let notice = DiskNotice { free_bytes: 3_000_000_000, freed_bytes: 40_000_000_000, removed: 12, still_low: false, folders: Vec::new() };
         assert!(store.warn_disk_low(runner, &notice).await.unwrap());
         assert!(!store.warn_disk_low(runner, &notice).await.unwrap(), "one notice per hour");
         let bell: (String, String) = sqlx::query_as(
@@ -3557,7 +3572,7 @@ mod tests {
         assert!(bell.1.contains("removed 12 closed quest workspaces (40.0 GB)"), "{}", bell.1);
 
         let report = crate::world::WorldStore::new(pool.clone());
-        sqlx::query("UPDATE world_runners SET capabilities = jsonb_build_object('workspaces', jsonb_build_object('bytes', 9000000000, 'tasks', 3, 'free_gb', 2, 'total_gb', 460, 'low', true, 'largest', jsonb_build_array(jsonb_build_object('id', $2::text, 'bytes', 5000000000), jsonb_build_object('id', $3::text, 'bytes', 3000000000)))) WHERE id = $1")
+        sqlx::query("UPDATE world_runners SET capabilities = jsonb_build_object('workspaces', jsonb_build_object('bytes', 9000000000, 'tasks', 3, 'free_gb', 2, 'total_gb', 460, 'low', true, 'largest', jsonb_build_array(jsonb_build_object('id', $2::text, 'bytes', 5000000000, 'temp_bytes', 4000000000), jsonb_build_object('id', $3::text, 'bytes', 3000000000, 'temp_bytes', 2000000000)), 'temp_bytes', 6000000000)) WHERE id = $1")
             .bind(runner)
             .bind(done_old.to_string())
             .bind(open.to_string())
@@ -3567,6 +3582,7 @@ mod tests {
         let usage = report.workspace_use(owner).await.unwrap();
         assert_eq!(usage.len(), 1);
         assert_eq!((usage[0].bytes, usage[0].tasks, usage[0].reclaimable_bytes, usage[0].reclaimable_tasks, usage[0].low), (9_000_000_000, 3, 5_000_000_000, 1, true));
+        assert_eq!((usage[0].temp_bytes, usage[0].reclaimable_temp_bytes), (6_000_000_000, 4_000_000_000), "only the closed quest's temp counts as reclaimable");
         let request = crate::cleanup::CleanupRequest { owner, org: None, agent: None, kind: crate::cleanup::CleanupKind::Workspaces, older_than_days: 0, by_agent: None };
         let preview = report.clean_up(request, false).await.unwrap();
         assert_eq!((preview.rows, preview.bytes, preview.applied), (1, 5_000_000_000, false));
@@ -3784,10 +3800,11 @@ mod tests {
             .await
             .unwrap();
         assert!(store.expire_stale().await.unwrap().is_empty(), "a sleeping Mac keeps its lease");
-        assert!(!store
+        assert!(store
             .heartbeat_lease(other.runner.id, claim.lease_id)
             .await
-            .unwrap().is_some());
+            .unwrap()
+            .is_none());
         assert!(store
             .heartbeat_lease(registration.runner.id, claim.lease_id)
             .await
@@ -3815,10 +3832,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(error.as_deref(), Some(RUNNER_ASLEEP_ERROR));
-        assert!(!store
+        assert!(store
             .heartbeat_lease(registration.runner.id, claim.lease_id)
             .await
-            .unwrap().is_some());
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -3919,10 +3937,11 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        assert!(!store
+        assert!(store
             .heartbeat_lease(registration.runner.id, claim.lease_id)
             .await
-            .unwrap().is_some());
+            .unwrap()
+            .is_none());
         assert!(store.lease_for_mcp(&token("mcp-timeout")).await.unwrap().is_none());
         assert_eq!(store.expire_stale().await.unwrap(), vec![run_id]);
         let status = sqlx::query_as::<_, (String, Option<String>)>(
@@ -3961,10 +3980,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(!store
+        assert!(store
             .heartbeat_lease(registration.runner.id, claim.lease_id)
             .await
-            .unwrap().is_some());
+            .unwrap()
+            .is_none());
         let status =
             sqlx::query_scalar::<_, String>("SELECT status FROM session_runs WHERE id = $1")
                 .bind(run_id)
@@ -4007,10 +4027,11 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-        assert!(!store
+        assert!(store
             .heartbeat_lease(registration.runner.id, claim.lease_id)
             .await
-            .unwrap().is_some());
+            .unwrap()
+            .is_none());
         assert!(store.lease_for_mcp(&token("mcp-role")).await.unwrap().is_none());
         assert_eq!(store.expire_stale().await.unwrap(), vec![run_id]);
         let status = sqlx::query_as::<_, (String, Option<String>)>(

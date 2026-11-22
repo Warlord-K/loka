@@ -330,7 +330,7 @@ mod tests {
         assert_eq!(loose.folder.name, "notes");
         assert_eq!(loose.file.as_deref(), Some("todo.md"));
 
-        for bad in ["~/top.txt", "~/.ssh/id", "~/missing.rs", "relative/path.rs", "~/code/../code/app", &base.join("outside/x.txt").to_string_lossy().to_string(), "/etc/hosts"] {
+        for bad in ["~/top.txt", "~/.ssh/id", "~/missing.rs", "relative/path.rs", "~/code/../code/app", base.join("outside/x.txt").to_string_lossy().as_ref(), "/etc/hosts"] {
             assert!(place_path_in(&home, &runner, bad).is_err(), "{bad}");
         }
         assert_eq!(read(&runner).len(), 2);

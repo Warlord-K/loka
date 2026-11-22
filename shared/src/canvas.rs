@@ -28,7 +28,7 @@ pub const KINDS: [&str; 10] = ["image", "video", "model", "note", "sticky", "ref
 pub const COLORS: [&str; 6] = ["lemon", "rose", "mint", "aqua", "honey", "sand"];
 pub const LAYOUTS: [&str; 3] = ["row", "grid", "flow"];
 pub const MODEL_MIME: &str = "model/gltf-binary";
-const REF_KINDS: [&str; 5] = ["quest", "report", "msg", "todo", "agent"];
+const REF_KINDS: [&str; 6] = ["quest", "report", "msg", "todo", "agent", "practice"];
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Canvas {
@@ -822,10 +822,14 @@ impl WorldStore {
         Ok(())
     }
 
-    pub async fn create_canvas(&self, mut new: crate::reports::NewReport, canvas: Canvas) -> Result<Report> {
+    pub async fn create_canvas(&self, new: crate::reports::NewReport, canvas: Canvas) -> Result<Report> {
+        self.create_canvas_with(new, canvas, None).await
+    }
+
+    pub(crate) async fn create_canvas_with(&self, mut new: crate::reports::NewReport, canvas: Canvas, practice: Option<&Value>) -> Result<Report> {
         canvas.validate()?;
         new.body = canvas.summary();
-        self.insert_report(new, Some(&canvas)).await
+        self.insert_report(new, Some(&canvas), practice).await
     }
 
     pub async fn change_canvas(&self, id: Uuid, by: ReportActor, ops: Vec<Op>) -> Result<Option<(Report, Vec<String>)>> {
@@ -876,7 +880,7 @@ impl WorldStore {
             let Some((kind, raw)) = target.split_once(':') else { continue };
             match (kind, raw.strip_prefix("ch").and_then(|n| n.parse::<i64>().ok())) {
                 ("msg", Some(id)) => channel_ids.push(id),
-                ("quest" | "report" | "todo" | "msg", None) => wanted.entry(kind).or_default().push(raw),
+                ("quest" | "report" | "todo" | "msg" | "practice", None) => wanted.entry(kind).or_default().push(raw),
                 ("agent", _) => {
                     slugs.push(raw.to_lowercase());
                     wanted.entry(kind).or_default().push(raw);
@@ -898,6 +902,13 @@ impl WorldStore {
                      WHERE r.org_id = $1 AND (r.owner_user_id = $2 OR r.visibility = 'public') AND {match}
                      ORDER BY r.updated_at DESC LIMIT 200",
                     "r",
+                ),
+                "practice" => (
+                    "SELECT p.id, r.title AS a, p.status AS b, p.n::text || ' ' || COALESCE(p.\"check\"->>'fix', '') AS c
+                     FROM world_practice_attempts p JOIN world_reports r ON r.id = p.report_id
+                     WHERE r.org_id = $1 AND (r.owner_user_id = $2 OR r.visibility = 'public') AND {match}
+                     ORDER BY p.created_at DESC LIMIT 200",
+                    "p",
                 ),
                 "todo" => (
                     "SELECT d.id, d.text AS a, d.status AS b, '' AS c FROM world_todos d
@@ -978,6 +989,11 @@ impl WorldStore {
                     "quest" => format!("Quest \"{}\" ({})", flat(&row.a, 160), row.b.replace('_', " ")),
                     "report" => format!("{} \"{}\": {}", if row.b == "canvas" { "Canvas" } else { "Report" }, flat(&row.a, 160), flat(&row.c, 200)),
                     "todo" => format!("To-do \"{}\" ({})", flat(&row.a, 200), row.b),
+                    "practice" => {
+                        let (n, fix) = row.c.split_once(' ').unwrap_or((row.c.as_str(), ""));
+                        let fix = if fix.is_empty() { String::new() } else { format!(", fix: {}", flat(fix, 160)) };
+                        format!("Practice attempt {n} on \"{}\" ({}){fix}", flat(&row.a, 160), row.b)
+                    }
                     "msg" => format!("Message from {} in {}'s chat: {}", row.a, row.b, flat(&row.c, 400)),
                     _ if row.b.is_empty() => format!("Agent {}", row.a),
                     _ => format!("Agent {}, {}", row.a, flat(&row.b, 120)),

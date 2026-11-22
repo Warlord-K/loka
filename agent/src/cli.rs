@@ -201,6 +201,33 @@ pub(crate) fn temp_dir() -> PathBuf {
     job_temp_dir().unwrap_or_else(std::env::temp_dir)
 }
 
+pub(crate) const QUEST_TEMP_PREFIX: &str = "loka-q-";
+
+pub(crate) fn quest_id(working_dir: &Path) -> Option<uuid::Uuid> {
+    let parts: Vec<&std::ffi::OsStr> = working_dir.components().map(|part| part.as_os_str()).collect();
+    let at = parts.windows(2).position(|pair| pair[0] == "tasks" && pair[1].to_str().is_some_and(|id| id.parse::<uuid::Uuid>().is_ok()))?;
+    parts[at + 1].to_str()?.parse().ok()
+}
+
+pub(crate) fn quest_temp_name(id: uuid::Uuid) -> String {
+    format!("{QUEST_TEMP_PREFIX}{}", &id.simple().to_string()[..12])
+}
+
+pub(crate) fn quest_temp_dir(working_dir: &Path) -> Option<PathBuf> {
+    if job_user().is_some() {
+        return None;
+    }
+    Some(std::env::temp_dir().join(quest_temp_name(quest_id(working_dir)?)))
+}
+
+fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir)
+}
+
 fn job_temp_dir() -> Option<PathBuf> {
     slot_dir(JOB_UID.try_with(JobUid::id).ok()?)
 }
@@ -901,6 +928,12 @@ pub struct CliOptions<'a> {
 }
 
 impl CliOptions<'_> {
+    pub fn sign_commits(&self, command: &mut tokio::process::Command) {
+        if !self.lean {
+            crate::git::workspace::sign_with_loka_key(command, self.working_dir);
+        }
+    }
+
     pub fn child_environment(&self) -> BTreeMap<String, String> {
         let mut environment = self.provider_keys.clone();
         environment.extend(self.environment.clone());
@@ -1105,6 +1138,10 @@ pub fn configure_child_environment(
         }
     }
     cmd.envs(explicit);
+    if let Some(dir) = cmd.as_std().get_current_dir().and_then(quest_temp_dir) {
+        ensure_private_dir(&dir)?;
+        cmd.env("TMPDIR", dir);
+    }
     for (name, value) in environment {
         anyhow::ensure!(
             loka_shared::environment::valid_name(name) || runtime_name(name),
@@ -1272,6 +1309,41 @@ mod environment_tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn quest_runs_get_their_own_temp_dir() {
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        let tree = |id: uuid::Uuid| std::path::PathBuf::from(format!("/Users/a b/Library/Application Support/dev.ygpt.loka/runner/workspaces/tasks/{id}/world"));
+        let temp_of = |dir: &std::path::Path| {
+            let mut command = tokio::process::Command::new("true");
+            command.current_dir(dir);
+            configure_child_environment(&mut command, &BTreeMap::new()).unwrap();
+            child_env(&command).get("TMPDIR").cloned().flatten()
+        };
+        let one = temp_of(&tree(first)).expect("quest temp dir");
+        let two = temp_of(&tree(second)).expect("quest temp dir");
+        assert_ne!(one, two);
+        assert_eq!(one, std::env::temp_dir().join(super::quest_temp_name(first)).to_string_lossy().to_string());
+        assert!(std::path::Path::new(&one).is_dir());
+        assert_eq!(temp_of(&tree(first).join("src")).as_deref(), Some(one.as_str()));
+        assert!(one.len() < 100 && !one.contains(' '));
+        let _ = std::fs::remove_dir_all(&one);
+        let _ = std::fs::remove_dir_all(&two);
+    }
+
+    #[test]
+    fn quest_temp_skips_other_dirs() {
+        let id = uuid::Uuid::new_v4();
+        assert!(super::quest_id(std::path::Path::new("/r/workspaces/agents/main")).is_none());
+        assert!(super::quest_id(std::path::Path::new("/r/workspaces/tasks/not-a-uuid/repo")).is_none());
+        assert_eq!(super::quest_id(std::path::Path::new(&format!("/tasks/x/runner/workspaces/tasks/{id}/repo"))), Some(id));
+        let mut elsewhere = tokio::process::Command::new("true");
+        elsewhere.current_dir("/r/workspaces/agents/main");
+        configure_child_environment(&mut elsewhere, &BTreeMap::new()).unwrap();
+        let temp = child_env(&elsewhere).get("TMPDIR").cloned().flatten().unwrap_or_default();
+        assert!(!temp.contains(super::QUEST_TEMP_PREFIX));
     }
 
     #[test]

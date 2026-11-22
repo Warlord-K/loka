@@ -678,6 +678,17 @@ async fn handle_failure(
         ctx.store.record_quick_reply(&agent, session, run.id, &format!("I could not answer that: {error}"), true).await?;
         return Ok(());
     }
+    if run.kind == "review" && prompts::failed_nudge_settles(&run.prompt, error) && loka_shared::quests::compare_candidates(session).is_none() {
+        let agent = ctx.store.get_agent(run.agent_id).await?.ok_or_else(|| anyhow!("agent missing"))?;
+        let manual = session
+            .asked_by
+            .as_ref()
+            .and_then(|asked_by| asked_by.get("manual"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let output = prompts::failed_nudge_output(error);
+        return settle_review(ctx, &agent, session, run, &output, manual).await;
+    }
     if run.kind == "review" {
         ctx.store.set_session_status(session.id, "failed", Some(error)).await?;
         if let Some(ids) = loka_shared::quests::compare_candidates(session) {
@@ -1018,10 +1029,26 @@ async fn after_review(
         .and_then(|a| a.get("manual"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    if prompts::needs_verdict(output)
+        && loka_shared::quests::compare_candidates(review).is_none()
+        && ctx.store.nudge_for_verdict(review.id).await?.is_some()
+    {
+        return Ok(());
+    }
+    settle_review(ctx, agent, review, run, output, manual).await
+}
+
+async fn settle_review(
+    ctx: &Ctx,
+    agent: &WorldAgent,
+    review: &AgentSession,
+    run: &SessionRun,
+    output: &str,
+    manual: bool,
+) -> Result<()> {
     if manual {
         ctx.store.set_session_status(review.id, "completed", Some(&tail(output, 2000))).await?;
-        let verdict = extract_raw(output, "verdict")
-            .unwrap_or_else(|| json!({ "verdict": "unparsed", "summary": tail(output, 800) }));
+        let verdict = review_verdict_value(output);
         let requester = review
             .asked_by
             .as_ref()
@@ -1061,10 +1088,7 @@ async fn after_review(
         .ok_or_else(|| anyhow!("task session missing"))?;
     ctx.store.set_session_status(review.id, "completed", Some(&tail(output, 2000))).await?;
     let verdict = prompts::readable_verdict(output);
-    let verdict_value = match verdict {
-        Some(_) => extract_raw(output, "verdict").unwrap_or_default(),
-        None => json!({ "verdict": "unparsed", "summary": tail(output, 800), "note": prompts::UNREADABLE_VERDICT_NOTE }),
-    };
+    let verdict_value = review_verdict_value(output);
     let wants_changes = verdict.as_ref().is_some_and(|v| v.verdict == "changes" && !v.findings.is_empty());
     if wants_changes && task_session.review_rounds < ctx.max_review_rounds {
         let round = ctx.store.bump_review_round(task_session.id).await?;
@@ -1532,6 +1556,13 @@ impl SecretRedactor {
     }
 }
 
+fn review_verdict_value(output: &str) -> Value {
+    match prompts::readable_verdict(output) {
+        Some(_) => extract_raw(output, "verdict").unwrap_or_default(),
+        None => json!({ "verdict": prompts::NO_VERDICT, "summary": tail(output, 800), "note": prompts::UNREADABLE_VERDICT_NOTE }),
+    }
+}
+
 fn extract_raw(output: &str, name: &str) -> Option<Value> {
     serde_json::from_str(&prompts::block_body(output, name)?.1).ok()
 }
@@ -1554,8 +1585,25 @@ fn task_timeout() -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{completion_error, reported_pr_to_keep, session_id_after_run, SecretRedactor};
+    use super::{completion_error, reported_pr_to_keep, review_verdict_value, session_id_after_run, SecretRedactor};
     use crate::git::github::{HeadPr, PrInfo};
+
+    #[test]
+    fn a_review_without_a_readable_verdict_settles_as_no_verdict() {
+        for output in [
+            "The tests are still compiling, I'll wait.",
+            "<!-- verdict {\"verdict\":\"maybe\"} verdict -->",
+            super::prompts::failed_nudge_output("timed out").as_str(),
+        ] {
+            let value = review_verdict_value(output);
+            assert_eq!(value["verdict"], super::prompts::NO_VERDICT);
+            assert_eq!(value["note"], super::prompts::UNREADABLE_VERDICT_NOTE);
+            assert!(completion_error(&super::prompts::Report { status: Some("done".into()), ..Default::default() }, Some(&value), true).is_none());
+        }
+        let readable = review_verdict_value("<!-- verdict {\"verdict\":\"approve\",\"summary\":\"ok\"} verdict -->");
+        assert_eq!(readable["verdict"], "approve");
+        assert!(readable.get("note").is_none());
+    }
 
     #[test]
     fn another_branchs_pr_is_never_attached_from_the_report() {
@@ -1613,7 +1661,7 @@ mod tests {
         assert!(completion_error(&done, None, true).is_some());
         assert!(completion_error(&done, Some(&json!({ "verdict": "changes", "summary": "test is failing" })), true).is_none());
         assert!(completion_error(&done, Some(&json!({ "verdict": "review failed", "summary": "timed out" })), true).is_some());
-        assert!(completion_error(&done, Some(&json!({ "verdict": "unparsed" })), true).is_none());
+        assert!(completion_error(&done, Some(&json!({ "verdict": "no verdict" })), true).is_none());
     }
 
     #[test]

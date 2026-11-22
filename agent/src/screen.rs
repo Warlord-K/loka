@@ -65,7 +65,7 @@ description: Take a screenshot or a short screen recording of your owner's Mac t
 ---
 # Screen
 
-Your owner allowed you to capture this Mac's screen. Run it with this exact prefix, written out in full every time:
+Your owner allowed you to capture this Mac's screen. Run it with this exact prefix, written out in full every time, as a command on its own (no pipe, `&&`, `;` or `cd`, or the sandbox keeps it from working):
 
 `{launcher}`
 
@@ -166,8 +166,9 @@ fn run(args: &[String]) -> Result<PathBuf, String> {
     if !output.status.success() || empty {
         let _ = std::fs::remove_file(&file);
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let sandbox = if crate::browser::inside_sandbox() { format!(" {}", crate::browser::RUN_ALONE) } else { String::new() };
         return Err(format!(
-            "the capture failed{}. Loka may need Screen Recording permission: System Settings > Privacy & Security > Screen Recording, then restart Loka",
+            "the capture failed{}. Loka may need Screen Recording permission: System Settings > Privacy & Security > Screen Recording, then restart Loka.{sandbox}",
             if detail.is_empty() { String::new() } else { format!(" ({detail})") }
         ));
     }

@@ -454,6 +454,13 @@ fn render_event(item: &InboxItem, tasks: &[AgentTask]) -> String {
             s("pr_url"),
             p.get("checks").and_then(Value::as_array).map(|c| c.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default()
         ),
+        "actions.problem" => format!(
+            "[event] actions.problem: some actions in your last reply did not run:\n{}\n\nFix the ids or the shape and send those actions again in this reply. Tell your person only if it keeps failing.",
+            p.get("problems")
+                .and_then(Value::as_array)
+                .map(|list| list.iter().filter_map(Value::as_str).map(|line| format!("- {line}")).collect::<Vec<_>>().join("\n"))
+                .unwrap_or_default()
+        ),
         "quest.parts" if p.get("closed").and_then(Value::as_bool) == Some(true) => format!(
             "[event] quest.parts: every part of your quest is finished ({} parts, the last was \"{}\"), so the quest closed itself.\ntask_id: {}\ntitle: {}\n\nTell the person who asked what was done across the parts, in a few lines, with the pull request links (list_tasks and agent_activity have them).",
             p.get("parts").and_then(Value::as_i64).unwrap_or(0),
@@ -620,6 +627,19 @@ fn render_event(item: &InboxItem, tasks: &[AgentTask]) -> String {
             s("text"),
             s("mark_id")
         ),
+        "practice.ready" => format!(
+            "[event] practice.ready: {} pressed Ready on attempt {} of their {} practice canvas report:{} \"{}\" and you are their coach.\nattempt: {}\nThe drawing is attached as an image.{}\n\nStrokes, in the order drawn:\n{}\n\nEarlier attempts, newest first:\n{}\n\nLook at the image and the stroke order (count, order and direction matter for kanji), compare with the earlier attempts, then call practice_check with attempt set to {} and a specific right, fix and next (score 0 to 100 is optional). practice_check posts your answer in their chat, so end this turn with an empty actions list and no reply. read_practice with strokes true has the full stroke data.",
+            sender(p),
+            p.get("n").and_then(Value::as_i64).unwrap_or(0),
+            one_line(&s("subject"), 40),
+            s("report_id"),
+            one_line(&s("title"), 200),
+            s("attempt_id"),
+            p.get("note").and_then(Value::as_str).filter(|n| !n.trim().is_empty()).map(|n| format!("\nTheir note: {}", n.trim())).unwrap_or_default(),
+            s("strokes_summary"),
+            practice_history(p),
+            s("attempt_id")
+        ),
         "todo.dismissed" => format!(
             "[event] {} dismissed \"{}\" from their To do list without taking any of the actions you suggested ({} after you added it). Mark it dismissed in your notes with update_my_notes so you do not suggest it again. Then end with an empty actions list and say nothing.",
             or(&s("by"), "Your person"),
@@ -687,12 +707,17 @@ pub fn quick_task(task: &AgentTask, working_dir: &str) -> String {
     task_from(QUICK_TASK, task, working_dir, None)
 }
 
+const NO_REPO_LINE: &str = "No repository is set on this quest, so this workspace is an empty folder, not a git checkout: nothing in it is committed, pushed or opened as a pull request for you. If the work changes a GitHub repository, clone it into this folder (`git clone https://github.com/owner/name`), work on a new branch there, push it with `git push --no-track origin HEAD`, open the pull request with `gh pr create` and put its link in the report's \"pr_url\", and list \"set the repo on the quest\" in followups. If the work is not code, carry on in this folder.";
+
+fn repo_line(repo: Option<&str>) -> String {
+    match repo {
+        Some(repo) => format!("Repository: {repo} (branch already checked out in the workspace)"),
+        None => NO_REPO_LINE.to_string(),
+    }
+}
+
 fn task_from(template: &str, task: &AgentTask, working_dir: &str, feedback: Option<&str>) -> String {
-    let repo_line = task
-        .repo
-        .as_deref()
-        .map(|r| format!("Repository: {r} (branch already checked out in the workspace)"))
-        .unwrap_or_default();
+    let repo_line = repo_line(task.repo.as_deref());
     let feedback = feedback
         .map(|f| format!("\nThe independent reviewer asked for changes. Address every finding:\n{f}\n"))
         .unwrap_or_default();
@@ -1151,6 +1176,40 @@ pub fn split_actions(output: &str) -> (String, Vec<Action>) {
     (before, actions)
 }
 
+pub fn action_problems(output: &str) -> Vec<String> {
+    let Some((_, block)) = extract_block(output, "actions") else {
+        return Vec::new();
+    };
+    let values = match serde_json::from_str::<Vec<Value>>(&block) {
+        Ok(values) => values,
+        Err(error) => {
+            return vec![format!(
+                "Your actions block is not a valid JSON list ({}), so none of its actions ran. Send the actions again.",
+                truncate_chars(&error.to_string(), 160)
+            )]
+        }
+    };
+    values
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, value)| {
+            let kind = value.get("type").and_then(Value::as_str).unwrap_or("none").to_string();
+            let problem = match serde_json::from_value::<Action>(value) {
+                Err(error) => truncate_chars(&error.to_string(), 160),
+                Ok(Action::Escalate { text } | Action::Ask { text, .. } | Action::Drafts { text, .. }) if text.trim().is_empty() => {
+                    "it has no text".to_string()
+                }
+                Ok(_) => return None,
+            };
+            Some(format!("Action {} (type {kind}) was ignored: {problem}. Send it again in the right shape.", index + 1))
+        })
+        .collect()
+}
+
+fn truncate_chars(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
+}
+
 pub fn plan_text(output: &str) -> String {
     let Some((before, block)) = extract_block(output, "plan") else {
         return plain_dashes(&tail_chars(output.trim(), 4000));
@@ -1424,8 +1483,26 @@ pub fn parse_verdict(output: &str) -> Option<Verdict> {
     extract_block(output, "verdict").and_then(|(_, b)| serde_json::from_str(&b).ok())
 }
 
+pub const NO_VERDICT: &str = "no verdict";
+
 pub const UNREADABLE_VERDICT_NOTE: &str =
-    "The reviewer gave no readable verdict twice, so the work went ahead without one";
+    "Review ended without a verdict, even after the reviewer was asked for one. The work went ahead without it, so ask for another review if you want one";
+
+pub fn failed_nudge_output(error: &str) -> String {
+    format!("The reviewer was asked for a verdict again, but that follow-up failed: {error}")
+}
+
+pub fn is_verdict_nudge(prompt: &str) -> bool {
+    prompt.starts_with(loka_shared::world::VERDICT_NUDGE_MARK)
+}
+
+pub fn failed_nudge_settles(prompt: &str, error: &str) -> bool {
+    is_verdict_nudge(prompt) && !loka_shared::cli_errors::describe(error).starts_with("Stopped by")
+}
+
+pub fn needs_verdict(output: &str) -> bool {
+    readable_verdict(output).is_none() && parse_verdict(output).is_none_or(|verdict| verdict.verdict != "pick")
+}
 
 pub fn readable_verdict(output: &str) -> Option<Verdict> {
     parse_verdict(output).filter(|verdict| matches!(verdict.verdict.as_str(), "approve" | "changes"))
@@ -1705,6 +1782,19 @@ fn slack_author(p: &Value) -> String {
     }
 }
 
+fn practice_history(p: &Value) -> String {
+    let lines: Vec<String> = p
+        .get("history")
+        .and_then(Value::as_array)
+        .map(|h| h.iter().filter_map(|a| a.get("line").and_then(Value::as_str)).map(|l| format!("- {l}")).collect())
+        .unwrap_or_default();
+    if lines.is_empty() {
+        "(none, this is the first attempt)".into()
+    } else {
+        lines.join("\n")
+    }
+}
+
 fn sender(p: &Value) -> String {
     let name = one_line(p.get("author").and_then(Value::as_str).map(str::trim).filter(|n| !n.is_empty()).unwrap_or("someone"), 80);
     if p.get("author_kind").and_then(Value::as_str) == Some("agent") {
@@ -1735,9 +1825,31 @@ fn pretty(value: Option<&Value>) -> String {
     }
 }
 
+
+fn answered_quote(p: &Value) -> String {
+    match p.get("answers").and_then(Value::as_str).map(str::trim).filter(|q| !q.is_empty()) {
+        Some(question) => {
+            let quoted: Vec<String> = question.lines().map(|l| format!("> {l}")).collect();
+            format!("(replying to your question)\n{}\n", quoted.join("\n"))
+        }
+        None => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quests_without_a_repo_are_told_their_folder_is_not_a_checkout() {
+        assert_eq!(repo_line(Some("acme/app")), "Repository: acme/app (branch already checked out in the workspace)");
+        let none = repo_line(None);
+        assert!(none.contains("empty folder, not a git checkout") && none.contains("git clone") && none.contains("git push --no-track origin HEAD") && none.contains("pr_url"));
+        assert!(!none.contains('\u{2014}'));
+        for template in [TASK, QUICK_TASK] {
+            assert!(template.contains("{repo_line}"));
+        }
+    }
 
     #[test]
     fn failures_carry_their_cause_and_the_right_advice() {
@@ -1785,6 +1897,15 @@ mod tests {
         assert!(skipped.contains("Ada [not your owner]") && skipped.contains("kept your defaults (claude sonnet)") && skipped.contains("no execution device"));
         let goal = render_item(&inbox(3, "onboarding.finished", serde_json::json!({ "author": "Ada", "from_owner": true, "cli": "claude", "model": "opus", "has_device": true, "goal": "Contribute to astral-sh/uv\nmostly the resolver" })), &[]);
         assert!(goal.contains("> Contribute to astral-sh/uv\n> mostly the resolver") && goal.contains("features onboarding") && !goal.contains("one concrete first step"));
+    }
+
+    #[test]
+    fn practice_ready_tells_the_coach_how_to_answer() {
+        let practice = render_item(&inbox(1, "practice.ready", serde_json::json!({ "author": "Ada", "from_owner": true, "n": 3, "subject": "japanese", "report_id": "r1", "title": "Kanji", "attempt_id": "a3", "note": "stroke 2 felt off", "strokes_summary": "1 strokes on a 100x100 canvas", "history": [{ "line": "#2 checked: right: x; fix: y; next: z" }] })), &[]);
+        assert!(practice.starts_with("[event] practice.ready: Ada [your owner, verified] pressed Ready on attempt 3 of their japanese practice canvas report:r1 \"Kanji\""));
+        assert!(practice.contains("\nTheir note: stroke 2 felt off") && practice.contains("- #2 checked: right: x") && practice.contains("practice_check with attempt set to a3"));
+        let first = render_item(&inbox(1, "practice.ready", serde_json::json!({ "author": "Ada", "n": 1, "attempt_id": "a1" })), &[]);
+        assert!(first.contains("(none, this is the first attempt)") && !first.contains("Their note"));
     }
 
     #[test]
@@ -2066,6 +2187,35 @@ mod tests {
         assert!(limited.contains("- manage_agents: revoked"));
         assert!(!limited.contains("main agent"));
         assert!(!limited.contains("When designing a new agent"));
+    }
+
+    #[test]
+    fn empty_text_actions_are_reported_and_problems_reach_the_prompt() {
+        let out = "x\n<!-- actions\n[{\"type\":\"reply\",\"text\":\"\"},{\"type\":\"ask\",\"text\":\"  \"},{\"type\":\"escalate\",\"text\":\"help\"},{\"type\":\"drafts\",\"text\":\"\"}]\nactions -->";
+        let problems = action_problems(out);
+        assert_eq!(problems.len(), 2);
+        assert!(problems[0].starts_with("Action 2 (type ask) was ignored: it has no text"));
+        assert!(problems[1].starts_with("Action 4 (type drafts) was ignored: it has no text"));
+        let prompt = render_item(&inbox(9, "actions.problem", serde_json::json!({ "problems": problems })), &[]);
+        assert!(prompt.starts_with("[event] actions.problem:"));
+        assert!(prompt.contains("- Action 2 (type ask) was ignored") && prompt.contains("- Action 4 (type drafts)"));
+        assert!(prompt.contains("send those actions again"));
+    }
+
+    #[test]
+    fn dropped_actions_are_reported() {
+        let ok = "x\n<!-- actions\n[{\"type\":\"reply\",\"text\":\"hi\"}]\nactions -->";
+        assert!(action_problems(ok).is_empty());
+        assert!(action_problems("no block here").is_empty());
+        let mixed = "x\n<!-- actions\n[{\"type\":\"reply\",\"text\":\"hi\"},{\"type\":\"bogus\"},{\"type\":\"start_task\"}]\nactions -->";
+        let problems = action_problems(mixed);
+        assert_eq!(problems.len(), 2);
+        assert!(problems[0].starts_with("Action 2 (type bogus) was ignored") && problems[0].contains("unknown variant"));
+        assert!(problems[1].starts_with("Action 3 (type start_task) was ignored") && problems[1].contains("task_id"));
+        let broken = "x\n<!-- actions\n[{\"type\":\"reply\",\nactions -->";
+        let problems = action_problems(broken);
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("not a valid JSON list") && problems[0].contains("none of its actions ran"));
     }
 
     #[test]
@@ -2447,14 +2597,23 @@ mod tests {
         assert!(readable_verdict("<!-- verdict not json verdict -->").is_none());
         assert!(readable_verdict("").is_none());
     }
-}
 
-fn answered_quote(p: &Value) -> String {
-    match p.get("answers").and_then(Value::as_str).map(str::trim).filter(|q| !q.is_empty()) {
-        Some(question) => {
-            let quoted: Vec<String> = question.lines().map(|l| format!("> {l}")).collect();
-            format!("(replying to your question)\n{}\n", quoted.join("\n"))
-        }
-        None => String::new(),
+    #[test]
+    fn a_review_that_stops_for_background_work_still_needs_a_verdict() {
+        let waiting = "I started cargo test in the background. The tests are still compiling, I'll wait.";
+        assert!(needs_verdict(waiting));
+        assert!(needs_verdict(""));
+        assert!(needs_verdict("<!-- verdict {\"verdict\":\"maybe\"} verdict -->"));
+        assert!(!needs_verdict("Tests pass.\n<!-- verdict {\"verdict\":\"approve\",\"summary\":\"ok\"} verdict -->"));
+        assert!(!needs_verdict("<!-- verdict {\"verdict\":\"pick\",\"winner\":1} verdict -->"));
+        let nudge = loka_shared::world::VERDICT_NUDGE;
+        assert!(is_verdict_nudge(nudge));
+        assert!(needs_verdict(&failed_nudge_output("timed out")));
+        assert!(failed_nudge_settles(nudge, "run timed out"));
+        assert!(!failed_nudge_settles(nudge, "Stopped by Ana. Do not restart this work unless they ask."));
+        assert!(!failed_nudge_settles(nudge, "Stopped by Loka. Organization suspended"));
+        assert!(!failed_nudge_settles("Review the work", "run timed out"));
+        assert!(!is_verdict_nudge("Review the work"));
+        assert!(nudge.contains("<!-- verdict") && nudge.ends_with("verdict -->"));
     }
 }

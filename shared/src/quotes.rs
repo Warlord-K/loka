@@ -1,9 +1,9 @@
 use serde_json::{json, Value};
 
-const TEXT_CHARS: usize = 2000;
+pub const TEXT_CHARS: usize = 2000;
 pub const CONTEXT_CHARS: usize = 4000;
 const LABEL_CHARS: usize = 120;
-const SOURCE_KINDS: &[&str] = &["msg:ch", "msg:", "report:", "todo:", "quest:", "agent:"];
+const SOURCE_KINDS: &[&str] = &["msg:ch", "msg:", "report:", "todo:", "quest:", "agent:", "practice:"];
 
 fn capped(value: Option<&Value>, max: usize) -> Option<String> {
     let text = value?.as_str()?.trim();
@@ -17,6 +17,9 @@ fn source(value: Option<&Value>) -> Option<String> {
         return crate::canvas::quote_source(raw).map(|_| raw.to_string());
     }
     let id = &raw[kind.len()..];
+    if *kind == "practice:" && id.chars().filter(|c| *c != '-').count() < crate::practice::MIN_PREFIX {
+        return None;
+    }
     let valid = !id.is_empty()
         && id.len() <= 36
         && if *kind == "msg:ch" { id.chars().all(|c| c.is_ascii_digit()) } else { id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') };
@@ -81,5 +84,18 @@ mod tests {
         assert_eq!(render(&json!({})), "");
         assert_eq!(clean(Some(&json!({ "text": "x", "source": "report:abcdef12#i1a2" }))).unwrap()["source"], "report:abcdef12#i1a2");
         assert!(clean(Some(&json!({ "text": "x", "source": "report:abcdef12#bad item" }))).unwrap().get("source").is_none());
+    }
+
+    #[test]
+    fn practice_attempts_are_quote_sources_with_their_check_as_text() {
+        assert_eq!(clean(Some(&json!({ "text": "x", "source": "practice:abcdef12" }))).unwrap()["source"], "practice:abcdef12");
+        assert!(clean(Some(&json!({ "text": "x", "source": "practice:abc123" }))).unwrap().get("source").is_none());
+        assert!(clean(Some(&json!({ "text": "x", "source": "practice:abcdefgh" }))).unwrap().get("source").is_none());
+        let check = crate::practice::Check::new("Even spacing", "Lift at the end", "Write it again", Some(80.0)).unwrap();
+        assert_eq!(
+            crate::practice::quote_text("japanese", 3, Some(&check)),
+            "Japanese practice, attempt 3, score 80/100. Right: Even spacing Fix: Lift at the end Next: Write it again"
+        );
+        assert_eq!(crate::practice::quote_text("life-drawing", 1, None), "Life Drawing practice, attempt 1 (waiting for the coach)");
     }
 }

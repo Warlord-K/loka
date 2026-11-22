@@ -8,6 +8,7 @@ mod music_tools;
 mod quests;
 mod reports_tools;
 mod canvas_tools;
+mod practice_tools;
 mod runs;
 mod schedule;
 mod teams_tools;

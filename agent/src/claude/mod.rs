@@ -322,7 +322,12 @@ pub(crate) fn command(opts: &CliOptions<'_>, mcp_config_path: Option<&Path>, lau
     cmd.current_dir(opts.working_dir);
     cmd.kill_on_drop(true);
     configure_child_environment(&mut cmd, &opts.child_environment())?;
+    opts.sign_commits(&mut cmd);
     launch.configure(&mut cmd);
+    let quest_temp = crate::cli::quest_temp_dir(opts.working_dir);
+    if let Some(dir) = &quest_temp {
+        cmd.env("CLAUDE_CODE_TMPDIR", dir);
+    }
 
     let configured_effort = if opts.effort.is_none() {
         match std::env::var("WORLD_CLAUDE_EFFORT") {
@@ -372,8 +377,12 @@ pub(crate) fn command(opts: &CliOptions<'_>, mcp_config_path: Option<&Path>, lau
     let settings = if (opts.lean && !lean_reads) || skip_user_settings { with_auth(&mut cmd, settings) } else { settings };
     if let Some(mut settings) = settings {
         sandbox::open_for_owner(&mut settings);
+        if let Some(dir) = &quest_temp {
+            sandbox::allow_write(&mut settings, dir);
+        }
         if sandbox_mode != sandbox::Mode::Off {
             cmd.env("GIT_TEMPLATE_DIR", "");
+            sandbox::owner_git_env(&mut cmd);
         }
         if mode == Permission::Auto {
             settings["autoMode"] = serde_json::json!({ "allow": owner_allow(&opts.environment) });
@@ -1115,6 +1124,52 @@ mod tests {
         assert!(init.success());
         assert!(!dir.join(".git/hooks").exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn owner_runs_get_git_config_that_avoids_shared_config_writes() {
+        let env = |opts: &CliOptions<'_>| {
+            let cmd = command(opts, None, &Launch::assume("claude")).expect("command builds");
+            cmd.as_std()
+                .get_envs()
+                .filter_map(|(name, value)| Some((name.to_string_lossy().into_owned(), value?.to_string_lossy().into_owned())))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let owner = env(&options(false, Vec::new(), false, Approval::Auto, "sonnet"));
+        let count: usize = owner["GIT_CONFIG_COUNT"].parse().unwrap();
+        assert!(count >= 1);
+        let entries: Vec<(&str, &str)> = (count - 1..count).map(|i| (owner[&format!("GIT_CONFIG_KEY_{i}")].as_str(), owner[&format!("GIT_CONFIG_VALUE_{i}")].as_str())).collect();
+        assert_eq!(entries, crate::claude::sandbox::OWNER_GIT_CONFIG);
+        assert!(!env(&options(true, Vec::new(), false, Approval::Auto, "sonnet")).contains_key("GIT_CONFIG_COUNT"));
+    }
+
+    #[test]
+    fn quest_claude_runs_get_their_own_writable_temp_dir() {
+        let id = uuid::Uuid::new_v4();
+        let tree: &'static Path = Box::leak(Box::new(PathBuf::from(format!("/Users/a/Library/Application Support/dev.ygpt.loka/runner/workspaces/tasks/{id}/world"))));
+        let expected = std::env::temp_dir().join(crate::cli::quest_temp_name(id));
+        let launch = Launch::assume("claude");
+        let build = |working_dir: &'static Path| {
+            let mut opts = options(false, Vec::new(), false, Approval::Auto, "sonnet");
+            opts.working_dir = working_dir;
+            command(&opts, None, &launch)
+        };
+        let cmd = build(tree).expect("owner command builds");
+        let env: std::collections::BTreeMap<String, String> = cmd
+            .as_std()
+            .get_envs()
+            .filter_map(|(name, value)| Some((name.to_string_lossy().into_owned(), value?.to_string_lossy().into_owned())))
+            .collect();
+        assert_eq!(env["TMPDIR"], expected.to_string_lossy());
+        assert_eq!(env["CLAUDE_CODE_TMPDIR"], expected.to_string_lossy());
+        let args: Vec<String> = cmd.as_std().get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        let settings: serde_json::Value = serde_json::from_str(after(&args, "--settings").unwrap()).unwrap();
+        let write: Vec<&str> = settings["sandbox"]["filesystem"]["allowWrite"].as_array().unwrap().iter().filter_map(|p| p.as_str()).collect();
+        assert!(write.contains(&expected.to_string_lossy().as_ref()), "{write:?}");
+        let _ = std::fs::remove_dir_all(&expected);
+        let elsewhere = build(Path::new("/tmp")).expect("command builds");
+        let inherited = elsewhere.as_std().get_envs().find(|(name, _)| *name == "CLAUDE_CODE_TMPDIR").and_then(|(_, value)| value?.to_str());
+        assert!(!inherited.is_some_and(|dir| dir.contains(crate::cli::QUEST_TEMP_PREFIX)));
     }
 
     #[test]

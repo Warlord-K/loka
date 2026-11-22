@@ -104,7 +104,7 @@ impl CliFailure {
                 "The CLI refused the permission mode Loka asked for, so it could not edit files or run commands. Loka never switches to full access on its own: pick a model with auto mode, set the agent's approval to Full, or set it to Read only. If the device's Claude settings turn full access off, allow it there.".to_string()
             }
             FailureKind::DiskFull => {
-                "The disk on the device that ran this work is full, so nothing could be written. Loka removes closed quest workspaces when space runs low, but there was nothing left to remove. Free up space on that device, or clear closed quest workspaces under You > Storage, then retry.".to_string()
+                "The disk on the device that ran this work is full, so nothing could be written. Loka clears closed quest workspaces and temp folders when space runs low, and does not start new runs until 5 GB are free, but there was nothing left to clear. Free up space on that device (the bell lists its biggest folders), or clear closed quests under You > Storage, then retry.".to_string()
             }
             FailureKind::Vault => {
                 "A key the agent uses is a 1Password reference (op://) that could not be read. Vault references are read only on your own Mac: install the 1Password CLI there (brew install 1password-cli), turn on 1Password > Settings > Developer > Integrate with 1Password CLI, unlock 1Password, check the reference in You > Environment, then retry.".to_string()

@@ -970,6 +970,7 @@ impl RunnerCoordinator {
         let thread = self.store.reply_thread(agent, &items).await?;
         let root = loka_shared::replies::reply_root(&items);
         let (text, actions) = prompts::split_actions(output);
+        let mut problems = prompts::action_problems(output);
         let mut replied = false;
         let mut started = HashSet::new();
         for action in actions {
@@ -979,16 +980,17 @@ impl RunnerCoordinator {
                     replied = true;
                 }
                 Action::StartTask { task_id, brief, review, reviewer, time_limit_minutes, milestones, quest } => {
-                    let Ok(task_id) = task_id.parse::<Uuid>() else {
-                        continue;
+                    let task_id = match crate::quests::start_target(&self.store, agent, &task_id).await {
+                        Ok(id) => id,
+                        Err(problem) => {
+                            problems.push(problem);
+                            continue;
+                        }
                     };
                     let choice = reviewer.as_ref().and_then(ReviewerChoice::from_value);
-                    if crate::quests::assigned_elsewhere(&self.store, task_id, agent.id).await {
-                        continue;
-                    }
                     if started.insert(task_id) {
                         if let Err(error) = crate::quests::apply_choice(&self.store, task_id, &quest).await {
-                            self.system_note(agent, &format!("Could not set the quest options on task {task_id}: {error}")).await?;
+                            problems.push(format!("Could not set the quest options on task {task_id}: {error}"));
                             continue;
                         }
                         crate::quests::seed_milestones(&self.store, agent.id, task_id, &milestones).await;
@@ -996,14 +998,10 @@ impl RunnerCoordinator {
                             .start_task(agent, main, task_id, brief.as_deref(), review.unwrap_or(false) || choice.is_some(), choice.as_ref())
                             .await
                         {
-                            self.system_note(
-                                agent,
-                                &format!("Could not start task {task_id}: {error}"),
-                            )
-                            .await?;
+                            problems.push(format!("Could not start task {task_id}: {error}"));
                         } else if let Some(minutes) = time_limit_minutes {
                             if let Err(error) = self.store.set_task_time_limit(task_id, Some(minutes)).await {
-                                self.system_note(agent, &format!("Could not set the time limit on task {task_id}: {error}")).await?;
+                                problems.push(format!("Could not set the time limit on task {task_id}: {error}"));
                             }
                         }
                     }
@@ -1066,10 +1064,10 @@ impl RunnerCoordinator {
             }
             let brief = (!text.trim().is_empty()).then_some(text.as_str());
             if let Err(error) = self.start_task(agent, main, task_id, brief, false, None).await {
-                self.system_note(agent, &format!("Could not start task {task_id}: {error}"))
-                    .await?;
+                problems.push(format!("Could not start task {task_id}: {error}"));
             }
         }
+        crate::quests::tell_agent(&self.store, agent, run_id, &items, &problems).await?;
         self.runners.finish_run_inbox(run_id, "done", None).await?;
         if let Some(current) = self
             .store
@@ -1417,6 +1415,22 @@ impl RunnerCoordinator {
         run_id: Uuid,
         output: &str,
     ) -> Result<()> {
+        if prompts::needs_verdict(output)
+            && loka_shared::quests::compare_candidates(review).is_none()
+            && self.store.nudge_for_verdict(review.id).await?.is_some()
+        {
+            return Ok(());
+        }
+        self.settle_review(agent, review, run_id, output).await
+    }
+
+    async fn settle_review(
+        &self,
+        agent: &WorldAgent,
+        review: &AgentSession,
+        run_id: Uuid,
+        output: &str,
+    ) -> Result<()> {
         self.store
             .set_session_status(review.id, "completed", Some(&tail(output, 2000)))
             .await?;
@@ -1438,7 +1452,7 @@ impl RunnerCoordinator {
             return Ok(());
         }
         let verdict = prompts::readable_verdict(output);
-        let verdict_value = review_value(output, !manual);
+        let verdict_value = review_value(output, true);
         if manual {
             let requester = review
                 .asked_by
@@ -2227,6 +2241,17 @@ impl RunnerCoordinator {
                 .await?;
             return Ok(());
         }
+        if kind == "review"
+            && loka_shared::quests::compare_candidates(session).is_none()
+            && self
+                .store
+                .get_run(run_id)
+                .await?
+                .is_some_and(|run| prompts::failed_nudge_settles(&run.prompt, error))
+        {
+            let output = prompts::failed_nudge_output(error);
+            return self.settle_review(agent, session, run_id, &output).await;
+        }
         if kind == "review" {
             self.store
                 .set_session_status(session.id, "failed", Some(error))
@@ -2990,8 +3015,8 @@ fn review_value(output: &str, final_attempt: bool) -> Value {
         None if prompts::parse_verdict(output).is_some_and(|v| v.verdict == "pick") => {
             json!({ "verdict": "pick", "summary": tail(output, 800) })
         }
-        None if final_attempt => json!({ "verdict": "unparsed", "summary": tail(output, 800), "note": prompts::UNREADABLE_VERDICT_NOTE }),
-        None => json!({ "verdict": "unparsed", "summary": tail(output, 800) }),
+        None if final_attempt => json!({ "verdict": prompts::NO_VERDICT, "summary": tail(output, 800), "note": prompts::UNREADABLE_VERDICT_NOTE }),
+        None => json!({ "verdict": prompts::NO_VERDICT, "summary": tail(output, 800) }),
     }
 }
 
@@ -3186,7 +3211,7 @@ mod tests {
         assert_eq!(changes["findings"].as_array().map(Vec::len), Some(1));
         assert!(changes.get("note").is_none());
         let unreadable = review_value("I looked and it seems fine", true);
-        assert_eq!(unreadable["verdict"], "unparsed");
+        assert_eq!(unreadable["verdict"], crate::prompts::NO_VERDICT);
         assert_eq!(unreadable["note"], crate::prompts::UNREADABLE_VERDICT_NOTE);
         assert!(review_value("I looked and it seems fine", false).get("note").is_none());
     }

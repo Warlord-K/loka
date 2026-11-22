@@ -252,7 +252,9 @@ fn provider_base(id: &str, base: &str) -> String {
 
 fn base_command(opts: &CliOptions<'_>, config: Option<&Path>, agent: Option<&RunAgent>) -> Result<tokio::process::Command> {
     let mut cmd = job_command("opencode");
+    cmd.current_dir(opts.working_dir);
     configure_child_environment(&mut cmd, &opts.child_environment())?;
+    opts.sign_commits(&mut cmd);
     if let Some(config) = config {
         cmd.env("OPENCODE_CONFIG", config);
     }
@@ -611,7 +613,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_opencode_sends_its_key_through_the_proxy() {
-        let proxy = crate::key_proxy::tests::test_proxy();
+        crate::key_proxy::tests::test_proxy();
         let (upstream, seen) = crate::key_proxy::tests::upstream().await;
         let home = std::env::temp_dir().join(format!("opencode-key-proxy-{}", std::process::id()));
         for (model, var, value, base_var, base) in [

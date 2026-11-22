@@ -186,6 +186,7 @@ mod tests {
             include_str!("music_tools.rs"),
             include_str!("reports_tools.rs"),
             include_str!("canvas_tools.rs"),
+            include_str!("practice_tools.rs"),
             include_str!("teams_tools.rs"),
         ]
         .join("\n");

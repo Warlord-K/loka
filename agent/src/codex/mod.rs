@@ -253,6 +253,7 @@ async fn run_exec(opts: CliOptions<'_>) -> Result<CliResult> {
     cmd.current_dir(opts.working_dir);
     cmd.kill_on_drop(true);
     configure_child_environment(&mut cmd, &opts.child_environment())?;
+    opts.sign_commits(&mut cmd);
     let chatgpt_login = exec_uses_chatgpt_login(&cmd);
     let shielded = crate::key_proxy::shield_codex(&mut cmd, chatgpt_login);
 

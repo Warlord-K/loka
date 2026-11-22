@@ -380,9 +380,232 @@ async fn pending_changes(worktree_path: &Path, untracked: &str) -> Result<String
     run_git_checked_output(worktree_path, &args).await
 }
 
-const UNSIGNED_LEFTOVERS: &str = "Publish found uncommitted changes and commit.gpgsign is on, but no signing key could sign them, so it will not commit them unsigned. Commit them yourself with a signed commit, or set user.signingkey (or add ~/.ssh/loka_signing), then publish again.";
+pub const SIGNING_SETUP: &str = "Show the owner setup:signing so they can create the Loka signing key (~/.ssh/loka_signing) and add its public key to GitHub as a Signing key.";
 
-const FALLBACK_SIGNING_KEYS: [&str; 3] = [".ssh/loka_signing", ".ssh/karna_signing", ".ssh/signing_key_active"];
+const UNSIGNED_LEFTOVERS: &str = "Publish found uncommitted changes and commit.gpgsign is on, but no configured key could sign them, so it will not commit them unsigned. Loka never signs with another key in its place. Fix the configured key or set user.signingkey, then publish again.";
+
+pub const LOKA_SIGNING_KEY: &str = ".ssh/loka_signing";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Signing {
+    Configured,
+    Loka(PathBuf),
+    Unset,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitSigning {
+    pub key: String,
+    pub gpgsign: bool,
+    pub format: String,
+    pub program: String,
+}
+
+impl GitSigning {
+    pub fn from_config_list(list: &str) -> Self {
+        let mut values: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for entry in list.split('\0').filter(|entry| !entry.is_empty()) {
+            let (name, value) = entry.split_once('\n').unwrap_or((entry, "true"));
+            values.insert(name.to_ascii_lowercase(), value.to_string());
+        }
+        let get = |name: &str| values.get(name).map(|value| value.trim().to_string()).unwrap_or_default();
+        let format = match get("gpg.format").to_ascii_lowercase().as_str() {
+            "" => "openpgp".to_string(),
+            other => other.to_string(),
+        };
+        let program = Some(get(&format!("gpg.{format}.program")))
+            .filter(|program| !program.is_empty())
+            .unwrap_or_else(|| if format == "openpgp" { get("gpg.program") } else { String::new() });
+        GitSigning {
+            key: get("user.signingkey"),
+            gpgsign: matches!(get("commit.gpgsign").to_ascii_lowercase().as_str(), "true" | "yes" | "on" | "1"),
+            format,
+            program,
+        }
+    }
+
+    fn signer(&self) -> String {
+        if !self.program.is_empty() {
+            return self.program.clone();
+        }
+        match self.format.as_str() {
+            "ssh" => "ssh-keygen",
+            "x509" => "gpgsm",
+            _ => "gpg",
+        }
+        .to_string()
+    }
+
+    pub fn configured(&self, path: Option<&std::ffi::OsStr>) -> bool {
+        !self.key.is_empty() || (self.gpgsign && self.format != "ssh" && on_path(&self.signer(), path))
+    }
+
+    pub fn problem(&self, home: Option<&Path>, path: Option<&std::ffi::OsStr>) -> Option<String> {
+        let signer = self.signer();
+        if !on_path(&signer, path) {
+            return Some(format!("{signer} is not installed, so git cannot sign with the configured key"));
+        }
+        if self.format != "ssh" || self.key.is_empty() || self.key.starts_with("key::") || self.key.starts_with("ssh-") {
+            return None;
+        }
+        let file = match (self.key.strip_prefix("~/"), home) {
+            (Some(rest), Some(home)) => home.join(rest),
+            _ => PathBuf::from(&self.key),
+        };
+        (!file.is_file()).then(|| format!("the signing key {} does not exist", self.key))
+    }
+}
+
+fn on_path(program: &str, path: Option<&std::ffi::OsStr>) -> bool {
+    if program.contains('/') {
+        return Path::new(program).is_file();
+    }
+    path.is_some_and(|paths| std::env::split_paths(paths).any(|dir| dir.join(program).is_file()))
+}
+
+pub fn signing_choice(git: &GitSigning, home: Option<&Path>, path: Option<&std::ffi::OsStr>) -> Signing {
+    if git.configured(path) {
+        return Signing::Configured;
+    }
+    match home.map(|home| home.join(LOKA_SIGNING_KEY)).filter(|key| key.is_file()) {
+        Some(key) => Signing::Loka(key),
+        None => Signing::Unset,
+    }
+}
+
+pub fn loka_key_config(key: &Path) -> [(&'static str, String); 3] {
+    [
+        ("gpg.format", "ssh".to_string()),
+        ("user.signingkey", key.display().to_string()),
+        ("commit.gpgsign", "true".to_string()),
+    ]
+}
+
+fn command_env(command: &std::process::Command, name: &str) -> Option<std::ffi::OsString> {
+    command.get_envs().find(|(key, _)| *key == name).and_then(|(_, value)| value.map(ToOwned::to_owned))
+}
+
+fn git_signing_for(command: Option<&std::process::Command>, dir: &Path) -> GitSigning {
+    let mut git = std::process::Command::new("git");
+    if let Some(command) = command {
+        git.env_clear().envs(command.get_envs().filter_map(|(name, value)| Some((name, value?))));
+    }
+    git.args(["config", "--list", "-z"])
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let list = git.output().ok().filter(|out| out.status.success()).map(|out| String::from_utf8_lossy(&out.stdout).into_owned());
+    GitSigning::from_config_list(&list.unwrap_or_default())
+}
+
+pub fn append_git_config(command: &mut tokio::process::Command, entries: &[(&str, &str)]) {
+    let start = command_env(command.as_std(), "GIT_CONFIG_COUNT").and_then(|value| value.to_str()?.parse::<usize>().ok()).unwrap_or(0);
+    for (offset, (key, value)) in entries.iter().enumerate() {
+        command.env(format!("GIT_CONFIG_KEY_{}", start + offset), key).env(format!("GIT_CONFIG_VALUE_{}", start + offset), value);
+    }
+    command.env("GIT_CONFIG_COUNT", (start + entries.len()).to_string());
+}
+
+pub fn sign_with_loka_key(command: &mut tokio::process::Command, dir: &Path) -> Signing {
+    let home = command_env(command.as_std(), "HOME").map(PathBuf::from);
+    let path = command_env(command.as_std(), "PATH").or_else(|| std::env::var_os("PATH"));
+    let git = git_signing_for(Some(command.as_std()), dir);
+    let choice = signing_choice(&git, home.as_deref(), path.as_deref());
+    if let Signing::Loka(key) = &choice {
+        let config = loka_key_config(key);
+        let entries: Vec<(&str, &str)> = config.iter().map(|(key, value)| (*key, value.as_str())).collect();
+        append_git_config(command, &entries);
+    }
+    choice
+}
+
+pub fn ensure_loka_key_in(home: &Path, configured: bool) -> Result<bool> {
+    let key = home.join(LOKA_SIGNING_KEY);
+    if configured {
+        return Ok(false);
+    }
+    let public = PathBuf::from(format!("{}.pub", key.display()));
+    match std::fs::symlink_metadata(&key) {
+        Ok(_) if key.is_file() => return Ok(false),
+        Ok(_) => bail!("{} exists but is not a key file (a dangling symlink or a folder), so Loka left it alone and created no key", key.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("Could not check {}", key.display())),
+    }
+    match std::fs::symlink_metadata(&public) {
+        Ok(_) => bail!("{} exists without its private key, so Loka left it alone and created no key", public.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("Could not check {}", public.display())),
+    }
+    let ssh = key.parent().expect("the Loka key has a parent");
+    std::fs::create_dir_all(ssh).with_context(|| format!("Could not create {}", ssh.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(ssh, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let output = std::process::Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-C", "loka-signing", "-f"])
+        .arg(&key)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("Could not run ssh-keygen to create the Loka signing key")?;
+    if !output.status.success() {
+        bail!("ssh-keygen could not create the Loka signing key: {}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(true)
+}
+
+pub fn ensure_loka_key() {
+    if !cfg!(target_os = "macos") || crate::cli::job_user().is_some() {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return;
+    };
+    let path = std::env::var_os("PATH");
+    let configured = git_signing_for(None, &home).configured(path.as_deref());
+    match ensure_loka_key_in(&home, configured) {
+        Ok(true) => info!(key = %home.join(LOKA_SIGNING_KEY).display(), "Created the Loka signing key for quest commits"),
+        Ok(false) => {}
+        Err(error) => warn!(%error, "could not create the Loka signing key, quest commits stay unsigned"),
+    }
+}
+
+pub fn signing_view() -> serde_json::Value {
+    static CACHE: std::sync::Mutex<Option<(std::time::Instant, serde_json::Value)>> = std::sync::Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((_, view)) = cache.as_ref().filter(|(at, _)| at.elapsed() < std::time::Duration::from_secs(60)) {
+        return view.clone();
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let path = std::env::var_os("PATH");
+    let dir = home.clone().unwrap_or_else(std::env::temp_dir);
+    let git = git_signing_for(None, &dir);
+    let mut view = signing_view_of(&git, home.as_deref(), path.as_deref());
+    view["job_uids"] = serde_json::json!(crate::cli::job_user().is_some());
+    *cache = Some((std::time::Instant::now(), view.clone()));
+    view
+}
+
+fn signing_view_of(git: &GitSigning, home: Option<&Path>, path: Option<&std::ffi::OsStr>) -> serde_json::Value {
+    match signing_choice(git, home, path) {
+        Signing::Configured => serde_json::json!({ "source": "configured", "problem": git.problem(home, path) }),
+        Signing::Unset => serde_json::json!({ "source": "unset", "requires": git.gpgsign }),
+        Signing::Loka(key) => {
+            let public = PathBuf::from(format!("{}.pub", key.display()));
+            let fingerprint = std::process::Command::new("ssh-keygen")
+                .arg("-lf")
+                .arg(if public.is_file() { &public } else { &key })
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| String::from_utf8_lossy(&out.stdout).split_whitespace().nth(1).map(str::to_string));
+            serde_json::json!({ "source": "loka", "key": format!("~/{LOKA_SIGNING_KEY}"), "public": public.is_file(), "fingerprint": fingerprint })
+        }
+    }
+}
 
 const SIGNING_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -402,57 +625,47 @@ async fn commit_signed_with_home(
         return Ok(false);
     }
     let message = without_coauthors(message);
-    let gpgsign = gpgsign_enabled(worktree_path).await?;
-    let configured = !run_git_output(worktree_path, &["config", "--get", "user.signingkey"]).await?.trim().is_empty();
-    let mut attempts: Vec<Vec<String>> = Vec::new();
-    if configured || gpgsign {
-        attempts.push(Vec::new());
-    }
-    let only_default_key = !configured && attempts.len() == 1;
-    if let Some(home) = home {
-        for key in FALLBACK_SIGNING_KEYS.iter().map(|key| home.join(key)).filter(|key| key.is_file()) {
-            attempts.push(vec![
-                "-c".to_string(),
-                "gpg.format=ssh".to_string(),
-                "-c".to_string(),
-                format!("user.signingkey={}", key.display()),
-            ]);
+    let git = GitSigning::from_config_list(&run_git_output(worktree_path, &["config", "--list", "-z"]).await?);
+    let path = std::env::var_os("PATH");
+    let flags: Vec<String> = match signing_choice(&git, home, path.as_deref()) {
+        Signing::Unset if git.gpgsign => {
+            bail!("{UNSIGNED_LEFTOVERS} {SIGNING_SETUP}");
         }
-    }
-    let only_default_key = only_default_key && attempts.len() == 1;
-    if attempts.is_empty() {
-        stage_all(worktree_path).await?;
-        if let Err(error) = run_git(worktree_path, &["commit", "-m", &message]).await {
-            unstage(worktree_path).await?;
-            return Err(error);
-        }
-        return Ok(true);
-    }
-    let mut failures = Vec::new();
-    for flags in attempts {
-        let mut args = flags;
-        args.extend(["commit", "-S", "-m"].map(String::from));
-        args.push(message.clone());
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        stage_all(worktree_path).await?;
-        match run_signing_git(worktree_path, &args, gnupg_home, SIGNING_LIMIT).await {
-            Err(error) => {
+        Signing::Unset => {
+            stage_all(worktree_path).await?;
+            if let Err(error) = run_git(worktree_path, &["commit", "-m", &message]).await {
                 unstage(worktree_path).await?;
-                failures.push(format!("{error:#}"));
+                return Err(error);
             }
-            Ok(()) if commit_is_signed(worktree_path, "HEAD").await? => return Ok(true),
-            Ok(()) => {
-                undo_head_commit(worktree_path).await?;
-                failures.push("the commit came out without a signature".to_string());
-            }
+            return Ok(true);
         }
+        Signing::Configured => Vec::new(),
+        Signing::Loka(path) => loka_key_config(&path).into_iter().flat_map(|(name, value)| ["-c".to_string(), format!("{name}={value}")]).collect(),
+    };
+    let mut args = flags.clone();
+    args.extend(["commit", "-S", "-m"].map(String::from));
+    args.push(message);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    stage_all(worktree_path).await?;
+    let failure = match run_signing_git(worktree_path, &args, gnupg_home, SIGNING_LIMIT).await {
+        Err(error) => {
+            unstage(worktree_path).await?;
+            format!("{error:#}")
+        }
+        Ok(()) if commit_is_signed(worktree_path, "HEAD").await? => return Ok(true),
+        Ok(()) => {
+            undo_head_commit(worktree_path).await?;
+            "the commit came out without a signature".to_string()
+        }
+    };
+    let key = &git.key;
+    if key.is_empty() && flags.is_empty() {
+        bail!("{UNSIGNED_LEFTOVERS} Details: {failure}");
     }
-    if only_default_key {
-        bail!("{UNSIGNED_LEFTOVERS} Details: {}", failures.join("; "));
-    }
+    let which = if flags.is_empty() { format!("the configured signing key ({key})") } else { format!("the Loka signing key (~/{LOKA_SIGNING_KEY})") };
+    let setup = if flags.is_empty() { String::new() } else { format!("{SIGNING_SETUP} ") };
     bail!(
-        "Publish could not sign the commit for the uncommitted changes, so it did not commit them: {}",
-        failures.join("; ")
+        "Publish could not sign the commit for the uncommitted changes with {which}, so it did not commit them. Loka never signs with another key in its place. {setup}Details: {failure}"
     )
 }
 
@@ -1510,7 +1723,190 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_signs_leftovers_with_a_fallback_key_even_with_gpgsign_off() -> Result<()> {
+    async fn signing_uses_the_configured_key_else_the_loka_key_and_ignores_every_other_key() -> Result<()> {
+        let home = std::env::temp_dir().join(format!("loka-sign-home-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(home.join(".ssh")).await?;
+        for other in ["karna_signing", "signing_key_active", "id_ed25519"] {
+            ssh_key(&home.join(".ssh").join(other)).await?;
+        }
+        let path = std::env::var_os("PATH");
+        let path = path.as_deref();
+        let none = GitSigning::from_config_list("");
+        assert_eq!(signing_choice(&none, Some(&home), path), Signing::Unset);
+        assert_eq!(signing_choice(&none, None, path), Signing::Unset);
+        ssh_key(&home.join(LOKA_SIGNING_KEY)).await?;
+        assert_eq!(signing_choice(&none, Some(&home), path), Signing::Loka(home.join(".ssh/loka_signing")));
+        let explicit = GitSigning::from_config_list("user.signingkey\n/missing/key.pub\0gpg.format\nssh\0");
+        assert_eq!(signing_choice(&explicit, Some(&home), path), Signing::Configured, "an explicit key is never swapped, even a broken one");
+        assert!(explicit.problem(Some(&home), path).unwrap().contains("does not exist"));
+        let no_gpg = GitSigning::from_config_list("commit.gpgsign\ntrue\0gpg.program\n/nowhere/gpg\0");
+        assert_eq!(signing_choice(&no_gpg, Some(&home), path), Signing::Loka(home.join(".ssh/loka_signing")), "gpgsign with no gpg cannot sign, so the Loka key signs");
+        tokio::fs::remove_dir_all(&home).await?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_mac_runner_creates_the_loka_key_once_and_only_when_nothing_else_signs() -> Result<()> {
+        let home = std::env::temp_dir().join(format!("loka-key-home-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&home)?;
+        assert!(!ensure_loka_key_in(&home, true)?, "a configured signer is left alone");
+        assert!(!home.join(LOKA_SIGNING_KEY).exists());
+        assert!(ensure_loka_key_in(&home, false)?);
+        let key = home.join(LOKA_SIGNING_KEY);
+        assert!(key.is_file() && home.join(".ssh/loka_signing.pub").is_file());
+        let first = std::fs::read(&key)?;
+        assert!(!ensure_loka_key_in(&home, false)?, "an existing Loka key is never replaced");
+        assert_eq!(std::fs::read(&key)?, first);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(home.join(".ssh"))?.permissions().mode() & 0o777, 0o700);
+            assert_eq!(std::fs::metadata(&key)?.permissions().mode() & 0o077, 0, "the private key is private");
+        }
+        assert_eq!(signing_choice(&GitSigning::default(), Some(&home), std::env::var_os("PATH").as_deref()), Signing::Loka(key));
+        std::fs::remove_dir_all(&home)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_broken_loka_key_is_reported_and_never_replaced() -> Result<()> {
+        let home = std::env::temp_dir().join(format!("loka-key-home-{}", Uuid::new_v4()));
+        let ssh = home.join(".ssh");
+        std::fs::create_dir_all(&ssh)?;
+        let key = home.join(LOKA_SIGNING_KEY);
+        let public = ssh.join("loka_signing.pub");
+
+        std::fs::write(&public, "ssh-ed25519 AAAA orphan")?;
+        let error = ensure_loka_key_in(&home, false).unwrap_err().to_string();
+        assert!(error.contains("without its private key"), "{error}");
+        assert!(std::fs::symlink_metadata(&key).is_err(), "no key is created next to an orphan public key");
+        assert_eq!(std::fs::read_to_string(&public)?, "ssh-ed25519 AAAA orphan");
+        std::fs::remove_file(&public)?;
+
+        std::os::unix::fs::symlink(ssh.join("nowhere"), &public)?;
+        assert!(ensure_loka_key_in(&home, false).is_err(), "a dangling public key link counts as an orphan");
+        assert!(std::fs::symlink_metadata(&key).is_err());
+        std::fs::remove_file(&public)?;
+
+        let target = ssh.join("moved_away");
+        std::os::unix::fs::symlink(&target, &key)?;
+        let error = ensure_loka_key_in(&home, false).unwrap_err().to_string();
+        assert!(error.contains("not a key file"), "{error}");
+        assert!(!target.exists(), "ssh-keygen never follows a dangling link");
+        assert!(std::fs::symlink_metadata(&public).is_err());
+        assert_eq!(std::fs::read_link(&key)?, target);
+        std::fs::remove_file(&key)?;
+
+        let real = ssh.join("real_key");
+        std::fs::write(&real, "private")?;
+        std::os::unix::fs::symlink(&real, &key)?;
+        assert!(!ensure_loka_key_in(&home, false)?, "a link to a real key is an existing key");
+        assert_eq!(std::fs::read_to_string(&real)?, "private");
+        assert!(std::fs::symlink_metadata(&public).is_err());
+
+        std::fs::remove_dir_all(&home)?;
+        Ok(())
+    }
+
+    #[test]
+    fn git_signing_reads_the_config_list_and_finds_a_missing_signer() {
+        let git = GitSigning::from_config_list("user.name\nT\0commit.gpgsign\nyes\0gpg.format\nSSH\0gpg.ssh.program\n/opt/ssh-keygen\0user.signingkey\n~/.ssh/k.pub\0");
+        assert_eq!(git, GitSigning { key: "~/.ssh/k.pub".into(), gpgsign: true, format: "ssh".into(), program: "/opt/ssh-keygen".into() });
+        let bare = GitSigning::from_config_list("commit.gpgsign\0");
+        assert!(bare.gpgsign && bare.format == "openpgp" && bare.key.is_empty());
+        let empty_path = std::ffi::OsString::new();
+        assert!(!bare.configured(Some(&empty_path)), "gpgsign without an installed gpg cannot sign");
+        assert!(bare.problem(None, Some(&empty_path)).unwrap().contains("gpg is not installed"));
+        let ssh_only = GitSigning::from_config_list("commit.gpgsign\ntrue\0gpg.format\nssh\0");
+        assert!(!ssh_only.configured(std::env::var_os("PATH").as_deref()), "ssh signing needs a key");
+    }
+
+    fn session_command(repo: &Path, home: &Path) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("git");
+        command
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", home)
+            .env("TMPDIR", std::env::temp_dir())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .current_dir(repo);
+        command
+    }
+
+    fn session_config(command: &tokio::process::Command) -> std::collections::BTreeMap<String, String> {
+        let env: std::collections::BTreeMap<String, String> = command
+            .as_std()
+            .get_envs()
+            .filter_map(|(name, value)| Some((name.to_string_lossy().into_owned(), value?.to_string_lossy().into_owned())))
+            .collect();
+        let count = env.get("GIT_CONFIG_COUNT").and_then(|count| count.parse::<usize>().ok()).unwrap_or(0);
+        (0..count).map(|i| (env[&format!("GIT_CONFIG_KEY_{i}")].clone(), env[&format!("GIT_CONFIG_VALUE_{i}")].clone())).collect()
+    }
+
+    #[tokio::test]
+    async fn sessions_get_the_loka_key_only_when_nothing_else_is_configured() -> Result<()> {
+        let repo = test_repo().await?;
+        run_git(&repo.0, &["config", "--unset", "commit.gpgsign"]).await?;
+        let home = repo.0.join(".git/home");
+        tokio::fs::create_dir_all(home.join(".ssh")).await?;
+        ssh_key(&home.join(".ssh/karna_signing")).await?;
+
+        let mut command = session_command(&repo.0, &home);
+        assert_eq!(sign_with_loka_key(&mut command, &repo.0), Signing::Unset);
+        assert!(session_config(&command).is_empty(), "another project's key must never be picked");
+
+        ssh_key(&home.join(LOKA_SIGNING_KEY)).await?;
+        let mut command = session_command(&repo.0, &home);
+        command.env("GIT_CONFIG_COUNT", "1").env("GIT_CONFIG_KEY_0", "safe.directory").env("GIT_CONFIG_VALUE_0", "*");
+        let key = home.join(LOKA_SIGNING_KEY);
+        assert_eq!(sign_with_loka_key(&mut command, &repo.0), Signing::Loka(key.clone()));
+        let config = session_config(&command);
+        assert_eq!(config.get("safe.directory").map(String::as_str), Some("*"));
+        assert_eq!(config.get("gpg.format").map(String::as_str), Some("ssh"));
+        assert_eq!(config.get("user.signingkey"), Some(&key.display().to_string()));
+        assert_eq!(config.get("commit.gpgsign").map(String::as_str), Some("true"));
+
+        tokio::fs::write(repo.0.join("work"), "work").await?;
+        let added = session_command(&repo.0, &home).args(["add", "work"]).output().await?;
+        assert!(added.status.success());
+        command.args(["commit", "-q", "-m", "feat: session work"]);
+        let committed = command.output().await?;
+        assert!(committed.status.success(), "{}", String::from_utf8_lossy(&committed.stderr));
+        assert!(commit_is_signed(&repo.0, "HEAD").await?, "a plain git commit in the session is signed with the Loka key");
+
+        run_git(&repo.0, &["config", "user.signingkey", "/owner/key.pub"]).await?;
+        let mut command = session_command(&repo.0, &home);
+        assert_eq!(sign_with_loka_key(&mut command, &repo.0), Signing::Configured);
+        assert!(session_config(&command).is_empty(), "the owner's own key always wins");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_never_signs_with_another_key_found_in_home() -> Result<()> {
+        let repo = test_repo().await?;
+        run_git(&repo.0, &["config", "user.signingkey", ""]).await?;
+        let home = repo.0.join(".git/home");
+        tokio::fs::create_dir_all(home.join(".ssh")).await?;
+        ssh_key(&home.join(".ssh/karna_signing")).await?;
+        ssh_key(&home.join(".ssh/signing_key_active")).await?;
+        tokio::fs::write(repo.0.join("left"), "left").await?;
+        assert!(commit_isolated(&repo.0, "feat: leftovers", Some(&home)).await?);
+        assert!(!commit_is_signed(&repo.0, "HEAD").await?, "no configured key and no Loka key means unsigned, never a borrowed key");
+
+        run_git(&repo.0, &["config", "gpg.format", "ssh"]).await?;
+        run_git(&repo.0, &["config", "user.signingkey", &repo.0.join("missing-key").to_string_lossy()]).await?;
+        let before = run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?;
+        tokio::fs::write(repo.0.join("more"), "more").await?;
+        let error = commit_isolated(&repo.0, "feat: more", Some(&home)).await.unwrap_err();
+        assert!(error.to_string().contains("never signs with another key"), "{error:#}");
+        assert_eq!(run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?, before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_signs_leftovers_with_the_loka_key_even_with_gpgsign_off() -> Result<()> {
         let repo = test_repo().await?;
         run_git(&repo.0, &["config", "user.signingkey", ""]).await?;
         let home = repo.0.join("home");
@@ -1612,6 +2008,28 @@ mod tests {
         assert!(repo.0.join("sprite-stack.ts").is_file());
         let error = commit_isolated(&repo.0, "feat: leftovers", None).await.unwrap_err();
         assert!(error.to_string().contains("will not commit them unsigned"), "{error:#}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gpgsign_without_a_signer_refuses_with_the_setup_card_or_uses_the_loka_key() -> Result<()> {
+        let repo = test_repo().await?;
+        run_git(&repo.0, &["config", "user.signingkey", ""]).await?;
+        run_git(&repo.0, &["config", "commit.gpgsign", "true"]).await?;
+        run_git(&repo.0, &["config", "gpg.program", "/nowhere/gpg"]).await?;
+        let before = run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?;
+        let home = repo.0.join(".git/home");
+        tokio::fs::create_dir_all(home.join(".ssh")).await?;
+        ssh_key(&home.join(".ssh/karna_signing")).await?;
+        tokio::fs::write(repo.0.join("left"), "left").await?;
+        let error = commit_isolated(&repo.0, "feat: leftovers", Some(&home)).await.unwrap_err();
+        assert!(error.to_string().contains("setup:signing"), "{error:#}");
+        assert_eq!(run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?, before);
+        assert!(staged(&repo.0).await?.is_empty());
+
+        ssh_key(&home.join(LOKA_SIGNING_KEY)).await?;
+        assert!(commit_isolated(&repo.0, "feat: leftovers", Some(&home)).await?);
+        assert!(commit_is_signed(&repo.0, "HEAD").await?);
         Ok(())
     }
 
@@ -1753,10 +2171,9 @@ mod tests {
         assert!(error.to_string().contains("does not exist"));
     }
 
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-            std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
-        LOCK.lock().unwrap()
+    async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        LOCK.lock().await
     }
 
     struct EnvRestore(Vec<(&'static str, Option<String>)>);
@@ -1813,7 +2230,7 @@ mod tests {
 
     #[tokio::test]
     async fn startup_never_rewrites_a_global_git_identity() -> Result<()> {
-        let _guard = env_lock();
+        let _guard = env_lock().await;
         let _restore = EnvRestore::stash(&["HOME", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL"]);
         clear_git_env();
         let home = temp_path("loka-home");
@@ -1840,7 +2257,7 @@ mod tests {
 
     #[tokio::test]
     async fn repo_identity_is_left_untouched_when_present() -> Result<()> {
-        let _guard = env_lock();
+        let _guard = env_lock().await;
         let _restore = EnvRestore::stash(&["HOME", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL"]);
         clear_git_env();
         let home = temp_path("loka-home");
@@ -1867,7 +2284,7 @@ mod tests {
 
     #[tokio::test]
     async fn owner_identity_comes_from_gh_repo_level_only() -> Result<()> {
-        let _guard = env_lock();
+        let _guard = env_lock().await;
         let _restore =
             EnvRestore::stash(&["HOME", "PATH", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL"]);
         clear_git_env();
@@ -1912,7 +2329,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_owner_identity_falls_back_without_global_writes() -> Result<()> {
-        let _guard = env_lock();
+        let _guard = env_lock().await;
         let _restore =
             EnvRestore::stash(&["HOME", "PATH", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL"]);
         clear_git_env();

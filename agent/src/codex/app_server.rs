@@ -209,6 +209,7 @@ impl AppServer {
         cmd.current_dir(opts.working_dir);
         cmd.kill_on_drop(true);
         configure_child_environment(&mut cmd, &opts.child_environment())?;
+        opts.sign_commits(&mut cmd);
         let api_key_login = opts.provider_keys.contains_key("OPENAI_API_KEY");
         let chatgpt_login = super::uses_chatgpt_login(&cmd, api_key_login);
         let shielded = crate::key_proxy::shield_codex(&mut cmd, chatgpt_login);

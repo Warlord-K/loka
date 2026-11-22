@@ -21,6 +21,9 @@ mod reports_tools;
 #[path = "world/canvas_tools.rs"]
 mod canvas_tools;
 
+#[path = "world/practice_tools.rs"]
+mod practice_tools;
+
 #[path = "world/teams_tools.rs"]
 mod teams_tools;
 

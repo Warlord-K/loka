@@ -8,7 +8,7 @@ Style A is off by default. Each person turns it on under You > Appearance > New 
 
 With it off, the classic art is drawn exactly as before the redesign. `world-game.tsx` builds Hearth and regions with `world-classic.ts` and `regions-classic.ts` (verbatim copies of the pre-redesign `world.ts` and `regions.ts`: old lot sizes, lamp spots, ground colours and window light pools), the engine keeps the old zoom (`round(css * dpr)`, dpr capped at 2) and never loads the atlas, and `figureOf`/`thingOf` return nothing, so every agent and thing keeps its code-drawn art. Keep those two files untouched; a change meant for both arts goes into each.
 
-Style A agents wear no hats: `withoutHats` (`frontend/lib/looks.ts`) drops every hat accessory (`HATS`) from the look before a cast figure is built, and keeps the rest. The classic art still draws hats.
+Style A agents wear no headwear: `withoutHeadwear` (`frontend/lib/looks.ts`) drops every head accessory (`HEADWEAR`: the `HATS` plus horns, headband, bun and headphones) from the look before a cast figure is built, and keeps the rest. The look data is untouched and the classic art still draws them.
 
 Accessories without art are dropped the same way (`withArtOnly` in `frontend/lib/sprite-manifest.ts`): quest gear such as a quill or feather, and the golden quill cosmetic, leave the look before a cast figure is built, so an agent whose body has art never falls back to the classic figure. While its body or accessory sheet is still loading, an agent shows only its shadow (`figurePending`); a sheet that fails or takes longer than `LOAD_TIMEOUT_MS` falls back to the drawn figure and is tried again in the background after `retryDelay` (and at once when the switch is turned back on), keeping the drawn figure until it loads.
 
@@ -16,20 +16,21 @@ Accessories without art are dropped the same way (`withArtOnly` in `frontend/lib
 
 Measured on the current export (`python3` over `frontend/public/sprites/style-a/`, frame times from a headless Chrome harness with a pixel read each frame so the raster is included):
 
-- On disk: 1.53 MB in all. `atlas.png` 0.30 MB, 30 body sheets 0.93 MB, 16 accessory sheets 0.13 MB, `manifest.json` 0.17 MB.
-- Decoded: 50.8 MB if every sheet loaded (atlas 3.4 MB, bodies 40.1 MB, 0.7 to 2.2 MB each, accessories 7.2 MB). Sheets load only for bodies and accessories in use: a town of 12 agents with 7 bodies loads 15 sheets, 14.7 MB.
+- On disk: 1.61 MB in all. `atlas.png` 0.37 MB (0.07 MB of it the action props), 30 body sheets 0.93 MB, 16 accessory sheets 0.13 MB, `manifest.json` 0.17 MB.
+- Decoded: 51.8 MB if every sheet loaded (atlas 4.5 MB, bodies 40.1 MB, 0.7 to 2.2 MB each, accessories 7.2 MB). Sheets load only for bodies and accessories in use: a town of 12 agents with 7 bodies loads 15 sheets, 14.7 MB.
 - Per look: the cut and recoloured frames of one figure are about 0.8 MB (27 frames of 64x118 for a human), built once per look and cached.
 - Frame time, 12 agents and 4 shops, median per frame (classic, then new): 1440x900 at dpr 1, 6.7 and 6.1 ms; at dpr 2, 26.1 and 24.2 ms; at dpr 3 (capped to 2), 26.8 and 24.2 ms; a 390x844 phone at dpr 3, 6.7 and 6.5 ms. These are software raster numbers, so real GPUs are faster; the new art costs no more than the classic art.
 
 
 ## Updating the art
 
-Two exports live in the repo, outside `public/`, so they never ship as they are:
+Three exports live in the repo, outside `public/`, so they never ship as they are:
 
 - `frontend/sprites/style-a/`: Buildings, places and decorations. `manifest.json` (an `items` list: `name`, `file`, `w`, `h`, `density`, `anchor`, optional `sign`, `masks`, `points`) plus `sprites/` and `variants/`.
 - `frontend/sprites/cast/`: Characters. `manifest.json` (version 2: `bodies`, `accessories`, `size_classes`, `region_colours_in_mask`, plus `hole_check`, `proportion_template` and other notes the packer ignores) plus `bodies/` and `accessories/`.
+- `frontend/sprites/props/`: Action and activity props (work stations, trade tools, warrior slimes, job pips, status bubbles and icons, the reading book, held quest gear and cosmetics, and every particle kind: smoke, petal, heart, spark, chip, bubble, the four runes, hit, rocket and flare). `manifest.json` (an `items` list like the world export, but each item has a `frames` list, so loops such as the bubbling cauldron and the bouncing slimes are one thing with 8 frames) plus `sprites/`. All are density 4 at 1.5x the classic size, each with its own palette plus up to 3 accents and the cast's plum outline `#411334`.
 
-Full-size sources stay out of git. A manifest may name its source zip in `sources_url`, and the packed manifest keeps them as `sources.world` and `sources.cast`. To take a new export, replace its folder whole and repack:
+Full-size sources stay out of git. A manifest may name its source zip in `sources_url`, and the packed manifest keeps them as `sources.world`, `sources.cast` and `sources.props`. To take a new export, replace its folder whole and repack:
 
 ```bash
 rm -rf frontend/sprites/cast && mkdir -p frontend/sprites/cast
@@ -37,11 +38,12 @@ cp -R <export>/manifest.json <export>/bodies <export>/accessories frontend/sprit
 python3 frontend/scripts/pack-sprites.py
 ```
 
-It needs Pillow (`--world`, `--cast` and `--out` pick other folders). It writes `frontend/public/sprites/style-a/`: `atlas.png` with every thing, `cast/bodies/*.png` and `cast/accessories/*.png` (the export sheets as they are, masks left out), and `manifest.json`. Run `npm test` in `frontend/` afterwards.
+It needs Pillow (`--world`, `--cast`, `--props` and `--out` pick other folders). It writes `frontend/public/sprites/style-a/`: `atlas.png` with every thing, `cast/bodies/*.png` and `cast/accessories/*.png` (the export sheets as they are, masks left out), and `manifest.json`. Run `npm test` in `frontend/` afterwards.
 
 - Thing points come only from each item's `points` (`door`, `chimney`, `clock_face`, `flag`, `light`, `flame`, `opening`, ...), scaled by `conventions.points` (x and w by png width / `w`, y and h by png height / `h`). A rect becomes two corner points. For `clock_face` the packer measures the face, adds `clock_rim` at 0.8 of its radius and clears the painted hands inside 0.65 of it, because the engine draws the live hands.
 - Cast bodies keep their sheet, frame size, feet anchor and 8-frame walks per view. Each walk frame gets `slots` = `accessory_anchors[view]` plus `walk.offsets[view][k]`, except `hand`, which is `accessory_anchors[view].hand` plus `hand_walk_offsets[view][k]`, and `layers.hand` = `hand_walk_layers[view][k]`. Swaps come from `palette` and `palette_regions` for the regions skin, hair, shirt, pants, suit and tie, shaded by lightness against `region_defaults`.
 - Cast accessories keep every size class (44, 52, 60, 72, 88) with a rect, pivot and layer per view.
+- Props are packed as things (one rect per frame). The engine reads them by name with `propOf(key, frame)` in `sprites.ts`, never through `thingOf`, and every draw in `work.ts` (`drawStationArt`, `drawToolArt`, `drawSlimeArt`, `drawPipsArt`, `drawStatusArt`, `drawBookArt`, `drawIconArt`, `drawHeldArt`, `drawParticleArt`) returns false while the new art is off so the classic code draws instead. Accessories with a `gear_<name>` prop and no cast art (the sword and lantern quest gear, the golden quill cosmetic) are held in the figure's hands (`heldGearOf`, `heldSpots` in the engine): front view both hands, side view near hand over and far hand under the body, back view under. A warrior swinging its trade tool skips the held sword (`TOOL_GEAR`). Horns quest gear is headwear and stays hidden like hats. The smith and wizard stations carry a `glow` point, where the engine draws the classic glow and strike pulse as a light layer (never baked). Particles are drawn in white and light grey and tinted per particle colour at draw time (`tinted`, by lightness, outline kept), so one sprite serves every colour; sparks, flares and hits shade their outline in the tint colour instead, because they are light. Tools carry a `grip` point (struck frames rotate the tool a quarter turn around it); bubbles carry `tail` (the columns kept whole when the job bubble is stretched for more pips) and `centre` (where icons go).
 
 ## Scale
 
@@ -110,5 +112,7 @@ Recoloured and layered frames are built once per look and cached, never per fram
 | `swaps` | As for bodies, for unmasked colours (house walls). |
 
 Thing keys the engine looks up: `shop`, `civic_clock`, `civic_library`, `civic_forge`, `civic_post`, `civic_market`, `civic_observatory`, `banyan`, `portal_arch`, `noticeboard`, `waysign`, `lantern_post`, `campfire`, `banner`, `stake`, `tree_green`, `tree_blossom`, `tree_autumn`, `tree_pine`, `tree_pine_snow`, `bush`, `bush_flowers`, `rock`, `reeds`, `cactus`, `ice_rock`, `lamp`, `bench`, `crate`, `barrel`, `planter`, `signpost`, `palm`, `snowman`, `mossy_log`, `sandstone`, `bollard`, `boulder`.
+
+Hearth fauna and room furniture are things too. The fauna keys are `critter_duck` (frames: white, yellow, mallard), `critter_duckling`, `critter_sparrow` (stand, peck, wings up, wings down), `critter_cat` and `critter_cat_grey` (walk, asleep), `critter_koi`, `critter_peacock` and `critter_peacock_fan` (drawn behind the bird and scaled while it opens). They are density 4 like the cast, 1.5x the drawn size, and the engine picks the frame itself; walking cats and peacocks bob half an art px instead of a walk cycle. Room furniture is `room_<kind>` for every `FurnitureKind` but `mentor` (a cast figure), density 2, fitted to its tile footprint and up to 1.25x the drawn height. `room_rug` and `room_bed` carry a `tint` mask (the furniture `tint`), `room_terminal` an `led` mask (the device state colour); state glows stay engine layers. An export item may list several files in `frames`; the packer places each as one frame of the thing.
 
 Body species the engine can draw: every name in `SPECIES_OPTIONS` (`frontend/lib/looks.ts`), the same list the agent tools offer. `human` is the default, and `person` or any species Loka does not know draws a human; `businessman` (with a briefcase unless the look names its own accessories) and `kid` are human bodies with human palettes.

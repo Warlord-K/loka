@@ -311,8 +311,20 @@ test("the shipped atlas covers every building, place and decoration of the expor
     "rock", "reeds", "cactus", "ice_rock", "lamp", "bench", "crate", "barrel", "planter", "signpost",
     "palm", "snowman", "mossy_log", "sandstone", "bollard", "boulder",
   ];
-  for (const name of names) assert.equal(shipped.things[name]?.density, 2, name);
-  assert.equal(Object.keys(shipped.things).length, names.length);
+  const fauna = { critter_duck: 3, critter_duckling: 1, critter_sparrow: 4, critter_cat: 2, critter_cat_grey: 2, critter_koi: 2, critter_peacock: 1, critter_peacock_fan: 1 };
+  const rooms = [
+    "shelf", "desk", "terminal", "machine", "clock", "counter", "mailbox", "telescope", "anvil", "workbench", "bell",
+    "scale", "lamp", "chest", "plant", "rug", "bed", "hearth", "chart", "drum", "doorway",
+  ].map((kind) => `room_${kind}`);
+  for (const name of [...names, ...rooms]) assert.equal(shipped.things[name]?.density, 2, name);
+  for (const [name, frames] of Object.entries(fauna)) {
+    assert.equal(shipped.things[name]?.density, 4, name);
+    assert.equal(shipped.things[name].frames.length, frames, name);
+  }
+  const props = JSON.parse(readFileSync(new URL("../sprites/props/manifest.json", import.meta.url), "utf8"));
+  assert.equal(Object.keys(shipped.things).length, names.length + rooms.length + Object.keys(fauna).length + props.items.length);
+  assert.ok(shipped.things.room_rug.masks.tint && shipped.things.room_bed.masks.tint && shipped.things.room_terminal.masks.led);
+  assert.ok(shipped.things.room_machine.masks.led && shipped.things.room_machine.masks.tint);
   assert.ok(shipped.things.shop.masks.roof && shipped.things.shop.masks.awning);
   assert.ok(shipped.things.shop.sign && shipped.things.shop.points.chimney);
   const world = JSON.parse(readFileSync(new URL("../sprites/style-a/manifest.json", import.meta.url), "utf8"));
@@ -349,4 +361,34 @@ test("no accessory or gear sends a style A agent back to the classic figure", ()
   }
   const plain = { body: "human", accessories: ["glasses"] };
   assert.equal(withArtOnly(shipped, plain, canonical, innate), plain);
+});
+
+test("the shipped atlas carries every action and activity prop at 4x density", () => {
+  const props = JSON.parse(readFileSync(new URL("../sprites/props/manifest.json", import.meta.url), "utf8"));
+  const wanted = [
+    "station_carpenter", "station_smith", "station_alchemist", "station_wizard",
+    "tool_carpenter", "tool_smith", "tool_alchemist", "tool_wizard", "tool_warrior",
+    "slime_task", "slime_review", "slime_followup", "slime_publish",
+    "pip_task", "pip_review", "pip_followup", "pip_publish",
+    "bubble_speech", "bubble_thought", "icon_alert", "icon_error", "icon_dot_on", "icon_dot_off", "icon_star",
+    "prop_book", "gear_lantern", "gear_quill", "gear_sword",
+    "particle_smoke_s", "particle_smoke_m", "particle_smoke_l", "particle_petal", "particle_heart", "particle_spark", "particle_chip",
+    "particle_bubble_s", "particle_bubble_l", "particle_rune_0", "particle_rune_1", "particle_rune_2", "particle_rune_3",
+    "particle_hit_s", "particle_hit_m", "particle_hit_l", "particle_rocket", "particle_flare_s", "particle_flare_l",
+  ];
+  for (const name of wanted) assert.ok(props.items.some((item) => item.name === name), name);
+  for (const item of props.items) {
+    const thing = shipped.things[item.name];
+    assert.equal(thing?.density, 4, item.name);
+    assert.equal(thing.frames.length, item.frames.length, item.name);
+    assert.equal(item.hole_check.fails_left, 0, item.name);
+  }
+  assert.equal(shipped.things.station_alchemist.frames.length, 8);
+  assert.equal(shipped.things.slime_task.frames.length, 8);
+  for (const station of ["station_smith", "station_wizard"]) assert.equal(shipped.things[station].points.glow?.length, 1, station);
+  for (const tool of ["tool_carpenter", "tool_smith", "tool_alchemist", "tool_wizard", "tool_warrior", "gear_lantern", "gear_quill", "gear_sword"]) assert.equal(shipped.things[tool].points.grip?.length, 1, tool);
+  for (const bubble of ["bubble_speech", "bubble_thought"]) {
+    assert.equal(shipped.things[bubble].points.tail?.length, 2, bubble);
+    assert.equal(shipped.things[bubble].points.centre?.length, 1, bubble);
+  }
 });

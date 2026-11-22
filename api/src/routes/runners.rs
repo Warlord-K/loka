@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::{auth::UserId, AppState};
+use loka_shared::readiness::SigningNotice;
 
 type ApiError = (StatusCode, Json<Value>);
 
@@ -249,6 +250,40 @@ pub async fn heartbeat(
     Ok(Json(beat(&state, runner_id, &request).await?))
 }
 
+type ToldSigning = std::sync::Mutex<Option<std::collections::HashSet<String>>>;
+
+fn claim_signing_notice(told: &ToldSigning, key: &str) -> bool {
+    told.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get_or_insert_with(Default::default).insert(key.to_string())
+}
+
+fn settle_signing_notice(told: &ToldSigning, key: &str, outcome: &anyhow::Result<SigningNotice>) {
+    if matches!(outcome, Ok(SigningNotice::Sent | SigningNotice::AlreadySent | SigningNotice::NothingToSay)) {
+        return;
+    }
+    if let Some(told) = told.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_mut() {
+        told.remove(key);
+    }
+}
+
+fn tell_signing_problem_once(state: &AppState, view: &RunnerView) {
+    static TOLD: ToldSigning = std::sync::Mutex::new(None);
+    let Some((key, _)) = loka_shared::readiness::signing_notice(view) else {
+        return;
+    };
+    if !claim_signing_notice(&TOLD, &key) {
+        return;
+    }
+    let world = state.world.clone();
+    let view = view.clone();
+    tokio::spawn(async move {
+        let outcome = world.tell_signing_problem(&view).await;
+        if let Err(error) = &outcome {
+            tracing::warn!(%error, runner_id = %view.id, "could not tell the owner about commit signing");
+        }
+        settle_signing_notice(&TOLD, &key, &outcome);
+    });
+}
+
 async fn beat(state: &AppState, runner_id: Uuid, request: &RunnerHeartbeat) -> Result<RunnerView, ApiError> {
     if !request.capabilities.is_object() {
         return Err(problem(
@@ -275,6 +310,7 @@ async fn beat(state: &AppState, runner_id: Uuid, request: &RunnerHeartbeat) -> R
                 "Runner is revoked",
             )
         })?;
+    tell_signing_problem_once(state, &view);
     match state.runners.adopt_stranded(runner_id, None).await {
         Ok(adopted) if !adopted.is_empty() => {
             tracing::info!(%runner_id, count = adopted.len(), "Put agents with no device on this runner");
@@ -1080,4 +1116,28 @@ async fn ensure_agent_owner(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod signing_notice_tests {
+    use super::*;
+
+    #[test]
+    fn a_signing_notice_is_remembered_once_sent_and_retried_only_without_a_main_agent_or_on_errors() {
+        let told: ToldSigning = std::sync::Mutex::new(None);
+        assert!(claim_signing_notice(&told, "runner:loka"));
+        assert!(!claim_signing_notice(&told, "runner:loka"), "a notice in flight is not sent twice");
+        settle_signing_notice(&told, "runner:loka", &Ok(SigningNotice::NoMainAgent));
+        assert!(claim_signing_notice(&told, "runner:loka"), "no main agent yet, so the next heartbeat tries again");
+        settle_signing_notice(&told, "runner:loka", &Err(anyhow::anyhow!("database away")));
+        assert!(claim_signing_notice(&told, "runner:loka"), "an error is retried on the next heartbeat");
+        settle_signing_notice(&told, "runner:loka", &Ok(SigningNotice::Sent));
+        assert!(!claim_signing_notice(&told, "runner:loka"), "a sent notice is remembered");
+        assert!(claim_signing_notice(&told, "runner:unset"));
+        settle_signing_notice(&told, "runner:unset", &Ok(SigningNotice::AlreadySent));
+        assert!(!claim_signing_notice(&told, "runner:unset"), "a notice another replica or an earlier process sent is remembered");
+        assert!(claim_signing_notice(&told, "other:unset"));
+        settle_signing_notice(&told, "other:unset", &Ok(SigningNotice::NothingToSay));
+        assert!(!claim_signing_notice(&told, "other:unset"), "nothing to say is not retried every heartbeat");
+    }
 }

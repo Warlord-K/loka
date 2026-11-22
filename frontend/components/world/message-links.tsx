@@ -5,6 +5,7 @@ import { ArrowBendUpLeft, Check, LinkSimple } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
 import { dayLabel, messageTime } from "@/lib/world";
 import { scrollWithin } from "@/lib/scroll";
+import { ATTEMPT_ID } from "@/lib/practice";
 
 export type LinkedMessage = {
   ref: string;
@@ -44,8 +45,8 @@ export function messageUrl(ref: string): string {
   return `${window.location.origin}/world?msg=${ref}`;
 }
 
-export type WorldLinkKind = "quest" | "report" | "todo";
-const WORLD_LINK_KINDS: WorldLinkKind[] = ["quest", "report", "todo"];
+export type WorldLinkKind = "quest" | "report" | "todo" | "practice";
+const WORLD_LINK_KINDS: WorldLinkKind[] = ["quest", "report", "todo", "practice"];
 const WORLD_ID = /^[0-9a-fA-F][0-9a-fA-F-]{5,35}$/;
 const WORLD_ITEM = /^[A-Za-z0-9_-]{1,40}$/;
 
@@ -60,7 +61,7 @@ export function worldRefFromHref(href?: string | null): { kind: WorldLinkKind; r
     if (url.pathname.replace(/\/$/, "") !== "/world") return null;
     for (const kind of WORLD_LINK_KINDS) {
       const ref = url.searchParams.get(kind);
-      if (!ref || !WORLD_ID.test(ref)) continue;
+      if (!ref || !(kind === "practice" ? ATTEMPT_ID : WORLD_ID).test(ref)) continue;
       const item = kind === "report" ? url.searchParams.get("item") : null;
       return item && WORLD_ITEM.test(item) ? { kind, ref: ref.toLowerCase(), item } : { kind, ref: ref.toLowerCase() };
     }

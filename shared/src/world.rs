@@ -450,6 +450,12 @@ pub const REPORT_NUDGE: &str = "[report missing]\nYour last message ended withou
 
 pub const REPORT_NUDGES: i64 = 2;
 
+pub const VERDICT_NUDGE: &str = "[verdict missing]\nYour last message ended without the verdict block, so the author cannot tell whether the work passed. Commands you started in the background are stopped when your turn ends, so do not wait for them: run any check you still need in the foreground and let it finish, or leave it out and say so. Do not start the review over. Then end your final message with the verdict block in exactly this form (an HTML comment holding one JSON object):\n<!-- verdict\n{\"verdict\": \"approve\" | \"changes\", \"summary\": \"...\", \"findings\": [{\"severity\": \"high|medium|low\", \"path\": \"...\", \"issue\": \"...\"}]}\nverdict -->";
+
+pub const VERDICT_NUDGE_MARK: &str = "[verdict missing]";
+
+pub const VERDICT_NUDGES: i64 = 2;
+
 pub const APPROVAL_MODES: [&str; 3] = ["auto", "full", "read_only"];
 pub const DEFAULT_MAIN_SUBSCRIPTIONS: &[&str] = &["task.finished", "run.failed", "run.timed_out", "agent.created"];
 
@@ -2860,6 +2866,47 @@ impl WorldStore {
         Ok(Some(run_id))
     }
 
+    pub async fn nudge_for_verdict(&self, review_session_id: Uuid) -> Result<Option<Uuid>> {
+        let mut tx = self.pool.begin().await?;
+        let session = sqlx::query_as::<_, (Uuid, Option<Uuid>, Option<String>)>(
+            "SELECT agent_id, task_id, cli_session_id FROM agent_sessions WHERE id = $1 AND role = 'review' FOR UPDATE",
+        )
+        .bind(review_session_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((agent_id, task_id, Some(_))) = session else {
+            return Ok(None);
+        };
+        let (nudged, open) = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT COUNT(*) FILTER (WHERE starts_with(prompt, '[verdict missing]')),
+                    COUNT(*) FILTER (WHERE status IN ('queued', 'running'))
+             FROM session_runs WHERE session_id = $1 AND kind = 'review'",
+        )
+        .bind(review_session_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if nudged >= VERDICT_NUDGES || open > 0 {
+            return Ok(None);
+        }
+        let run_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, prompt, timeout_secs, activity)
+             VALUES ($1, $2, $3, 'review', 'queued', $4, 3600, 'Waiting for the review verdict')
+             RETURNING id",
+        )
+        .bind(review_session_id)
+        .bind(agent_id)
+        .bind(task_id)
+        .bind(VERDICT_NUDGE)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE agent_sessions SET status = 'active', updated_at = NOW() WHERE id = $1")
+            .bind(review_session_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Some(run_id))
+    }
+
     pub async fn record_run_end(
         &self,
         run_id: Uuid,
@@ -4573,6 +4620,7 @@ impl WorldStore {
              JOIN agent_sessions s ON s.id = r.session_id
              WHERE s.parent_session_id = $1 AND s.role = 'review' AND r.kind = 'review'
                AND COALESCE((s.asked_by->>'manual')::boolean, false) = false
+               AND NOT starts_with(r.prompt, '[verdict missing]')
                AND r.created_at > COALESCE(
                  (SELECT MAX(created_at) FROM session_runs WHERE session_id = $1 AND kind IN ('task', 'followup')),
                  '-infinity')",
@@ -4915,6 +4963,11 @@ impl WorldStore {
                    WHERE r.org_id = $2
                      AND ($4 OR r.visibility = 'public' OR r.owner_user_id = $3)
                      AND strpos(r.body, '/api/world/uploads/' || u.id::text) > 0
+                 )
+                 OR EXISTS (
+                   SELECT 1 FROM world_practice_attempts p JOIN world_reports r ON r.id = p.report_id
+                   WHERE p.image_upload_id = u.id AND r.org_id = $2
+                     AND ($4 OR r.visibility = 'public' OR r.owner_user_id = $3)
                  )
                )",
         )
@@ -5862,7 +5915,7 @@ mod tests {
 
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
-    use super::{parse_skill_markdown, raw_skill_url, resume_prompt, AgentUpdate, RetryRunError, TaskResume, WorldStore};
+    use super::{parse_skill_markdown, raw_skill_url, resume_prompt, AgentUpdate, RetryRunError, TaskResume, WorldStore, VERDICT_NUDGE};
     use chrono::{DateTime, Utc};
     use serde_json::Value;
     use uuid::Uuid;
@@ -7991,6 +8044,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_review_without_a_verdict_is_resumed_twice_then_left() -> anyhow::Result<()> {
+        let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let _db = steer_db().read().await;
+        let pool = PgPoolOptions::new().max_connections(2).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let agent: Uuid = sqlx::query_scalar("INSERT INTO agent_profiles (slug, name, cli, model) VALUES ($1, 'Rev', 'codex', 'gpt') RETURNING id")
+            .bind(format!("rev-{tag}"))
+            .fetch_one(&pool)
+            .await?;
+        let user: Uuid = sqlx::query_scalar("INSERT INTO users (email, name, world_role) VALUES ($1, 'Ana', 'write') RETURNING id")
+            .bind(format!("ana-{tag}@test.dev"))
+            .fetch_one(&pool)
+            .await?;
+        let task: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_tasks (user_id, title, status, assigned_agent_id) VALUES ($1, 'review me', 'done', $2) RETURNING id",
+        )
+        .bind(user)
+        .bind(agent)
+        .fetch_one(&pool)
+        .await?;
+        let parent = Uuid::new_v4();
+        insert_session(&pool, parent, agent, "task", "completed", Some(task), None, Some("author"), None, None).await?;
+
+        let fresh = Uuid::new_v4();
+        insert_session(&pool, fresh, agent, "review", "completed", Some(task), Some(parent), None, None, None).await?;
+        assert!(store.nudge_for_verdict(fresh).await?.is_none(), "a review that never started has nothing to resume");
+
+        let review = Uuid::new_v4();
+        insert_session(&pool, review, agent, "review", "completed", Some(task), Some(parent), Some("reviewer-1"), None, Some(serde_json::json!({ "manual": true }))).await?;
+        let first = insert_run(&pool, review, agent, Some(task), "review", "completed", None).await?;
+        assert_eq!(store.review_runs_since_work(parent).await?, 0, "manual reviews never count");
+        let one = store.nudge_for_verdict(review).await?.expect("first nudge");
+        assert!(store.nudge_for_verdict(review).await?.is_none(), "one resume at a time");
+        let (kind, status, prompt, session_status): (String, String, String, String) = sqlx::query_as(
+            "SELECT r.kind, r.status, r.prompt, s.status FROM session_runs r JOIN agent_sessions s ON s.id = r.session_id WHERE r.id = $1",
+        )
+        .bind(one)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!((kind.as_str(), status.as_str(), prompt.as_str(), session_status.as_str()), ("review", "queued", VERDICT_NUDGE, "active"));
+        assert_ne!(one, first);
+        sqlx::query("UPDATE session_runs SET status = 'completed', finished_at = NOW() WHERE id = $1").bind(one).execute(&pool).await?;
+        let two = store.nudge_for_verdict(review).await?.expect("second nudge");
+        sqlx::query("UPDATE session_runs SET status = 'completed', finished_at = NOW() WHERE id = $1").bind(two).execute(&pool).await?;
+        assert!(store.nudge_for_verdict(review).await?.is_none(), "after two nudges the result says there was no verdict");
+
+        let auto = Uuid::new_v4();
+        insert_session(&pool, auto, agent, "review", "completed", Some(task), Some(parent), Some("reviewer-2"), None, None).await?;
+        insert_run(&pool, auto, agent, Some(task), "review", "completed", None).await?;
+        let nudge = store.nudge_for_verdict(auto).await?.expect("auto review nudge");
+        sqlx::query("UPDATE session_runs SET status = 'completed', finished_at = NOW() WHERE id = $1").bind(nudge).execute(&pool).await?;
+        assert_eq!(store.review_runs_since_work(parent).await?, 1, "a nudge is not another review");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn report_nudges_and_task_resume_never_duplicate_work() -> anyhow::Result<()> {
         let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
             return Ok(());
@@ -8200,6 +8312,7 @@ mod tests {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn insert_session(
         pool: &sqlx::PgPool,
         id: Uuid,

@@ -59,6 +59,7 @@ pub async fn run(opts: CliOptions<'_>) -> Result<CliResult> {
 pub(crate) async fn acp_setup(opts: &CliOptions<'_>) -> Result<crate::acp::Setup> {
     let mut command = job_command("cursor-agent");
     configure_child_environment(&mut command, &opts.child_environment())?;
+    opts.sign_commits(&mut command);
     shield_commands(&mut command, opts);
     command.arg("acp");
     let mut keep: Vec<Box<dyn Send>> = Vec::new();
@@ -492,6 +493,7 @@ async fn run_inner(opts: &CliOptions<'_>, plugin_dir: Option<&Path>) -> Result<C
     cmd.current_dir(opts.working_dir);
     cmd.kill_on_drop(true);
     configure_child_environment(&mut cmd, &opts.child_environment())?;
+    opts.sign_commits(&mut cmd);
     shield_commands(&mut cmd, opts);
 
     cmd.arg("-p");

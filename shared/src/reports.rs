@@ -16,10 +16,10 @@ const KEEP_REVISIONS: i64 = 100;
 const MERGE_SECS: i64 = 300;
 const QUIET_CHARS: usize = 600;
 const VISIBLE: &str = "(r.org_id = $9 AND (r.owner_user_id = $1 OR r.visibility = 'public'))";
-const BRIEF_COLUMNS: &str = "r.id, r.owner_user_id, r.author_agent_id, r.author_user_id, r.title, r.slug, r.tags, r.folder, r.pinned,
+pub(crate) const BRIEF_COLUMNS: &str = "r.id, r.owner_user_id, r.author_agent_id, r.author_user_id, r.title, r.slug, r.tags, r.folder, r.pinned,
   r.visibility, r.revision, r.task_id, r.created_at, r.updated_at, left(r.body, 280) AS excerpt, octet_length(r.body) AS size, r.kind,
   (SELECT COUNT(*) FROM world_canvas_marks m WHERE m.report_id = r.id AND m.status = 'open') AS open_marks,
-  CASE WHEN r.kind = 'canvas' AND jsonb_typeof(r.canvas->'items') = 'array' THEN jsonb_array_length(r.canvas->'items') ELSE 0 END AS item_count";
+  CASE WHEN r.kind = 'canvas' AND jsonb_typeof(r.canvas->'items') = 'array' THEN jsonb_array_length(r.canvas->'items') ELSE 0 END AS item_count, r.practice";
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct Report {
@@ -45,6 +45,8 @@ pub struct Report {
     pub kind: String,
     #[sqlx(default)]
     pub canvas: Option<serde_json::Value>,
+    #[sqlx(default)]
+    pub practice: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize)]
@@ -68,6 +70,7 @@ pub struct ReportBrief {
     pub kind: String,
     pub open_marks: i64,
     pub item_count: i32,
+    pub practice: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize)]
@@ -150,6 +153,7 @@ pub struct ReportFilter {
     pub folder: Option<String>,
     pub tag: Option<String>,
     pub limit: Option<i64>,
+    pub practice: Option<bool>,
 }
 
 pub fn can_read(report: &Report, viewer: Uuid, role: Role, org: Uuid) -> bool {
@@ -414,10 +418,10 @@ impl WorldStore {
     }
 
     pub async fn create_report(&self, new: NewReport) -> Result<Report> {
-        self.insert_report(new, None).await
+        self.insert_report(new, None, None).await
     }
 
-    pub(crate) async fn insert_report(&self, new: NewReport, canvas: Option<&crate::canvas::Canvas>) -> Result<Report> {
+    pub(crate) async fn insert_report(&self, new: NewReport, canvas: Option<&crate::canvas::Canvas>, practice: Option<&serde_json::Value>) -> Result<Report> {
         let title = clean_title(&new.title)?;
         check_body(&new.body)?;
         let folder = clean_folder(new.folder.as_deref().unwrap_or(""))?;
@@ -444,8 +448,8 @@ impl WorldStore {
         let links = self.resolve_report_links(new.owner_user_id, org, &new.body, None).await?;
         let mut tx = self.pool().begin().await?;
         let report = sqlx::query_as::<_, Report>(
-            "INSERT INTO world_reports (owner_user_id, author_agent_id, author_user_id, title, slug, body, tags, folder, pinned, visibility, links, task_id, org_id, kind, canvas)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CASE WHEN $14::jsonb IS NULL THEN 'doc' ELSE 'canvas' END, $14) RETURNING *",
+            "INSERT INTO world_reports (owner_user_id, author_agent_id, author_user_id, title, slug, body, tags, folder, pinned, visibility, links, task_id, org_id, kind, canvas, practice)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CASE WHEN $14::jsonb IS NULL THEN 'doc' ELSE 'canvas' END, $14, $15) RETURNING *",
         )
         .bind(new.owner_user_id)
         .bind(new.by.agent())
@@ -461,6 +465,7 @@ impl WorldStore {
         .bind(new.task_id)
         .bind(org)
         .bind(&canvas)
+        .bind(practice)
         .fetch_one(&mut *tx)
         .await?;
         sqlx::query(
@@ -563,6 +568,7 @@ impl WorldStore {
                AND ($2::text IS NULL OR r.title ILIKE $2 OR r.body ILIKE $2 OR array_to_string(r.tags, ' ') ILIKE $2)
                AND ($3::text IS NULL OR r.folder = $3 OR r.folder LIKE $3 || '/%' OR $3 = '')
                AND ($4::text IS NULL OR $4 = ANY(r.tags))
+               AND ($7::bool IS NULL OR (r.practice IS NOT NULL) = $7)
              ORDER BY ($2::text IS NOT NULL AND r.title ILIKE $2) DESC, r.pinned DESC, r.updated_at DESC
              LIMIT $5",
             visible = VISIBLE.replace("$9", "$6"),
@@ -573,6 +579,7 @@ impl WorldStore {
         .bind(tag)
         .bind(filter.limit.unwrap_or(300).clamp(1, 1000))
         .bind(org)
+        .bind(filter.practice)
         .fetch_all(self.pool())
         .await?)
     }

@@ -1,11 +1,11 @@
-import type { LokaLook } from "./types";
+import type { LokaLook, Trade } from "./types";
 import { makePeacock } from "./art";
 import { buildSheet, type CharacterSheet, type Dir } from "./characters";
-import type { Room } from "./interior";
+import type { Room, RoomGlow } from "./interior";
 import { context, ellipse, makeCanvas } from "./pixels";
-import { figureOf, figurePending, newArtOn, placeArt, type Placed } from "./sprites";
+import { figureOf, figurePending, heldGearOf, newArtOn, placeArt, rememberThing, thingKey, thingOf, type Placed, type ThingImage } from "./sprites";
 import { T, type Activity, type Light, type Npc, type Place, type Spot, type World, type WorldObject } from "./world";
-import { drawPips, drawRune, drawSlime, drawStation, drawTool, slimeAt, stationAt, STRIKE_PERIOD, tempo, WORK_LIGHT } from "./work";
+import { drawBookArt, drawHeldArt, drawIconArt, drawParticleArt, drawPips, drawPipsArt, drawRune, drawSlime, drawSlimeArt, drawStation, drawStationArt, drawStatusArt, drawTool, drawToolArt, slimeArtAt, slimeAt, stationAt, STRIKE_PERIOD, tempo, WORK_LIGHT } from "./work";
 import { TEXT_SCALE_EVENT } from "@/lib/text-scale";
 import { MAX_DPR, placed, snapScale, walkFrame } from "@/lib/sprite-manifest";
 
@@ -183,6 +183,32 @@ const IDLE_FPS = 6;
 const SHADOW_RX = 0.42;
 const SHADOW_RY = 0.07;
 const ART_SHADOW = "rgba(38,24,34,0.22)";
+const ART_INK = "#411334";
+const ART_PAPER = "#fef9e5";
+const TOOL_REACH = 3;
+const TOOL_LIFT = 2;
+const BOOK_LIFT = 3;
+const HAND_REACH = 0.2;
+const STEADY_GLOW = 0.5;
+const TOOL_GEAR: Partial<Record<Trade, string>> = { warrior: "sword" };
+const HAND_LIFT = 0.3;
+const SLIME_PIPS_ABOVE = 22;
+
+function critterArt(key: string): object {
+  const ref = {};
+  rememberThing(ref, key);
+  return ref;
+}
+
+const DUCK = critterArt("critter_duck");
+const DUCKLING = critterArt("critter_duckling");
+const DUCK_FRAME: Record<string, number> = { "#f6f1e7": 0, "#e8b64a": 1, "#8a6a4a": 2 };
+const SPARROW = critterArt("critter_sparrow");
+const CAT = critterArt("critter_cat");
+const CAT_GREY = critterArt("critter_cat_grey");
+const KOI = critterArt("critter_koi");
+const PEACOCK = critterArt("critter_peacock");
+const PEACOCK_FAN = critterArt("critter_peacock_fan");
 
 function drift(d: { x: number; y: number }, vx0: number, vy0: number, vw: number, vh: number, draw: (x: number, y: number) => void): void {
   const bx = d.x * DRIFT_CELL;
@@ -1013,7 +1039,7 @@ export class LokaEngine {
       if (r() < 0.6)
         this.particles.push({ x: st.x - 5 + r() * 8, y: st.y - 13, vx: (r() - 0.5) * 4, vy: -6 - r() * 4, life: 0, max: 1.6, size: 1, kind: "rune", color: r() < 0.5 ? "#9fdcff" : "#c39bff", glyph: Math.floor(r() * 4) });
     } else {
-      const s = slimeAt(st.x, st.y, 0, this.t);
+      const s = newArtOn() ? slimeArtAt(st.x, st.y, 0) : slimeAt(st.x, st.y, 0, this.t);
       this.particles.push({ x: s.x, y: s.y - 4, vx: 0, vy: 0, life: 0, max: 0.22, size: 1, kind: "hit", color: "#ffffff" });
       for (let i = 0; i < 3; i++)
         this.particles.push({ x: s.x, y: s.y - 4, vx: (r() - 0.5) * 40, vy: -10 - r() * 20, life: 0, max: 0.4, size: 1, kind: "spark", color: npc.jobs[0] === "review" ? "#6bc7e8" : "#9bf08b" });
@@ -1845,22 +1871,25 @@ export class LokaEngine {
       list.push({
         y: npc.y,
         draw: () => {
-          this.drawCharacter(sheet, npc.dir, step, npc.x, npc.y);
-          if (busy) drawTool(ctx, trade, npc.x, hands, struck, this.t);
+          this.drawCharacter(sheet, npc.dir, step, npc.x, npc.y, busy ? TOOL_GEAR[trade] : undefined);
+          if (busy && !drawToolArt(ctx, trade, npc.x - TOOL_REACH, hands - TOOL_LIFT, struck)) drawTool(ctx, trade, npc.x, hands, struck, this.t);
           if (reading) this.drawBook(npc.x, hands);
         },
       });
       if (!atWork) continue;
       const st = stationAt(npc.homeX, npc.homeY);
+      const t = this.opts.reducedMotion ? 0 : this.t;
+      const art = newArtOn();
       if (trade === "warrior") {
         npc.jobs.slice(0, 3).forEach((kind, i) => {
-          const s = slimeAt(st.x, st.y, i, this.opts.reducedMotion ? 0 : this.t);
+          const s = art ? slimeArtAt(st.x, st.y, i) : slimeAt(st.x, st.y, i, t);
           const flash = i === 0 && struck ? 1 : 0;
-          list.push({ y: s.y, draw: () => drawSlime(ctx, kind, s.x, s.y, this.opts.reducedMotion ? 0 : this.t, i, flash) });
+          list.push({ y: s.y, draw: () => drawSlimeArt(ctx, kind, s.x, s.y, t, i, flash) || drawSlime(ctx, kind, s.x, s.y, t, i, flash) });
         });
       } else {
         const glow = struck ? 1 : 0.5 + Math.sin(this.t * 2 + npc.phase) * 0.3;
-        list.push({ y: st.y - 1, draw: () => drawStation(ctx, trade, st.x, st.y, this.t, glow) });
+        const steady = this.opts.reducedMotion ? STEADY_GLOW : glow;
+        list.push({ y: st.y - 1, draw: () => drawStationArt(ctx, trade, st.x, st.y, t, steady) || drawStation(ctx, trade, st.x, st.y, this.t, glow) });
       }
     }
     for (const c of this.world.critters) {
@@ -1926,17 +1955,39 @@ export class LokaEngine {
     ctx.setTransform(P, 0, 0, P, this.offX, this.offY);
     ctx.drawImage(room.ground, 0, 0);
     const pl = this.player;
-    const list: { y: number; draw: () => void }[] = room.objects.map((o) => ({
-      y: o.y,
-      draw: () => ctx.drawImage(o.sprite.img, Math.round(o.x - o.sprite.ax), Math.round(o.y + 1 - o.sprite.ay)),
-    }));
+    const rugs = room.objects.filter((o) => thingKey(o.sprite) === "room_rug");
+    for (const o of rugs) {
+      const art = this.artOf(o, false);
+      if (art) ctx.drawImage(art.art.img, art.x, o.y, art.w, art.h);
+      else ctx.drawImage(o.sprite.img, Math.round(o.x - o.sprite.ax), o.y);
+    }
+    const onFloor = room.glows.filter((glow) => glow.source && glow.floor !== undefined && thingOf(glow.source, 0));
+    this.drawRoomGlows(onFloor.map((glow) => ({ ...glow, y: glow.floor ?? glow.y })));
+    const list: { y: number; draw: () => void }[] = room.objects.filter((o) => !rugs.includes(o)).map((o) => {
+      const art = this.artOf(o, false);
+      if (!art) return { y: o.y, draw: () => ctx.drawImage(o.sprite.img, Math.round(o.x - o.sprite.ax), Math.round(o.y + 1 - o.sprite.ay)) };
+      return {
+        y: o.y,
+        draw: () => {
+          const ground = art.at([art.art.ax, art.art.ay]);
+          ellipse(ctx, ground.x, ground.y + 1, art.w * SHADOW_RX, art.w * SHADOW_RY, ART_SHADOW);
+          ctx.drawImage(art.art.img, art.x, art.y + 1, art.w, art.h);
+        },
+      };
+    });
     list.push({ y: pl.y, draw: () => this.drawCharacter(this.playerSheet, pl.dir, pl.moving ? pl.anim : null, pl.x, pl.y) });
     list.sort((a, b) => a.y - b.y);
     for (const d of list) d.draw();
     this.drawMarker();
+    this.drawRoomGlows(room.glows.filter((glow) => !onFloor.includes(glow)));
+    this.drawPrompt();
+  }
+
+  private drawRoomGlows(glows: RoomGlow[]): void {
+    const { ctx, P } = this;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.globalCompositeOperation = "lighter";
-    for (const glow of room.glows) {
+    for (const glow of glows) {
       const sx = glow.x * P + this.offX;
       const sy = glow.y * P + this.offY;
       const pulse = glow.pulse && !this.opts.reducedMotion ? 0.75 + Math.sin(this.t * 4 + glow.x) * 0.25 : 1;
@@ -1950,7 +2001,6 @@ export class LokaEngine {
     }
     ctx.globalCompositeOperation = "source-over";
     ctx.setTransform(P, 0, 0, P, this.offX, this.offY);
-    this.drawPrompt();
   }
 
   private drawFade(): void {
@@ -2108,7 +2158,18 @@ export class LokaEngine {
     return figure ? Math.max(0, figure.height - CODE_HEIGHT) : 0;
   }
 
-  private drawCharacter(sheet: CharacterSheet, dir: Dir, step: number | null, x: number, y: number): void {
+  private heldSpots(gear: string[], dir: Dir, height: number, x: number, y: number): { gear: string; x: number; y: number; under: boolean }[] {
+    const reach = height * HAND_REACH;
+    const hand = y - height * HAND_LIFT;
+    const ahead = dir === "left" ? -1 : 1;
+    const spots =
+      dir === "down" ? [{ x: x + reach, under: false }, { x: x - reach, under: false }]
+      : dir === "up" ? [{ x: x - reach, under: true }, { x: x + reach, under: true }]
+      : [{ x: x + ahead, under: false }, { x: x - ahead * 3, under: true }];
+    return gear.slice(0, spots.length).map((g, i) => ({ gear: g, x: spots[i].x, y: hand, under: spots[i].under }));
+  }
+
+  private drawCharacter(sheet: CharacterSheet, dir: Dir, step: number | null, x: number, y: number, inTool?: string): void {
     const ctx = this.ctx;
     const figure = figureOf(sheet);
     if (figure) {
@@ -2120,6 +2181,8 @@ export class LokaEngine {
       ctx.drawImage(this.shadow, Math.round(x - 6 * grow), Math.round(y - 2), Math.round(12 * grow), 4);
       const w = img.width / figure.density;
       const h = img.height / figure.density;
+      const held = this.heldSpots(heldGearOf(sheet).filter((g) => g !== inTool), dir, figure.height, x, y);
+      for (const g of held) if (g.under) drawHeldArt(ctx, g.gear, g.x, g.y);
       if (pose.flip) {
         ctx.save();
         ctx.translate(px + w, py);
@@ -2127,6 +2190,7 @@ export class LokaEngine {
         ctx.drawImage(img, 0, 0, w, h);
         ctx.restore();
       } else ctx.drawImage(img, px, py, w, h);
+      for (const g of held) if (!g.under) drawHeldArt(ctx, g.gear, g.x, g.y);
       return;
     }
     ctx.drawImage(this.shadow, Math.round(x - 6), Math.round(y - 2));
@@ -2155,6 +2219,10 @@ export class LokaEngine {
       ctx.fillStyle = "rgba(210,240,250,0.55)";
       ctx.fillRect(-7, 1, 3, 1);
       ctx.fillRect(-10, 2, 2, 1);
+      if (this.drawArt(d.small ? DUCKLING : DUCK, DUCK_FRAME[d.color] ?? 0, 0, 1)) {
+        ctx.restore();
+        continue;
+      }
       if (d.small) {
         ctx.fillStyle = d.color;
         ctx.fillRect(-2, -2, 4, 2);
@@ -2179,6 +2247,27 @@ export class LokaEngine {
     }
   }
 
+  private drawArt(ref: object, frame: number, x: number, y: number, flip = false, scale = 1, centre = false): ThingImage | null {
+    const art = thingOf(ref, frame);
+    if (!art) return null;
+    const d = art.density;
+    const w = (art.img.width / d) * scale;
+    const h = (art.img.height / d) * scale;
+    const left = Math.round((x - (art.ax / d) * scale) * d) / d;
+    const top = Math.round((centre ? y - h / 2 : y - (art.ay / d) * scale) * d) / d;
+    const ctx = this.ctx;
+    if (!flip) {
+      ctx.drawImage(art.img, left, top, w, h);
+      return art;
+    }
+    ctx.save();
+    ctx.translate(2 * x, 0);
+    ctx.scale(-1, 1);
+    ctx.drawImage(art.img, left, top, w, h);
+    ctx.restore();
+    return art;
+  }
+
   private drawPeacock(): void {
     const ctx = this.ctx;
     const p = this.peacock;
@@ -2187,6 +2276,13 @@ export class LokaEngine {
     ctx.translate(Math.round(p.x), Math.round(p.y));
     if (p.facing < 0) ctx.scale(-1, 1);
     ctx.drawImage(this.shadow, -6, -2);
+    const step = this.t < p.pauseUntil ? 0 : Math.floor(this.t * 6) % 2;
+    if (thingOf(PEACOCK, 0)) {
+      if (p.open > 0.05) this.drawArt(PEACOCK_FAN, 0, -9, -8, false, p.open);
+      this.drawArt(PEACOCK, 0, 0, -step / 2);
+      ctx.restore();
+      return;
+    }
     if (p.open > 0.05) {
       const fw = Math.max(2, Math.round(s.fan.width * p.open));
       const fh = Math.max(2, Math.round(s.fan.height * p.open));
@@ -2200,6 +2296,7 @@ export class LokaEngine {
 
   private drawBook(x: number, y: number): void {
     const ctx = this.ctx;
+    if (drawBookArt(ctx, x, y - BOOK_LIFT)) return;
     const bx = Math.round(x) - 4;
     const by = Math.round(y) - 10;
     ctx.fillStyle = "#7a3b2e";
@@ -2219,6 +2316,7 @@ export class LokaEngine {
     const x = Math.round(f.x + f.dir * 12 * k);
     const y = Math.round(f.y - Math.sin(Math.PI * k) * 11);
     const ctx = this.ctx;
+    if (this.drawArt(KOI, k < 0.5 ? 0 : 1, x, y, f.dir > 0, 1, true)) return;
     ctx.fillStyle = "#e88a4a";
     ctx.fillRect(x - 2, y - 1, 4, 2);
     ctx.fillStyle = "#f6d0a8";
@@ -2235,6 +2333,7 @@ export class LokaEngine {
       const y = Math.round(b.y);
       if (flying) {
         const up = Math.floor(this.t * 12 + b.phase) % 2 === 0;
+        if (this.drawArt(SPARROW, up ? 2 : 3, x, y, false, 1, true)) continue;
         ctx.fillStyle = "#3b3240";
         ctx.fillRect(x, y, 1, 1);
         ctx.fillRect(x - 2, up ? y - 1 : y + 1, 2, 1);
@@ -2244,6 +2343,7 @@ export class LokaEngine {
       const peck = !this.opts.reducedMotion && Math.sin(this.t * 2.3 + b.phase) > 0.75 ? 1 : 0;
       ctx.fillStyle = "rgba(20,24,20,0.2)";
       ctx.fillRect(x - 1, y + 1, 4, 1);
+      if (this.drawArt(SPARROW, peck, x + 1, y + 1)) continue;
       ctx.fillStyle = "#7a5a44";
       ctx.fillRect(x - 1, y - 2, 3, 2);
       ctx.fillStyle = "#5a4032";
@@ -2260,6 +2360,11 @@ export class LokaEngine {
     if (c.facing < 0) ctx.scale(-1, 1);
     ctx.fillStyle = "rgba(20,24,20,0.22)";
     ctx.fillRect(-4, -1, 9, 2);
+    const bob = c.target && !c.sleeping ? (Math.floor(c.anim) % 2) / 2 : 0;
+    if (this.drawArt(c.coat === "#8a8f99" ? CAT_GREY : CAT, c.sleeping ? 1 : 0, 0, 1 - bob)) {
+      ctx.restore();
+      return;
+    }
     if (c.sleeping) {
       ctx.fillStyle = c.coat;
       ctx.fillRect(-4, -4, 8, 4);
@@ -2379,6 +2484,8 @@ export class LokaEngine {
   private drawSays(): void {
     const { ctx, P } = this;
     let any = false;
+    const ink = newArtOn() ? ART_INK : "#261822";
+    const paper = newArtOn() ? ART_PAPER : "#fbf3e0";
     const speakers: { x: number; y: number; say: { text: string } }[] = [];
     for (const npc of this.world.npcs) if (npc.say && this.focusKey !== `r:${npc.resident.id}`) speakers.push({ x: npc.x, y: npc.y - this.liftOf(npc.sheet), say: npc.say });
     for (const c of this.world.critters) if (c.say && this.focusKey !== `f:${c.id}`) speakers.push({ x: c.x, y: c.y - this.liftOf(c.sheet), say: c.say });
@@ -2398,11 +2505,11 @@ export class LokaEngine {
       const top = Math.round((npc.y - 36) * P + this.offY - h);
       if (cx < -w || cx > this.w + w || top < -h * 2 || top > this.h) continue;
       const left = Math.round(cx - w / 2);
-      ctx.fillStyle = "#261822";
+      ctx.fillStyle = ink;
       ctx.beginPath();
       ctx.roundRect(left - P / 2, top - P / 2, w + P, h + P, h * 0.3);
       ctx.fill();
-      ctx.fillStyle = "#fbf3e0";
+      ctx.fillStyle = paper;
       ctx.beginPath();
       ctx.roundRect(left, top, w, h, h * 0.28);
       ctx.fill();
@@ -2411,7 +2518,7 @@ export class LokaEngine {
       ctx.lineTo(cx + P * 1.5, top + h);
       ctx.lineTo(cx, top + h + P * 1.6);
       ctx.fill();
-      ctx.fillStyle = "#261822";
+      ctx.fillStyle = ink;
       ctx.fillText(npc.say.text, cx, top + h / 2 + 1);
     }
     if (any) ctx.setTransform(P, 0, 0, P, this.offX, this.offY);
@@ -2419,6 +2526,7 @@ export class LokaEngine {
 
   private drawStaffBadge(x: number, y: number): void {
     const ctx = this.ctx;
+    if (drawIconArt(ctx, "star", x + 6.5, y - 20.5)) return;
     const bx = Math.round(x + 4);
     const by = Math.round(y - 23);
     ctx.fillStyle = "#1d1b2a";
@@ -2447,6 +2555,7 @@ export class LokaEngine {
     const nightTone = this.timeValue > 1.2;
     for (const p of this.particles) {
       const k = p.life / p.max;
+      if (this.drawParticleArt(p, k, nightTone)) continue;
       if (p.kind === "smoke") {
         const a = (p.color === "busy" ? 0.7 : 0.55) * (1 - k);
         ctx.fillStyle = nightTone ? `rgba(150,150,170,${a * 0.75})` : p.color === "busy" ? `rgba(225,222,230,${a})` : `rgba(240,240,245,${a})`;
@@ -2514,6 +2623,40 @@ export class LokaEngine {
         ctx.fillRect(x, y + 2, 1, 1);
         ctx.globalAlpha = 1;
       }
+    }
+  }
+
+  private drawParticleArt(p: Particle, k: number, nightTone: boolean): boolean {
+    const ctx = this.ctx;
+    const fade = Math.max(0, 1 - k);
+    const flicker = Math.max(0, 1 - k * k);
+    switch (p.kind) {
+      case "smoke": {
+        const size = p.size < 3 ? "smoke_s" : p.size < 4.5 ? "smoke_m" : "smoke_l";
+        const tone = nightTone ? "#9696aa" : p.color === "busy" ? "#e1dee6" : "#f0f0f5";
+        return drawParticleArt(ctx, size, p.x, p.y, tone, (p.color === "busy" ? 0.7 : 0.55) * fade * (nightTone ? 0.75 : 1));
+      }
+      case "spark":
+        return drawParticleArt(ctx, "spark", p.x + 0.5, p.y + 0.5, p.color, flicker);
+      case "chip":
+        return drawParticleArt(ctx, "chip", p.x + 0.5, p.y + 0.5, p.color, 1, Math.floor(this.t * 10 + p.max * 9) % 2 === 1);
+      case "bubble":
+        if (k > 0.85) return drawParticleArt(ctx, "flare_s", p.x + 0.5, p.y + 0.5, p.color);
+        return drawParticleArt(ctx, p.size > 1 ? "bubble_l" : "bubble_s", p.x + 0.5, p.y + 0.5, p.color, 0.85);
+      case "rune":
+        return drawParticleArt(ctx, `rune_${(p.glyph ?? 0) % 4}`, p.x + 1.5, p.y + 1.5, p.color, Math.max(0, Math.min(1, k * 4, (1 - k) * 2)));
+      case "hit": {
+        const r = 1 + Math.round(k * 3);
+        return drawParticleArt(ctx, r <= 1 ? "hit_s" : r <= 3 ? "hit_m" : "hit_l", p.x + 0.5, p.y + 0.5, p.color, fade);
+      }
+      case "rocket":
+        return drawParticleArt(ctx, "rocket", p.x + 0.5, p.y + 2, "#fff2c4");
+      case "flare":
+        return drawParticleArt(ctx, k < 0.3 ? "flare_l" : "flare_s", p.x + 0.5, p.y + 0.5, p.color, flicker);
+      case "petal":
+        return drawParticleArt(ctx, "petal", p.x + 1, p.y + 0.5, p.color, 1, Math.floor(this.t * 4 + p.max) % 2 === 1);
+      case "heart":
+        return drawParticleArt(ctx, "heart", p.x + 0.5, p.y + 0.5, p.color, fade);
     }
   }
 
@@ -2659,10 +2802,14 @@ export class LokaEngine {
     const ctx = this.ctx;
     for (const npc of this.world.npcs) {
       const lift = this.liftOf(npc.sheet);
-      if (this.reading(npc)) drawPips(ctx, npc.jobs, npc.x, npc.y - 27 - lift, this.opts.reducedMotion ? 0 : this.t);
+      const t = this.opts.reducedMotion ? 0 : this.t;
+      const pips = (x: number, y: number) => drawPipsArt(ctx, npc.jobs, x, y + 6, t) || drawPips(ctx, npc.jobs, x, y, t);
+      if (this.reading(npc)) pips(npc.x, npc.y - 27 - lift);
       else if (npc.mode === "working" && npc.activity === "work" && npc.jobs.length) {
         const st = stationAt(npc.homeX, npc.homeY);
-        drawPips(ctx, npc.jobs, npc.resident.trade === "warrior" ? st.x - 2 : st.x, st.y - (npc.resident.trade === "warrior" ? 16 : 26), this.opts.reducedMotion ? 0 : this.t);
+        const warrior = npc.resident.trade === "warrior";
+        const above = warrior ? (newArtOn() ? SLIME_PIPS_ABOVE : 16) : 26;
+        pips(warrior ? st.x - 2 : st.x, st.y - above);
       }
       if (npc.moving) continue;
       if (this.focusKey === `r:${npc.resident.id}`) continue;
@@ -2672,6 +2819,7 @@ export class LokaEngine {
       const w = kind === "dots" ? 13 : 9;
       const x = Math.round(npc.x - w / 2);
       const y = Math.round(npc.y - 34 - lift + bob);
+      if (drawStatusArt(ctx, kind, npc.x, y + 12, this.t)) continue;
       ctx.fillStyle = "#261822";
       ctx.fillRect(x, y, w, 10);
       ctx.fillStyle = "#fbf3e0";
@@ -2709,7 +2857,7 @@ export class LokaEngine {
     const label = this.labelOf(f);
     const thing = f.kind === "thing" ? this.room?.things.find((x) => x.id === f.id) : null;
     const wearer = f.kind === "resident" ? this.npcById.get(f.id)?.sheet : f.kind === "folk" ? this.world.critters.find((c) => c.id === f.id)?.sheet : undefined;
-    const lift = thing ? thing.lift + 6 : f.kind === "place" ? 40 : f.kind === "board" ? 38 : f.kind === "peacock" ? 26 : f.kind === "plot" ? 34 : 30 + (wearer ? this.liftOf(wearer) : 0);
+    const lift = thing ? thing.lift + 6 : f.kind === "place" ? 40 : f.kind === "board" ? 38 : f.kind === "peacock" ? (thingOf(PEACOCK, 0) ? 32 : 26) : f.kind === "plot" ? 34 : 30 + (wearer ? this.liftOf(wearer) : 0);
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     const size = Math.max(13, P * 4);
     ctx.font = this.font(size);

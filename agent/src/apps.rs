@@ -87,7 +87,7 @@ Your owner allowed quests on this Mac to use its apps, but you must ask before t
 call the `ask_to_use_apps` tool with one line on what you want to do and why. Their answer reaches you as a message.
 Until they allow it, every command below is refused. If they say not now, finish without apps.
 
-Always run it with this exact prefix, written out in full every time:
+Always run it with this exact prefix, written out in full every time, as a command on its own (no pipe, `&&`, `;` or `cd`, or the sandbox keeps it from working):
 
 `{launcher}`
 
@@ -176,6 +176,11 @@ fn run(args: &[String]) -> Result<i32, String> {
     use std::io::Write;
     let _ = std::io::stdout().write_all(&output.stdout);
     let _ = std::io::stderr().write_all(&output.stderr);
+    if !output.status.success() {
+        if let Some(note) = crate::browser::sandbox_note(&String::from_utf8_lossy(&output.stderr)) {
+            eprintln!("apps: {note}");
+        }
+    }
     Ok(output.status.code().unwrap_or(1))
 }
 

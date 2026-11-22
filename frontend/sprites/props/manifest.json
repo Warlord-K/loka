@@ -1,0 +1,1115 @@
+{
+ "version": 1,
+ "style": "Loka style A action and activity props: 4x density at 1.5x size, own palette per sprite plus up to 3 accents, plum outline #411334",
+ "pipeline": "fal-ai/nano-banana-pro/edit sheets (Style A agent refs first), loops from minimax/h3-max-turbo/image-to-video on #FF00FF, border flood fill key, 8x8 area shrink with outline ink, hole check per frame",
+ "sources_bytes": 41638986,
+ "items": [
+  {
+   "name": "station_carpenter",
+   "w": 71,
+   "h": 60,
+   "density": 4,
+   "anchor": {
+    "x": 35,
+    "y": 60
+   },
+   "frames": [
+    "sprites/station_carpenter.png"
+   ],
+   "bytes": 3172,
+   "ram_bytes": 17040,
+   "colours": 16,
+   "hole_check": {
+    "holes_found": 1,
+    "gaps_kept": 1,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "station_smith",
+   "w": 48,
+   "h": 62,
+   "density": 4,
+   "anchor": {
+    "x": 24,
+    "y": 62
+   },
+   "points": {
+    "glow": [
+     20,
+     24
+    ]
+   },
+   "frames": [
+    "sprites/station_smith.png"
+   ],
+   "bytes": 1546,
+   "ram_bytes": 11904,
+   "colours": 16,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "station_alchemist",
+   "w": 58,
+   "h": 79,
+   "density": 4,
+   "anchor": {
+    "x": 29,
+    "y": 79
+   },
+   "frames": [
+    "sprites/station_alchemist_0.png",
+    "sprites/station_alchemist_1.png",
+    "sprites/station_alchemist_2.png",
+    "sprites/station_alchemist_3.png",
+    "sprites/station_alchemist_4.png",
+    "sprites/station_alchemist_5.png",
+    "sprites/station_alchemist_6.png",
+    "sprites/station_alchemist_7.png"
+   ],
+   "bytes": 18455,
+   "ram_bytes": 146624,
+   "colours": 24,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "station_wizard",
+   "w": 54,
+   "h": 66,
+   "density": 4,
+   "anchor": {
+    "x": 27,
+    "y": 66
+   },
+   "points": {
+    "glow": [
+     35,
+     10
+    ]
+   },
+   "frames": [
+    "sprites/station_wizard.png"
+   ],
+   "bytes": 2465,
+   "ram_bytes": 14256,
+   "colours": 20,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "tool_carpenter",
+   "w": 26,
+   "h": 44,
+   "density": 4,
+   "anchor": {
+    "x": 12,
+    "y": 38
+   },
+   "points": {
+    "grip": [
+     12,
+     38
+    ]
+   },
+   "frames": [
+    "sprites/tool_carpenter.png"
+   ],
+   "bytes": 661,
+   "ram_bytes": 4576,
+   "colours": 13,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "tool_smith",
+   "w": 25,
+   "h": 46,
+   "density": 4,
+   "anchor": {
+    "x": 12,
+    "y": 40
+   },
+   "points": {
+    "grip": [
+     12,
+     40
+    ]
+   },
+   "frames": [
+    "sprites/tool_smith.png"
+   ],
+   "bytes": 657,
+   "ram_bytes": 4600,
+   "colours": 11,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "tool_alchemist",
+   "w": 14,
+   "h": 48,
+   "density": 4,
+   "anchor": {
+    "x": 6,
+    "y": 42
+   },
+   "points": {
+    "grip": [
+     6,
+     42
+    ]
+   },
+   "frames": [
+    "sprites/tool_alchemist.png"
+   ],
+   "bytes": 663,
+   "ram_bytes": 2688,
+   "colours": 9,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "tool_wizard",
+   "w": 35,
+   "h": 40,
+   "density": 4,
+   "anchor": {
+    "x": 4,
+    "y": 35
+   },
+   "points": {
+    "grip": [
+     4,
+     35
+    ]
+   },
+   "frames": [
+    "sprites/tool_wizard.png"
+   ],
+   "bytes": 807,
+   "ram_bytes": 5600,
+   "colours": 10,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "tool_warrior",
+   "w": 18,
+   "h": 48,
+   "density": 4,
+   "anchor": {
+    "x": 8,
+    "y": 42
+   },
+   "points": {
+    "grip": [
+     8,
+     42
+    ]
+   },
+   "frames": [
+    "sprites/tool_warrior.png"
+   ],
+   "bytes": 616,
+   "ram_bytes": 3456,
+   "colours": 11,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "gear_lantern",
+   "w": 15,
+   "h": 30,
+   "density": 4,
+   "anchor": {
+    "x": 7,
+    "y": 30
+   },
+   "points": {
+    "grip": [
+     7,
+     1
+    ]
+   },
+   "frames": [
+    "sprites/gear_lantern.png"
+   ],
+   "bytes": 790,
+   "ram_bytes": 1800,
+   "colours": 12,
+   "hole_check": {
+    "holes_found": 3,
+    "gaps_kept": 3,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "prop_book",
+   "w": 40,
+   "h": 28,
+   "density": 4,
+   "anchor": {
+    "x": 20,
+    "y": 28
+   },
+   "frames": [
+    "sprites/prop_book.png"
+   ],
+   "bytes": 946,
+   "ram_bytes": 4480,
+   "colours": 13,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "gear_quill",
+   "w": 18,
+   "h": 30,
+   "density": 4,
+   "anchor": {
+    "x": 1,
+    "y": 26
+   },
+   "points": {
+    "grip": [
+     1,
+     26
+    ]
+   },
+   "frames": [
+    "sprites/gear_quill.png"
+   ],
+   "bytes": 595,
+   "ram_bytes": 2160,
+   "colours": 9,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "gear_sword",
+   "w": 15,
+   "h": 40,
+   "density": 4,
+   "anchor": {
+    "x": 7,
+    "y": 35
+   },
+   "points": {
+    "grip": [
+     7,
+     35
+    ]
+   },
+   "frames": [
+    "sprites/gear_sword.png"
+   ],
+   "bytes": 537,
+   "ram_bytes": 2400,
+   "colours": 11,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "bubble_speech",
+   "w": 44,
+   "h": 38,
+   "density": 4,
+   "anchor": {
+    "x": 22,
+    "y": 38
+   },
+   "points": {
+    "tail": [
+     17,
+     32,
+     10,
+     6
+    ],
+    "centre": [
+     22,
+     16
+    ]
+   },
+   "frames": [
+    "sprites/bubble_speech.png"
+   ],
+   "bytes": 410,
+   "ram_bytes": 6688,
+   "colours": 4,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "bubble_thought",
+   "w": 40,
+   "h": 44,
+   "density": 4,
+   "anchor": {
+    "x": 19,
+    "y": 44
+   },
+   "points": {
+    "tail": [
+     15,
+     35,
+     10,
+     9
+    ],
+    "centre": [
+     20,
+     19
+    ]
+   },
+   "frames": [
+    "sprites/bubble_thought.png"
+   ],
+   "bytes": 664,
+   "ram_bytes": 7040,
+   "colours": 4,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "icon_alert",
+   "w": 7,
+   "h": 22,
+   "density": 4,
+   "anchor": {
+    "x": 3,
+    "y": 11
+   },
+   "frames": [
+    "sprites/icon_alert.png"
+   ],
+   "bytes": 247,
+   "ram_bytes": 616,
+   "colours": 5,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "icon_error",
+   "w": 19,
+   "h": 20,
+   "density": 4,
+   "anchor": {
+    "x": 9,
+    "y": 10
+   },
+   "frames": [
+    "sprites/icon_error.png"
+   ],
+   "bytes": 508,
+   "ram_bytes": 1520,
+   "colours": 7,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "icon_dot_off",
+   "w": 8,
+   "h": 8,
+   "density": 4,
+   "anchor": {
+    "x": 4,
+    "y": 4
+   },
+   "frames": [
+    "sprites/icon_dot_off.png"
+   ],
+   "bytes": 188,
+   "ram_bytes": 256,
+   "colours": 5,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "icon_dot_on",
+   "w": 8,
+   "h": 8,
+   "density": 4,
+   "anchor": {
+    "x": 4,
+    "y": 4
+   },
+   "frames": [
+    "sprites/icon_dot_on.png"
+   ],
+   "bytes": 162,
+   "ram_bytes": 256,
+   "colours": 3,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "icon_star",
+   "w": 24,
+   "h": 24,
+   "density": 4,
+   "anchor": {
+    "x": 12,
+    "y": 12
+   },
+   "frames": [
+    "sprites/icon_star.png"
+   ],
+   "bytes": 458,
+   "ram_bytes": 2304,
+   "colours": 5,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "pip_task",
+   "w": 10,
+   "h": 12,
+   "density": 4,
+   "anchor": {
+    "x": 5,
+    "y": 6
+   },
+   "frames": [
+    "sprites/pip_task.png"
+   ],
+   "bytes": 210,
+   "ram_bytes": 480,
+   "colours": 6,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "pip_review",
+   "w": 10,
+   "h": 12,
+   "density": 4,
+   "anchor": {
+    "x": 5,
+    "y": 6
+   },
+   "frames": [
+    "sprites/pip_review.png"
+   ],
+   "bytes": 230,
+   "ram_bytes": 480,
+   "colours": 5,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "pip_followup",
+   "w": 10,
+   "h": 12,
+   "density": 4,
+   "anchor": {
+    "x": 5,
+    "y": 6
+   },
+   "frames": [
+    "sprites/pip_followup.png"
+   ],
+   "bytes": 223,
+   "ram_bytes": 480,
+   "colours": 5,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "pip_publish",
+   "w": 10,
+   "h": 12,
+   "density": 4,
+   "anchor": {
+    "x": 5,
+    "y": 6
+   },
+   "frames": [
+    "sprites/pip_publish.png"
+   ],
+   "bytes": 231,
+   "ram_bytes": 480,
+   "colours": 5,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   },
+   "recoloured_from": "pip_review"
+  },
+  {
+   "name": "particle_smoke_s",
+   "w": 10,
+   "h": 10,
+   "density": 4,
+   "anchor": {
+    "x": 5,
+    "y": 5
+   },
+   "frames": [
+    "sprites/particle_smoke_s.png"
+   ],
+   "bytes": 261,
+   "ram_bytes": 400,
+   "colours": 4,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "particle_smoke_m",
+   "w": 16,
+   "h": 16,
+   "density": 4,
+   "anchor": {
+    "x": 8,
+    "y": 8
+   },
+   "frames": [
+    "sprites/particle_smoke_m.png"
+   ],
+   "bytes": 365,
+   "ram_bytes": 1024,
+   "colours": 4,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "particle_smoke_l",
+   "w": 22,
+   "h": 22,
+   "density": 4,
+   "anchor": {
+    "x": 11,
+    "y": 11
+   },
+   "frames": [
+    "sprites/particle_smoke_l.png"
+   ],
+   "bytes": 436,
+   "ram_bytes": 1936,
+   "colours": 4,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "particle_petal",
+   "w": 10,
+   "h": 10,
+   "density": 4,
+   "anchor": {
+    "x": 5,
+    "y": 5
+   },
+   "frames": [
+    "sprites/particle_petal.png"
+   ],
+   "bytes": 199,
+   "ram_bytes": 400,
+   "colours": 4,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "particle_heart",
+   "w": 18,
+   "h": 16,
+   "density": 4,
+   "anchor": {
+    "x": 9,
+    "y": 8
+   },
+   "frames": [
+    "sprites/particle_heart.png"
+   ],
+   "bytes": 326,
+   "ram_bytes": 1152,
+   "colours": 5,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "particle_spark",
+   "w": 10,
+   "h": 10,
+   "density": 4,
+   "anchor": {
+    "x": 5,
+    "y": 5
+   },
+   "frames": [
+    "sprites/particle_spark.png"
+   ],
+   "bytes": 169,
+   "ram_bytes": 400,
+   "colours": 2,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "particle_chip",
+   "w": 9,
+   "h": 9,
+   "density": 4,
+   "anchor": {
+    "x": 4,
+    "y": 4
+   },
+   "frames": [
+    "sprites/particle_chip.png"
+   ],
+   "bytes": 214,
+   "ram_bytes": 324,
+   "colours": 3,
+   "hole_check": {
+    "holes_found": 1,
+    "gaps_kept": 1,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "particle_bubble_s",
+   "w": 9,
+   "h": 9,
+   "density": 4,
+   "anchor": {
+    "x": 4,
+    "y": 4
+   },
+   "frames": [
+    "sprites/particle_bubble_s.png"
+   ],
+   "bytes": 230,
+   "ram_bytes": 324,
+   "colours": 4,
+   "hole_check": {
+    "holes_found": 1,
+    "gaps_kept": 1,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "particle_bubble_l",
+   "w": 13,
+   "h": 13,
+   "density": 4,
+   "anchor": {
+    "x": 6,
+    "y": 6
+   },
+   "frames": [
+    "sprites/particle_bubble_l.png"
+   ],
+   "bytes": 297,
+   "ram_bytes": 676,
+   "colours": 4,
+   "hole_check": {
+    "holes_found": 1,
+    "gaps_kept": 1,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "particle_rune_0",
+   "w": 13,
+   "h": 13,
+   "density": 4,
+   "anchor": {
+    "x": 6,
+    "y": 6
+   },
+   "frames": [
+    "sprites/particle_rune_0.png"
+   ],
+   "bytes": 190,
+   "ram_bytes": 676,
+   "colours": 2,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "particle_rune_1",
+   "w": 13,
+   "h": 13,
+   "density": 4,
+   "anchor": {
+    "x": 6,
+    "y": 6
+   },
+   "frames": [
+    "sprites/particle_rune_1.png"
+   ],
+   "bytes": 267,
+   "ram_bytes": 676,
+   "colours": 3,
+   "hole_check": {
+    "holes_found": 4,
+    "gaps_kept": 4,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "particle_rune_2",
+   "w": 13,
+   "h": 13,
+   "density": 4,
+   "anchor": {
+    "x": 6,
+    "y": 6
+   },
+   "frames": [
+    "sprites/particle_rune_2.png"
+   ],
+   "bytes": 235,
+   "ram_bytes": 676,
+   "colours": 3,
+   "hole_check": {
+    "holes_found": 1,
+    "gaps_kept": 1,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "particle_rune_3",
+   "w": 13,
+   "h": 15,
+   "density": 4,
+   "anchor": {
+    "x": 6,
+    "y": 7
+   },
+   "frames": [
+    "sprites/particle_rune_3.png"
+   ],
+   "bytes": 213,
+   "ram_bytes": 780,
+   "colours": 3,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "particle_hit_s",
+   "w": 12,
+   "h": 12,
+   "density": 4,
+   "anchor": {
+    "x": 6,
+    "y": 6
+   },
+   "frames": [
+    "sprites/particle_hit_s.png"
+   ],
+   "bytes": 259,
+   "ram_bytes": 576,
+   "colours": 4,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "particle_hit_m",
+   "w": 18,
+   "h": 18,
+   "density": 4,
+   "anchor": {
+    "x": 9,
+    "y": 9
+   },
+   "frames": [
+    "sprites/particle_hit_m.png"
+   ],
+   "bytes": 247,
+   "ram_bytes": 1296,
+   "colours": 3,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "particle_hit_l",
+   "w": 26,
+   "h": 26,
+   "density": 4,
+   "anchor": {
+    "x": 13,
+    "y": 13
+   },
+   "frames": [
+    "sprites/particle_hit_l.png"
+   ],
+   "bytes": 308,
+   "ram_bytes": 2704,
+   "colours": 3,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "particle_rocket",
+   "w": 8,
+   "h": 16,
+   "density": 4,
+   "anchor": {
+    "x": 4,
+    "y": 8
+   },
+   "frames": [
+    "sprites/particle_rocket.png"
+   ],
+   "bytes": 266,
+   "ram_bytes": 512,
+   "colours": 4,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "particle_flare_s",
+   "w": 6,
+   "h": 6,
+   "density": 4,
+   "anchor": {
+    "x": 3,
+    "y": 3
+   },
+   "frames": [
+    "sprites/particle_flare_s.png"
+   ],
+   "bytes": 131,
+   "ram_bytes": 144,
+   "colours": 2,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "particle_flare_l",
+   "w": 10,
+   "h": 10,
+   "density": 4,
+   "anchor": {
+    "x": 5,
+    "y": 5
+   },
+   "frames": [
+    "sprites/particle_flare_l.png"
+   ],
+   "bytes": 188,
+   "ram_bytes": 400,
+   "colours": 3,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "slime_task",
+   "w": 69,
+   "h": 50,
+   "density": 4,
+   "anchor": {
+    "x": 34,
+    "y": 50
+   },
+   "frames": [
+    "sprites/slime_task_0.png",
+    "sprites/slime_task_1.png",
+    "sprites/slime_task_2.png",
+    "sprites/slime_task_3.png",
+    "sprites/slime_task_4.png",
+    "sprites/slime_task_5.png",
+    "sprites/slime_task_6.png",
+    "sprites/slime_task_7.png"
+   ],
+   "bytes": 15023,
+   "ram_bytes": 110400,
+   "colours": 24,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "slime_review",
+   "w": 71,
+   "h": 57,
+   "density": 4,
+   "anchor": {
+    "x": 35,
+    "y": 57
+   },
+   "frames": [
+    "sprites/slime_review_0.png",
+    "sprites/slime_review_1.png",
+    "sprites/slime_review_2.png",
+    "sprites/slime_review_3.png",
+    "sprites/slime_review_4.png",
+    "sprites/slime_review_5.png",
+    "sprites/slime_review_6.png",
+    "sprites/slime_review_7.png"
+   ],
+   "bytes": 16066,
+   "ram_bytes": 129504,
+   "colours": 24,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "slime_followup",
+   "w": 68,
+   "h": 60,
+   "density": 4,
+   "anchor": {
+    "x": 34,
+    "y": 60
+   },
+   "frames": [
+    "sprites/slime_followup_0.png",
+    "sprites/slime_followup_1.png",
+    "sprites/slime_followup_2.png",
+    "sprites/slime_followup_3.png",
+    "sprites/slime_followup_4.png",
+    "sprites/slime_followup_5.png",
+    "sprites/slime_followup_6.png",
+    "sprites/slime_followup_7.png"
+   ],
+   "bytes": 16998,
+   "ram_bytes": 130560,
+   "colours": 24,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  },
+  {
+   "name": "slime_publish",
+   "w": 73,
+   "h": 54,
+   "density": 4,
+   "anchor": {
+    "x": 36,
+    "y": 54
+   },
+   "frames": [
+    "sprites/slime_publish_0.png",
+    "sprites/slime_publish_1.png",
+    "sprites/slime_publish_2.png",
+    "sprites/slime_publish_3.png",
+    "sprites/slime_publish_4.png",
+    "sprites/slime_publish_5.png",
+    "sprites/slime_publish_6.png",
+    "sprites/slime_publish_7.png"
+   ],
+   "bytes": 13604,
+   "ram_bytes": 126144,
+   "colours": 24,
+   "hole_check": {
+    "holes_found": 0,
+    "gaps_kept": 0,
+    "fails_left": 0
+   }
+  }
+ ]
+}

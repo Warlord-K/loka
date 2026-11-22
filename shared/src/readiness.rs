@@ -5,6 +5,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::runners::{RunnerStore, RunnerView};
+use crate::world::{emit_in, NewEvent, WorldStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -448,6 +449,190 @@ fn coding_clis(s: &Signals) -> Feature {
     setup(KEY, LABEL, reason, step, Some(Action::Devices)).fixed_by(fix)
 }
 
+pub const SIGNING_COMMAND: &str = "ssh-keygen -q -t ed25519 -N '' -C loka-signing -f ~/.ssh/loka_signing && (gh ssh-key add ~/.ssh/loka_signing.pub --type signing --title 'Loka signing key' || (gh auth refresh -h github.com -s admin:ssh_signing_key && gh ssh-key add ~/.ssh/loka_signing.pub --type signing --title 'Loka signing key'))";
+
+fn signing_problem(runner: &RunnerView) -> Option<String> {
+    let view = runner.capabilities.get("signing").filter(|view| view.is_object())?;
+    match view.get("source").and_then(Value::as_str) {
+        Some("loka") => None,
+        Some("configured") => view.get("problem").and_then(Value::as_str).map(str::to_string),
+        _ if view.get("requires").and_then(Value::as_bool) == Some(true) => Some("commit.gpgsign is on but nothing can sign".to_string()),
+        _ => Some("no commit signing key".to_string()),
+    }
+}
+
+fn signing_ready(device: &RunnerView) -> Feature {
+    const KEY: &str = "signing";
+    const LABEL: &str = "Commit signing";
+    let view = &device.capabilities["signing"];
+    if view.get("source").and_then(Value::as_str) == Some("configured") {
+        return ready(KEY, LABEL, format!("Quests on {} sign with the signing key set in your git config.", device.name));
+    }
+    let fingerprint = view.get("fingerprint").and_then(Value::as_str).map(|f| format!(" ({f})")).unwrap_or_default();
+    let public = if view.get("public").and_then(Value::as_bool) == Some(false) {
+        " Its public half is missing: recreate it with ssh-keygen -y -f ~/.ssh/loka_signing > ~/.ssh/loka_signing.pub."
+    } else {
+        ""
+    };
+    ready(
+        KEY,
+        LABEL,
+        format!(
+            "Quests on {} sign with the Loka key ~/.ssh/loka_signing{fingerprint}. Add ~/.ssh/loka_signing.pub to GitHub as a Signing key so their commits show Verified.{public}",
+            device.name
+        ),
+    )
+}
+
+fn signing(s: &Signals) -> Feature {
+    const KEY: &str = "signing";
+    const LABEL: &str = "Commit signing";
+    let reporting: Vec<&RunnerView> = s.own.iter().filter(|r| r.capabilities.get("signing").is_some_and(Value::is_object)).collect();
+    let macs: Vec<&RunnerView> = reporting.iter().copied().filter(|r| desktop(r)).collect();
+    let devices = if macs.is_empty() { reporting } else { macs };
+    let Some(first) = first_online(&devices).or(devices.first().copied()) else {
+        return unavailable(KEY, LABEL, "No device reports how it signs quest commits yet.");
+    };
+    let broken: Vec<(&RunnerView, String)> = devices.iter().filter_map(|r| signing_problem(r).map(|problem| (*r, problem))).collect();
+    if broken.is_empty() {
+        return signing_ready(first);
+    }
+    let reason = format!(
+        "{}. Quest commits there go out unsigned or fail to publish, and Loka never borrows another key from ~/.ssh.",
+        broken.iter().map(|(r, problem)| format!("{}: {problem}", r.name)).collect::<Vec<_>>().join("; ")
+    );
+    let unset: Vec<&RunnerView> = broken
+        .iter()
+        .filter(|(r, _)| r.capabilities["signing"].get("source").and_then(Value::as_str) != Some("configured"))
+        .map(|(r, _)| *r)
+        .collect();
+    let separate_users: Vec<&str> = broken
+        .iter()
+        .filter(|(r, _)| r.capabilities["signing"].get("job_uids").and_then(Value::as_bool) == Some(true))
+        .map(|(r, _)| r.name.as_str())
+        .collect();
+    if separate_users.len() == broken.len() {
+        return unavailable(
+            KEY,
+            LABEL,
+            format!(
+                "Quests on {} run as separate users with a fresh home each time, so Loka cannot sign their commits there yet and they go out unsigned.",
+                separate_users.join(", ")
+            ),
+        );
+    }
+    if unset.is_empty() {
+        return setup(
+            KEY,
+            LABEL,
+            reason,
+            "Fix user.signingkey and gpg.format in your git config, or remove them so Loka signs with its own key.",
+            Some(Action::Devices),
+        );
+    }
+    let target = first_online(&unset).or(unset.first().copied());
+    setup(
+        KEY,
+        LABEL,
+        reason,
+        format!("Create the Loka signing key on {} and add its public key to GitHub as a Signing key.", target.map(|r| r.name.as_str()).unwrap_or("that device")),
+        Some(Action::Devices),
+    )
+    .fixed_by(command(SIGNING_COMMAND, target.filter(|r| online(r)), true))
+}
+
+pub fn signing_notice(runner: &RunnerView) -> Option<(String, String)> {
+    if !desktop(runner) {
+        return None;
+    }
+    let view = runner.capabilities.get("signing").filter(|view| view.is_object())?;
+    let source = view.get("source").and_then(Value::as_str)?;
+    let key = format!("{}:{source}", runner.id);
+    if source == "loka" {
+        let fingerprint = view.get("fingerprint").and_then(Value::as_str).map(|f| format!(" ({f})")).unwrap_or_default();
+        return Some((
+            key,
+            format!(
+                "Quest commits on {} are signed with the Loka key ~/.ssh/loka_signing{fingerprint}, never another key from ~/.ssh. If you have not yet, add its public key to GitHub as a Signing key once so they show Verified (if gh asks for the admin:ssh_signing_key scope, run gh auth refresh -h github.com -s admin:ssh_signing_key in a terminal first):\n\n```bash\n{LOKA_KEY_UPLOAD}\n```",
+                runner.name
+            ),
+        ));
+    }
+    let problem = signing_problem(runner)?;
+    let fix = if source == "configured" {
+        "Fix user.signingkey in your git config, or remove it so Loka signs with its own key."
+    } else {
+        "Create the Loka signing key and add it to GitHub as a Signing key:\n\nsetup:signing"
+    };
+    Some((
+        key,
+        format!(
+            "Quest commits on {} cannot be signed ({problem}), so they go out unsigned or fail to publish, and I never borrow another key from ~/.ssh. {fix}",
+            runner.name
+        ),
+    ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigningNotice {
+    Sent,
+    AlreadySent,
+    NoMainAgent,
+    NothingToSay,
+}
+
+pub const LOKA_KEY_UPLOAD: &str = "gh ssh-key add ~/.ssh/loka_signing.pub --type signing --title 'Loka signing key'";
+
+impl WorldStore {
+    pub async fn tell_signing_problem(&self, runner: &RunnerView) -> Result<SigningNotice> {
+        let Some((key, body)) = signing_notice(runner) else {
+            return Ok(SigningNotice::NothingToSay);
+        };
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('signing_notice:' || $1, 0))")
+            .bind(runner.id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        let Some((agent_id, name, slug)) = sqlx::query_as::<_, (Uuid, String, String)>(
+            "SELECT a.id, a.name, a.slug FROM users u JOIN agent_profiles a ON a.id = u.main_agent_id WHERE u.id = $1",
+        )
+        .bind(runner.owner_user_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            return Ok(SigningNotice::NoMainAgent);
+        };
+        let Some(message_id) = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agent_messages (agent_id, author_kind, body, meta)
+             SELECT $1, 'agent', $3, jsonb_build_object('signing_notice', $2::text)
+              WHERE NOT EXISTS (SELECT 1 FROM agent_messages WHERE agent_id = $1 AND meta->>'signing_notice' = $2::text)
+             RETURNING id",
+        )
+        .bind(agent_id)
+        .bind(&key)
+        .bind(&body)
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            return Ok(SigningNotice::AlreadySent);
+        };
+        emit_in(
+            &mut tx,
+            &NewEvent::new("message.created").agent(agent_id).payload(serde_json::json!({
+                "message_id": message_id,
+                "author": name,
+                "author_kind": "agent",
+                "author_slug": slug,
+                "body": body,
+            })),
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(SigningNotice::Sent)
+    }
+}
+
 fn live_voice(s: &Signals) -> Feature {
     const KEY: &str = "live_voice";
     const LABEL: &str = "Live voice";
@@ -487,6 +672,7 @@ pub fn evaluate(signals: &Signals) -> Readiness {
         features: vec![
             devices(signals),
             coding_clis(signals),
+            signing(signals),
             terminal(signals),
             browser(signals),
             screen(signals),
@@ -639,6 +825,103 @@ mod tests {
         let r = evaluate(&Signals { own: vec![mac], ..Signals::default() });
         assert!(r.features.iter().find(|f| f.key == "clis").is_some_and(|f| f.state == State::NeedsSetup && f.fix.is_none()));
         assert_eq!(state(&evaluate(&Signals::default()), "clis"), State::Unavailable);
+    }
+
+    #[test]
+    fn signing_follows_the_key_the_device_reports() {
+        let fix = |r: &Readiness| r.features.iter().find(|f| f.key == "signing").and_then(|f| f.fix.clone());
+        assert_eq!(state(&evaluate(&Signals::default()), "signing"), State::Unavailable);
+        let unset = runner("Studio", "macos", "online", json!({ "signing": { "source": "unset" } }));
+        let id = unset.id;
+        let r = evaluate(&Signals { own: vec![unset], ..Default::default() });
+        assert_eq!(state(&r, "signing"), State::NeedsSetup);
+        assert_eq!(fix(&r), Some(Fix::Command { command: SIGNING_COMMAND.into(), runner_id: id, runner: "Studio".into(), interactive: true }));
+        assert!(SIGNING_COMMAND.contains("~/.ssh/loka_signing") && !SIGNING_COMMAND.contains("karna"));
+        let loka = runner("Studio", "macos", "online", json!({ "signing": { "source": "loka", "public": true, "fingerprint": "SHA256:abc" } }));
+        let r = evaluate(&Signals { own: vec![loka], ..Default::default() });
+        assert_eq!(state(&r, "signing"), State::Ready);
+        assert!(find(&r, "signing").unwrap().reason.contains("SHA256:abc"));
+        let configured = runner("Studio", "macos", "offline", json!({ "signing": { "source": "configured" } }));
+        assert_eq!(state(&evaluate(&Signals { own: vec![configured], ..Default::default() }), "signing"), State::Ready);
+        let broken = runner("Studio", "macos", "online", json!({ "signing": { "source": "configured", "problem": "gpg is not installed, so git cannot sign with the configured key" } }));
+        let r = evaluate(&Signals { own: vec![broken], ..Default::default() });
+        assert_eq!(state(&r, "signing"), State::NeedsSetup, "a configured signer that cannot sign is not ready");
+        assert!(find(&r, "signing").unwrap().fix.is_none(), "the Loka key never replaces an explicit key, so no create command");
+    }
+
+    #[tokio::test]
+    async fn a_mac_that_cannot_sign_tells_the_owner_once_in_chat() -> Result<()> {
+        let Ok(url) = std::env::var("READINESS_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email, world_role) VALUES ($1, 'write') RETURNING id")
+            .bind(format!("signing-{tag}@test.dev"))
+            .fetch_one(&pool)
+            .await?;
+        let mut mac = runner("Air", "macos", "online", json!({ "signing": { "source": "unset" } }));
+        mac.owner_user_id = owner;
+        assert_eq!(store.tell_signing_problem(&mac).await?, SigningNotice::NoMainAgent, "nobody to speak without a main agent");
+        let main: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id) VALUES ($1, 'Mira', 'claude', 'haiku', $2) RETURNING id",
+        )
+        .bind(format!("mira-{tag}"))
+        .bind(owner)
+        .fetch_one(&pool)
+        .await?;
+        sqlx::query("UPDATE users SET main_agent_id = $2 WHERE id = $1").bind(owner).bind(main).execute(&pool).await?;
+        assert_eq!(store.tell_signing_problem(&mac).await?, SigningNotice::Sent);
+        assert_eq!(store.tell_signing_problem(&mac).await?, SigningNotice::AlreadySent, "once per Mac");
+        let body: String = sqlx::query_scalar("SELECT body FROM agent_messages WHERE agent_id = $1 AND meta->>'signing_notice' LIKE '%:unset'")
+            .bind(main)
+            .fetch_one(&pool)
+            .await?;
+        assert!(body.contains("Air") && body.ends_with("setup:signing"), "{body}");
+        let bell: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_notifications WHERE user_id = $1 AND kind = 'message'")
+            .bind(owner)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(bell, 1, "the owner sees it in the bell");
+        let mut made = mac.clone();
+        made.capabilities = json!({ "signing": { "source": "loka", "fingerprint": "SHA256:xyz" } });
+        assert_eq!(store.tell_signing_problem(&made).await?, SigningNotice::Sent, "a Mac that now has the Loka key gets the upload step once");
+        assert_eq!(store.tell_signing_problem(&made).await?, SigningNotice::AlreadySent);
+        let mut fine = mac.clone();
+        fine.id = Uuid::new_v4();
+        fine.capabilities = json!({ "signing": { "source": "configured" } });
+        assert_eq!(store.tell_signing_problem(&fine).await?, SigningNotice::NothingToSay);
+        Ok(())
+    }
+
+    #[test]
+    fn signing_lists_every_mac_without_a_key_and_explains_cloud_runners() {
+        let ready_mac = runner("Studio", "macos", "online", json!({ "signing": { "source": "loka", "public": true } }));
+        let bare_mac = runner("Air", "macos", "online", json!({ "signing": { "source": "unset" } }));
+        let cloud = runner("Cloud", "linux", "online", json!({ "signing": { "source": "unset", "job_uids": true } }));
+        let air = bare_mac.id;
+        let r = evaluate(&Signals { own: vec![cloud.clone(), ready_mac.clone(), bare_mac], ..Default::default() });
+        let feature = find(&r, "signing").unwrap();
+        assert_eq!(feature.state, State::NeedsSetup);
+        assert!(feature.reason.contains("Air: no commit signing key") && !feature.reason.contains("Cloud"), "{}", feature.reason);
+        assert!(matches!(&feature.fix, Some(Fix::Command { runner_id, .. }) if *runner_id == air), "the command runs on the Mac without a key");
+        let r = evaluate(&Signals { own: vec![cloud.clone(), ready_mac], ..Default::default() });
+        assert_eq!(state(&r, "signing"), State::Ready, "Macs win over cloud runners");
+        let r = evaluate(&Signals { own: vec![cloud.clone()], ..Default::default() });
+        let feature = find(&r, "signing").unwrap();
+        assert!(feature.fix.is_none() && feature.reason.contains("separate users"), "a key in ~/.ssh is never seen by job users, so no setting is offered");
+        let r = evaluate(&Signals { own: vec![cloud.clone()], ..Default::default() });
+        assert_eq!(state(&r, "signing"), State::Unavailable);
+        assert!(signing_notice(&cloud).is_none(), "only Macs get the chat notice");
+        let lone = runner("Air", "macos", "online", json!({ "signing": { "source": "unset" } }));
+        let (key, body) = signing_notice(&lone).unwrap();
+        assert!(body.ends_with("setup:signing") && key.ends_with(":unset"));
+        let made = runner("Air", "macos", "online", json!({ "signing": { "source": "loka", "fingerprint": "SHA256:xyz" } }));
+        let (key, body) = signing_notice(&made).unwrap();
+        assert!(key.ends_with(":loka") && body.contains("SHA256:xyz") && body.contains(LOKA_KEY_UPLOAD), "{body}");
+        let own = runner("Air", "macos", "online", json!({ "signing": { "source": "configured" } }));
+        assert!(signing_notice(&own).is_none(), "a working key of the owner needs no word");
     }
 
 }

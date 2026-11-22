@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { CallTurns, RESERVATION_MS } from "./call-turns.ts";
+import { CallTurns, CallUtterances, RESERVATION_MS, ReplyWait, joinSegments } from "./call-turns.ts";
 
 test("each turn is saved once, in order", () => {
   const turns = new CallTurns();
@@ -101,4 +101,111 @@ test("releasing a filled turn keeps it", () => {
   turns.set("user", "u-6", "Thanks");
   turns.release("u-6");
   assert.deepEqual(turns.transcript().map((l) => l.text), ["Thanks"]);
+});
+
+test("pauses in one utterance never save a prefix, only the whole thing once", () => {
+  const turns = new CallTurns();
+  const said = new CallUtterances(turns);
+  turns.reserve("user", "u-i1", 1000);
+  said.hear("i1", "Okay and");
+  said.hear("i1", "Okay and one");
+  assert.deepEqual(turns.unsaved(1100), [], "nothing is saved while the person is still talking");
+  turns.reserve("user", "u-i2", 1200);
+  said.hear("i2", "more thing,");
+  said.hear("i2", "more thing, check the build");
+  turns.release("u-i2");
+  turns.set("agent", "a-1", "Sure, checking", true);
+  assert.deepEqual(turns.unsaved(1300), [], "the answer waits behind the open question");
+  assert.equal(turns.holding(), true);
+  assert.deepEqual(said.close(), { key: "u-i1", text: "Okay and one more thing, check the build", open: false });
+  const lines = turns.unsaved(1400);
+  assert.deepEqual(
+    lines.map((l) => [l.role, l.key, l.text]),
+    [
+      ["user", "u-i1", "Okay and one more thing, check the build"],
+      ["agent", "a-1", "Sure, checking"],
+    ],
+  );
+  turns.markSaved(lines);
+  assert.deepEqual(turns.unsaved(1500), []);
+  assert.equal(said.close(), null);
+});
+
+test("the agent hears the open utterance in full before it is saved", () => {
+  const turns = new CallTurns();
+  const said = new CallUtterances(turns);
+  said.hear("i1", "I mean you should be");
+  said.hear("i2", "able to open it from the side chat");
+  assert.deepEqual(turns.transcript(), [{ role: "user", key: "u-i1", text: "I mean you should be able to open it from the side chat" }]);
+});
+
+test("a cumulative or repeated transcript replaces the segments instead of doubling them", () => {
+  const turns = new CallTurns();
+  const said = new CallUtterances(turns);
+  said.hear("i1", "I would say");
+  said.hear("i2", "I would say ship it today");
+  said.hear("i1", "I would say");
+  assert.equal(said.close()?.text, "I would say ship it today");
+});
+
+test("a later, longer transcript of a finished utterance updates it in place", () => {
+  const turns = new CallTurns();
+  const said = new CallUtterances(turns);
+  said.hear("i1", "Okay and one");
+  said.close();
+  turns.markSaved(turns.unsaved());
+  assert.deepEqual(said.hear("i1", "Okay and one last thing"), { key: "u-i1", text: "Okay and one last thing", open: false });
+  assert.deepEqual(turns.unsaved(), [{ role: "user", key: "u-i1", text: "Okay and one last thing" }]);
+  said.hear("i2", "Thanks");
+  assert.equal(said.isOpen(), true);
+  assert.deepEqual(turns.unsaved(), [{ role: "user", key: "u-i1", text: "Okay and one last thing" }], "the next utterance waits until it is finished");
+});
+
+test("hanging up saves an utterance that was still open", () => {
+  const turns = new CallTurns();
+  const said = new CallUtterances(turns);
+  said.hear("i1", "Bye for");
+  assert.deepEqual(turns.unsaved(Date.now(), false), [{ role: "user", key: "u-i1", text: "Bye for" }]);
+});
+
+test("segments join in the order they were spoken, even when transcripts arrive out of order", () => {
+  const turns = new CallTurns();
+  const said = new CallUtterances(turns);
+  said.spoken("i1");
+  said.spoken("i2");
+  said.hear("i2", "check the build");
+  said.hear("i1", "Okay and one more thing,");
+  assert.equal(said.close()?.text, "Okay and one more thing, check the build");
+});
+
+test("pieces that only share a first word are both kept", () => {
+  assert.equal(joinSegments(["No.", "not today, maybe tomorrow"]), "No. not today, maybe tomorrow");
+  assert.equal(joinSegments(["So", "something broke in the build"]), "So something broke in the build");
+  assert.equal(joinSegments(["Okay and one more thing,", "Okay?"]), "Okay and one more thing, Okay?");
+  assert.equal(joinSegments(["I would say", "I would say ship it today"]), "I would say ship it today");
+  assert.equal(joinSegments(["Yes", "Yes"]), "Yes Yes");
+});
+
+test("talking over the agent's answer keeps one message for the whole utterance", () => {
+  const turns = new CallTurns();
+  const said = new CallUtterances(turns);
+  const wait = new ReplyWait();
+  said.hear("i1", "Okay and one");
+  wait.replied(false);
+  assert.equal(wait.heard(true, false), false, "the answer is still playing, so the turn stays open");
+  assert.deepEqual(turns.unsaved(), []);
+  wait.interrupted();
+  said.hear("i2", "more thing, check the build");
+  assert.equal(wait.heard(false, false), false, "a cut answer never closes the turn");
+  wait.replied(false);
+  assert.equal(wait.heard(false, true), false, "still generating");
+  assert.equal(wait.heard(false, false), true, "played out uncut");
+  said.close();
+  assert.deepEqual(turns.unsaved(), [{ role: "user", key: "u-i1", text: "Okay and one more thing, check the build" }]);
+});
+
+test("a cut answer never closes the turn even after it finishes playing", () => {
+  const wait = new ReplyWait();
+  wait.replied(true);
+  assert.equal(wait.heard(false, false), false);
 });

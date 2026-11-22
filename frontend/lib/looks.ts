@@ -72,8 +72,10 @@ export const LOOK_ACCESSORIES: Accessory[] = [
 
 export const HATS: Accessory[] = ["beanie", "cap", "mortarboard", "wizard", "hardhat", "crown"];
 
-export function withoutHats(look: LokaLook): LokaLook {
-  return look.accessories?.some((a) => HATS.includes(a)) ? { ...look, accessories: look.accessories.filter((a) => !HATS.includes(a)) } : look;
+export const HEADWEAR: Accessory[] = [...HATS, "horns", "headband", "bun", "headphones"];
+
+export function withoutHeadwear(look: LokaLook): LokaLook {
+  return look.accessories?.some((a) => HEADWEAR.includes(a)) ? { ...look, accessories: look.accessories.filter((a) => !HEADWEAR.includes(a)) } : look;
 }
 
 const ACCESSORY_ALIASES: Record<string, Accessory> = {

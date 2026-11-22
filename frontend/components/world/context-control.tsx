@@ -1,27 +1,33 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { ArrowCounterClockwise, ArrowsInSimple } from "@phosphor-icons/react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { cn } from "@/lib/utils";
 import { compactNumber } from "@/lib/world";
 import {
+  AUTO_CONTEXT_MAX_TOKENS,
+  AUTO_CONTEXT_MIN_TOKENS,
   CONTEXT_EVENT,
   CONTEXT_MISSING,
   CONTEXT_WARN_RATIO,
   compactAgentContext,
   contextRatio,
+  defaultAutoTokens,
   fetchAgentContext,
+  patchAgentContext,
   readContext,
   resetAgentContext,
   type AgentContext,
+  type AutoContextAction,
+  type AutoContextPatch,
   type ContextRequest,
 } from "@/lib/agent-context";
 import type { WorldEvent } from "@/lib/world";
 import { Shimmer } from "./shimmer";
 import { qk } from "@/lib/query-keys";
-import { BTN, BTN_SM, BTN_SECONDARY_SM } from "./styles";
+import { BTN, BTN_SM, BTN_SECONDARY_SM, SEGMENT, SEGMENT_ITEM, SEGMENT_OFF, SEGMENT_ON } from "./styles";
 import { GHOST_ICON_BTN } from "./settings-shell";
 import { MENU } from "./controls";
 import { POPOVER_MOTION } from "./motion";
@@ -127,6 +133,145 @@ export function ContextMeter({ context, className }: { context: AgentContext | n
         />
       </span>
     </span>
+  );
+}
+
+const AUTO_ACTIONS: { value: AutoContextAction; label: string }[] = [
+  { value: "compact", label: "Compact" },
+  { value: "reset", label: "Reset" },
+];
+
+function tokenText(n: number | null): string {
+  return n == null ? "" : n.toLocaleString();
+}
+
+function AutoContextRow({ agentId, agentName, context }: { agentId: string; agentName: string; context: AgentContext }) {
+  const client = useQueryClient();
+  const inputId = useId();
+  const saved = context.auto_context_tokens;
+  const action = context.auto_context_action;
+  const max = context.max_tokens;
+  const [draft, setDraft] = useState(tokenText(saved));
+  const [error, setError] = useState<string | null>(null);
+  const [savingTokens, setSavingTokens] = useState(0);
+  const queue = useRef<Promise<void>>(Promise.resolve());
+
+  useEffect(() => {
+    setDraft(tokenText(saved));
+  }, [saved]);
+
+  const send = async (patch: AutoContextPatch) => {
+    const tokens = "auto_context_tokens" in patch;
+    if (tokens) setSavingTokens((n) => n + 1);
+    setError(null);
+    const result = await patchAgentContext(agentId, patch);
+    if (tokens) setSavingTokens((n) => n - 1);
+    if (result.ok) {
+      client.setQueryData(qk.agent.context(agentId), result.context);
+      setDraft(tokenText(result.context.auto_context_tokens));
+    } else {
+      setError(result.error);
+    }
+  };
+
+  const save = (patch: AutoContextPatch) => {
+    queue.current = queue.current.then(() => send(patch));
+    return queue.current;
+  };
+
+  const commit = () => {
+    const digits = draft.replace(/\D/g, "");
+    const tokens = digits ? Number(digits) : null;
+    if (tokens === saved) {
+      setError(null);
+      setDraft(tokenText(saved));
+      return;
+    }
+    if (tokens !== null && tokens < AUTO_CONTEXT_MIN_TOKENS) {
+      setError(`Use at least ${AUTO_CONTEXT_MIN_TOKENS.toLocaleString()} tokens, or use the default.`);
+      return;
+    }
+    if (tokens !== null && max && tokens >= max) {
+      setError(`Keep it below ${max.toLocaleString()}, the model's context window.`);
+      return;
+    }
+    if (tokens !== null && !max && tokens > AUTO_CONTEXT_MAX_TOKENS) {
+      setError(`Keep it at or below ${AUTO_CONTEXT_MAX_TOKENS.toLocaleString()} tokens.`);
+      return;
+    }
+    void save({ auto_context_tokens: tokens });
+  };
+
+  const fallback = defaultAutoTokens(context);
+  const verb = action === "compact" ? "compacts" : "resets";
+  const summary =
+    saved === null
+      ? fallback
+        ? `Default, about ${fallback.toLocaleString()} tokens. After a turn past it, ${agentName} ${verb} on their own.`
+        : "Default. Enter a token count to set your own limit."
+      : `After a turn past ${saved.toLocaleString()} tokens, ${agentName} ${verb} on their own.`;
+
+  return (
+    <div className="space-y-2 border-t-2 border-w-line pt-2.5">
+      <div className="flex items-center justify-between gap-2">
+        <label htmlFor={inputId} className="text-w-xs font-semibold text-w-strong">
+          Auto limit
+        </label>
+        <div role="radiogroup" aria-label="When the limit is passed" className={cn(SEGMENT, "shrink-0")}>
+          {AUTO_ACTIONS.map((a) => (
+            <button
+              key={a.value}
+              type="button"
+              role="radio"
+              aria-checked={action === a.value}
+              onClick={() => {
+                if (action !== a.value) void save({ auto_context_action: a.value });
+              }}
+              className={cn(SEGMENT_ITEM, "px-2 py-0.5 motion-reduce:transition-none", action === a.value ? SEGMENT_ON : SEGMENT_OFF)}
+            >
+              {a.label}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="flex items-center gap-2">
+        <input
+          id={inputId}
+          type="text"
+          inputMode="numeric"
+          autoComplete="off"
+          placeholder={fallback ? `Default, about ${fallback.toLocaleString()}` : "Default"}
+          value={draft}
+          disabled={savingTokens > 0}
+          aria-invalid={!!error}
+          aria-describedby={`${inputId}-note`}
+          onChange={(e) => {
+            setDraft(e.target.value);
+            setError(null);
+          }}
+          onBlur={commit}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              commit();
+            }
+          }}
+          className="h-8 w-24 min-w-0 rounded-lg border-2 border-w-ink bg-w-field px-2 text-w-sm tabular-nums outline-none transition-shadow duration-150 placeholder:text-w-faint focus:ring-2 focus:ring-w-teal disabled:opacity-60 motion-reduce:transition-none"
+        />
+        <span className="min-w-0 flex-1 truncate text-w-xs tabular-nums text-w-muted">{max ? `of ${max.toLocaleString()}` : "window unknown"}</span>
+        {saved !== null && (
+          <button type="button" onClick={() => void save({ auto_context_tokens: null })} className={cn(BTN_SECONDARY_SM, "shrink-0")}>
+            Use default
+          </button>
+        )}
+      </div>
+      <p id={`${inputId}-note`} className={cn("text-w-xs leading-relaxed", error ? "text-w-alert" : "text-w-muted")} role={error ? "alert" : undefined}>
+        {error ?? summary}
+      </p>
+      {!error && action === "compact" && !context.can_compact && (
+        <p className="text-w-xs leading-relaxed text-w-muted">This CLI cannot compact, so it resets instead.</p>
+      )}
+    </div>
   );
 }
 
@@ -295,6 +440,7 @@ export function ContextButton({
                 </div>
               </div>
             )}
+            {context && stage === "menu" && <AutoContextRow agentId={agentId} agentName={agentName} context={context} />}
           </motion.div>
         )}
       </AnimatePresence>

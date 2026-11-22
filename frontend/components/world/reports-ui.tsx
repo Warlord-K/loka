@@ -4,7 +4,7 @@ import { quoteProps } from "./quote";
 import { SOLO } from "@/lib/edition";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { latestRequests } from "@/lib/canvas-marks";
-import { ArrowCounterClockwise, SquaresFour, ArrowLeft, CaretDown, CaretRight, Check, ClockCounterClockwise, FileText, Folder, FolderOpen, Globe, Link as LinkIcon, ListBullets, Lock, Code, Copy, DownloadSimple, PencilSimple, Plus, Trash, Clock, Files, FolderSimple, Hash, Notebook, PushPinSimple, UserCircle, type Icon as PhosphorIcon, SidebarSimple } from "@phosphor-icons/react";
+import { ArrowCounterClockwise, SquaresFour, Student, ArrowLeft, CaretDown, CaretRight, Check, ClockCounterClockwise, FileText, Folder, FolderOpen, Globe, Link as LinkIcon, ListBullets, Lock, Code, Copy, DownloadSimple, PencilSimple, Plus, Trash, Clock, Files, FolderSimple, Hash, Notebook, PushPinSimple, UserCircle, type Icon as PhosphorIcon, SidebarSimple } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
 import { WindowHeader, EmptyState, GHOST_ICON_BTN } from "./settings-shell";
 import { AgentFace } from "./channel-ui";
@@ -39,6 +39,8 @@ import dynamic from "next/dynamic";
 import { focusPointAt, type FocusPoint } from "@/lib/caret";
 import { downloadText, fileSlug, useCopy } from "@/lib/copy";
 import { PaneResizer, usePaneWidth } from "./pane-resizer";
+import { AnimatePresence } from "framer-motion";
+import { PRACTICE_OPEN, subjectLabel, takePracticeWanted } from "@/lib/practice";
 
 const ReportCanvas = dynamic(() => import("./report-canvas"), {
   ssr: false,
@@ -48,6 +50,17 @@ const ReportCanvas = dynamic(() => import("./report-canvas"), {
     </div>
   ),
 });
+
+const PracticeView = dynamic(() => import("./practice-view").then((m) => m.PracticeView), {
+  ssr: false,
+  loading: () => (
+    <div className="grid h-full place-items-center text-w-base text-w-muted">
+      <Shimmer>Opening the practice</Shimmer>
+    </div>
+  ),
+});
+
+const NewPracticeDialog = dynamic(() => import("./practice-view").then((m) => m.NewPracticeDialog), { ssr: false });
 
 const DocEditor = dynamic(() => import("./doc-editor").then((m) => m.DocEditor), {
   ssr: false,
@@ -344,6 +357,16 @@ export function ReportsPanel({
       return !v;
     });
   const [focusPoint, setFocusPoint] = useState<FocusPoint | null>(null);
+  const [practiceDialog, setPracticeDialog] = useState(false);
+  useEffect(() => {
+    const open = () => {
+      takePracticeWanted();
+      setPracticeDialog(true);
+    };
+    if (takePracticeWanted()) setPracticeDialog(true);
+    window.addEventListener(PRACTICE_OPEN, open);
+    return () => window.removeEventListener(PRACTICE_OPEN, open);
+  }, []);
   const editing = mode === "edit";
   const dirty = useMemo(() => {
     if (!draft) return false;
@@ -863,7 +886,12 @@ export function ReportsPanel({
               >
                 <span className="flex items-start gap-2">
                   <span className="min-w-0 flex-1 text-w-sm font-semibold leading-snug text-w-strong">{r.title}</span>
-                  {r.kind === "canvas" && (
+                  {r.practice ? (
+                    <span className={cn(PILL_INFO, "mt-0.5 shrink-0 gap-1")} title={`Practice canvas for ${subjectLabel(r.practice.subject)}`}>
+                      <Student size={11} weight="bold" aria-hidden />
+                      {subjectLabel(r.practice.subject)}
+                    </span>
+                  ) : r.kind === "canvas" && (
                     <span className={cn(PILL_INFO, "mt-0.5 shrink-0 gap-1")} title={r.open_marks ? `Canvas with ${r.open_marks} open marks` : "Canvas"}>
                       <SquaresFour size={11} weight="bold" aria-hidden />
                       Canvas{r.open_marks ? ` · ${r.open_marks}` : ""}
@@ -1342,6 +1370,10 @@ export function ReportsPanel({
         actions={
           <>
             <ScopeToggle others={othersCount} className="hidden @3xl:inline-flex" />
+            <button type="button" onClick={() => setPracticeDialog(true)} className={BTN_SECONDARY} title="Practise writing or drawing, and a coach agent checks each attempt">
+              <Student size={14} weight="bold" />
+              <span className="hidden @lg:inline">New practice</span>
+            </button>
             <button type="button" onClick={() => void newCanvas()} className={BTN_SECONDARY} title="Start a canvas: a board for images, notes and live cards">
               <SquaresFour size={14} weight="bold" />
               <span className="hidden @lg:inline">New canvas</span>
@@ -1387,6 +1419,19 @@ export function ReportsPanel({
         <div ref={readerRef} className={cn("min-h-0 flex-1 @container/reader", report?.kind === "canvas" && mode === "read" ? "overflow-hidden" : "overflow-y-auto", !readerOpen && "hidden @2xl:block")}>
           {mode === "edit" ? (
             editor
+          ) : detail && report?.practice && mode !== "history" ? (
+            <PracticeView
+              key={report.id}
+              detail={detail}
+              agents={agents}
+              meId={meId}
+              focusItem={focus && focus.id && report.id.startsWith(focus.id) ? (focus.item ?? null) : null}
+              onOpenAgent={onOpenAgent}
+              onChanged={() => {
+                loadDetail(report.id);
+                loadAll();
+              }}
+            />
           ) : detail && report?.kind === "canvas" && mode !== "history" ? (
             <ReportCanvas
               key={report.id}
@@ -1437,6 +1482,23 @@ export function ReportsPanel({
           )}
         </div>
       </div>
+      <AnimatePresence>
+        {practiceDialog && (
+          <NewPracticeDialog
+            key="new-practice"
+            agents={agents}
+            onClose={() => setPracticeDialog(false)}
+            onCreated={(id) => {
+              setPracticeDialog(false);
+              setMode("read");
+              setDraft(null);
+              setSelected(id);
+              loadAll();
+              window.dispatchEvent(new CustomEvent(REPORTS_STALE, { detail: { report_id: id } }));
+            }}
+          />
+        )}
+      </AnimatePresence>
     </div>
   );
 }

@@ -418,7 +418,7 @@ mod tests {
         let spec = Spec { working_dir: std::env::temp_dir(), read_only: false, readable: Vec::new(), state: Vec::new() };
         let owner = paths(&spec, &BTreeMap::new(), None);
         assert!(owner.hidden.iter().any(|p| p.ends_with(".ssh")));
-        assert!(owner.readable.iter().any(|p| p.ends_with(".ssh/karna_signing")));
+        assert!(owner.readable.iter().any(|p| p.ends_with(".ssh/loka_signing")));
         assert!(owner.readable.iter().any(|p| p.ends_with(".ssh/known_hosts")));
         assert!(!owner.readable.iter().any(|p| p.ends_with(".ssh/id_ed25519") || p.ends_with(".ssh")));
         assert!(owner.writable.iter().any(|p| p.ends_with(".ssh/known_hosts")));
@@ -572,9 +572,9 @@ for line in sys.stdin:
 
     #[test]
     #[ignore]
-    fn live_owner_seatbelt_signs_with_the_karna_key_and_pushes() {
+    fn live_owner_seatbelt_signs_with_the_loka_key_and_pushes() {
         let home = PathBuf::from(std::env::var_os("HOME").unwrap());
-        let key = std::env::var("SIGN_TEST_KEY").map(PathBuf::from).unwrap_or_else(|_| home.join(".ssh/karna_signing"));
+        let key = std::env::var("SIGN_TEST_KEY").map(PathBuf::from).unwrap_or_else(|_| home.join(".ssh/loka_signing"));
         let remote = std::env::var("PUSH_TEST_REMOTE").unwrap_or_else(|_| "https://github.com/Warlord-K/loka.git".into());
         let over_https = remote.starts_with("https://");
         let token = std::env::var("GH_TOKEN").ok().filter(|token| !token.is_empty()).or_else(|| {

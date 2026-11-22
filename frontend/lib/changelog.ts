@@ -7,7 +7,7 @@ export type ChangelogEntry = {
 export const CHANGELOG: ChangelogEntry[] = [
   {
     date: "2026-11-22",
-    title: "New art, calls in the chat, live dictation",
+    title: "New art, calls in the chat, practice with a coach",
     items: [
       "**New art (preview)**: switch on New art (preview) in You > Appearance to see Loka newly drawn: every agent walks at a bigger size in its own colours, and houses, civic buildings, trees and decorations are redrawn, with palms, snowmen, mossy logs and boulders in the regions. The classic art stays the default.",
       "**Calls happen in the chat**: a voice call now shows your whole chat with that agent, and both sides of the call land in it as you talk, so nothing is lost when a call drops mid-sentence. Call from the chat next to a report and the call stays there.",
@@ -18,6 +18,14 @@ export const CHANGELOG: ChangelogEntry[] = [
       "Quests can now message other agents, such as the main agent that started them, by name or handle.",
       "The Slack tools your agents use now know which Slack workspace and account Loka is watching, so they post as you in the right workspace.",
       "Sign-ins of MCP servers that use mcp-remote stay out of quest folders and are never committed.",
+      "**Practice with a coach**: start a practice from Reports or Cmd K, pick Japanese, drawing or anything else and a coach agent, then write or draw with a pen, pencil, marker or your mouse. Press Ready (or say ready) and your coach answers with what is right, what to fix and the next exercise. Every attempt stays in a strip below the page so you and your coach can see your progress.",
+      "**Auto context limit**: in an agent's context menu (top of its chat), set a token count and pick Compact or Reset, and the agent tidies its conversation on its own after a turn that passes it. Use default goes back to the built-in limit of about 70% of the window.",
+      "**New art (preview)** now also redraws the home town's ducks, cats, sparrows, koi and the peacock, every piece of furniture inside buildings and houses, and agents' work, tools, sparks and status bubbles.",
+      "**A full disk no longer stops every quest**: a closed quest's temp folder is deleted an hour after the quest closes, You > Storage counts temp folders, and while your Mac has under 5 GB free new quests fail with a plain \"disk is full\" note instead of breaking halfway.",
+      "Quests sign their commits only with your own git signing key or Loka's own key (~/.ssh/loka_signing), never another key they find on your Mac. When neither exists, Loka creates its own key and your main agent tells you once how to add it to GitHub so commits show Verified.",
+      "A review that stops without giving a verdict is asked again for one, and if none comes the result says \"Review ended without a verdict\".",
+      "On a voice call, what you say lands in the chat as one whole message after you finish talking, and short pauses mid-sentence no longer split it.",
+      "Quests on your Mac can build iOS apps with xcodebuild inside the sandbox and create branches from origin/main without failing to save their tracking setup.",
     ],
   },
   {

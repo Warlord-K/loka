@@ -1,7 +1,7 @@
 import { decode, encode } from "@msgpack/msgpack";
 import { holdMusic } from "./music";
 import { holdSounds } from "./sounds";
-import { CallTurns } from "@/lib/call-turns";
+import { CallTurns, CallUtterances, RESERVATION_MS, ReplyWait, UTTERANCE_SETTLE_MS } from "@/lib/call-turns";
 
 export type LivePhase = "connecting" | "listening" | "hearing" | "thinking" | "speaking";
 
@@ -78,28 +78,6 @@ const AUDIO_DELTA = new Set(["response.output_audio.delta", "response.audio.delt
 
 function str(v: unknown): string {
   return typeof v === "string" ? v : "";
-}
-
-function tokens(text: string) {
-  return text
-    .trim()
-    .split(/\s+/)
-    .map((raw) => ({ raw, w: raw.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "") }))
-    .filter((t) => t.w);
-}
-
-function suffixAfter(prev: string, next: string): string | null {
-  const a = tokens(prev);
-  const b = tokens(next);
-  if (!a.length || b.length < a.length) return null;
-  for (let i = 0; i < a.length; i++) {
-    const last = i === a.length - 1;
-    if (a[i].w !== b[i].w && !(last && b[i].w.startsWith(a[i].w))) return null;
-  }
-  return b
-    .slice(a.length)
-    .map((t) => t.raw)
-    .join(" ");
 }
 
 function toBase64(bytes: Uint8Array): string {
@@ -182,6 +160,7 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
   let playhead = 0;
   const sources = new Set<AudioBufferSourceNode>();
   const turns = new CallTurns();
+  const utterances = new CallUtterances(turns);
   let endSent = false;
   const userText = new Map<string, string>();
   const agentText = new Map<string, string>();
@@ -189,7 +168,9 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
   const calls = new Set<string>();
   let openCalls = 0;
   const updates: string[] = [];
-  let lastUser = { key: "", text: "" };
+  let settleTimer = 0;
+  const replyWait = new ReplyWait();
+  let lastHeardAt = 0;
   let dropAudio = false;
   let sessionSent: Record<string, unknown> = cfg.session;
   let sessionRetried = false;
@@ -232,23 +213,40 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
   const record = (role: "user" | "agent", key: string, text: string, partial = false) => {
     if (turns.set(role, key, text, partial)) schedule(partial ? 4000 : 400);
   };
-  const hearUser = (itemKey: string, text: string) => {
-    const t = text.trim();
-    if (!t) return;
-    const rest = lastUser.text ? suffixAfter(lastUser.text, t) : null;
-    if (rest === null) {
-      lastUser = { key: `u-${itemKey}`, text: t };
-      h.onCaption(lastUser.key, "you", t);
-      record("user", lastUser.key, t);
-      return;
-    }
-    lastUser = { ...lastUser, text: t };
-    h.onCaption(lastUser.key, "you", t);
-    if (!rest.trim()) return;
-    record("user", lastUser.key, t);
+  const closeUser = () => {
+    window.clearTimeout(settleTimer);
+    settleTimer = 0;
+    const done = utterances.close();
+    if (!done) return;
+    h.onCaption(done.key, "you", done.text);
+    schedule(400);
   };
-  const userKey = (itemKey: string, text: string) =>
-    lastUser.text && (suffixAfter(lastUser.text, text) !== null || suffixAfter(text, lastUser.text) !== null) ? lastUser.key : `u-${itemKey}`;
+  const userBusy = () => (hearing && !muted) || sources.size > 0 || ((committing || awaitingUser.size > 0) && Date.now() - lastHeardAt < RESERVATION_MS);
+  const armSettle = () => {
+    window.clearTimeout(settleTimer);
+    settleTimer = window.setTimeout(() => {
+      settleTimer = 0;
+      if (!utterances.isOpen()) return;
+      if (userBusy()) armSettle();
+      else closeUser();
+    }, UTTERANCE_SETTLE_MS);
+  };
+  const settleUser = () => {
+    if (!utterances.isOpen()) return;
+    if (userBusy()) armSettle();
+    else closeUser();
+  };
+  const afterReply = () => {
+    if (replyWait.heard(sources.size > 0, responding)) settleUser();
+  };
+  const hearUser = (itemKey: string, text: string) => {
+    const heard = utterances.hear(itemKey, text);
+    if (!heard) return;
+    lastHeardAt = Date.now();
+    h.onCaption(heard.key, "you", heard.text, heard.open);
+    if (heard.open) armSettle();
+    else schedule(400);
+  };
   const context = () =>
     turns
       .transcript()
@@ -289,13 +287,6 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
     saving = next.catch(() => undefined);
     return next;
   };
-  const finishUsers = () => {
-    for (const [key, text] of userText) {
-      if (finished.has(`u-${key}`) || !text.trim()) continue;
-      finished.add(`u-${key}`);
-      hearUser(key, text);
-    }
-  };
   const waitForUsers = async (ms: number) => {
     const until = performance.now() + ms;
     const unheard = () => [...userText.entries()].some(([key, text]) => text.trim() && !finished.has(`u-${key}`));
@@ -329,12 +320,14 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
     sources.add(src);
     src.onended = () => {
       sources.delete(src);
+      afterReply();
       settle();
     };
     settle();
   };
 
   const bargeIn = () => {
+    replyWait.interrupted();
     stopPlayback();
     if (responding) {
       dropAudio = true;
@@ -347,6 +340,8 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
     const full = (text ?? agentText.get(key) ?? "").trim();
     if (!full) return;
     finished.add(key);
+    replyWait.replied(dropAudio);
+    afterReply();
     h.onCaption(key, "them", full);
     record("agent", key, full);
   };
@@ -373,6 +368,8 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
     try {
       const parsed = (args ? JSON.parse(args) : {}) as { text?: string };
       if (name === "send_to_agent") {
+        await waitForUsers(1500);
+        closeUser();
         const text = str(parsed.text).trim();
         await flush(false);
         if (!text) output = JSON.stringify({ ok: false, error: "empty request" });
@@ -428,6 +425,7 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
       committing = false;
       if (str(ev.item_id)) {
         awaitingUser.add(str(ev.item_id));
+        utterances.spoken(str(ev.item_id));
         turns.reserve("user", `u-${str(ev.item_id)}`);
       }
       return;
@@ -440,6 +438,7 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
     }
     if (type === "input_audio_buffer.speech_stopped") {
       hearing = false;
+      lastHeardAt = Date.now();
       uncommitted = false;
       window.clearTimeout(waiting);
       waiting = window.setTimeout(() => {
@@ -466,17 +465,15 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
     if (USER_PARTIAL.has(type)) {
       const text = type.endsWith(".delta") ? (userText.get(itemKey) ?? "") + str(ev.delta) : str(ev.transcript);
       userText.set(itemKey, text);
-      const key = userKey(itemKey, text);
-      if (key !== lastUser.key || tokens(text).length >= tokens(lastUser.text).length) h.onCaption(key, "you", text, true);
+      hearUser(itemKey, text);
       return;
     }
     if (type === USER_FAILED || USER_DONE.has(type)) {
       awaitingUser.delete(itemKey);
       const text = (type === USER_FAILED ? "" : str(ev.transcript)) || userText.get(itemKey) || "";
-      if (!finished.has(`u-${itemKey}`) && text.trim()) {
-        finished.add(`u-${itemKey}`);
-        hearUser(itemKey, text);
-      }
+      finished.add(`u-${itemKey}`);
+      userText.set(itemKey, text);
+      hearUser(itemKey, text);
       turns.release(`u-${itemKey}`);
       if (!ids) userSeq++;
       return;
@@ -508,6 +505,7 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
       if (!ids && !response.id) agentSeq++;
       responding = false;
       settle();
+      afterReply();
       sendUpdates();
     }
   };
@@ -531,6 +529,7 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
     sources.add(src);
     src.onended = () => {
       sources.delete(src);
+      afterReply();
       settle();
     };
     settle();
@@ -590,8 +589,8 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
   };
   window.addEventListener("world-event", onWorld);
   const onLeave = () => {
+    closeUser();
     keepCutTurns();
-    finishUsers();
     void flush(true);
   };
   window.addEventListener("pagehide", onLeave);
@@ -655,6 +654,7 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
       releaseSounds();
       releaseMusic();
       window.clearTimeout(flushTimer);
+      window.clearTimeout(settleTimer);
       window.clearTimeout(stopTimer);
       window.clearTimeout(waiting);
       window.clearInterval(vad);
@@ -670,8 +670,8 @@ export async function startLive(agentId: string, h: LiveHandlers): Promise<LiveC
       }
       hearing = false;
       window.removeEventListener("pagehide", onLeave);
+      closeUser();
       keepCutTurns();
-      finishUsers();
       if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close(1000);
       await ctx.close().catch(() => undefined);
       await flush(true);

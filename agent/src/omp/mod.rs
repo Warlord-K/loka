@@ -469,10 +469,11 @@ impl RpcProbe {
         let run_dir = prepare_run_dir(opts).await?;
         let mut cmd = job_command("omp");
         cmd.kill_on_drop(true);
+        cmd.current_dir(opts.working_dir);
         configure_child_environment(&mut cmd, &opts.child_environment())?;
+        opts.sign_commits(&mut cmd);
         cmd.env_remove("OMP_PROFILE").env_remove("PI_PROFILE");
         cmd.env("PI_CODING_AGENT_DIR", &run_dir.0);
-        cmd.current_dir(opts.working_dir);
         cmd.args(["--mode", "rpc", "--no-title", "--no-tools", "--no-skills", "--no-rules", "--no-extensions", "--no-lsp"]);
         cmd.arg("--session-dir").arg(&sessions);
         if !opts.model.is_empty() {
@@ -644,10 +645,11 @@ pub(crate) async fn build_command(opts: &CliOptions<'_>, rpc: bool) -> Result<(C
 
     let mut cmd = job_command("omp");
     cmd.kill_on_drop(true);
+    cmd.current_dir(opts.working_dir);
     configure_child_environment(&mut cmd, &opts.child_environment())?;
+    opts.sign_commits(&mut cmd);
     cmd.env_remove("OMP_PROFILE").env_remove("PI_PROFILE");
     cmd.env("PI_CODING_AGENT_DIR", &run_dir.0);
-    cmd.current_dir(opts.working_dir);
     if rpc {
         cmd.args(["--mode", "rpc", "--auto-approve", "--no-title"]);
     } else {

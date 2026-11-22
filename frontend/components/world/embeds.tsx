@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, type ReactNode } from "react";
-import { ArrowSquareOut, CheckSquare, FileText, FlowArrow, Hash, Square, Timer, UserCircle } from "@phosphor-icons/react";
+import { ArrowSquareOut, CheckSquare, FileText, FlowArrow, Hash, Square, Student, Timer, UserCircle } from "@phosphor-icons/react";
 import { cn, safeDecode } from "@/lib/utils";
 import { messageTime, dayLabel, worldApi, type ChannelSummary, type TaskBrief, type Todo, type WorldAgent } from "@/lib/world";
 import { AgentFace } from "./channel-ui";
@@ -11,6 +11,7 @@ import { SlackMark } from "./panels";
 import { StatusIcon, statusLabel } from "./quest-ui";
 import { countdown, focusTodo, isTimerTodo } from "./todos-ui";
 import { canvasItemKind, canvasItemLabel, openReport, REPORTS_STALE, reportsApi, type CanvasItem, type ReportBrief } from "@/lib/reports";
+import { ATTEMPT_ID, ATTEMPT_ID_SOURCE, checkOf, openPractice, practiceApi, subjectLabel, type AttemptCard } from "@/lib/practice";
 
 const REF_SOURCE = "ch\\d{1,18}|[0-9a-fA-F][0-9a-fA-F-]{5,35}";
 const ID_SOURCE = "[0-9a-fA-F][0-9a-fA-F-]{5,35}";
@@ -26,6 +27,7 @@ export type Embed =
   | { kind: "todo"; ref: string }
   | { kind: "quest"; ref: string }
   | { kind: "report"; ref: string; item?: string }
+  | { kind: "practice"; ref: string }
   | { kind: "agent"; ref: string }
   | { kind: "setup"; key: string }
   | { kind: "channel"; id: string }
@@ -56,8 +58,8 @@ export function embedFromHref(href?: string | null): Embed | null {
   if (item) return { kind: "report", ref: item[1].toLowerCase(), item: item[2].slice(1) };
   const agent = href.match(/^agent:([A-Za-z0-9][A-Za-z0-9_-]{0,63})$/i);
   if (agent) return { kind: "agent", ref: agent[1].toLowerCase() };
-  const scheme = href.match(/^(todo|quest|report):(.+)$/i);
-  if (scheme) return ID.test(scheme[2]) ? { kind: scheme[1].toLowerCase() as "todo" | "quest" | "report", ref: scheme[2].toLowerCase() } : null;
+  const scheme = href.match(/^(todo|quest|report|practice):(.+)$/i);
+  if (scheme) return (scheme[1].toLowerCase() === "practice" ? ATTEMPT_ID : ID).test(scheme[2]) ? { kind: scheme[1].toLowerCase() as "todo" | "quest" | "report" | "practice", ref: scheme[2].toLowerCase() } : null;
   if (href.startsWith("#channel-")) return { kind: "channel", id: href.slice(9) };
   const slack = href.match(SLACK);
   if (slack) return { kind: "slack", url: href, workspace: slack[1], thread: /[?&]thread_ts=/.test(href) };
@@ -69,12 +71,13 @@ export function embedFromHref(href?: string | null): Embed | null {
 }
 
 export function allowedEmbedUrl(url: string): boolean {
-  return /^(msg|todo|quest|report):/i.test(url) || SETUP.test(url) || url.startsWith("#channel-");
+  return /^(msg|todo|quest|report|practice):/i.test(url) || SETUP.test(url) || url.startsWith("#channel-");
 }
 
 const SETUP = /^setup:([a-z][a-z_-]{1,31})$/i;
-const CARD_LINE = new RegExp(`^([ \\t]*)((?:msg|todo|quest|report):(?:${REF_SOURCE})(?:${ITEM_SOURCE})?|setup:[A-Za-z][A-Za-z_-]{1,31}|https?:\\/\\/\\S+)[ \\t]*$`, "gm");
+const CARD_LINE = new RegExp(`^([ \\t]*)((?:msg|todo|quest|report):(?:${REF_SOURCE})(?:${ITEM_SOURCE})?|practice:(?:${ATTEMPT_ID_SOURCE})|setup:[A-Za-z][A-Za-z_-]{1,31}|https?:\\/\\/\\S+)[ \\t]*$`, "gm");
 const BARE = new RegExp(`(^|[\\s(])(msg|todo|quest|report):(${REF_SOURCE})(${ITEM_SOURCE})?`, "gi");
+const PRACTICE_BARE = new RegExp(`(^|[\\s(])practice:(${ATTEMPT_ID_SOURCE})(?![0-9a-fA-F-])`, "gi");
 const CHANNEL = /(^|[\s(])#([A-Za-z][\w-]{0,79})/g;
 
 export function linkEmbeds(text: string, channels: Map<string, string>): string {
@@ -88,6 +91,7 @@ export function linkEmbeds(text: string, channels: Map<string, string>): string 
       const tail = item && scheme.toLowerCase() === "report" ? item : "";
       return `${lead}[${scheme}:${ref}${tail}](${scheme.toLowerCase()}:${ref}${tail})${item && !tail ? item : ""}`;
     })
+    .replace(PRACTICE_BARE, (whole, lead: string, ref: string, offset: number, all: string) => (lead === "(" && all[offset - 1] === "]" ? whole : `${lead}[practice:${ref}](practice:${ref})`))
     .replace(CHANNEL, (whole, lead: string, name: string) => {
       const id = channels.get(name.toLowerCase());
       return id ? `${lead}[#${name}](#channel-${id})` : whole;
@@ -396,6 +400,7 @@ function ReportEmbed({ refId, item, label, card }: { refId: string; item?: strin
   const report = state.report;
   if (!report) return <Missing label={label || "a report you cannot open"} />;
   const canvas = report.kind === "canvas";
+  if (report.practice) return <PracticeReportEmbed report={report} label={label} card={card} />;
   if (canvas && item) return <CanvasItemEmbed report={report} itemId={item} label={label} card={card} />;
   const what = canvas
     ? [`Canvas · ${report.item_count} ${report.item_count === 1 ? "item" : "items"}`, report.open_marks ? `${report.open_marks} open ${report.open_marks === 1 ? "mark" : "marks"}` : null]
@@ -414,6 +419,108 @@ function ReportEmbed({ refId, item, label, card }: { refId: string; item?: strin
       }
       onClick={() => openReport(report.id)}
     />
+  );
+}
+
+function PracticeReportEmbed({ report, label, card }: { report: ReportBrief; label?: string; card: boolean }) {
+  const agents = useLoaded(agentsOnce, "agents");
+  const practice = report.practice;
+  const coach = practice?.coach_agent_id ? agents?.find((a) => a.id === practice.coach_agent_id) : undefined;
+  const subject = practice ? subjectLabel(practice.subject) : "";
+  return (
+    <Shell
+      card={card}
+      icon={<Student size={12} weight="bold" />}
+      label={label || report.title}
+      byline={["Practice", subject, coach ? `coach ${coach.name}` : null, `${dayLabel(report.updated_at)} ${messageTime(report.updated_at)}`].filter(Boolean).join(" · ")}
+      body={
+        <>
+          <span className="block font-semibold">{report.title}</span>
+          <span className="flex items-center gap-1.5 text-w-text2">
+            {coach && <AgentFace agent={coach} size={16} />}
+            {coach ? `${coach.name} checks each attempt` : "Pick a coach to get each attempt checked"}
+          </span>
+        </>
+      }
+      onClick={() => openPractice(report.id)}
+    />
+  );
+}
+
+const attemptCache = new Map<string, Promise<AttemptCard | null>>();
+const attemptSeen = new Map<string, AttemptCard | null>();
+if (typeof window !== "undefined")
+  window.addEventListener("world-event", (e) => {
+    const type = (e as CustomEvent<{ type?: string; payload?: { attempt_id?: unknown } }>).detail?.type;
+    if (type === "practice.checked" || type === "practice.ready") attemptCache.clear();
+  });
+
+function attemptCard(ref: string): Promise<AttemptCard | null> {
+  const hit = attemptCache.get(ref);
+  if (hit) return hit;
+  const pending = practiceApi
+    .attempt(ref)
+    .catch(() => null)
+    .then((a) => {
+      attemptSeen.set(ref, a);
+      return a;
+    });
+  attemptCache.set(ref, pending);
+  return pending;
+}
+
+function PracticeEmbed({ refId, label, card }: { refId: string; label?: string; card: boolean }) {
+  const [state, setState] = useState<{ ref: string; attempt: AttemptCard | null } | null>(() => (attemptSeen.has(refId) ? { ref: refId, attempt: attemptSeen.get(refId) ?? null } : null));
+  const [stamp, setStamp] = useState(0);
+  useEffect(() => {
+    const on = (e: Event) => {
+      const ev = (e as CustomEvent<{ type?: string; payload?: { attempt_id?: unknown } }>).detail;
+      if (ev?.type?.startsWith("practice.") && typeof ev.payload?.attempt_id === "string" && ev.payload.attempt_id.startsWith(refId)) setStamp(Date.now());
+    };
+    window.addEventListener("world-event", on);
+    return () => window.removeEventListener("world-event", on);
+  }, [refId]);
+  useEffect(() => {
+    let live = true;
+    void attemptCard(refId).then((attempt) => live && setState({ ref: refId, attempt }));
+    return () => {
+      live = false;
+    };
+  }, [refId, stamp]);
+  const icon = <Student size={12} weight="bold" />;
+  if (!state || state.ref !== refId) return <Shell card={card} icon={icon} label={label || "practice attempt"} />;
+  const attempt = state.attempt;
+  if (!attempt) return <Missing label="Attempt not found" />;
+  const check = checkOf(attempt.check);
+  const open = () => openPractice(attempt.report_id, attempt.id);
+  if (!card) return <Shell card={false} icon={icon} label={label || `Attempt ${attempt.n} of ${attempt.title}`} onClick={open} />;
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation();
+        open();
+      }}
+      className={cn(CARD, "!flex-row items-start gap-3")}
+    >
+      {attempt.image_upload_id ? (
+        <img src={`/api/world/uploads/${attempt.image_upload_id}`} alt="" loading="lazy" className="h-16 w-16 shrink-0 rounded-md border-2 border-w-line2 bg-w-field object-contain" />
+      ) : (
+        <span className="grid h-16 w-16 shrink-0 place-items-center rounded-md border-2 border-dashed border-w-line2 text-w-muted">{icon}</span>
+      )}
+      <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+        <span className="flex min-w-0 items-center gap-1.5 text-w-xs font-semibold text-w-muted">
+          {icon}
+          <span className="min-w-0 truncate">{[`Attempt ${attempt.n}`, subjectLabel(attempt.subject), check ? (typeof check.score === "number" ? `${check.score}/100` : "checked") : "waiting for the coach"].join(" · ")}</span>
+        </span>
+        <span className="truncate text-w-sm font-semibold text-w-text">{label || attempt.title}</span>
+        {check ? (
+          <span className="line-clamp-2 text-w-sm leading-snug text-w-text2">Fix: {check.fix}</span>
+        ) : (
+          <span className="text-w-sm text-w-muted">Not checked yet</span>
+        )}
+      </span>
+    </button>
   );
 }
 
@@ -571,6 +678,8 @@ export function EmbedView({ embed, label, card }: { embed: Embed; label?: string
       return <AgentEmbed refId={embed.ref} label={label} card={card} />;
     case "report":
       return <ReportEmbed refId={embed.ref} item={embed.item} label={label} card={card} />;
+    case "practice":
+      return <PracticeEmbed refId={embed.ref} label={label} card={card} />;
     case "setup":
       return <SetupCard featureKey={embed.key} />;
     case "channel":

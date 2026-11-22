@@ -11,6 +11,21 @@ pub const LAUNCHER_ENV: &str = "WORLD_BROWSER_LAUNCHER";
 pub const ROOT_ENV: &str = "WORLD_GATE_ROOT";
 pub const MEDIA_DIR: &str = "media";
 
+pub const RUN_ALONE: &str = "Run the launcher as the whole command, with no pipe, `&&`, `;`, `cd` or `$(...)` around it: the sandbox only lets it out when it stands alone, and anything combined with it runs inside the sandbox, where it fails.";
+
+pub(crate) fn inside_sandbox() -> bool {
+    std::env::var_os("SANDBOX_RUNTIME").is_some_and(|v| !v.is_empty())
+}
+
+pub(crate) fn sandbox_note(failure: &str) -> Option<String> {
+    note_for(inside_sandbox(), failure)
+}
+
+fn note_for(inside: bool, failure: &str) -> Option<String> {
+    let blocked = ["not writable", "not permitted", "denied"].iter().any(|word| failure.to_lowercase().contains(word));
+    (inside && blocked).then(|| format!("This looks like the sandbox refusing it. {RUN_ALONE}"))
+}
+
 pub fn media_dir(root: &Path, agent_id: Uuid) -> PathBuf {
     root.join(MEDIA_DIR).join(agent_id.to_string())
 }
@@ -237,7 +252,7 @@ description: Browse the web on your owner's Mac with a real Chrome window: read 
 # Browser
 
 You have a fast browser CLI made for agents on this Mac. Always run it with this exact command prefix, written out in full
-every time (no variables, aliases or `cd` first, or it will not reach the browser):
+every time (no variables, aliases, `cd` first, pipes or `&&`, or it will not reach the browser, because the sandbox lets it out only as a command on its own):
 
 `{launcher}`
 
@@ -664,6 +679,11 @@ fn run_gate(args: &[String]) -> Result<i32, Refusal> {
     use std::io::Write;
     let _ = std::io::stdout().write_all(&output.stdout);
     let _ = std::io::stderr().write_all(&output.stderr);
+    if !output.status.success() {
+        if let Some(note) = sandbox_note(&String::from_utf8_lossy(&output.stderr)) {
+            eprintln!("browser: {note}");
+        }
+    }
     Ok(output.status.code().unwrap_or(1))
 }
 
@@ -761,6 +781,16 @@ mod tests {
                 assert!(check_url(url, reach).is_err(), "{url} must be blocked for {reach:?}");
             }
         }
+    }
+
+    #[test]
+    fn a_sandboxed_launcher_failure_says_to_run_it_alone() {
+        let failure = "Socket directory '/Users/me/.agent-browser' is not writable: Operation not permitted (os error 1)";
+        let note = note_for(true, failure).unwrap();
+        assert!(note.contains("no pipe") && note.contains("`cd`"));
+        assert!(note_for(false, failure).is_none());
+        assert!(note_for(true, "Navigation failed: net::ERR_CONNECTION_REFUSED").is_none());
+        assert!(skill_for(Engine::Chrome, "/x/loka-agent browser a quest").contains("pipes"));
     }
 
     #[test]

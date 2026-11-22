@@ -60,6 +60,7 @@ pub fn tools(tool: fn(&str, &str, Value, &[&str]) -> Value) -> Vec<Value> {
                 "query": s("Words to look for, optional"),
                 "folder": s("Only this folder and its subfolders, optional"),
                 "tag": s("Only reports with this tag, optional"),
+                "practice": { "type": "boolean", "description": "true lists only practice canvases, false leaves them out" },
                 "limit": { "type": "integer", "description": "At most this many, default 30" }
             }),
             &[],
@@ -84,7 +85,9 @@ fn line(r: &ReportBrief) -> String {
     if r.pinned {
         extra.push("pinned".into());
     }
-    if r.kind == "canvas" {
+    if let Some(subject) = r.practice.as_ref().and_then(|p| p.get("subject")).and_then(Value::as_str) {
+        extra.push(format!("{subject} practice canvas, read_practice"));
+    } else if r.kind == "canvas" {
         extra.push(if r.open_marks > 0 { format!("canvas, {} open marks", r.open_marks) } else { "canvas".into() });
     }
     if r.visibility == "public" {
@@ -239,6 +242,7 @@ pub async fn call(store: &WorldStore, caller: &WorldAgent, quest: Option<Uuid>, 
                 folder: arg("folder").map(String::from),
                 tag: arg("tag").map(String::from),
                 limit: Some(args.get("limit").and_then(Value::as_i64).unwrap_or(30).clamp(1, 100)),
+                practice: args.get("practice").and_then(Value::as_bool),
             };
             let found = store.list_reports(owner, org, &filter).await?;
             Ok(if found.is_empty() { "No reports matched.".into() } else { found.iter().map(line).collect::<Vec<_>>().join("\n") })

@@ -52,7 +52,7 @@ impl CleanupKind {
             Self::Chats => "chat messages with your agents",
             Self::Quests => "finished, failed and cancelled quests with their sessions, runs and logs (lifetime cost stays)",
             Self::Activity => "activity feed events, including cleared bell items",
-            Self::Workspaces => "workspaces of closed quests on your devices (worktrees, build output and scratch files; branches, commits and pull requests stay)",
+            Self::Workspaces => "workspaces and temp folders of closed quests on your devices (worktrees, build output, test databases and scratch files; branches, commits and pull requests stay)",
         }
     }
 }
@@ -97,6 +97,8 @@ pub struct WorkspaceUse {
     pub low: bool,
     pub reclaimable_bytes: i64,
     pub reclaimable_tasks: i64,
+    pub temp_bytes: i64,
+    pub reclaimable_temp_bytes: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -192,13 +194,18 @@ impl WorldStore {
         let store = RunnerStore::new(self.pool().clone());
         let mut found = Vec::new();
         for (runner_id, name, status, view) in runners {
-            let largest: Vec<(Uuid, i64)> = view["largest"]
+            let largest: Vec<(Uuid, i64, i64)> = view["largest"]
                 .as_array()
-                .map(|list| list.iter().filter_map(|row| Some((row["id"].as_str()?.parse().ok()?, row["bytes"].as_i64()?))).collect())
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|row| Some((row["id"].as_str()?.parse().ok()?, row["bytes"].as_i64()?, row["temp_bytes"].as_i64().unwrap_or(0))))
+                        .collect()
+                })
                 .unwrap_or_default();
-            let ids: Vec<Uuid> = largest.iter().map(|(id, _)| *id).collect();
+            let ids: Vec<Uuid> = largest.iter().map(|(id, _, _)| *id).collect();
             let closed: Vec<Uuid> = store.closed_tasks(runner_id, &ids, true).await?.into_iter().map(|task| task.id).collect();
-            let reclaimable: Vec<i64> = largest.iter().filter(|(id, _)| closed.contains(id)).map(|(_, bytes)| *bytes).collect();
+            let reclaimed: Vec<&(Uuid, i64, i64)> = largest.iter().filter(|(id, _, _)| closed.contains(id)).collect();
+            let reclaimable: Vec<i64> = reclaimed.iter().map(|(_, bytes, _)| *bytes).collect();
             found.push(WorkspaceUse {
                 runner_id,
                 name,
@@ -210,6 +217,8 @@ impl WorldStore {
                 low: view["low"].as_bool().unwrap_or(false),
                 reclaimable_bytes: reclaimable.iter().sum(),
                 reclaimable_tasks: reclaimable.len() as i64,
+                temp_bytes: view["temp_bytes"].as_i64().unwrap_or(0),
+                reclaimable_temp_bytes: reclaimed.iter().map(|(_, _, temp)| *temp).sum(),
             });
         }
         Ok(found)

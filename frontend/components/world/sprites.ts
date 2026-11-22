@@ -1,4 +1,4 @@
-import { canonicalBody, speciesFor, withoutHats } from "@/lib/looks";
+import { canonicalBody, speciesFor, withoutHeadwear } from "@/lib/looks";
 import {
   accessoryView,
   bodyFor,
@@ -282,7 +282,7 @@ export function figureOf(sheet: object): Figure | null {
   }
   const raw = looks.get(sheet);
   if (!raw) return null;
-  const look = hit && hit.version === version ? hit.look : withArtOnly(active.manifest, withoutHats(raw), canonicalBody, innate);
+  const look = hit && hit.version === version ? hit.look : withArtOnly(active.manifest, withoutHeadwear(raw), canonicalBody, innate);
   const id = figureKey(active, look);
   const figure = id ? figureFor(active, look, id) : null;
   if (figure === undefined) {
@@ -432,7 +432,7 @@ function figureFor(set: SpriteSet, look: LokaLook, { body, key: cacheKey }: Figu
 export async function figurePreview(look: LokaLook): Promise<string | null> {
   if (!enabled || !active) return null;
   for (let tries = 0; tries < 80; tries++) {
-    const shown = withArtOnly(active.manifest, withoutHats(look), canonicalBody, innate);
+    const shown = withArtOnly(active.manifest, withoutHeadwear(look), canonicalBody, innate);
     const id = figureKey(active, shown);
     const figure = id ? figureFor(active, shown, id) : null;
     if (figure === null) return null;
@@ -502,6 +502,34 @@ export function thingOf(sprite: object, seed: number): ThingImage | null {
   };
   thingCache.set(cacheKey, made);
   return made;
+}
+
+export function propOf(key: string, frame = 0): ThingImage | null {
+  if (!active || !enabled) return null;
+  const spec = active.manifest.things[key];
+  if (!spec) return null;
+  const count = spec.frames.length;
+  const index = ((Math.floor(frame) % count) + count) % count;
+  const cacheKey = `prop:${key}:${index}`;
+  const hit = thingCache.get(cacheKey);
+  if (hit) return hit;
+  const made: ThingImage = {
+    img: maskedCut(active.atlas, spec.frames[index], new Map(), []),
+    ax: spec.anchor[0],
+    ay: spec.anchor[1],
+    density: spec.density,
+    sign: spec.sign,
+    points: spec.points,
+  };
+  thingCache.set(cacheKey, made);
+  return made;
+}
+
+export function heldGearOf(sheet: object): string[] {
+  const set = active;
+  if (!set || !enabled) return [];
+  const worn = looks.get(sheet)?.accessories ?? [];
+  return worn.filter((a) => !set.manifest.accessories[a] && set.manifest.things[`gear_${a}`]);
 }
 
 export interface Placed {
