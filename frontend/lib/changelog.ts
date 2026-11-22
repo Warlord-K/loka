@@ -7,8 +7,9 @@ export type ChangelogEntry = {
 export const CHANGELOG: ChangelogEntry[] = [
   {
     date: "2026-11-22",
-    title: "Settings, Academy courses, calls in quick chats and new art",
+    title: "Upgrade to Pro, Academy courses, Settings and new art",
     items: [
+      "**Upgrade to Pro** from the Mac app moves your agents, reports and keys to Loka Pro and installs it for you. Your free Loka stays as it was.",
       "**Settings**: the window behind your name is now called Settings, with a gear on your name card. Cmd K finds it when you type settings, preferences or profile.",
       "**Quick chats do more**: select text and press **Quote** to ask about exactly that, or press the phone button for a live call that stays in that quick chat.",
       "**Open commands in your terminal**: every command an agent gives you has **Open in terminal** and **Copy** next to **Run**. Open in terminal types it at the prompt without running it and opens that agent beside the terminal. Select terminal output and press **Quote** to ask your agent about it.",

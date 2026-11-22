@@ -1,15 +1,19 @@
 mod checks;
+mod verify;
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::Serialize;
+use sha2::Digest;
 use tauri::{AppHandle, Manager, WebviewWindow};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use checks::{Arrival, MoveSummary, Moved, ProInfo, Ticket};
+use checks::{Arrival, MoveSummary, Moved, ProInfo, ProRelease, Ticket};
+use verify::Refusal;
 
 const WAIT_FOR_BROWSER: Duration = Duration::from_secs(20 * 60);
 const READ_REQUEST: Duration = Duration::from_secs(10);
@@ -25,6 +29,10 @@ const MOVE_FAILED: &str = "Could not move your Loka";
 const UNREACHABLE: &str = "Could not reach Loka Pro. Check your connection";
 const EXPIRED: &str = "This upgrade link has expired";
 const EVENT: &str = "world:upgrade";
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const NEWER_RELEASES: u32 = 3;
+const QUIT_AFTER: Duration = Duration::from_secs(3);
+const EXPIRED_DOWNLOAD: &str = "The download link has expired. Download Loka Pro in your browser.";
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub(crate) struct UpgradeView {
@@ -57,6 +65,9 @@ struct Flow {
     generation: u64,
     task: Option<tauri::async_runtime::JoinHandle<()>>,
     page: Option<String>,
+    ticket: Option<Ticket>,
+    next: Option<ProInfo>,
+    target: Option<PathBuf>,
 }
 
 const WORKING: &[&str] = &["waiting", "checking", "packing", "moving", "downloading", "verifying", "installing", "opening"];
@@ -93,11 +104,14 @@ fn show(app: &AppHandle, generation: u64, change: impl FnOnce(&mut Flow) -> Upgr
         if flow.generation != generation {
             return false;
         }
+        let before = flow.view.step;
         let view = change(&mut flow);
         flow.view = view.clone();
+        if before != view.step {
+            eprintln!("Upgrade to Pro: {}", view.step);
+        }
         view
     };
-    eprintln!("Upgrade to Pro: {}", view.step);
     announce(app, &view);
     true
 }
@@ -107,7 +121,10 @@ fn step(app: &AppHandle, generation: u64, name: &'static str) -> bool {
 }
 
 fn fail_move(app: &AppHandle, generation: u64, error: String) {
-    show(app, generation, |flow| UpgradeView { step: "move_failed", error: Some(error), ..flow.view.clone() });
+    show(app, generation, |flow| {
+        flow.ticket = None;
+        UpgradeView { step: "move_failed", error: Some(error), ..flow.view.clone() }
+    });
 }
 
 #[tauri::command]
@@ -137,6 +154,7 @@ pub(crate) fn upgrade_cancel(window: WebviewWindow) -> Result<UpgradeView, Strin
         }
         flow.generation += 1;
         flow.page = None;
+        flow.ticket = None;
         flow.view = idle();
     }
     let view = current(app);
@@ -164,9 +182,50 @@ pub(crate) async fn upgrade_retry(window: WebviewWindow, action: String) -> Resu
             Ok(current(app))
         }
         ("again", "move_failed" | "timed_out" | "idle") => start(app).await,
+        ("again", "download_failed" | "check_failed" | "install_blocked") => {
+            let generation = {
+                let upgrade = app.state::<Upgrade>();
+                let flow = upgrade.flow.lock().map_err(|_| "Loka could not read the upgrade.".to_string())?;
+                let open = flow.next.as_ref().and_then(|next| next.pro.as_ref()).is_some_and(|pro| verify::still_open(pro.download_until.as_deref(), verify::now_seconds()));
+                if flow.ticket.is_none() || !open {
+                    return Err(EXPIRED_DOWNLOAD.into());
+                }
+                flow.generation
+            };
+            let runner = app.clone();
+            tauri::async_runtime::spawn(async move {
+                install_pro(&runner, generation).await;
+            });
+            Ok(current(app))
+        }
+        ("open", "open_failed") => {
+            let (generation, target, args) = {
+                let upgrade = app.state::<Upgrade>();
+                let flow = upgrade.flow.lock().map_err(|_| "Loka could not read the upgrade.".to_string())?;
+                let args = flow.next.as_ref().and_then(|next| verify::launch_args(&next.launch)).unwrap_or_default();
+                (flow.generation, flow.target.clone().ok_or_else(|| "Loka Pro is not installed yet.".to_string())?, args)
+            };
+            let runner = app.clone();
+            tauri::async_runtime::spawn(async move {
+                open_pro(&runner, generation, target, args).await;
+            });
+            Ok(current(app))
+        }
+        ("finder", _) => {
+            let target = app.state::<Upgrade>().flow.lock().ok().and_then(|flow| flow.target.clone()).unwrap_or_else(|| PathBuf::from("/Applications").join(verify::APP_NAME));
+            let _ = tauri::async_runtime::spawn_blocking(move || verify::reveal(&target)).await;
+            Ok(current(app))
+        }
+        ("close", "done") => {
+            quit(app).await;
+            Ok(current(app))
+        }
         ("close", step) if !working(step) => {
             if let Ok(mut flow) = app.state::<Upgrade>().flow.lock() {
                 flow.generation += 1;
+                flow.ticket = None;
+                flow.next = None;
+                flow.target = None;
                 flow.view = idle();
             }
             Ok(current(app))
@@ -188,6 +247,9 @@ async fn start(app: &AppHandle) -> Result<UpgradeView, String> {
             return Err("An upgrade is already running.".into());
         }
         flow.generation += 1;
+        flow.ticket = None;
+        flow.next = None;
+        flow.target = None;
         flow.page = Some(page.clone());
         flow.view = UpgradeView { step: "waiting", ..UpgradeView::default() };
         flow.generation
@@ -215,8 +277,10 @@ async fn run(app: AppHandle, generation: u64, listener: TcpListener, state: Stri
         return;
     };
     let org = ticket.org.clone();
+    let kept = ticket.clone();
     if !show(&app, generation, |flow| {
         flow.page = None;
+        flow.ticket = Some(kept);
         UpgradeView { step: "checking", org: Some(org), ..UpgradeView::default() }
     }) {
         return;
@@ -475,5 +539,249 @@ async fn moved(app: &AppHandle, generation: u64, next: ProInfo, summary: Option<
     let site = checks::pro_site();
     let page = checks::download_page(&next, &site);
     let version = next.pro.as_ref().map(|pro| pro.version.clone());
-    show(app, generation, |flow| summary_view(UpgradeView { step: "moved", download_page: Some(page), version, ..flow.view.clone() }, summary.as_ref()));
+    let automatic = verify::installable(&next).is_some() && verify::launch_args(&next.launch).is_some();
+    let shown = show(app, generation, |flow| {
+        flow.next = Some(next);
+        let step = if automatic { "downloading" } else { "moved" };
+        summary_view(UpgradeView { step, download_page: Some(page), version, ..flow.view.clone() }, summary.as_ref())
+    });
+    if shown && automatic {
+        install_pro(app, generation).await;
+    }
+}
+
+fn download_failed(app: &AppHandle, generation: u64, step: &'static str) {
+    show(app, generation, |flow| {
+        let can_retry = flow.next.as_ref().and_then(|next| next.pro.as_ref()).is_some_and(|pro| verify::still_open(pro.download_until.as_deref(), verify::now_seconds()));
+        UpgradeView { step, can_retry, done: None, total: None, ..flow.view.clone() }
+    });
+}
+
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new() -> Option<TempDir> {
+        use std::os::unix::fs::DirBuilderExt;
+        let path = std::env::temp_dir().join(format!("loka-pro-{}", checks::random_hex(8).ok()?));
+        std::fs::DirBuilder::new().mode(0o700).create(&path).ok()?;
+        Some(TempDir(path))
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+struct Fetched {
+    dir: TempDir,
+    dmg: PathBuf,
+    sha256: String,
+    size: u64,
+}
+
+enum Fetch {
+    Done(Fetched),
+    Newer,
+    Failed,
+}
+
+async fn download(app: &AppHandle, generation: u64, client: &reqwest::Client, ticket: &Ticket, release: &ProRelease) -> Fetch {
+    if !verify::same_origin(&release.download_url, &ticket.api) {
+        eprintln!("Upgrade to Pro: refused a download address outside the Pro API");
+        return Fetch::Failed;
+    }
+    let Some(dir) = TempDir::new() else {
+        return Fetch::Failed;
+    };
+    let Ok(auth) = bearer(ticket) else {
+        return Fetch::Failed;
+    };
+    let sent = client.get(&release.download_url).header(reqwest::header::AUTHORIZATION, auth).timeout(DOWNLOAD_TIMEOUT).send().await;
+    let Ok(mut response) = sent else {
+        eprintln!("Upgrade to Pro: the download got no answer");
+        return Fetch::Failed;
+    };
+    let status = response.status().as_u16();
+    eprintln!("Upgrade to Pro: GET /api/move/pro-dmg {status}");
+    if status == 409 {
+        return Fetch::Newer;
+    }
+    if status != 200 {
+        return Fetch::Failed;
+    }
+    let total = response.content_length().or(release.size);
+    let dmg = dir.0.join("Loka Pro.dmg");
+    let Ok(mut file) = std::fs::OpenOptions::new().write(true).create_new(true).open(&dmg) else {
+        return Fetch::Failed;
+    };
+    let mut hasher = sha2::Sha256::new();
+    let mut done: u64 = 0;
+    let mut shown: u64 = 0;
+    show(app, generation, |flow| UpgradeView { done: Some(0), total, ..flow.view.clone() });
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                done += chunk.len() as u64;
+                if release.size.is_some_and(|size| done > size) || file.write_all(&chunk).is_err() {
+                    return Fetch::Failed;
+                }
+                hasher.update(&chunk);
+                if done - shown >= 1024 * 1024 {
+                    shown = done;
+                    if !show(app, generation, |flow| UpgradeView { done: Some(done), total, ..flow.view.clone() }) {
+                        return Fetch::Failed;
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {
+                eprintln!("Upgrade to Pro: the download stopped");
+                return Fetch::Failed;
+            }
+        }
+    }
+    if file.sync_all().is_err() {
+        return Fetch::Failed;
+    }
+    show(app, generation, |flow| UpgradeView { done: Some(done), total, ..flow.view.clone() });
+    Fetch::Done(Fetched { dir, dmg, sha256: checks::hex(&hasher.finalize()), size: done })
+}
+
+fn check_and_install(app: &AppHandle, generation: u64, fetched: &Fetched, release: &ProRelease) -> Result<PathBuf, Refusal> {
+    if !verify::sized_right(fetched.size, release.size) {
+        return Err(Refusal::Check("size"));
+    }
+    if !verify::hash_matches(&fetched.sha256, &release.sha256) {
+        return Err(Refusal::Check("sha256"));
+    }
+    let team = release.team_id.clone().ok_or(Refusal::Check("team"))?;
+    let mounted = verify::Mounted::attach(&fetched.dmg, &fetched.dir.0.join("mnt"))?;
+    let app_path = mounted.app_for(&release.bundle_id)?;
+    verify::check_signature(&app_path, &team)?;
+    verify::check_notarized(&app_path)?;
+    if !step(app, generation, "installing") {
+        return Err(Refusal::Install("The upgrade was stopped.".into()));
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let target = verify::install_target(home.as_deref()).ok_or_else(|| Refusal::Install("Loka could not find a place to install Loka Pro.".into()))?;
+    if let Ok(mut flow) = app.state::<Upgrade>().flow.lock() {
+        flow.target = Some(target.clone());
+    }
+    verify::install(&app_path, &target, release, home.as_deref())?;
+    drop(mounted);
+    Ok(target)
+}
+
+async fn install_pro(app: &AppHandle, generation: u64) {
+    let (ticket, mut next) = {
+        let upgrade = app.state::<Upgrade>();
+        let Ok(flow) = upgrade.flow.lock() else {
+            return;
+        };
+        match (flow.ticket.clone(), flow.next.clone()) {
+            (Some(ticket), Some(next)) => (ticket, next),
+            _ => return,
+        }
+    };
+    let Ok(client) = pro_client() else {
+        return download_failed(app, generation, "download_failed");
+    };
+    let mut newer = 0;
+    let fetched = loop {
+        let Some(release) = verify::installable(&next).cloned() else {
+            return moved_without_app(app, generation, next);
+        };
+        let version = release.version.clone();
+        if !show(app, generation, |flow| UpgradeView { step: "downloading", version: Some(version), error: None, blocked: None, done: None, total: release.size, ..flow.view.clone() }) {
+            return;
+        }
+        match download(app, generation, &client, &ticket, &release).await {
+            Fetch::Done(fetched) => break (fetched, release),
+            Fetch::Newer if newer < NEWER_RELEASES => {
+                newer += 1;
+                match pro_info(&client, &ticket).await {
+                    Ok(info) => {
+                        next = info.clone();
+                        if let Ok(mut flow) = app.state::<Upgrade>().flow.lock() {
+                            flow.next = Some(info);
+                        }
+                    }
+                    Err(_) => return download_failed(app, generation, "download_failed"),
+                }
+            }
+            Fetch::Newer | Fetch::Failed => return download_failed(app, generation, "download_failed"),
+        }
+    };
+    if !step(app, generation, "verifying") {
+        return;
+    }
+    let checking = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let (fetched, release) = fetched;
+        let result = check_and_install(&checking, generation, &fetched, &release);
+        drop(fetched);
+        result
+    })
+    .await
+    .unwrap_or_else(|_| Err(Refusal::Install("Loka could not install Loka Pro.".into())));
+    let target = match result {
+        Ok(target) => target,
+        Err(Refusal::Check(stage)) => {
+            eprintln!("Upgrade to Pro: refused the download at the {stage} check");
+            return download_failed(app, generation, "check_failed");
+        }
+        Err(refusal) => {
+            let (blocked, error) = match refusal {
+                Refusal::Running => (Some("running"), None),
+                Refusal::Other => (Some("other"), None),
+                Refusal::Install(error) => (None, Some(error)),
+                Refusal::Check(_) => (None, None),
+            };
+            show(app, generation, |flow| {
+                let can_retry = flow.next.as_ref().and_then(|next| next.pro.as_ref()).is_some_and(|pro| verify::still_open(pro.download_until.as_deref(), verify::now_seconds()));
+                UpgradeView { step: "install_blocked", blocked, error, can_retry, done: None, total: None, ..flow.view.clone() }
+            });
+            return;
+        }
+    };
+    let args = verify::launch_args(&next.launch).unwrap_or_default();
+    open_pro(app, generation, target, args).await;
+}
+
+fn moved_without_app(app: &AppHandle, generation: u64, next: ProInfo) {
+    let page = checks::download_page(&next, &checks::pro_site());
+    show(app, generation, |flow| UpgradeView { step: "moved", download_page: Some(page), done: None, total: None, ..flow.view.clone() });
+}
+
+async fn open_pro(app: &AppHandle, generation: u64, target: PathBuf, args: Vec<String>) {
+    if !step(app, generation, "opening") {
+        return;
+    }
+    let launching = target.clone();
+    let opened = tauri::async_runtime::spawn_blocking(move || verify::launch(&launching, &args)).await.unwrap_or(false);
+    if !opened {
+        show(app, generation, |flow| {
+            flow.target = Some(target);
+            UpgradeView { step: "open_failed", ..flow.view.clone() }
+        });
+        return;
+    }
+    let login_note = crate::native::stop_starting_at_login(app);
+    if !show(app, generation, |flow| {
+        flow.ticket = None;
+        UpgradeView { step: "done", login_note, ..flow.view.clone() }
+    }) {
+        return;
+    }
+    tokio::time::sleep(QUIT_AFTER).await;
+    quit(app).await;
+}
+
+async fn quit(app: &AppHandle) {
+    let quitting = app.clone();
+    let _ = tauri::async_runtime::spawn_blocking(move || crate::native::pause_worker_for_update(&quitting)).await;
+    crate::native::shutdown(app);
+    app.exit(0);
 }

@@ -1283,6 +1283,11 @@ pub(crate) fn runner_busy(app: &AppHandle) -> u32 {
         .unwrap_or(0)
 }
 
+pub(crate) fn stop_starting_at_login(app: &AppHandle) -> bool {
+    let autolaunch = app.autolaunch();
+    autolaunch.is_enabled().unwrap_or(false) && autolaunch.disable().is_ok()
+}
+
 pub(crate) fn pause_worker_for_update(app: &AppHandle) {
     if let Some(state) = app.try_state::<NativeState>() {
         state.runner.hand_off(libc::SIGUSR1, Duration::from_secs(25));

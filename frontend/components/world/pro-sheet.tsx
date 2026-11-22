@@ -70,7 +70,7 @@ type Screen = {
   body: React.ReactNode;
   live?: boolean;
   details?: boolean;
-  buttons: { label: string; action: UpgradeAction | "start" | "cancel" | "waitlist" | "dismiss"; primary?: boolean }[];
+  buttons: { label: string; action: UpgradeAction | "start" | "cancel" | "waitlist"; primary?: boolean }[];
 };
 
 function screenFor(view: UpgradeView): Screen {
@@ -157,7 +157,12 @@ function screenFor(view: UpgradeView): Screen {
     case "install_blocked":
       return {
         title: "Couldn't install Loka Pro",
-        body: view.blocked === "other" ? "Another app is already called Loka Pro in Applications." : "Quit Loka Pro and try again.",
+        body:
+          view.blocked === "other"
+            ? "Another app is already called Loka Pro in Applications."
+            : view.blocked === "running" || !view.error
+              ? "Quit Loka Pro and try again."
+              : view.error,
         buttons: [
           { label: "Try again", action: "again", primary: true },
           { label: "Show in Finder", action: "finder" },
@@ -193,7 +198,7 @@ function Details({ view }: { view: UpgradeView }) {
         {view.renamed.map((line) => (
           <li key={`r-${line}`}>{line}</li>
         ))}
-        {view.needs_values.length > 0 && <li>Add these keys again in Loka Pro under You &gt; Keys: {view.needs_values.join(", ")}</li>}
+        {view.needs_values.length > 0 && <li>Add these keys again in Loka Pro under Settings &gt; Keys: {view.needs_values.join(", ")}</li>}
         {view.notes.map((line) => (
           <li key={`n-${line}`}>{line}</li>
         ))}
@@ -226,10 +231,6 @@ function UpgradeSheet({ onClose }: { onClose: () => void }) {
       setProblem(null);
       if (action === "waitlist") {
         window.open(PRO_WAITLIST_URL, "_blank", "noopener,noreferrer");
-        onClose();
-        return;
-      }
-      if (action === "dismiss") {
         onClose();
         return;
       }
