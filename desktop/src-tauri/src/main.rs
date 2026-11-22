@@ -6,6 +6,7 @@ mod local;
 mod native;
 mod shell_env;
 mod updates;
+mod upgrade;
 mod workbench;
 
 fn main() {

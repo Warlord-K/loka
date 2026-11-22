@@ -57,7 +57,11 @@ type DesktopCommand =
   | "update_stop_waiting"
   | "update_parts_apply"
   | "update_parts_auto"
-  | "update_auto";
+  | "update_auto"
+  | "upgrade_start"
+  | "upgrade_status"
+  | "upgrade_cancel"
+  | "upgrade_retry";
 
 export interface UpdateView {
   state: "idle" | "checking" | "downloading" | "ready" | "waiting" | "current" | "failed" | "installing";
@@ -84,6 +88,48 @@ export interface UpdateParts {
 }
 
 export const UPDATE_EVENT = "world:update";
+
+export type UpgradeStep =
+  | "idle"
+  | "waiting"
+  | "checking"
+  | "packing"
+  | "moving"
+  | "downloading"
+  | "verifying"
+  | "installing"
+  | "opening"
+  | "done"
+  | "moved"
+  | "download_failed"
+  | "check_failed"
+  | "move_failed"
+  | "timed_out"
+  | "install_blocked"
+  | "open_failed";
+
+export type UpgradeAction = "page" | "again" | "download" | "close" | "open" | "finder";
+
+export interface UpgradeView {
+  step: UpgradeStep;
+  org: string | null;
+  version: string | null;
+  done: number | null;
+  total: number | null;
+  error: string | null;
+  agents: number | null;
+  reports: number | null;
+  keys: number | null;
+  renamed: string[];
+  needs_values: string[];
+  notes: string[];
+  download_page: string | null;
+  can_retry: boolean;
+  blocked: "running" | "other" | null;
+  login_note: boolean;
+}
+
+export const UPGRADE_EVENT = "world:upgrade";
 
 export interface SharedFolder {
   id: string;
@@ -142,4 +188,8 @@ export const desktopApi = {
   setAutoUpdate: (enabled: boolean) => invoke<UpdateView>("update_auto", { enabled }),
   applyUpdateParts: () => invoke<void>("update_parts_apply"),
   setAutoUpdateParts: (enabled: boolean) => invoke<UpdateView>("update_parts_auto", { enabled }),
+  upgradeStart: () => invoke<UpgradeView>("upgrade_start"),
+  upgradeStatus: () => invoke<UpgradeView>("upgrade_status"),
+  upgradeCancel: () => invoke<UpgradeView>("upgrade_cancel"),
+  upgradeRetry: (action: UpgradeAction) => invoke<UpgradeView>("upgrade_retry", { action }),
 };

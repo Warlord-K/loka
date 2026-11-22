@@ -194,7 +194,11 @@ pub fn run() {
             crate::updates::update_stop_waiting,
             crate::updates::update_parts_apply,
             crate::updates::update_parts_auto,
-            crate::updates::update_auto
+            crate::updates::update_auto,
+            crate::upgrade::upgrade_start,
+            crate::upgrade::upgrade_status,
+            crate::upgrade::upgrade_cancel,
+            crate::upgrade::upgrade_retry
         ])
         .setup(|app| {
             let root = app.path().app_data_dir()?;
@@ -228,6 +232,7 @@ pub fn run() {
             app.manage(components);
             app.manage(Arc::new(crate::workbench::Workbench::new()));
             app.manage(crate::updates::Updates::default());
+            app.manage(crate::upgrade::Upgrade::default());
             keep_awake();
             build_window(app)?;
             build_menu(app)?;
@@ -659,6 +664,21 @@ fn owner_client(app: &AppHandle) -> Result<reqwest::Client, String> {
     session.set_sensitive(true);
     headers.insert(APP_SESSION_HEADER, session);
     local_builder().default_headers(headers).build().map_err(display_error)
+}
+
+pub(crate) async fn move_out(app: &AppHandle) -> Result<Vec<u8>, String> {
+    let response = owner_client(app)?
+        .post(format!("{}/api/world/me/move-out", api_origin(app)))
+        .timeout(Duration::from_secs(120))
+        .send()
+        .await
+        .map_err(|_| "Loka could not pack your Loka.".to_string())?;
+    let status = response.status();
+    eprintln!("Upgrade to Pro: POST /api/world/me/move-out {}", status.as_u16());
+    if !status.is_success() {
+        return Err(format!("Loka could not pack your Loka ({})", status.as_u16()));
+    }
+    response.bytes().await.map(|bytes| bytes.to_vec()).map_err(|_| "Loka could not pack your Loka.".to_string())
 }
 
 fn local_client() -> Result<reqwest::Client, String> {

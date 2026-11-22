@@ -43,6 +43,10 @@ fn main() {
                 "update_parts_apply",
                 "update_parts_auto",
                 "update_auto",
+                "upgrade_start",
+                "upgrade_status",
+                "upgrade_cancel",
+                "upgrade_retry",
             ]),
         ),
     )
