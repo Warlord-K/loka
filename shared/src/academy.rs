@@ -15,7 +15,7 @@ pub const NOT_YOUR_REPORT: &str = "Only the person who owns a report can practis
 pub const CANVAS: &str = "canvas";
 pub const MAX_READING: usize = 12;
 pub const PASS_SCORE: i32 = 60;
-pub const CANVAS_PROMPT: &str = "Draw it on the canvas and press Ready. Your coach checks the picture and every stroke.";
+pub const CANVAS_PROMPT: &str = "Draw it in the workspace and press Ready. Your coach checks the picture and every stroke.";
 pub const DIFFICULTIES: &[&str] = &["easy", "medium", "hard"];
 pub const SKILLS: &[&str] = &[
     "algorithms",
@@ -401,7 +401,7 @@ pub fn challenge_data(args: &Value) -> Result<(String, Value)> {
         bail!("a dsa challenge needs tests or a rubric");
     }
     if canvas && (!choices.is_empty() || !tests.is_null()) {
-        bail!("a canvas lesson is checked by its coach from the drawing; leave out choices and tests");
+        bail!("a practice workspace lesson is checked by its coach from the drawing; leave out choices and tests");
     }
     if !canvas && correct.is_empty() && rubric.is_none() && tests.is_null() {
         bail!("give a rubric (or, for a multiple choice quiz, choices and correct) so the answer can be graded");
@@ -647,7 +647,7 @@ impl WorldStore {
             "source_report": report.id.to_string(),
             "course": course.id.to_string(),
             "prompt": if canvas {
-                format!("Study the canvas \"{title}\" under Read first, then draw or write it from memory here and press Ready. Your coach checks the picture and every stroke.")
+                format!("Study the workspace \"{title}\" under Read first, then draw or write it from memory here and press Ready. Your coach checks the picture and every stroke.")
             } else {
                 format!("Read \"{title}\" under Read first. Then explain its main ideas in your own words, with one example of your own.")
             },
@@ -693,7 +693,7 @@ impl WorldStore {
                 .find_report(owner, org, key)
                 .await?
                 .filter(|r| r.owner_user_id == owner)
-                .ok_or_else(|| anyhow!("no report or canvas of your person matches {key}; reading has to be their own reports"))?;
+                .ok_or_else(|| anyhow!("no report or workspace of your person matches {key}; reading has to be their own reports"))?;
             if !ids.contains(&report.id) {
                 ids.push(report.id);
             }
@@ -881,7 +881,7 @@ impl WorldStore {
             }
             let (title, fresh) = challenge_data(&Value::Object(merged))?;
             if (fresh.get("type").and_then(Value::as_str) == Some(CANVAS)) != was_canvas {
-                bail!("a lesson cannot switch to or from a canvas; make a new lesson instead");
+                bail!("a lesson cannot switch to or from a practice workspace; make a new lesson instead");
             }
             for k in ["rubric", "choices", "correct"] {
                 data.remove(k);
@@ -1127,7 +1127,7 @@ impl WorldStore {
             .filter(|i| i.kind == "challenge" && i.status != "archived" && i.owner_user_id == Some(user))
             .ok_or(AcademyError::NotFound)?;
         if item.data.get("type").and_then(Value::as_str) == Some(CANVAS) {
-            return Err(AcademyError::Invalid("This lesson is answered on its canvas: open it, draw, and press Ready.".into()));
+            return Err(AcademyError::Invalid("This lesson is answered in its workspace: open it, draw, and press Ready.".into()));
         }
         let correct: Vec<i64> = item.data.get("correct").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_i64).collect()).unwrap_or_default();
         let local = !correct.is_empty();
@@ -1769,6 +1769,7 @@ mod tests {
     fn canvas_lessons_need_no_rubric_but_refuse_choices() {
         let (_, data) = challenge_data(&json!({ "title": "Kana", "type": "canvas", "skill": "japanese" })).unwrap();
         assert_eq!((data["type"].as_str(), data["prompt"].as_str()), (Some("canvas"), Some(CANVAS_PROMPT)));
+        assert!(CANVAS_PROMPT.contains("workspace") && !CANVAS_PROMPT.contains("canvas"));
         assert!(challenge_data(&json!({ "title": "Kana", "type": "canvas", "skill": "japanese", "choices": ["a"], "correct": [1] })).is_err());
         assert!(challenge_data(&json!({ "title": "x", "type": "puzzle", "skill": "logic", "rubric": "r" })).is_err(), "other lessons still need a prompt");
     }

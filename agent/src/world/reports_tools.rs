@@ -55,12 +55,13 @@ pub fn tools(tool: fn(&str, &str, Value, &[&str]) -> Value) -> Vec<Value> {
         ),
         tool(
             "list_reports",
-            "List or search your person's reports (and public ones): title, id, folder, tags and when it changed. query searches titles, bodies and tags.",
+            "List or search your person's reports and workspaces (and public ones): title, id, folder, tags and when it changed. query searches titles, bodies and tags. Written pages live in Reports; workspace boards live in Workspaces.",
             json!({
                 "query": s("Words to look for, optional"),
                 "folder": s("Only this folder and its subfolders, optional"),
                 "tag": s("Only reports with this tag, optional"),
-                "practice": { "type": "boolean", "description": "true lists only practice canvases, false leaves them out" },
+                "kind": { "type": "string", "enum": ["doc", "canvas"], "description": "doc lists written reports; canvas lists workspaces" },
+                "practice": { "type": "boolean", "description": "true lists only practice workspaces, false leaves them out" },
                 "limit": { "type": "integer", "description": "At most this many, default 30" }
             }),
             &[],
@@ -86,9 +87,9 @@ fn line(r: &ReportBrief) -> String {
         extra.push("pinned".into());
     }
     if let Some(subject) = r.practice.as_ref().and_then(|p| p.get("subject")).and_then(Value::as_str) {
-        extra.push(format!("{subject} canvas lesson, list_challenges"));
+        extra.push(format!("{subject} practice workspace lesson, list_challenges"));
     } else if r.kind == "canvas" {
-        extra.push(if r.open_marks > 0 { format!("canvas, {} open marks", r.open_marks) } else { "canvas".into() });
+        extra.push(if r.open_marks > 0 { format!("workspace, {} open marks", r.open_marks) } else { "workspace".into() });
     }
     if r.visibility == "public" {
         extra.push("public".into());
@@ -165,7 +166,7 @@ pub async fn call(store: &WorldStore, caller: &WorldAgent, quest: Option<Uuid>, 
                 return Ok(format!("Restored report:{} \"{}\" to revision {n}, now revision {}.", restored.id, restored.title, restored.revision));
             }
             if report.kind == "canvas" && (arg("body").is_some() || arg("append").is_some()) {
-                bail!("\"{}\" is a canvas; change it with canvas_add_items, canvas_update_items, canvas_connect and canvas_layout", report.title);
+                bail!("\"{}\" is a workspace; change it with canvas_add_items, canvas_update_items, canvas_connect and canvas_layout", report.title);
             }
             for text in [arg("body"), arg("append")].into_iter().flatten() {
                 loka_shared::ui_cards::check_markdown(text)?;
@@ -243,7 +244,9 @@ pub async fn call(store: &WorldStore, caller: &WorldAgent, quest: Option<Uuid>, 
                 folder: arg("folder").map(String::from),
                 tag: arg("tag").map(String::from),
                 limit: Some(args.get("limit").and_then(Value::as_i64).unwrap_or(30).clamp(1, 100)),
+                offset: None,
                 practice: args.get("practice").and_then(Value::as_bool),
+                kind: arg("kind").map(String::from),
             };
             let found = store.list_reports(owner, org, &filter).await?;
             Ok(if found.is_empty() { "No reports matched.".into() } else { found.iter().map(line).collect::<Vec<_>>().join("\n") })

@@ -42,6 +42,7 @@ pub struct BrowserHelp<'a> {
 pub enum QuestCard {
     Apps,
     BrowserHelp,
+    Question,
 }
 
 pub enum CardAnswer {
@@ -171,14 +172,17 @@ impl WorldStore {
     }
 
     pub async fn quest_card(&self, agent_id: Uuid, card: Uuid) -> Result<Option<QuestCard>> {
-        let keys = sqlx::query_as::<_, (bool, bool)>("SELECT meta ? 'apps', meta ? 'browser_help' FROM agent_messages WHERE id = $1 AND agent_id = $2")
-            .bind(card)
-            .bind(agent_id)
-            .fetch_optional(self.pool())
-            .await?;
+        let keys = sqlx::query_as::<_, (bool, bool, bool)>(
+            "SELECT meta ? 'apps', meta ? 'browser_help', kind = 'needs_you' AND meta ? 'question_card' FROM agent_messages WHERE id = $1 AND agent_id = $2",
+        )
+        .bind(card)
+        .bind(agent_id)
+        .fetch_optional(self.pool())
+        .await?;
         Ok(match keys {
-            Some((true, _)) => Some(QuestCard::Apps),
-            Some((_, true)) => Some(QuestCard::BrowserHelp),
+            Some((true, _, _)) => Some(QuestCard::Apps),
+            Some((_, true, _)) => Some(QuestCard::BrowserHelp),
+            Some((_, _, true)) => Some(QuestCard::Question),
             _ => None,
         })
     }
@@ -198,6 +202,28 @@ impl WorldStore {
         Ok(match (id("task_id"), id("session_id")) {
             (Some(task_id), Some(session_id)) => Some((meta, task_id, session_id)),
             _ => None,
+        })
+    }
+
+    pub async fn answer_question_card(&self, agent_id: Uuid, card: Uuid, text: &str, by: &str) -> Result<CardAnswer> {
+        let row = sqlx::query_as::<_, (Option<String>, Option<Uuid>)>(
+            "SELECT m.meta->'question_card'->>'question_id', a.owner_user_id
+             FROM agent_messages m JOIN agent_profiles a ON a.id = m.agent_id WHERE m.id = $1 AND m.agent_id = $2",
+        )
+        .bind(card)
+        .bind(agent_id)
+        .fetch_optional(self.pool())
+        .await?;
+        let Some((Some(question), Some(owner))) = row else {
+            return Ok(CardAnswer::Stale);
+        };
+        let Ok(question) = question.parse::<Uuid>() else {
+            return Ok(CardAnswer::Stale);
+        };
+        let settle = crate::quest_questions::Settle::new(crate::quest_questions::Outcome::Answered, text, crate::quest_questions::Who::person(owner, by));
+        Ok(match self.settle_question(question, settle).await? {
+            Some(_) => CardAnswer::Answered { yes: true },
+            None => CardAnswer::Stale,
         })
     }
 
@@ -222,6 +248,7 @@ impl WorldStore {
         match kind {
             QuestCard::Apps => self.answer_app_control(agent_id, card, text, by).await,
             QuestCard::BrowserHelp => self.answer_browser_help(agent_id, card, text, by).await,
+            QuestCard::Question => self.answer_question_card(agent_id, card, text, by).await,
         }
     }
 

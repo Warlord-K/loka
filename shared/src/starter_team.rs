@@ -170,6 +170,21 @@ fn add_cli(found: &mut Vec<CliModels>, opencode: bool, cli: &str, models: Vec<St
     }
 }
 
+fn signed_in(caps: &Value, cli: &str) -> bool {
+    match caps.get("tools").filter(|tools| tools.is_object()) {
+        Some(tools) => crate::onboarding::tool_state(tools, cli).is_none_or(|state| state == crate::onboarding::ToolState::Ready),
+        None => true,
+    }
+}
+
+pub const SEAT_SLOTS: &[&str] = &["coder-1", "reviewer", "coder-2"];
+
+pub fn seat_default(seat: &str, base: &Pick, pins: &crate::variety::Pins, clis: &[CliModels]) -> Pick {
+    let slot = SEAT_SLOTS.iter().position(|s| *s == seat).unwrap_or(0);
+    let picked = crate::variety::pick(crate::variety::Role::Seat, slot, pins, &crate::variety::Pick::new(&base.cli, &base.model), clis);
+    Pick { cli: picked.cli, model: picked.model }
+}
+
 pub fn available_clis(signals: &Signals, main_cli: &str, main_model: &str) -> Vec<CliModels> {
     let mut found: Vec<CliModels> = Vec::new();
     let add = |found: &mut Vec<CliModels>, cli: &str, models: Vec<String>| add_cli(found, signals.opencode, cli, models);
@@ -179,7 +194,7 @@ pub fn available_clis(signals: &Signals, main_cli: &str, main_model: &str) -> Ve
             continue;
         };
         for (cli, on) in backends {
-            if on.as_bool() == Some(true) {
+            if on.as_bool() == Some(true) && signed_in(&runner.capabilities, cli) {
                 add(&mut found, cli, runner_models(&runner.capabilities, cli));
             }
         }
@@ -496,6 +511,7 @@ impl WorldStore {
         let (main_cli, main_model) = main.map(|m| (m.cli.as_str(), m.model.as_str())).unwrap_or(("claude", "sonnet"));
         let clis = available_clis(signals, main_cli, main_model);
         let picks = pick_models(&clis);
+        let pins = crate::variety::Pins::rule_only(self.rule_model_pin(Some(scope.owner), scope.org).await?);
         let taken = self.taken_agent_names(scope).await?;
         let mut used: Vec<String> = Vec::new();
         let mut seats = Vec::new();
@@ -525,11 +541,8 @@ impl WorldStore {
                 continue;
             }
             let Some(picks) = picks.as_ref() else { continue };
-            let default = match job {
-                Job::Coder => &picks.coder,
-                Job::Reviewer => &picks.reviewer,
-            };
-            let pick = &seat_pick(&clis, default, wanted.flatten());
+            let default = seat_default(seat, &picks.coder, &pins, &clis);
+            let pick = &seat_pick(&clis, &default, wanted.flatten());
             let identity = identities(*job)
                 .iter()
                 .find(|i| {
@@ -810,6 +823,29 @@ impl WorldStore {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn starter_seats_spread_across_clis_and_a_rule_pin_wins() {
+        let clis = vec![
+            CliModels { cli: "claude".into(), models: vec!["opus".into(), "sonnet".into()] },
+            CliModels { cli: "codex".into(), models: vec!["gpt-5.5".into(), "gpt-5.5-mini".into()] },
+            CliModels { cli: "omp".into(), models: vec!["fal/kimi-k3".into()] },
+        ];
+        let base = Pick { cli: "claude".into(), model: "opus".into() };
+        let none = crate::variety::Pins::default();
+        let seats: Vec<String> = ["coder-1", "coder-2", "reviewer"].iter().map(|s| seat_default(s, &base, &none, &clis).cli).collect();
+        assert_eq!(seats, vec!["claude", "omp", "codex"], "coders and the reviewer each get their own CLI");
+        let two = &clis[..2];
+        assert_eq!(seat_default("reviewer", &base, &none, two).cli, "codex", "with two CLIs the reviewer takes the other one");
+        assert_eq!(seat_default("coder-2", &base, &none, &clis[..1]), base, "one CLI keeps every seat on it");
+        let pinned = crate::variety::Pins::rule_only(Some(crate::world::ReviewerChoice { cli: Some("codex".into()), model: "gpt-5.5-mini".into() }));
+        for seat in ["coder-1", "coder-2", "reviewer"] {
+            assert_eq!(seat_default(seat, &base, &pinned, &clis), Pick { cli: "codex".into(), model: "gpt-5.5-mini".into() });
+        }
+        let wanted = SeatPick { seat: "coder-2".into(), cli: Some("claude".into()), model: Some("sonnet".into()) };
+        let default = seat_default("coder-2", &base, &pinned, &clis);
+        assert_eq!(seat_pick(&clis, &default, Some(&wanted)), Pick { cli: "claude".into(), model: "sonnet".into() }, "a seat the person picked wins over the rule");
+    }
+
     use super::*;
     use crate::runners::RunnerView;
     use sqlx::postgres::PgPoolOptions;

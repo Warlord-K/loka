@@ -378,6 +378,10 @@ impl Caps {
         !self.known || self.flags.contains(flag)
     }
 
+    pub(crate) fn confirmed(&self, flag: &str) -> bool {
+        self.known && self.flags.contains(flag)
+    }
+
     pub(crate) fn mode(&self, mode: &str) -> bool {
         !self.known || self.modes.is_empty() || self.modes.iter().any(|m| m == mode)
     }

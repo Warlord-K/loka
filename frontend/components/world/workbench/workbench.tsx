@@ -16,6 +16,7 @@ import { TerminalTargetContext } from "../run-command";
 import { sendQuote, type MessageQuote } from "../quote";
 import type { TerminalReader } from "../terminal";
 import { scrollWithin } from "@/lib/scroll";
+import { consumeDiffHref } from "@/lib/feature-links";
 
 interface Layout {
   tabs: Tab[];
@@ -29,6 +30,11 @@ interface Layout {
   split: boolean;
   pane: string;
   extra: string[];
+}
+
+interface DirectDiffRequest {
+  sessionId: string;
+  nonce: number;
 }
 
 const DEFAULT_LAYOUT: Layout = {
@@ -47,6 +53,12 @@ const DEFAULT_LAYOUT: Layout = {
 
 function storageKey(sessionId: string) {
   return `world.workbench.v1:${sessionId}`;
+}
+
+function diffSession(request: OpenWorkshopDetail): string | null {
+  if (typeof request === "object") return request.diff && request.sessionId ? request.sessionId : null;
+  if (typeof window === "undefined") return null;
+  return new URLSearchParams(window.location.search).get("diff")?.toLowerCase() === request.toLowerCase() ? request : null;
 }
 
 const OLD_DEFAULT_RIGHT = 380;
@@ -335,8 +347,13 @@ export function Workbench({
   const [choices, setChoices] = useState<SessionBrief[] | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const [info, setInfo] = useState<WbOpen | null>(null);
+  const [infoFor, setInfoFor] = useState<string | null>(null);
   const [layout, setLayout] = useState<Layout>(DEFAULT_LAYOUT);
   const [changes, setChanges] = useState<WbChange[]>([]);
+  const [changesLoadedFor, setChangesLoadedFor] = useState<string | null>(null);
+  const [changesLoadedForToken, setChangesLoadedForToken] = useState<OpenWorkshopDetail | DirectDiffRequest | null>(null);
+  const [directDiff, setDirectDiff] = useState<DirectDiffRequest | null>(null);
+  const [changeRetry, setChangeRetry] = useState(0);
   const [refresh, setRefresh] = useState<{ nonce: number; paths: string[] }>({ nonce: 0, paths: [] });
   const [dirty, setDirty] = useState<string[]>([]);
   const [cursor, setCursor] = useState<{ line: number; column: number; language: string } | null>(null);
@@ -345,6 +362,13 @@ export function Workbench({
   const compact = useCompact();
   const editor = useRef<EditorHandle>(null);
   const restored = useRef<string | null>(null);
+  const changeLoads = useRef(0);
+  const directDiffNonce = useRef(0);
+  const openedDiff = useRef<OpenWorkshopDetail | DirectDiffRequest | null>(null);
+  const diffRetry = useRef<number | null>(null);
+  const diffRetriedFor = useRef<OpenWorkshopDetail | DirectDiffRequest | null>(null);
+  const pendingDiffSession = useRef<string | null>(null);
+  const pendingDiffToken = useRef<OpenWorkshopDetail | DirectDiffRequest | null>(null);
 
   const say = useCallback((text: string) => setToast(text), []);
   useEffect(() => {
@@ -355,12 +379,18 @@ export function Workbench({
 
   const agentId = session?.agent_id ?? (typeof request === "object" ? request.agentId ?? null : null);
   const agent = agents.find((a) => a.id === agentId) ?? null;
+  const requestedDiff = directDiff?.sessionId ?? diffSession(request);
+  const requestedDiffToken = directDiff ?? request;
+  pendingDiffSession.current = requestedDiff;
+  pendingDiffToken.current = requestedDiffToken;
+
+  useEffect(() => setDirectDiff(null), [request]);
 
   const reloadSession = useCallback(async () => {
     const wantId = typeof request === "string" ? request : request.sessionId ?? null;
     const wantTask = typeof request === "object" ? request.taskId ?? null : null;
     const wantAgent = typeof request === "object" ? request.agentId ?? null : null;
-    const list = await worldApi.sessions(wantAgent ?? undefined);
+    const list = await worldApi.sessions(wantAgent ?? undefined, wantId ?? undefined);
     if (wantId) return list.find((s) => s.id === wantId) ?? null;
     if (wantTask) return list.find((s) => s.task_id === wantTask && s.role === "task") ?? list.find((s) => s.task_id === wantTask) ?? null;
     const tasks = list.filter((s) => s.role === "task");
@@ -389,20 +419,38 @@ export function Workbench({
   const key = session ? sessionKeyFor(session) : null;
 
   useEffect(() => {
+    changeLoads.current += 1;
+    if (diffRetry.current !== null) window.clearTimeout(diffRetry.current);
+    diffRetry.current = null;
+    diffRetriedFor.current = null;
+    setChanges([]);
+    setChangesLoadedFor(null);
+    setChangesLoadedForToken(null);
+    return () => {
+      if (diffRetry.current !== null) window.clearTimeout(diffRetry.current);
+      diffRetry.current = null;
+    };
+  }, [session?.id]);
+
+  useEffect(() => {
     if (!session || !key) {
       if (session && !key) setProblem("This session has no folder.");
       return;
     }
     let gone = false;
     setChoices(null);
+    setInfo(null);
+    setInfoFor(null);
     wb.open(key, session.base_branch ?? null)
       .then((opened) => {
         if (gone) return;
         setInfo(opened);
+        setInfoFor(session.id);
         if (restored.current !== session.id) {
           restored.current = session.id;
           const stored = readLayout(session.id);
-          setLayout(window.matchMedia(COMPACT_QUERY).matches ? { ...stored, left: 0, rightOpen: false } : stored);
+          const initial = requestedDiff === session.id ? { ...stored, terminal: false } : stored;
+          setLayout(window.matchMedia(COMPACT_QUERY).matches ? { ...initial, left: 0, rightOpen: false } : initial);
         }
       })
       .catch((error: Error) => !gone && setProblem(error.message));
@@ -418,18 +466,41 @@ export function Workbench({
     } catch {}
   }, [layout, session]);
 
-  const wkey = info?.key ?? null;
+  const wkey = infoFor === session?.id ? info?.key ?? null : null;
   const loadChanges = useCallback(async () => {
     if (!wkey) return;
+    const load = ++changeLoads.current;
+    const sessionId = session?.id ?? null;
+    const loadToken = pendingDiffSession.current === sessionId ? pendingDiffToken.current : null;
+    if (diffRetry.current !== null) window.clearTimeout(diffRetry.current);
+    diffRetry.current = null;
     try {
       const result = await wb.changes(wkey, info?.base ?? null);
+      if (load !== changeLoads.current) return;
       setChanges(result.files);
-    } catch {}
-  }, [wkey, info?.base]);
+      setChangesLoadedFor(sessionId);
+      setChangesLoadedForToken(loadToken);
+    } catch {
+      if (load !== changeLoads.current) return;
+      setChanges([]);
+      setChangesLoadedFor(sessionId);
+      setChangesLoadedForToken(loadToken);
+      const retrySession = sessionId;
+      const retryToken = loadToken;
+      if (retrySession === sessionId && retryToken && openedDiff.current !== retryToken && diffRetriedFor.current !== retryToken && diffRetry.current === null) {
+        diffRetry.current = window.setTimeout(() => {
+          diffRetry.current = null;
+          if (changeLoads.current !== load || pendingDiffSession.current !== retrySession || pendingDiffToken.current !== retryToken) return;
+          diffRetriedFor.current = retryToken;
+          setChangeRetry((value) => value + 1);
+        }, 400);
+      }
+    }
+  }, [wkey, info?.base, session?.id]);
 
   useEffect(() => {
     void loadChanges();
-  }, [loadChanges]);
+  }, [loadChanges, changeRetry, directDiff]);
 
   useEffect(() => {
     if (!wkey) return;
@@ -559,8 +630,24 @@ export function Workbench({
   const openChange = useCallback((change: WbChange) => openFile(change.path, "diff"), [openFile]);
 
   useEffect(() => {
+    if (!requestedDiff || session?.id !== requestedDiff || changesLoadedFor !== requestedDiff || changesLoadedForToken !== requestedDiffToken || openedDiff.current === requestedDiffToken || !changes[0]) return;
+    openedDiff.current = requestedDiffToken;
+    if (typeof request === "string") {
+      const consumed = consumeDiffHref(window.location.href, requestedDiff);
+      if (consumed) window.history.replaceState(null, "", consumed);
+    }
+    openChange(changes[0]);
+  }, [changes, changesLoadedFor, changesLoadedForToken, openChange, request, requestedDiff, requestedDiffToken, session?.id]);
+
+  useEffect(() => {
     if (!session || !info) return;
-    setOpenWorkshop({ sessionId: session.id, agentId: session.agent_id, runnerId: agent?.runner_id ?? null, root: info.root });
+    setOpenWorkshop({
+      sessionId: session.id,
+      agentId: session.agent_id,
+      runnerId: agent?.runner_id ?? null,
+      root: info.root,
+      openDiff: () => setDirectDiff({ sessionId: session.id, nonce: ++directDiffNonce.current }),
+    });
     return () => setOpenWorkshop(null);
   }, [session, info, agent?.runner_id]);
 

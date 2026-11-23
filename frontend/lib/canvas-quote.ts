@@ -13,7 +13,7 @@ export function quoteItems(report: { id: string; title: string }, items: QuotedI
   const lines = chosen.map((i) => (i.label ? `${i.kind}: ${i.label}` : i.kind));
   return {
     text: (chosen.length === 1 ? lines[0] : lines.map((l) => `- ${l}`).join("\n")).slice(0, 2000),
-    label: `${chosen.length === 1 ? chosen[0].kind : `${chosen.length} items`} on canvas "${report.title}"`.slice(0, 120),
+    label: `${chosen.length === 1 ? chosen[0].kind : `${chosen.length} items`} on workspace "${report.title}"`.slice(0, 120),
     source: `report:${report.id}#${chosen.map((i) => i.id).join("+")}`,
   };
 }

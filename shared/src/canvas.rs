@@ -393,7 +393,7 @@ impl Canvas {
     pub fn parse(value: Option<&Value>) -> Result<Canvas> {
         match value {
             None | Some(Value::Null) => Ok(Canvas::default()),
-            Some(v) => serde_json::from_value(v.clone()).map_err(|e| anyhow!("unreadable canvas: {e}")),
+            Some(v) => serde_json::from_value(v.clone()).map_err(|e| anyhow!("unreadable workspace: {e}")),
         }
     }
 
@@ -405,9 +405,9 @@ impl Canvas {
             #[serde(default)]
             edges: Vec<EdgeInput>,
         }
-        let raw: Raw = serde_json::from_value(value.clone()).map_err(|e| anyhow!("unreadable canvas: {e}"))?;
+        let raw: Raw = serde_json::from_value(value.clone()).map_err(|e| anyhow!("unreadable workspace: {e}"))?;
         if raw.items.len() > MAX_ITEMS {
-            bail!("a canvas holds at most {MAX_ITEMS} items; start another canvas and link them");
+            bail!("a workspace holds at most {MAX_ITEMS} items; start another workspace and link them");
         }
         let mut taken: HashSet<String> = raw.items.iter().filter_map(|i| i.id.as_deref().map(|id| id.trim().to_string())).collect();
         let items: Vec<ItemInput> = raw
@@ -509,7 +509,7 @@ impl Canvas {
             },
         };
         if !taken.insert(id.clone()) {
-            bail!("item id {id} is already on the canvas");
+            bail!("item id {id} is already in the workspace");
         }
         let (w, h) = match input.embed.as_ref().and_then(|e| embed_kind(&e.kind.trim().to_lowercase())) {
             Some(embed) if kind == "embed" => embed.size,
@@ -566,7 +566,7 @@ impl Canvas {
                 Op::Update { items } => {
                     for input in items {
                         let id = input.id.as_deref().ok_or_else(|| anyhow!("update needs the id of each item"))?.trim().to_string();
-                        let at = self.index(&id).ok_or_else(|| anyhow!("no item {id} on this canvas"))?;
+                        let at = self.index(&id).ok_or_else(|| anyhow!("no item {id} in this workspace"))?;
                         if input.kind.as_deref().is_some_and(|k| k != self.items[at].kind) {
                             bail!("an item keeps its kind; remove it and add a new one instead");
                         }
@@ -594,7 +594,7 @@ impl Canvas {
         for input in edges {
             let (from, to) = (input.from.trim().to_string(), input.to.trim().to_string());
             if self.index(&from).is_none() || self.index(&to).is_none() {
-                bail!("arrows connect items that are on the canvas ({from} to {to})");
+                bail!("arrows connect items that are in the workspace ({from} to {to})");
             }
             if from == to {
                 bail!("an arrow needs two different items");
@@ -627,7 +627,7 @@ impl Canvas {
         }
         let mut order = Vec::new();
         for id in ids {
-            let at = self.index(id.trim()).ok_or_else(|| anyhow!("no item {} on this canvas", id.trim()))?;
+            let at = self.index(id.trim()).ok_or_else(|| anyhow!("no item {} in this workspace", id.trim()))?;
             if !order.contains(&at) {
                 order.push(at);
             }
@@ -667,10 +667,10 @@ impl Canvas {
 
     pub fn validate(&self) -> Result<()> {
         if self.items.len() > MAX_ITEMS {
-            bail!("a canvas holds at most {MAX_ITEMS} items; start another canvas and link them");
+            bail!("a workspace holds at most {MAX_ITEMS} items; start another workspace and link them");
         }
         if self.edges.len() > MAX_EDGES {
-            bail!("a canvas holds at most {MAX_EDGES} arrows");
+            bail!("a workspace holds at most {MAX_EDGES} arrows");
         }
         let mut ids = HashSet::new();
         for item in &self.items {
@@ -683,7 +683,7 @@ impl Canvas {
             }
             for v in [item.x, item.y] {
                 if !v.is_finite() || v.abs() > MAX_COORD {
-                    bail!("item {} is placed outside the canvas", item.id);
+                    bail!("item {} is placed outside the workspace", item.id);
                 }
             }
             for v in [item.w, item.h] {
@@ -716,11 +716,11 @@ impl Canvas {
         }
         for edge in &self.edges {
             if !ids.contains(edge.from.as_str()) || !ids.contains(edge.to.as_str()) {
-                bail!("arrow {} points at an item that is not on the canvas", edge.id);
+                bail!("arrow {} points at an item that is not in the workspace", edge.id);
             }
         }
         if serde_json::to_vec(self)?.len() > MAX_BYTES {
-            bail!("this canvas is too large; start another canvas and link them");
+            bail!("this workspace is too large; start another workspace and link them");
         }
         Ok(())
     }
@@ -728,7 +728,7 @@ impl Canvas {
     pub fn summary(&self) -> String {
         let mut items: Vec<&Item> = self.items.iter().collect();
         items.sort_by(|a, b| (a.y, a.x).partial_cmp(&(b.y, b.x)).unwrap_or(std::cmp::Ordering::Equal));
-        let mut out = vec![format!("Canvas with {} items and {} arrows.", self.items.len(), self.edges.len())];
+        let mut out = vec![format!("Workspace with {} items and {} arrows.", self.items.len(), self.edges.len())];
         for item in items {
             let caption = item.caption.as_deref().unwrap_or("").trim();
             let line = match item.kind.as_str() {
@@ -809,7 +809,7 @@ impl Canvas {
     }
 
     pub fn digest(&self, title: &str, report: Uuid, resolved: &HashMap<String, String>, max: usize) -> String {
-        let mut out = format!("Canvas \"{title}\" (report:{report}) with {} items and {} arrows.", self.items.len(), self.edges.len());
+        let mut out = format!("Workspace \"{title}\" (report:{report}) with {} items and {} arrows.", self.items.len(), self.edges.len());
         let order = self.reading_order();
         for (n, item) in order.iter().enumerate() {
             let line = self.describe_item(&item.id, resolved, 600).unwrap_or_default();
@@ -973,7 +973,7 @@ pub fn parse_ops(value: &Value) -> Result<Vec<Op>> {
         Value::Object(_) => Value::Array(vec![value.clone()]),
         _ => bail!("ops is a list of changes"),
     };
-    serde_json::from_value(list).map_err(|e| anyhow!("could not read the canvas change: {e}"))
+    serde_json::from_value(list).map_err(|e| anyhow!("could not read the workspace change: {e}"))
 }
 
 fn mime_fits(kind: &str, mime: &str) -> bool {
@@ -1010,13 +1010,29 @@ pub fn presence_event(report: &Report, user: Uuid, name: &str, presence: &Presen
 }
 
 impl WorldStore {
-    pub(crate) async fn check_canvas_uploads(&self, owner: Uuid, org: Option<Uuid>, canvas: &Canvas, before: &Canvas) -> Result<()> {
+    pub(crate) async fn check_canvas_uploads(
+        conn: &mut sqlx::PgConnection,
+        owner: Uuid,
+        org: Option<Uuid>,
+        canvas: &Canvas,
+        before: &Canvas,
+    ) -> Result<()> {
         let known: HashSet<Uuid> = before.upload_ids().into_iter().collect();
         let fresh: Vec<Uuid> = canvas.upload_ids().into_iter().filter(|u| !known.contains(u)).collect();
         if fresh.is_empty() {
             return Ok(());
         }
-        let found: HashMap<Uuid, String> = self.own_uploads(&fresh, owner, org).await?.into_iter().map(|u| (u.id, u.mime)).collect();
+        let found: HashMap<Uuid, String> = sqlx::query_as::<_, (Uuid, String)>(
+            "SELECT id, mime FROM world_uploads
+             WHERE id = ANY($1) AND uploaded_by = $2 AND org_id IS NOT DISTINCT FROM $3",
+        )
+        .bind(&fresh)
+        .bind(owner)
+        .bind(org)
+        .fetch_all(&mut *conn)
+        .await?
+        .into_iter()
+        .collect();
         for item in &canvas.items {
             let Some(id) = item.upload_id.filter(|u| fresh.contains(u)) else { continue };
             let Some(mime) = found.get(&id) else {
@@ -1044,7 +1060,7 @@ impl WorldStore {
                         .fetch_one(&mut *conn)
                         .await?;
                     if !own {
-                        bail!("device {device} is not one of your person's devices, so its terminal cannot go on this canvas");
+                        bail!("device {device} is not one of your person's devices, so its terminal cannot go in this workspace");
                     }
                 }
                 "quest" => {
@@ -1076,6 +1092,11 @@ impl WorldStore {
         self.create_canvas_with(new, canvas, None).await
     }
 
+    pub async fn create_canvas_idempotent(&self, new: crate::reports::NewReport, canvas: Canvas, request_id: Uuid) -> Result<Report> {
+        canvas.validate()?;
+        self.insert_canvas_idempotent(new, &canvas, request_id).await
+    }
+
     pub(crate) async fn create_canvas_with(&self, mut new: crate::reports::NewReport, canvas: Canvas, practice: Option<&Value>) -> Result<Report> {
         canvas.validate()?;
         new.body = canvas.summary();
@@ -1089,7 +1110,7 @@ impl WorldStore {
             return Ok(None);
         };
         if current.kind != "canvas" {
-            bail!("\"{}\" is a written report, not a canvas", current.title);
+            bail!("\"{}\" is a written report, not a workspace", current.title);
         }
         let before = Canvas::parse(current.canvas.as_ref())?;
         let mut canvas = before.clone();
@@ -1100,7 +1121,7 @@ impl WorldStore {
             tx.rollback().await?;
             return Ok(Some((current, added)));
         }
-        self.check_canvas_uploads(current.owner_user_id, current.org_id, &canvas, &before).await?;
+        Self::check_canvas_uploads(&mut tx, current.owner_user_id, current.org_id, &canvas, &before).await?;
         Self::check_canvas_embeds(&mut tx, current.owner_user_id, current.org_id, &mut canvas, &before).await?;
         let body = canvas.summary();
         let links = self.resolve_report_links(&mut *tx, current.owner_user_id, current.org_id, &body, Some(id)).await?;
@@ -1246,7 +1267,11 @@ impl WorldStore {
                 rows.get(kind).and_then(|found| pick_ref(found, kind, raw)).map(|row| match kind {
                     "quest" if row.c == "plan_waiting" => format!("Quest \"{}\" ({}, {})", flat(&row.a, 160), row.b.replace('_', " "), crate::world::PLAN_WAITING_NOTE),
                     "quest" => format!("Quest \"{}\" ({})", flat(&row.a, 160), row.b.replace('_', " ")),
-                    "report" => format!("{} \"{}\": {}", if row.b == "canvas" { "Canvas" } else { "Report" }, flat(&row.a, 160), flat(&row.c, 200)),
+                    "report" => {
+                        let mut preview = row.c.clone();
+                        crate::reports::normalize_workspace_summary(&row.b, &mut preview);
+                        format!("{} \"{}\": {}", if row.b == "canvas" { "Workspace" } else { "Report" }, flat(&row.a, 160), flat(&preview, 200))
+                    }
                     "todo" => format!("To-do \"{}\" ({})", flat(&row.a, 200), row.b),
                     "practice" => {
                         let (n, fix) = row.c.split_once(' ').unwrap_or((row.c.as_str(), ""));
@@ -1346,7 +1371,7 @@ impl WorldStore {
 
     pub async fn add_canvas_mark(&self, report: &Report, author: Uuid, mark: NewMark) -> Result<Mark> {
         if report.kind != "canvas" {
-            bail!("marks go on canvases");
+            bail!("marks go in workspaces");
         }
         let body = text_field(Some(mark.body), MAX_MARK, "a mark")?.ok_or_else(|| anyhow!("say what you would like changed"))?;
         let kind = match mark.kind.as_deref().unwrap_or("pin") {
@@ -1354,18 +1379,18 @@ impl WorldStore {
             _ => bail!("a mark is a pin or a sticky"),
         };
         if !mark.x.is_finite() || !mark.y.is_finite() || mark.x.abs() > MAX_COORD || mark.y.abs() > MAX_COORD {
-            bail!("the mark is outside the canvas");
+            bail!("the mark is outside the workspace");
         }
         let canvas = Canvas::parse(report.canvas.as_ref())?;
         let item = match mark.item_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             Some(id) if canvas.index(id).is_some() => Some(id.to_string()),
-            Some(id) => bail!("no item {id} on this canvas"),
+            Some(id) => bail!("no item {id} in this workspace"),
             None => None,
         };
         let near = if kind == "sticky" { canvas.near_item(item.as_deref(), (mark.x, mark.y)) } else { None };
         let open: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_canvas_marks WHERE report_id = $1 AND status = 'open'").bind(report.id).fetch_one(self.pool()).await?;
         if open >= MAX_OPEN_MARKS {
-            bail!("this canvas has {open} open marks; resolve some first");
+            bail!("this workspace has {open} open marks; resolve some first");
         }
         let saved = sqlx::query_as::<_, Mark>(
             "INSERT INTO world_canvas_marks (report_id, item_id, x, y, kind, body, author_user_id) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *",
@@ -1524,6 +1549,43 @@ mod tests {
         let report = store.create_canvas(new, start).await?;
         assert_eq!((report.kind.as_str(), report.revision), ("canvas", 1));
         assert!(report.body.contains("Option A"));
+        let newest_doc = store
+            .create_report(NewReport {
+                owner_user_id: owner,
+                by,
+                title: "Jinn notes".into(),
+                body: "Notes".into(),
+                folder: None,
+                tags: vec![],
+                visibility: None,
+                pinned: false,
+                task_id: None,
+            })
+            .await?;
+        let workspaces = store
+            .list_reports(
+                owner,
+                crate::orgs::DEFAULT_ORG,
+                &crate::reports::ReportFilter { kind: Some("canvas".into()), limit: Some(1), ..Default::default() },
+            )
+            .await?;
+        assert_eq!(workspaces.iter().map(|item| item.id).collect::<Vec<_>>(), vec![report.id]);
+        let docs = store
+            .list_reports(
+                owner,
+                crate::orgs::DEFAULT_ORG,
+                &crate::reports::ReportFilter { kind: Some("doc".into()), limit: Some(1), ..Default::default() },
+            )
+            .await?;
+        assert_eq!(docs.iter().map(|item| item.id).collect::<Vec<_>>(), vec![newest_doc.id]);
+        assert!(store
+            .list_reports(
+                owner,
+                crate::orgs::DEFAULT_ORG,
+                &crate::reports::ReportFilter { kind: Some("other".into()), ..Default::default() },
+            )
+            .await
+            .is_err());
         let stranger = Uuid::new_v4();
         let refused = store.change_canvas(report.id, by, parse_ops(&json!({ "op": "add", "items": [{ "kind": "image", "upload_id": stranger }] }))?).await;
         assert!(refused.is_err());
@@ -1539,6 +1601,7 @@ mod tests {
                     .await
             }
         };
+        assert_eq!(latest("report.created").await?["report_kind"], json!("canvas"));
         assert_eq!(latest("report.updated").await?["activity"], json!({ "verb": "connect", "items": ["a", "b"] }));
         let (again, _) = store.change_canvas(report.id, by, parse_ops(&json!({ "op": "update", "items": [{ "id": "a", "locked": true }] }))?).await?.unwrap();
         assert_eq!(again.revision, 2);
@@ -1704,7 +1767,7 @@ mod tests {
         let batch = store.describe_refs(owner, org, &[short.clone(), format!("agent:{}", slug.to_uppercase()), format!("report:{}", report.id), "agent:nobody-here".into()]).await?;
         assert!(batch[&short].contains("Ship the drawbridge"));
         assert_eq!(batch[&format!("agent:{}", slug.to_uppercase())], "Agent Boarder");
-        assert!(batch[&format!("report:{}", report.id)].starts_with("Canvas \"Castle plan\""));
+        assert!(batch[&format!("report:{}", report.id)].starts_with("Workspace \"Castle plan\""));
         assert!(!batch.contains_key("agent:nobody-here"));
         assert!(store.describe_refs(stranger, org, &[format!("todo:{todo}")]).await?.is_empty());
 
@@ -1896,7 +1959,7 @@ mod tests {
         let resolved = HashMap::from([("quest:abcdef12".to_string(), "Quest \"Fix login\" (in progress)".to_string())]);
         let id = Uuid::nil();
         let digest = c.digest("Plan", id, &resolved, 4000);
-        assert!(digest.starts_with(&format!("Canvas \"Plan\" (report:{id}) with 4 items")));
+        assert!(digest.starts_with(&format!("Workspace \"Plan\" (report:{id}) with 4 items")));
         let frame = digest.find("## frame f: Round 1").unwrap();
         assert!(frame < digest.find("ref q: Quest \"Fix login\" (in progress) (quest:abcdef12)").unwrap());
         assert!(digest.contains("ui u: Metric Spend today") && digest.contains("run r: runs `cargo test`"));

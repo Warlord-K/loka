@@ -82,6 +82,10 @@ pub struct LinkedMessage {
     pub channel_id: Option<Uuid>,
     pub channel_name: Option<String>,
     pub channel_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub room_kind: Option<String>,
     pub author: String,
     pub author_kind: String,
     pub author_emoji: Option<String>,
@@ -99,6 +103,8 @@ struct ThreadRow {
     body: String,
     created_at: DateTime<Utc>,
     scoped: bool,
+    task_id: Option<Uuid>,
+    room_kind: Option<String>,
 }
 
 #[derive(FromRow)]
@@ -164,6 +170,8 @@ impl WorldStore {
                     channel_id: Some(r.channel_id),
                     channel_name: Some(r.channel_name),
                     channel_kind: Some(r.channel_kind),
+                    task_id: None,
+                    room_kind: None,
                     author: r.author,
                     author_kind: r.author_kind,
                     author_emoji: r.author_emoji,
@@ -173,14 +181,35 @@ impl WorldStore {
             }
             Some(MessageRef::Thread(hex)) => {
                 let Some((low, high)) = bounds(&hex) else { return Ok(None) };
+                let canonical = crate::rooms::canonical_room_sql("source", "parent", "parent_lead");
+                let room_access = crate::rooms::agent_room_access_sql("room", "source", "$3");
+                let origin = crate::rooms::room_origin_part_with_question_sql(
+                    "m",
+                    "q",
+                    ("source", "parent", "parent_lead"),
+                    ("question_source", "question_parent", "question_parent_lead"),
+                );
                 let rows = sqlx::query_as::<_, ThreadRow>(&format!(
                     "SELECT m.id, m.agent_id, m.author_kind, {AUTHOR} AS author, a.avatar_emoji AS author_emoji,
                             m.body, m.created_at,
                             COALESCE($3::uuid IS NOT NULL AND (m.agent_id = $3 OR m.author_agent_id = $3), false) AS scoped
+                            , CASE WHEN m.meta ? 'room_only' THEN {canonical} END AS task_id
+                            , CASE WHEN m.meta ? 'room_only' THEN m.kind END AS room_kind
                      FROM agent_messages m
                      LEFT JOIN agent_profiles a ON a.id = m.author_agent_id
                      LEFT JOIN users u ON u.id = m.author_user_id
+                     LEFT JOIN agent_tasks source ON source.id::text = m.meta->>'task_id'
+                     LEFT JOIN agent_tasks parent ON parent.id = source.parent_task_id
+                     LEFT JOIN agent_profiles parent_lead ON parent_lead.id = parent.assigned_agent_id
+                     LEFT JOIN agent_tasks room ON room.id = {canonical}
+                     LEFT JOIN agent_messages q ON q.id::text = COALESCE(m.meta->>'answers_question', m.meta->>'answers')
+                     LEFT JOIN agent_tasks question_source ON question_source.id::text = q.meta->>'task_id'
+                     LEFT JOIN agent_tasks question_parent ON question_parent.id = question_source.parent_task_id
+                     LEFT JOIN agent_profiles question_parent_lead ON question_parent_lead.id = question_parent.assigned_agent_id
+                     LEFT JOIN agent_tasks part ON part.id::text = {origin}
                      WHERE m.id BETWEEN $1 AND $2
+                       AND (NOT (m.meta ? 'room_only') OR $3::uuid IS NULL
+                            OR {room_access} AND ({origin} IS NULL OR part.assigned_agent_id = $3))
                      ORDER BY scoped DESC, m.created_at DESC
                      LIMIT 2"
                 ))
@@ -201,6 +230,8 @@ impl WorldStore {
                     channel_id: None,
                     channel_name: None,
                     channel_kind: None,
+                    task_id: r.task_id,
+                    room_kind: r.room_kind.clone(),
                     author: r.author.clone(),
                     author_kind: r.author_kind.clone(),
                     author_emoji: r.author_emoji.clone(),
@@ -259,6 +290,45 @@ impl WorldStore {
         .await?)
     }
 
+    pub async fn sees_message_as(&self, message_id: Uuid, viewer: &crate::access::Viewer) -> Result<bool> {
+        let room_access = crate::rooms::room_access_sql("room", "lead", "$2", "$3", "$4");
+        let canonical = crate::rooms::canonical_room_sql("source", "parent", "parent_lead");
+        let origin = crate::rooms::room_origin_part_with_question_sql(
+            "m",
+            "q",
+            ("source", "parent", "parent_lead"),
+            ("question_source", "question_parent", "question_parent_lead"),
+        );
+        let part_access = crate::rooms::task_access_sql("part", "part_lead", "$2", "$3", "$4");
+        Ok(sqlx::query_scalar::<_, bool>(&format!(
+            "SELECT EXISTS (
+               SELECT 1 FROM agent_messages m
+               LEFT JOIN agent_tasks source ON source.id::text = m.meta->>'task_id'
+               LEFT JOIN agent_tasks parent ON parent.id = source.parent_task_id
+               LEFT JOIN agent_profiles parent_lead ON parent_lead.id = parent.assigned_agent_id
+               LEFT JOIN agent_tasks room ON room.id = {canonical}
+               LEFT JOIN agent_profiles lead ON lead.id = room.assigned_agent_id
+               LEFT JOIN agent_messages q ON q.id::text = COALESCE(m.meta->>'answers_question', m.meta->>'answers')
+               LEFT JOIN agent_tasks question_source ON question_source.id::text = q.meta->>'task_id'
+               LEFT JOIN agent_tasks question_parent ON question_parent.id = question_source.parent_task_id
+               LEFT JOIN agent_profiles question_parent_lead ON question_parent_lead.id = question_parent.assigned_agent_id
+               LEFT JOIN agent_tasks part ON part.id::text = {origin}
+               LEFT JOIN agent_profiles part_lead ON part_lead.id = part.assigned_agent_id
+               WHERE m.id = $1 AND (
+                 (m.meta ? 'room_only' AND room.org_id = $5 AND {room_access}
+                    AND ({origin} IS NULL OR part.org_id = $5 AND {part_access}))
+                 OR (NOT (m.meta ? 'room_only') AND {})))",
+            crate::guests::thread_filter("m.agent_id", "$2")
+        ))
+        .bind(message_id)
+        .bind(viewer.user)
+        .bind(viewer.role == crate::access::Role::Admin)
+        .bind(viewer.role >= crate::access::Role::Write)
+        .bind(viewer.org)
+        .fetch_one(self.pool())
+        .await?)
+    }
+
     pub async fn last_turn_replies(&self, agent_id: Uuid, session_id: Uuid) -> Result<Vec<(Uuid, String)>> {
         Ok(sqlx::query_as::<_, (Uuid, String)>(
             "SELECT id, body FROM agent_messages
@@ -274,7 +344,23 @@ impl WorldStore {
     }
 
     pub async fn find_messages(&self, agent_id: Uuid, query: &str, limit: i64) -> Result<Vec<FoundMessage>> {
+        self.find_messages_of(agent_id, query, None, limit).await
+    }
+
+    pub async fn find_messages_of(&self, agent_id: Uuid, query: &str, kind: Option<&str>, limit: i64) -> Result<Vec<FoundMessage>> {
+        let kinds: Option<Vec<String>> = kind.map(|k| match k {
+            "decision" => vec!["decision".into(), "answer".into()],
+            other => vec![other.to_string()],
+        });
         let pattern = format!("%{}%", query.trim().replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+        let canonical = crate::rooms::canonical_room_sql("source", "parent", "parent_lead");
+        let room_access = crate::rooms::agent_room_access_sql("room", "source", "$1");
+        let origin = crate::rooms::room_origin_part_with_question_sql(
+            "m",
+            "q",
+            ("source", "parent", "parent_lead"),
+            ("question_source", "question_parent", "question_parent_lead"),
+        );
         Ok(sqlx::query_as::<_, FoundMessage>(&format!(
             "SELECT * FROM (
                SELECT left(replace(m.id::text, '-', ''), 8) AS reference,
@@ -284,9 +370,21 @@ impl WorldStore {
                LEFT JOIN agent_profiles a ON a.id = m.author_agent_id
                LEFT JOIN users u ON u.id = m.author_user_id
                LEFT JOIN agent_profiles t ON t.id = m.agent_id
+               LEFT JOIN agent_tasks source ON source.id::text = m.meta->>'task_id'
+               LEFT JOIN agent_tasks parent ON parent.id = source.parent_task_id
+               LEFT JOIN agent_profiles parent_lead ON parent_lead.id = parent.assigned_agent_id
+               LEFT JOIN agent_tasks room ON room.id = {canonical}
+               LEFT JOIN agent_messages q ON q.id::text = COALESCE(m.meta->>'answers_question', m.meta->>'answers')
+               LEFT JOIN agent_tasks question_source ON question_source.id::text = q.meta->>'task_id'
+               LEFT JOIN agent_tasks question_parent ON question_parent.id = question_source.parent_task_id
+               LEFT JOIN agent_profiles question_parent_lead ON question_parent_lead.id = question_parent.assigned_agent_id
+               LEFT JOIN agent_tasks part ON part.id::text = {origin}
                WHERE (m.agent_id = $1 OR (m.author_kind = 'agent' AND m.author_agent_id = $1))
                  AND {thread}
+                 AND (NOT (m.meta ? 'room_only') OR {room_access}
+                      AND ({origin} IS NULL OR part.assigned_agent_id = $1))
                  AND m.body ILIKE $2
+                 AND ($4::text[] IS NULL OR m.kind = ANY($4))
                UNION ALL
                SELECT 'ch' || m.id::text AS reference,
                       CASE WHEN c.kind = 'dm' THEN 'a direct message' ELSE '#' || c.name END AS place,
@@ -296,13 +394,14 @@ impl WorldStore {
                JOIN channel_members cm ON cm.channel_id = m.channel_id AND cm.member_kind = 'agent' AND cm.member_id = $1
                LEFT JOIN agent_profiles a ON a.id = m.author_agent_id
                LEFT JOIN users u ON u.id = m.author_user_id
-               WHERE m.body ILIKE $2
+               WHERE m.body ILIKE $2 AND $4::text[] IS NULL
              ) found ORDER BY created_at DESC LIMIT $3",
             thread = crate::guests::thread_filter("$1", "(SELECT owner_user_id FROM agent_profiles WHERE id = $1)")
         ))
         .bind(agent_id)
         .bind(pattern)
         .bind(limit)
+        .bind(kinds)
         .fetch_all(self.pool())
         .await?)
     }
@@ -392,7 +491,100 @@ mod tests {
         let linked = store.linked_messages(&expanded, None).await?;
         assert_eq!(linked.len(), 1);
         assert_eq!(linked[0].excerpt, "zebra crossing plan");
+        let other_agent: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id) VALUES ($1, 'other links', 'claude', 'sonnet', $2) RETURNING id",
+        )
+        .bind(format!("other-links-{tag}"))
+        .bind(owner)
+        .fetch_one(&pool)
+        .await?;
+        let task: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_tasks (user_id, title, assigned_agent_id, asking) VALUES ($1, 'Linked room', $2, 'crew') RETURNING id",
+        )
+        .bind(owner)
+        .bind(agent)
+        .fetch_one(&pool)
+        .await?;
+        let part: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_tasks (user_id, title, assigned_agent_id, parent_task_id) VALUES ($1, 'Linked part', $2, $3) RETURNING id",
+        )
+        .bind(owner)
+        .bind(agent)
+        .bind(task)
+        .fetch_one(&pool)
+        .await?;
+        let room_message: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_messages (agent_id, author_kind, author_agent_id, body, meta, kind)
+             VALUES ($1, 'agent', $1, 'room reference', $2, 'decision') RETURNING id",
+        )
+        .bind(agent)
+        .bind(serde_json::json!({ "task_id": task, "room_only": true }))
+        .fetch_one(&pool)
+        .await?;
+        let part_message: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_messages (agent_id, author_kind, author_agent_id, body, meta, kind)
+             VALUES ($1, 'agent', $1, 'part reference', $2, 'question') RETURNING id",
+        )
+        .bind(agent)
+        .bind(serde_json::json!({ "task_id": task, "room_only": true, "question": { "part_id": part } }))
+        .fetch_one(&pool)
+        .await?;
+        let source_part_message: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_messages (agent_id, author_kind, author_agent_id, body, meta, kind)
+             VALUES ($1, 'agent', $1, 'source part reference', $2, 'question') RETURNING id",
+        )
+        .bind(agent)
+        .bind(serde_json::json!({ "task_id": part, "room_only": true }))
+        .fetch_one(&pool)
+        .await?;
+        let guest: Uuid = sqlx::query_scalar("INSERT INTO users (email) VALUES ($1) RETURNING id")
+            .bind(format!("guest-links-{tag}@example.test"))
+            .fetch_one(&pool)
+            .await?;
+        crate::orgs::join_default_for_tests(&pool, guest, None).await?;
+        sqlx::query("INSERT INTO quest_room_members (quest_id, member_kind, member_id, role, added_by_kind) VALUES ($1, 'person', $2, 'guest', 'loka')")
+            .bind(task)
+            .bind(guest)
+            .execute(&pool)
+            .await?;
+        let outsider: Uuid = sqlx::query_scalar("INSERT INTO users (email) VALUES ($1) RETURNING id")
+            .bind(format!("outsider-links-{tag}@example.test"))
+            .fetch_one(&pool)
+            .await?;
+        crate::orgs::join_default_for_tests(&pool, outsider, None).await?;
+        let viewer = |user, role| crate::access::Viewer {
+            user,
+            org: Some(crate::orgs::DEFAULT_ORG),
+            role,
+            org_role: None,
+            instance_admin: false,
+        };
+        let room_link = store.resolve_message(&room_message.to_string(), Some(agent)).await?.unwrap();
+        assert_eq!(room_link.task_id, Some(task));
+        assert_eq!(room_link.room_kind.as_deref(), Some("decision"));
+        assert!(store.resolve_message(&room_message.to_string(), Some(other_agent)).await?.is_none());
+        assert!(store.sees_message_as(room_message, &viewer(guest, crate::access::Role::Read)).await?);
+        assert!(!store.sees_message_as(room_message, &viewer(outsider, crate::access::Role::Read)).await?);
+        assert!(!store.sees_message_as(part_message, &viewer(guest, crate::access::Role::Read)).await?);
+        assert!(store.sees_message_as(part_message, &viewer(owner, crate::access::Role::Write)).await?);
+        assert!(!store.sees_message_as(source_part_message, &viewer(guest, crate::access::Role::Read)).await?);
+        assert!(store.sees_message_as(source_part_message, &viewer(owner, crate::access::Role::Write)).await?);
+        assert!(store.resolve_message(&source_part_message.to_string(), Some(agent)).await?.is_some());
+        assert!(store.resolve_message(&source_part_message.to_string(), Some(other_agent)).await?.is_none());
+        let guest_quote = store
+            .clean_quote(&viewer(guest, crate::access::Role::Read), Some(&serde_json::json!({ "text": "room reference", "source": format!("msg:{room_message}") })))
+            .await?
+            .unwrap();
+        assert!(guest_quote.get("source").is_some());
+        let outsider_quote = store
+            .clean_quote(&viewer(outsider, crate::access::Role::Read), Some(&serde_json::json!({ "text": "room reference", "source": format!("msg:{room_message}") })))
+            .await?
+            .unwrap();
+        assert!(outsider_quote.get("source").is_none());
         sqlx::query("DELETE FROM agent_messages WHERE id = $1").bind(id).execute(&pool).await?;
+        sqlx::query("DELETE FROM agent_profiles WHERE id = ANY($1)").bind(vec![agent, other_agent]).execute(&pool).await?;
+        sqlx::query("DELETE FROM agent_tasks WHERE id = ANY($1)").bind(vec![task, part]).execute(&pool).await?;
+        sqlx::query("DELETE FROM users WHERE id = ANY($1)").bind(vec![owner, guest, outsider]).execute(&pool).await?;
         Ok(())
     }
 

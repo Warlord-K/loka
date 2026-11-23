@@ -12,8 +12,8 @@ fn item_schema(with_file: bool) -> Value {
     let n = |d: &str| json!({ "type": "number", "description": d });
     let mut props = json!({
         "id": s("Your own short id (letters, digits, - or _) so arrows and later updates can name it; made up when left out"),
-        "kind": { "type": "string", "enum": canvas::KINDS, "description": "image, video, model (GLB 3D), note (markdown card), sticky, ref (a live card for a quest, report, canvas, chat message, to-do or agent), run (bash step with a Run button), frame (a captioned group box), ink, ui (a live json-render card, the same spec as show_ui), embed (a live terminal or running quest your person watches on the board)" },
-        "x": n("Left edge in canvas units; new items go in a row under everything when left out"),
+        "kind": { "type": "string", "enum": canvas::KINDS, "description": "image, video, model (GLB 3D), note (markdown card), sticky, ref (a live card for a quest, report, workspace, chat message, to-do or agent), run (bash step with a Run button), frame (a captioned group box), ink, ui (a live json-render card, the same spec as show_ui), embed (a live terminal or running quest your person watches on the board)" },
+        "x": n("Left edge in workspace units; new items go in a row under everything when left out"),
         "y": n("Top edge"),
         "w": n("Width, 24 to 4000"),
         "h": n("Height, 24 to 4000"),
@@ -56,12 +56,12 @@ fn arrows_schema() -> Value {
 
 pub fn tools(tool: fn(&str, &str, Value, &[&str]) -> Value) -> Vec<Value> {
     let s = |d: &str| json!({ "type": "string", "description": d });
-    let canvas_ref = s("The canvas: report:<id>, its id or first characters, its title or slug");
+    let canvas_ref = s("The workspace: report:<id>, its id or first characters, its title or slug");
     let items = |with_file: bool, d: &str| json!({ "type": "array", "items": item_schema(with_file), "description": d });
     vec![
         tool(
             "create_canvas",
-            "Make a canvas: a board in your person's Reports library where you place images, videos, 3D models, notes, stickies, live cards of Loka things (quests, reports, chat messages, to-dos, agents, ui cards) and runnable steps, joined by arrows. Use it instead of a written report when the work is visual or a set of options to compare. Your person can pan, zoom, move things, add stickies and pin marks on items; each mark wakes you with the item it points at.",
+            "Make a workspace: a board in your person's Workspaces library where you place images, videos, 3D models, notes, stickies, live cards of Loka things (quests, reports, chat messages, to-dos, agents, ui cards) and runnable steps, joined by arrows. Use it instead of a written report when the work is visual or a set of options to compare. To link it to a quest, set workspace true and seed useful items. Loka reuses that quest's workspace. Your person can pan, zoom, move things, add stickies and pin marks on items; each mark wakes you with the item it points at. After creation, give them the returned Open workspace link in the same reply.",
             json!({
                 "title": s("Short, specific title"),
                 "items": items(true, "Items to start with"),
@@ -69,19 +69,21 @@ pub fn tools(tool: fn(&str, &str, Value, &[&str]) -> Value) -> Vec<Value> {
                 "arrows": arrows_schema(),
                 "folder": s("Folder path like design/jinnfighter, optional"),
                 "tags": { "type": "array", "items": { "type": "string" } },
-                "public": { "type": "boolean", "description": "true lets everyone in this Loka see it" }
+                "public": { "type": "boolean", "description": "true lets everyone in this Loka see it" },
+                "workspace": { "type": "boolean", "description": "Create or reuse the workspace linked to a quest" },
+                "quest": s("Main chat: quest:<id> to link. A resident agent may link a quest assigned to it. In a task session the current quest is used")
             }),
             &["title"],
         ),
         tool(
             "canvas_add_items",
-            "Add items (and arrows between them) to a canvas. Items without x and y go in a new row under everything; follow up with canvas_layout to arrange them.",
+            "Add items (and arrows between them) to a workspace. Items without x and y go in a new row under everything; follow up with canvas_layout to arrange them.",
             json!({ "canvas": canvas_ref.clone(), "items": items(true, "Items to add"), "refs": refs_schema(), "arrows": arrows_schema() }),
             &["canvas"],
         ),
         tool(
             "canvas_update_items",
-            "Change, move, resize, lock or unlock, or remove canvas items and remove arrows. Each item in items names its id and only the fields to change. Rename the canvas, move its folder, share it or bring back an old revision with update_report; delete it with delete_report.",
+            "Change, move, resize, lock or unlock, or remove workspace items and remove arrows. Each item in items names its id and only the fields to change. Rename the workspace, move its folder, share it or bring back an old revision with update_report; delete it with delete_report.",
             json!({
                 "canvas": canvas_ref.clone(),
                 "items": items(false, "Changes, each with the id of the item"),
@@ -92,13 +94,13 @@ pub fn tools(tool: fn(&str, &str, Value, &[&str]) -> Value) -> Vec<Value> {
         ),
         tool(
             "canvas_connect",
-            "Draw arrows between canvas items, optionally labelled. Drawing an arrow that exists again changes its label.",
+            "Draw arrows between workspace items, optionally labelled. Drawing an arrow that exists again changes its label.",
             json!({ "canvas": canvas_ref.clone(), "arrows": arrows_schema() }),
             &["canvas", "arrows"],
         ),
         tool(
             "canvas_layout",
-            "Arrange canvas items: row (left to right), grid, or flow (a row joined by arrows in the given order).",
+            "Arrange workspace items: row (left to right), grid, or flow (a row joined by arrows in the given order).",
             json!({
                 "canvas": canvas_ref.clone(),
                 "ids": { "type": "array", "items": { "type": "string" }, "description": "Item ids in reading order" },
@@ -112,7 +114,7 @@ pub fn tools(tool: fn(&str, &str, Value, &[&str]) -> Value) -> Vec<Value> {
         ),
         tool(
             "canvas_marks",
-            "Read a canvas's items, arrows and your person's marks and stickies. Pass resolve with a mark id and a short reply once you have acted on it, reopen to bring one back, or remove to delete a mark that no longer applies.",
+            "Read a workspace's items, arrows and your person's marks and stickies. Pass resolve with a mark id and a short reply once you have acted on it, reopen to bring one back, or remove to delete a mark that no longer applies.",
             json!({
                 "canvas": canvas_ref.clone(),
                 "resolve": s("Mark id to resolve, optional"),
@@ -124,13 +126,13 @@ pub fn tools(tool: fn(&str, &str, Value, &[&str]) -> Value) -> Vec<Value> {
         ),
         tool(
             "read_canvas",
-            "Read a canvas as text: every item in reading order with quest, report, message, to-do and agent cards spelled out, the arrows and the open marks. Pass item to read one item in full with its arrows and marks.",
+            "Read a workspace as text: every item in reading order with quest, report, message, to-do and agent cards spelled out, the arrows and the open marks. Pass item to read one item in full with its arrows and marks.",
             json!({ "canvas": canvas_ref, "item": s("One item id to read in full, optional") }),
             &["canvas"],
         ),
         tool(
             "search_canvases",
-            "Find canvases (yours and public ones) by title or by what is on them: note and sticky text, captions, commands, card targets. Lists each canvas with the items that matched.",
+            "Find workspaces (yours and public ones) by title or by what is on them: note and sticky text, captions, commands, card targets. Lists each workspace with the items that matched.",
             json!({ "query": s("Words to look for") }),
             &["query"],
         ),
@@ -202,10 +204,10 @@ fn arrows_arg(args: &Value) -> Result<Vec<canvas::EdgeInput>> {
 }
 
 async fn find(store: &WorldStore, owner: Uuid, org: Uuid, key: Option<&str>) -> Result<Report> {
-    let key = key.ok_or_else(|| anyhow!("canvas is required"))?;
-    let report = store.find_report(owner, org, key).await?.ok_or_else(|| anyhow!("no canvas matches {key}; see list_reports"))?;
+    let key = key.ok_or_else(|| anyhow!("workspace is required"))?;
+    let report = store.find_report(owner, org, key).await?.ok_or_else(|| anyhow!("no workspace matches {key}; see search_canvases"))?;
     if report.kind != "canvas" {
-        bail!("\"{}\" is a written report; make a canvas with create_canvas", report.title);
+        bail!("\"{}\" is a written report; make a workspace with create_canvas", report.title);
     }
     if report.owner_user_id != owner {
         bail!("\"{}\" belongs to someone else; you can read it but not change it", report.title);
@@ -230,7 +232,7 @@ pub async fn view(store: &WorldStore, owner: Uuid, org: Uuid, report: &Report) -
     let found = store.describe_refs(owner, org, &canvas.targets()).await?;
     let open = marks.iter().filter(|m| m.status == "open").count();
     let mut out = format!(
-        "Canvas report:{} \"{}\" revision {}: {} items, {} arrows, {open} open marks.\n{}",
+        "Workspace report:{} \"{}\" revision {}: {} items, {} arrows, {open} open marks.\n{}",
         report.id,
         report.title,
         report.revision,
@@ -251,44 +253,90 @@ pub async fn view(store: &WorldStore, owner: Uuid, org: Uuid, report: &Report) -
     Ok(out)
 }
 
+async fn workspace_task(store: &WorldStore, caller: &WorldAgent, lease: Option<Uuid>, raw: Option<&str>) -> Result<Uuid> {
+    let owner = caller.owner_user_id.ok_or_else(|| anyhow!("you have no person to keep workspaces for"))?;
+    let org = caller.org_id.ok_or_else(|| anyhow!("you are not in an organization"))?;
+    let explicit = match raw.map(str::trim).filter(|raw| !raw.is_empty()) {
+        Some(raw) => Some(super::quests::find_task(store, Some(org), raw.strip_prefix("quest:").unwrap_or(raw), "make a workspace for").await.map_err(|problem| anyhow!(problem))?),
+        None => None,
+    };
+    if explicit.as_ref().is_some_and(|task| task.user_id != owner) {
+        bail!("that quest belongs to someone else");
+    }
+    if lease.is_none()
+        && !caller.is_main
+        && explicit.as_ref().is_none_or(|task| task.assigned_agent_id != Some(caller.id))
+    {
+        bail!("only the main agent, the agent assigned to a quest, or its quest session can start its workspace");
+    }
+    let task = explicit.as_ref().map(|task| task.id).or(lease).ok_or_else(|| anyhow!("quest is required for a workspace"))?;
+    let canonical = store.workspace_task_id(owner, org, task).await?.ok_or_else(|| anyhow!("that quest is gone or belongs to someone else"))?;
+    if let Some(lease) = lease {
+        let current = store.workspace_task_id(owner, org, lease).await?.ok_or_else(|| anyhow!("this quest is gone"))?;
+        if current != canonical {
+            bail!("a quest session can only create the workspace for its quest");
+        }
+    }
+    Ok(canonical)
+}
+
 pub async fn call(store: &WorldStore, caller: &WorldAgent, quest: Option<Uuid>, name: &str, args: &Value) -> Result<String> {
-    let owner = caller.owner_user_id.ok_or_else(|| anyhow!("you have no person to keep canvases for"))?;
+    let owner = caller.owner_user_id.ok_or_else(|| anyhow!("you have no person to keep workspaces for"))?;
     let org = caller.org_id.ok_or_else(|| anyhow!("you are not in an organization"))?;
     let arg = |k: &str| args.get(k).and_then(Value::as_str);
     let by = ReportActor::Agent(caller.id);
     let change = |ops: Vec<Op>| async move {
         let report = find(store, owner, org, arg("canvas")).await?;
-        store.change_canvas(report.id, by, ops).await?.ok_or_else(|| anyhow!("that canvas is gone"))
+        store.change_canvas(report.id, by, ops).await?.ok_or_else(|| anyhow!("that workspace is gone"))
     };
     match name {
         "create_canvas" => {
             let mut canvas = Canvas::default();
             canvas.apply_ops(vec![Op::Add { items: with_refs(args)?, edges: arrows_arg(args)? }], "agent")?;
-            let report = store
-                .create_canvas(
-                    NewReport {
-                        owner_user_id: owner,
-                        by,
-                        title: arg("title").unwrap_or("").to_string(),
-                        body: String::new(),
-                        folder: arg("folder").map(String::from),
-                        tags: list_arg(args, "tags"),
-                        visibility: args.get("public").and_then(Value::as_bool).filter(|p| *p).map(|_| "public".to_string()),
-                        pinned: false,
-                        task_id: quest,
-                    },
-                    canvas,
-                )
-                .await?;
+            let mut new = NewReport {
+                owner_user_id: owner,
+                by,
+                title: arg("title").unwrap_or("").to_string(),
+                body: String::new(),
+                folder: arg("folder").map(String::from),
+                tags: list_arg(args, "tags"),
+                visibility: args.get("public").and_then(Value::as_bool).filter(|p| *p).map(|_| "public".to_string()),
+                pinned: false,
+                task_id: quest,
+            };
+            let workspace = args.get("workspace").and_then(Value::as_bool).unwrap_or(false);
+            let (report, created) = if workspace {
+                if canvas.items.is_empty() {
+                    bail!("seed a workspace with useful items");
+                }
+                new.task_id = Some(workspace_task(store, caller, quest, arg("quest")).await?);
+                store.create_workspace(new, canvas, org).await?
+            } else {
+                (store.create_canvas(new, canvas).await?, true)
+            };
             let made = Canvas::parse(report.canvas.as_ref())?;
             let ids: Vec<String> = made.items.iter().map(|i| i.id.clone()).collect();
+            if workspace {
+                let action = if created { "Made" } else { "Reused" };
+                let next = if created {
+                    "Tell your person in a line or two and include this exact link in the same reply."
+                } else {
+                    "Its current items were preserved. Use read_canvas, then canvas_add_items to seed anything missing before sharing this link in the same reply. This retry added nothing."
+                };
+                return Ok(format!(
+                    "{action} workspace report:{} \"{}\". [Open workspace]({})\n{next}",
+                    report.id,
+                    report.title,
+                    loka_shared::app_links::workspace_url(report.id),
+                ));
+            }
             Ok(format!(
-                "Made canvas report:{} \"{}\". Items:\n{}{}\nTell your person in a line or two and put report:{} on its own line so it shows as a card.",
+                "Made workspace report:{} \"{}\". Items:\n{}{}\nTell your person in a line or two and include [Open workspace]({}) in the same reply.",
                 report.id,
                 report.title,
                 made.outline(),
                 ref_notes(store, owner, org, &made, &ids).await?,
-                report.id
+                loka_shared::app_links::workspace_url(report.id)
             ))
         }
         "canvas_add_items" => {
@@ -344,20 +392,20 @@ pub async fn call(store: &WorldStore, caller: &WorldAgent, quest: Option<Uuid>, 
                     store
                         .resolve_canvas_mark(&report, id, by, arg("reply").map(super::prompts::plain_dashes), reopen)
                         .await?
-                        .ok_or_else(|| anyhow!("no mark {id} on this canvas"))?;
+                        .ok_or_else(|| anyhow!("no mark {id} on this workspace"))?;
                 }
             }
             if let Some(raw) = arg("remove") {
                 let id = Uuid::parse_str(raw.trim()).map_err(|_| anyhow!("remove takes a mark id from canvas_marks"))?;
                 if !store.remove_canvas_mark(&report, id, by).await? {
-                    bail!("no mark {id} on this canvas");
+                    bail!("no mark {id} on this workspace");
                 }
             }
             view(store, owner, org, &report).await
         }
         "read_canvas" => {
-            let key = arg("canvas").ok_or_else(|| anyhow!("canvas is required"))?;
-            let report = store.find_report(owner, org, key).await?.ok_or_else(|| anyhow!("no canvas matches {key}; see search_canvases"))?;
+            let key = arg("canvas").ok_or_else(|| anyhow!("workspace is required"))?;
+            let report = store.find_report(owner, org, key).await?.ok_or_else(|| anyhow!("no workspace matches {key}; see search_canvases"))?;
             if report.kind != "canvas" {
                 bail!("\"{}\" is a written report; read it with get_report", report.title);
             }
@@ -369,7 +417,7 @@ pub async fn call(store: &WorldStore, caller: &WorldAgent, quest: Option<Uuid>, 
                 return Ok(format!("{digest}{tail}\n\nIds and positions: canvas_marks or get_report."));
             };
             let (canvas, found, _) = store.canvas_digest(owner, org, &report, 0).await?;
-            let line = canvas.describe_item(item, &found, 8000).ok_or_else(|| anyhow!("no item {item} on this canvas"))?;
+            let line = canvas.describe_item(item, &found, 8000).ok_or_else(|| anyhow!("no item {item} on this workspace"))?;
             let arrows: Vec<String> = canvas
                 .edges
                 .iter()
@@ -377,7 +425,7 @@ pub async fn call(store: &WorldStore, caller: &WorldAgent, quest: Option<Uuid>, 
                 .map(|e| format!("- arrow {} {} -> {}{}", e.id, e.from, e.to, e.label.as_deref().map(|l| format!(" \"{l}\"")).unwrap_or_default()))
                 .collect();
             let marks: Vec<String> = store.canvas_marks(report.id).await?.iter().filter(|m| m.item_id.as_deref() == Some(item)).map(|m| mark_line(m, &canvas)).collect();
-            let mut out = format!("On canvas report:{} \"{}\": {line}", report.id, report.title);
+            let mut out = format!("On workspace report:{} \"{}\": {line}", report.id, report.title);
             if !arrows.is_empty() {
                 out.push_str(&format!("\nArrows:\n{}", arrows.join("\n")));
             }
@@ -390,7 +438,7 @@ pub async fn call(store: &WorldStore, caller: &WorldAgent, quest: Option<Uuid>, 
             let query = arg("query").map(str::trim).filter(|q| q.chars().count() >= 2).ok_or_else(|| anyhow!("query needs at least two characters"))?;
             let hits = store.search_canvas_items(owner, org, query, 20).await?;
             if hits.is_empty() {
-                return Ok(format!("No canvas mentions \"{query}\"."));
+                return Ok(format!("No workspace mentions \"{query}\"."));
             }
             Ok(hits
                 .iter()
@@ -444,6 +492,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resident_main_chat_prepares_only_its_assigned_workspace() -> Result<()> {
+        let Ok(url) = std::env::var("REPORTS_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new().max_connections(1).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email, name) VALUES ($1, 'Workspace owner') RETURNING id")
+            .bind(format!("{tag}@workspace.test"))
+            .fetch_one(&pool)
+            .await?;
+        let resident: Uuid = sqlx::query_scalar("INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id) VALUES ($1, 'Resident', 'claude', 'opus', $2) RETURNING id")
+            .bind(format!("resident-{}", &tag[..8]))
+            .bind(owner)
+            .fetch_one(&pool)
+            .await?;
+        let caller = store.get_agent(resident).await?.expect("resident");
+        assert!(!caller.is_main);
+        let org = caller.org_id.expect("org");
+        let other_resident: Uuid = sqlx::query_scalar("INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id, org_id) VALUES ($1, 'Other resident', 'claude', 'opus', $2, $3) RETURNING id")
+            .bind(format!("other-resident-{}", &tag[..8]))
+            .bind(owner)
+            .bind(org)
+            .fetch_one(&pool)
+            .await?;
+        let foreign_owner: Uuid = sqlx::query_scalar("INSERT INTO users (email, name) VALUES ($1, 'Foreign owner') RETURNING id")
+            .bind(format!("{tag}-foreign@workspace.test"))
+            .fetch_one(&pool)
+            .await?;
+        let foreign_agent: Uuid = sqlx::query_scalar("INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id, org_id) VALUES ($1, 'Foreign resident', 'claude', 'opus', $2, $3) RETURNING id")
+            .bind(format!("foreign-resident-{}", &tag[..8]))
+            .bind(foreign_owner)
+            .bind(org)
+            .fetch_one(&pool)
+            .await?;
+        let assigned: Uuid = sqlx::query_scalar("INSERT INTO agent_tasks (user_id, title, repo, org_id, assigned_agent_id) VALUES ($1, 'Assigned workspace', 'acme/castle', $2, $3) RETURNING id")
+            .bind(owner)
+            .bind(org)
+            .bind(resident)
+            .fetch_one(&pool)
+            .await?;
+        let unrelated: Uuid = sqlx::query_scalar("INSERT INTO agent_tasks (user_id, title, repo, org_id, assigned_agent_id) VALUES ($1, 'Other workspace', 'acme/castle', $2, $3) RETURNING id")
+            .bind(owner)
+            .bind(org)
+            .bind(other_resident)
+            .fetch_one(&pool)
+            .await?;
+        let foreign: Uuid = sqlx::query_scalar("INSERT INTO agent_tasks (user_id, title, repo, org_id, assigned_agent_id) VALUES ($1, 'Foreign workspace', 'acme/castle', $2, $3) RETURNING id")
+            .bind(foreign_owner)
+            .bind(org)
+            .bind(foreign_agent)
+            .fetch_one(&pool)
+            .await?;
+        let args = |quest: Uuid, title: &str| {
+            json!({
+                "title": title,
+                "workspace": true,
+                "quest": format!("quest:{quest}"),
+                "items": [{ "kind": "ref", "target": format!("quest:{quest}") }]
+            })
+        };
+
+        let first = call(&store, &caller, None, "create_canvas", &args(assigned, "Assigned workspace")).await?;
+        let second = call(&store, &caller, None, "create_canvas", &args(assigned, "Assigned workspace")).await?;
+        assert!(first.contains("Made workspace") && second.contains("Reused workspace"), "{first}\n{second}");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_reports WHERE owner_user_id = $1 AND task_id = $2 AND kind = 'canvas' AND practice IS NULL")
+            .bind(owner)
+            .bind(assigned)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(count, 1);
+        let unrelated_error = call(&store, &caller, None, "create_canvas", &args(unrelated, "Other workspace")).await.unwrap_err().to_string();
+        assert!(unrelated_error.contains("agent assigned to a quest"), "{unrelated_error}");
+        let foreign_error = call(&store, &caller, None, "create_canvas", &args(foreign, "Foreign workspace")).await.unwrap_err().to_string();
+        assert!(foreign_error.contains("belongs to someone else"), "{foreign_error}");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn tools_read_search_add_refs_and_remove_marks() -> Result<()> {
         let Ok(url) = std::env::var("REPORTS_TEST_DATABASE_URL") else {
             return Ok(());
@@ -481,7 +608,87 @@ mod tests {
             "refs": [format!("quest:{quest}"), format!("todo:{todo}")]
         }))
         .await?;
-        assert!(made.contains("Raise the tower") && made.contains("Order the stones"), "{made}");
+        assert!(made.contains("Raise the tower") && made.contains("Order the stones") && made.contains("[Open workspace]("), "{made}");
+
+        let workspace_args = json!({
+            "title": "Raise the tower workspace",
+            "workspace": true,
+            "items": [{ "kind": "ref", "target": format!("quest:{quest}") }]
+        });
+        let (first, second) = tokio::join!(
+            call(&store, &caller, Some(quest), "create_canvas", &workspace_args),
+            call(&store, &caller, Some(quest), "create_canvas", &workspace_args),
+        );
+        let first = first?;
+        let second = second?;
+        assert!(first.contains("[Open workspace](") && second.contains("[Open workspace]("));
+        assert!(first.contains("Made workspace") || second.contains("Made workspace"));
+        assert!(first.contains("Reused workspace") || second.contains("Reused workspace"));
+        let workspace: Uuid = sqlx::query_scalar(
+            "SELECT id FROM world_reports WHERE owner_user_id = $1 AND task_id = $2 AND kind = 'canvas' AND practice IS NULL",
+        )
+        .bind(owner)
+        .bind(quest)
+        .fetch_one(&pool)
+        .await?;
+        let workspace_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM world_reports WHERE owner_user_id = $1 AND task_id = $2 AND kind = 'canvas' AND practice IS NULL",
+        )
+        .bind(owner)
+        .bind(quest)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(workspace_count, 1);
+        let empty_quest: Uuid = sqlx::query_scalar("INSERT INTO agent_tasks (user_id, title, repo, org_id, assigned_agent_id) VALUES ($1, 'Map the cellar', 'acme/castle', $2, $3) RETURNING id")
+            .bind(owner)
+            .bind(org)
+            .bind(agent)
+            .fetch_one(&pool)
+            .await?;
+        let empty_workspace = store
+            .create_canvas(
+                NewReport {
+                    owner_user_id: owner,
+                    by: ReportActor::Agent(agent),
+                    title: "Cellar map".into(),
+                    body: String::new(),
+                    folder: None,
+                    tags: vec![],
+                    visibility: None,
+                    pinned: false,
+                    task_id: Some(empty_quest),
+                },
+                Canvas::default(),
+            )
+            .await?;
+        let reused_empty = call(
+            &store,
+            &caller,
+            Some(empty_quest),
+            "create_canvas",
+            &json!({
+                "title": "Map the cellar workspace",
+                "workspace": true,
+                "items": [{ "kind": "ref", "target": format!("quest:{empty_quest}") }]
+            }),
+        )
+        .await?;
+        assert!(reused_empty.contains(&format!("Reused workspace report:{}", empty_workspace.id)), "{reused_empty}");
+        assert!(reused_empty.contains("current items were preserved") && reused_empty.contains("read_canvas") && reused_empty.contains("canvas_add_items") && reused_empty.contains("before sharing"), "{reused_empty}");
+        let empty_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_reports WHERE owner_user_id = $1 AND task_id = $2 AND kind = 'canvas'")
+            .bind(owner)
+            .bind(empty_quest)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(empty_count, 1);
+        assert!(Canvas::parse(store.get_report(empty_workspace.id).await?.expect("empty workspace").canvas.as_ref())?.items.is_empty());
+        let quiet: bool = sqlx::query_scalar(
+            "SELECT (payload->>'quiet')::boolean FROM world_events WHERE type = 'report.created' AND payload->>'report_id' = $1 ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(workspace.to_string())
+        .fetch_one(&pool)
+        .await?;
+        assert!(quiet);
         let report: Uuid = sqlx::query_scalar("SELECT id FROM world_reports WHERE owner_user_id = $1 AND title = 'Siege plan'").bind(owner).fetch_one(&pool).await?;
         let canvas = report.to_string();
 
@@ -495,13 +702,13 @@ mod tests {
         let whole = call(&store, &caller, None, "read_canvas", &json!({ "canvas": canvas })).await?;
         assert!(whole.contains(&word) && whole.contains("Raise the tower") && whole.contains("Order the stones") && whole.contains("Agent Mason"), "{whole}");
         let one = call(&store, &caller, None, "read_canvas", &json!({ "canvas": canvas, "item": "n" })).await?;
-        assert!(one.starts_with(&format!("On canvas report:{report} \"Siege plan\": note n")), "{one}");
+        assert!(one.starts_with(&format!("On workspace report:{report} \"Siege plan\": note n")), "{one}");
         assert!(call(&store, &caller, None, "read_canvas", &json!({ "canvas": canvas, "item": "nope" })).await.is_err());
 
         let found = call(&store, &caller, None, "search_canvases", &json!({ "query": word })).await?;
         assert!(found.contains(&format!("report:{report}")) && found.contains("note n"), "{found}");
         let none = call(&store, &caller, None, "search_canvases", &json!({ "query": format!("{word}zz") })).await?;
-        assert!(none.starts_with("No canvas mentions"));
+        assert!(none.starts_with("No workspace mentions"));
 
         let full = store.get_report(report).await?.expect("report");
         let mark = store.add_canvas_mark(&full, owner, canvas::NewMark { item_id: Some("n".into()), body: "dig deeper".into(), ..Default::default() }).await?;

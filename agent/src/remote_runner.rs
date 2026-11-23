@@ -9,8 +9,9 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::StreamExt;
 use loka_shared::runners::{
     LeaseBeat, LeaseSteers, RunnerCompletion, RunnerEvent, RunnerHeartbeat, RunnerJob, RunnerPoll, RunnerPolled,
-    RunnerPublish, RunnerUsage, RunnerWorkspace, RUNNER_LEASE_SECONDS,
+    RunnerPrCheck, RunnerPrCheckResult, RunnerPublish, RunnerUsage, RunnerWorkspace, RUNNER_LEASE_SECONDS,
 };
+use loka_shared::context::SentContext;
 use loka_shared::git_names::{validate_git_ref, validate_repo};
 use loka_shared::shell::{ShellFinish, ShellJob, OUTPUT_CAP};
 use reqwest::{Client, StatusCode};
@@ -46,7 +47,7 @@ const FATAL_DRAIN: Duration = Duration::from_secs(30);
 const TRANSCRIPT_GONE: &str = "[memory handoff] The saved transcript of your earlier work in this session was cleaned up, so this is a fresh start. Rebuild what you need from the quest folder (git status, git log, git diff, any open PR) and the message below, then continue.";
 const FOLDERS_FILE: &str = "folders.json";
 const SHELL_CANCEL_CHECK: Duration = Duration::from_secs(2);
-const CHAT_KINDS: [&str; 4] = ["turn", "aside", "direct", "quick"];
+const CHAT_KINDS: [&str; 5] = ["turn", "aside", "direct", "quick", "action"];
 const WORK_KINDS: [&str; 4] = ["task", "followup", "review", "publish"];
 const MCP_SOCKET: &str = "leases/mcp.sock";
 const MCP_HUB_SOCKET: &str = "leases/mcp-hub.sock";
@@ -198,7 +199,11 @@ pub(crate) struct ExecutionOutcome {
     pub(crate) pr_url: Option<String>,
     pub(crate) pr_number: Option<i64>,
     pub(crate) publish_pr_state: Option<String>,
+    pub(crate) checked_pr_url: Option<String>,
+    pub(crate) publish_pr_checked_at: Option<chrono::DateTime<chrono::Utc>>,
     pub(crate) work_summary: Option<String>,
+    pub(crate) context_sent: Option<SentContext>,
+    pub(crate) published_head: Option<String>,
 }
 
 
@@ -354,6 +359,13 @@ impl RunnerApi {
             .await
             .context("runner disk notice failed")?;
         ensure_success(response.status(), "runner disk notice")
+    }
+
+    async fn finish_pr_check(&self, result: &RunnerPrCheckResult) -> Result<()> {
+        let response = send_json(|| self.authorized(self.client.post(self.runner_url("/pr-checks"))), result)
+            .await
+            .context("runner PR check failed")?;
+        ensure_success(response.status(), "runner PR check")
     }
 
     async fn poll(&self, poll: &RunnerPoll) -> Result<Option<RunnerPolled>> {
@@ -815,6 +827,69 @@ impl Outage {
     }
 }
 
+async fn run_pr_check(check: &RunnerPrCheck) -> Result<Option<&'static str>> {
+    let repo = validate_repo(&check.repo)?;
+    let tracked = loka_shared::git_names::TrackedPr::parse(&check.pr_url)
+        .filter(|tracked| tracked.repo().eq_ignore_ascii_case(repo))
+        .filter(|tracked| i64::from(tracked.number()) == check.pr_number);
+    let Some(tracked) = tracked else {
+        bail!("PR check does not match its repository")
+    };
+    let view = pr_check_view(tracked.repo(), i64::from(tracked.number())).await?;
+    let returned = view
+        .get("url")
+        .and_then(Value::as_str)
+        .and_then(loka_shared::git_names::TrackedPr::parse);
+    if !returned.is_some_and(|returned| returned.same_identity(tracked))
+        || view.get("number").and_then(Value::as_i64) != Some(i64::from(tracked.number()))
+    {
+        bail!("PR check returned a different pull request")
+    }
+    Ok(match view.get("state").and_then(Value::as_str) {
+        Some("MERGED") => Some("merged"),
+        Some("CLOSED") => Some("closed"),
+        _ => None,
+    })
+}
+
+fn tracked_publish_pr(
+    publish: &RunnerPublish,
+) -> Result<Option<loka_shared::git_names::TrackedPr<'_>>> {
+    let Some(url) = publish.pr_url.as_deref() else {
+        return Ok(None);
+    };
+    let tracked = loka_shared::git_names::TrackedPr::parse(url)
+        .ok_or_else(|| anyhow!("recorded pull request is invalid"))?;
+    if publish
+        .pr_number
+        .is_some_and(|number| number != i64::from(tracked.number()))
+    {
+        bail!("recorded pull request number does not match its URL")
+    }
+    Ok(Some(tracked))
+}
+
+async fn pr_check_view(repo: &str, pr_number: i64) -> Result<Value> {
+    let number = pr_number.to_string();
+    let mut command = tokio::process::Command::new("gh");
+    command
+        .args(["pr", "view", &number, "--repo", repo, "--json", "state,url,number"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GH_PROMPT_DISABLED", "1")
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(
+        Duration::from_secs(60),
+        command.output(),
+    )
+    .await
+    .map_err(|_| anyhow!("gh timed out"))?
+    .context("could not run gh")?;
+    if !output.status.success() {
+        bail!("gh pr view failed: {}", loka_shared::cli_errors::error_text(String::from_utf8_lossy(&output.stderr).trim()))
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
 async fn runner_loop(
     api: RunnerApi,
     root: PathBuf,
@@ -829,6 +904,7 @@ async fn runner_loop(
     let shells = Arc::new(Semaphore::new(2));
     let terminals = Arc::new(Semaphore::new(loka_shared::terminal::max_per_device().max(1) as usize));
     let views = Arc::new(Semaphore::new(loka_shared::terminal::max_views_per_device().max(1) as usize));
+    let pr_checks = Arc::new(Semaphore::new(1));
     let mut claims = Claims { poll: true, shell: true, terminal: true };
     let warm = Pool::new(budget.warm_sessions);
     tokio::spawn(warm.clone().reap_loop());
@@ -895,6 +971,7 @@ async fn runner_loop(
             shell,
             terminal: terminal_room && room.shells,
             views: terminal_room && room.views,
+            pr_checks: beat && pr_checks.available_permits() > 0,
         };
         if poll_outage.failures > 0 && !outbox.finishing().is_empty() {
             outbox.flush(OUTBOX_FLUSH).await;
@@ -945,6 +1022,31 @@ async fn runner_loop(
                 continue;
             }
         };
+        if let Some(check) = polled.pr_check.clone() {
+            if let Ok(permit) = pr_checks.clone().try_acquire_owned() {
+                let api = api.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    match run_pr_check(&check).await {
+                        Ok(Some(state)) => {
+                            let result = RunnerPrCheckResult {
+                                task_id: check.task_id,
+                                repo: check.repo.clone(),
+                                pr_url: check.pr_url.clone(),
+                                pr_number: check.pr_number,
+                                state: state.to_string(),
+                                observed_at: check.observed_at,
+                            };
+                            if let Err(error) = api.finish_pr_check(&result).await {
+                                warn!(task = %check.task_id, error = %format!("{error:#}"), "Could not report PR check");
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => warn!(task = %check.task_id, error = %format!("{error:#}"), "Could not check PR"),
+                    }
+                });
+            }
+        }
         let claimed = polled.job.is_some() || polled.shell.is_some() || polled.terminal.is_some();
 
         if let Some(job) = polled.shell {
@@ -1285,10 +1387,14 @@ fn failed_completion(workspace_key: String, error: String) -> RunnerCompletion {
         pr_url: None,
         pr_number: None,
         publish_pr_state: None,
+        checked_pr_url: None,
+        publish_pr_checked_at: None,
         checkpoint: None,
         steered: Vec::new(),
         retryable: true,
         work_summary: None,
+        context_sent: None,
+        published_head: None,
     }
 }
 
@@ -1512,10 +1618,14 @@ pub(crate) fn errored_completion(
         pr_url: None,
         pr_number: None,
         publish_pr_state: None,
+        checked_pr_url: None,
+        publish_pr_checked_at: None,
         checkpoint: None,
         steered: Vec::new(),
         retryable,
         work_summary: None,
+        context_sent: None,
+        published_head: None,
     }
 }
 
@@ -1541,10 +1651,14 @@ pub(crate) fn success_completion(
         pr_url: outcome.pr_url,
         pr_number: outcome.pr_number,
         publish_pr_state: outcome.publish_pr_state,
+        checked_pr_url: outcome.checked_pr_url,
+        publish_pr_checked_at: outcome.publish_pr_checked_at,
         checkpoint: outcome.result.checkpoint,
         steered,
         retryable: false,
         work_summary: outcome.work_summary,
+        context_sent: outcome.context_sent,
+        published_head: outcome.published_head,
     }
 }
 
@@ -1580,7 +1694,11 @@ async fn close_run_browser_tabs(root: &Path, job: &RunnerJob) {
     }
 }
 
-fn start_fresh_if_transcript_missing(mut job: RunnerJob, storage: Option<&RunnerStorage>) -> RunnerJob {
+pub(crate) fn job_compacts_first(job: &RunnerJob) -> bool {
+    cli::resumes_to_compact(job.compact_first, job.resume, job.fork, job.cli_session_id.is_some(), job.rewind_to.is_some())
+}
+
+fn start_fresh_if_transcript_missing(job: RunnerJob, storage: Option<&RunnerStorage>) -> RunnerJob {
     let (true, Some(session_id)) = (job.resume, job.cli_session_id.as_deref()) else {
         return job;
     };
@@ -1592,12 +1710,21 @@ fn start_fresh_if_transcript_missing(mut job: RunnerJob, storage: Option<&Runner
         return job;
     }
     warn!(run_id = %job.run_id, %session_id, "CLI transcript is gone, starting a fresh session");
+    started_fresh(job)
+}
+
+fn started_fresh(mut job: RunnerJob) -> RunnerJob {
     job.cli_session_id = (job.cli == "claude").then(|| Uuid::new_v4().to_string());
     job.resume = false;
     job.fork = false;
     job.rewind_to = None;
     job.previous_run_id = None;
-    job.prompt = format!("{TRANSCRIPT_GONE}\n\n{}", job.prompt);
+    job.context_sent = job.context_sent.only(loka_shared::context::INSTRUCTIONS_BLOCK);
+    job.prompt = [Some(TRANSCRIPT_GONE.to_string()), job.fresh_instructions.take(), Some(std::mem::take(&mut job.prompt))]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n\n");
     job
 }
 
@@ -1632,11 +1759,15 @@ async fn execute_job_inner(
     } else {
         info!(run_id = %job.run_id, agent_id = %job.agent_id, kind = %job.kind, cli = %job.cli, "Executing runner job");
     }
+    if job.kind == loka_shared::pr_actions::KIND {
+        return pr_action_job(job).await;
+    }
     if job.kind == "publish" {
         let published = publish_job(root, job).await;
         stages.lock().unwrap().run_ms = Some(prepare_started.elapsed().as_millis());
         return published;
     }
+    let room_answer = job.room_answer || loka_shared::world::room_answer_workspace_key(&job.workspace.key);
     let work_root = root.to_path_buf();
     let workspace = if job.kind == "direct" {
         shared_folder(root, &job.workspace.key)?
@@ -1665,12 +1796,12 @@ async fn execute_job_inner(
         vault_values.extend(resolved.values().cloned());
         granted.extend(resolved);
     }
-    let mut skills = materialize_skills(&work_root, job).await?;
-    let browser = browser_grant(job, storage.is_none() && browser_ready());
+    let mut skills = if room_answer { Vec::new() } else { materialize_skills(&work_root, job).await? };
+    let browser = (!room_answer).then(|| browser_grant(job, storage.is_none() && browser_ready())).flatten();
     if let Some(grant) = browser {
         skills.push(materialize_browser(root, job, grant).await?);
     }
-    let apps_launcher = (storage.is_none() && crate::apps::wanted(&job.kind) && crate::apps::allowed())
+    let apps_launcher = (!room_answer && storage.is_none() && crate::apps::wanted(&job.kind) && crate::apps::allowed())
         .then(|| crate::apps::launcher(job.agent_id))
         .flatten();
     if let Some(launcher) = &apps_launcher {
@@ -1679,7 +1810,7 @@ async fn execute_job_inner(
         tokio::fs::write(&path, crate::apps::skill(launcher)).await?;
         skills.push(path);
     }
-    let screen = storage.is_none() && crate::screen::wanted(&job.kind) && crate::screen::allowed();
+    let screen = !room_answer && storage.is_none() && crate::screen::wanted(&job.kind) && crate::screen::allowed();
     let screen_launcher = if screen { crate::screen::launcher(job.agent_id) } else { None };
     if let Some(launcher) = &screen_launcher {
         let dir = secure_create_dir(&root.join("skills"), Path::new(&job.session_id.to_string()), false).await?;
@@ -1689,7 +1820,8 @@ async fn execute_job_inner(
     }
     let images = materialize_images(&work_root, job).await?;
     let files_note = materialize_files(&work_root, job).await?;
-    let prompt = prompt_with_skills(&job.prompt, &skills, storage);
+    let mut sent = job.context_sent.clone();
+    let prompt = prompt_with_skills(&job.prompt, &skills, storage.filter(|_| !room_answer), &mut sent);
     let prompt = match files_note {
         Some(note) => format!("{prompt}\n\n{note}"),
         None => prompt,
@@ -1741,6 +1873,9 @@ async fn execute_job_inner(
     let provided = provided_environment();
     for (name, value) in &provided {
         environment.entry(name.clone()).or_insert_with(|| value.clone());
+    }
+    if room_answer {
+        environment.insert(cli::ROOM_ANSWER_ENV.into(), "1".into());
     }
     add_gate_environment(&mut environment, root, job, browser, screen_launcher, apps_launcher);
     let browser_run = browser.map(|grant| OpenBrowserRun::new(job.lease_id, grant, pids.clone()));
@@ -1843,9 +1978,14 @@ async fn execute_job_inner(
     if compacting {
         warm.evict(job.session_id).await;
     }
+    let compact_first = job_compacts_first(job);
+    if compact_first {
+        warm.evict(job.session_id).await;
+    }
     let warm_turn = (job.kind == "turn" && job.lean || job.kind == "direct" && job.cli == "claude")
         && job.rewind_to.is_none()
         && !compacting
+        && !compact_first
         && warm::supports_model(&job.cli, opts.model)
         && (!job.metered || warm::reports_usage(&job.cli))
         && warm.enabled();
@@ -1874,7 +2014,7 @@ async fn execute_job_inner(
             }
             Ok(result)
         } else {
-            cli::run(&job.cli, opts).await
+            cli::run_compacting(&job.cli, opts, compact_first).await
         }
     });
     let outcome = (&mut cli).await;
@@ -1901,25 +2041,77 @@ async fn execute_job_inner(
     checkpointed.store(true, Ordering::Release);
     let mut result = outcome.map_err(|error| anyhow!(secrets.redact(&loka_shared::cli_errors::chain(&error))))?;
     result.output = secrets.redact(&result.output);
+    let has_report = crate::world::prompts::parse_report(&result.output).is_some();
     let work_summary = match (job.kind.as_str(), job.workspace.base_branch.as_deref()) {
-        ("task" | "followup", Some(base)) if job.workspace.repo.is_some() && crate::world::prompts::parse_report(&result.output).is_none() => {
+        ("task" | "followup", Some(base)) if job.workspace.repo.is_some() && !has_report => {
             crate::git::workspace::work_summary(&workspace, base).await
         }
         _ => None,
     }
     .map(|summary| secrets.redact(&summary));
-    let publish_pr_state = match job.kind.as_str() {
-        "followup" if job.workspace.repo.is_some() && crate::world::prompts::parse_report(&result.output).is_some() => {
-            crate::git::github::pr_sync(&workspace, claimed_at).await.report().map(str::to_string)
+    let (publish_pr_state, pr_url, pr_number, checked_pr_url) = match job.kind.as_str() {
+        "followup" if job.workspace.repo.is_some() => {
+            let observed = match job.publish.as_ref() {
+                Some(publish) => match tracked_publish_pr(publish).ok().flatten() {
+                    Some(tracked) => (crate::git::github::tracked_pr_sync(&workspace, claimed_at, tracked).await
+                        == loka_shared::runners::PrSync::Merged)
+                        .then(|| (tracked.url().to_string(), i64::from(tracked.number()))),
+                    None => None,
+                },
+                None => None,
+            };
+            if let Some((url, number)) = observed {
+                (Some("merged".to_string()), Some(url.clone()), Some(number), Some(url))
+            } else if has_report {
+                let sync = crate::git::github::pr_sync(&workspace, claimed_at).await;
+                let state = if sync == loka_shared::runners::PrSync::Merged {
+                    None
+                } else {
+                    sync.report().map(str::to_string)
+                };
+                (state, None, None, None)
+            } else {
+                (None, None, None, None)
+            }
         }
-        _ => None,
+        _ => (None, None, None, None),
     };
     Ok(ExecutionOutcome {
         result,
+        pr_url,
+        pr_number,
+        publish_pr_state,
+        checked_pr_url,
+        publish_pr_checked_at: None,
+        work_summary,
+        context_sent: Some(sent),
+        published_head: None,
+    })
+}
+
+async fn pr_action_job(job: &RunnerJob) -> Result<ExecutionOutcome> {
+    use loka_shared::pr_actions::Outcome;
+    let outcome = match job.pr_action.as_ref() {
+        Some(action) => crate::pr_actions::perform(&crate::pr_actions::Gh, action).await,
+        None => Outcome::failed("this job carried no pull request action"),
+    };
+    Ok(ExecutionOutcome {
+        result: crate::cli::CliResult {
+            output: serde_json::to_string(&outcome)?,
+            session_id: None,
+            cost_usd: 0.0,
+            exit_code: 0,
+            usage: crate::cli::Usage::default(),
+            checkpoint: None,
+        },
         pr_url: None,
         pr_number: None,
-        publish_pr_state,
-        work_summary,
+        publish_pr_state: None,
+        checked_pr_url: None,
+        publish_pr_checked_at: None,
+        work_summary: None,
+        published_head: None,
+        context_sent: None,
     })
 }
 
@@ -1934,15 +2126,119 @@ async fn publish_job(root: &Path, job: &RunnerJob) -> Result<ExecutionOutcome> {
         bail!("publish repository does not match the workspace");
     }
     let workspace = prepare_workspace(root, &job.workspace).await?;
+    let mut recorded_pr_open_at = None;
+    let tracked_pr = tracked_publish_pr(publish)?;
+    let tracked_pr_matches_workspace = tracked_pr.is_some_and(|tracked| tracked.repo().eq_ignore_ascii_case(repo));
+    let mut tracked_pr_state = None;
+    let mut tracked_pr_checked_at = None;
+    if let Some(tracked) = tracked_pr {
+        let checked_at = chrono::Utc::now();
+        let state = crate::git::github::pr_state(&workspace, tracked).await?;
+        if state == "OPEN" {
+            recorded_pr_open_at = Some(checked_at);
+        }
+        tracked_pr_state = Some(state.clone());
+        tracked_pr_checked_at = Some(checked_at);
+        if !tracked_pr_matches_workspace {
+            let state = state.to_lowercase();
+            return Ok(ExecutionOutcome {
+                result: crate::cli::CliResult {
+                    output: format!("Pull request #{} belongs to the quest's earlier repository, nothing to publish", tracked.number()),
+                    session_id: job.cli_session_id.clone(),
+                    cost_usd: 0.0,
+                    exit_code: 0,
+                    usage: crate::cli::Usage::default(),
+                    checkpoint: None,
+                },
+                pr_url: Some(tracked.url().to_string()),
+                pr_number: Some(i64::from(tracked.number())),
+                publish_pr_state: Some(state.clone()),
+                checked_pr_url: Some(tracked.url().to_string()),
+                publish_pr_checked_at: matches!(state.as_str(), "open" | "closed").then_some(checked_at),
+                work_summary: None,
+                context_sent: None,
+                published_head: None,
+            });
+        }
+    }
     let quest_branch = job
         .workspace
         .branch
         .as_deref()
         .filter(|name| !name.trim().is_empty())
         .unwrap_or(&publish.branch);
-    let committed = crate::git::workspace::commit_for_publish(&workspace, repo, &publish.commit_message).await?;
+    let committed = crate::git::workspace::commit_for_publish(&workspace, repo, &publish.commit_message, publish.other_writer.as_deref()).await?;
+    let mut carried = None;
+    if let (Some(tracked), Some(state)) = (tracked_pr, tracked_pr_state.as_deref()) {
+        match crate::git::github::carry_past_recorded_pr(
+            &workspace,
+            &publish.base_branch,
+            quest_branch,
+            i64::from(tracked.number()),
+            Some(state),
+            None,
+        )
+        .await?
+        {
+            crate::git::github::RecordedPr::Open => {}
+            crate::git::github::RecordedPr::Final { state, carried: None } => {
+                return Ok(ExecutionOutcome {
+                    result: crate::cli::CliResult {
+                        output: format!("Pull request #{} is already {state}, nothing new to publish", tracked.number()),
+                        session_id: job.cli_session_id.clone(),
+                        cost_usd: 0.0,
+                        exit_code: 0,
+                        usage: crate::cli::Usage::default(),
+                        checkpoint: None,
+                    },
+                    pr_url: Some(tracked.url().to_string()),
+                    pr_number: Some(i64::from(tracked.number())),
+                    publish_pr_state: Some(state.clone()),
+                    checked_pr_url: Some(tracked.url().to_string()),
+                    publish_pr_checked_at: tracked_pr_checked_at.filter(|_| state == "closed"),
+                    work_summary: None,
+                    context_sent: None,
+                    published_head: None,
+                });
+            }
+            crate::git::github::RecordedPr::Final { state, carried: Some(branch) } => {
+                carried = Some((
+                    branch,
+                    crate::git::github::follow_up_body(&publish.pr_body, i64::from(tracked.number()), &state),
+                    tracked.url().to_string(),
+                ));
+            }
+        }
+    }
     let ahead = crate::git::workspace::ahead_of_fresh_base(&workspace, &publish.base_branch).await?;
-    if publish.pr_number.is_none() && !ahead {
+    if tracked_pr.is_none() && !ahead {
+        let checked_at = chrono::Utc::now();
+        let recovered = match publish.recovery_branch.as_deref() {
+            Some(branch) => crate::git::github::recover_pr(&workspace, repo, branch, publish.reported_pr_number).await?,
+            None => None,
+        };
+        if let Some(recovered) = recovered {
+            let state = recovered.state.to_lowercase();
+            let recovered_url = recovered.info.url;
+            return Ok(ExecutionOutcome {
+                result: crate::cli::CliResult {
+                    output: format!("Found pull request #{} for this quest's branch", recovered.info.number),
+                    session_id: job.cli_session_id.clone(),
+                    cost_usd: 0.0,
+                    exit_code: 0,
+                    usage: crate::cli::Usage::default(),
+                    checkpoint: None,
+                },
+                pr_url: Some(recovered_url.clone()),
+                pr_number: Some(i64::from(recovered.info.number)),
+                publish_pr_state: Some(state.clone()),
+                checked_pr_url: Some(recovered_url),
+                publish_pr_checked_at: matches!(state.as_str(), "open" | "closed").then_some(checked_at),
+                work_summary: None,
+                context_sent: None,
+                published_head: None,
+            });
+        }
         return Ok(ExecutionOutcome {
             result: crate::cli::CliResult {
                 output: "Nothing to publish".to_string(),
@@ -1955,31 +2251,16 @@ async fn publish_job(root: &Path, job: &RunnerJob) -> Result<ExecutionOutcome> {
             pr_url: None,
             pr_number: None,
             publish_pr_state: None,
+            checked_pr_url: None,
+            publish_pr_checked_at: None,
             work_summary: None,
+            context_sent: None,
+            published_head: None,
         });
     }
-    if let (Some(number), Some(url)) = (publish.pr_number, publish.pr_url.as_deref()) {
-        if let Some(state) = crate::git::github::pr_state(&workspace, repo, number).await? {
-            if crate::git::github::is_final_pr_state(&state) {
-                let state = state.to_lowercase();
-                return Ok(ExecutionOutcome {
-                    result: crate::cli::CliResult {
-                        output: format!("Pull request #{number} is already {state}, nothing to publish"),
-                        session_id: job.cli_session_id.clone(),
-                        cost_usd: 0.0,
-                        exit_code: 0,
-                        usage: crate::cli::Usage::default(),
-                        checkpoint: None,
-                    },
-                    pr_url: Some(url.to_string()),
-                    pr_number: Some(number),
-                    publish_pr_state: Some(state),
-                    work_summary: None,
-                });
-            }
-        }
-    }
-    if let Some((url, number)) = kept_pr(publish, ahead) {
+    if let Some(tracked) = tracked_pr.filter(|_| !ahead) {
+        let url = tracked.url().to_string();
+        let number = i64::from(tracked.number());
         return Ok(ExecutionOutcome {
             result: crate::cli::CliResult {
                 output: format!("Nothing new to publish, keeping pull request #{number}"),
@@ -1989,10 +2270,14 @@ async fn publish_job(root: &Path, job: &RunnerJob) -> Result<ExecutionOutcome> {
                 usage: crate::cli::Usage::default(),
                 checkpoint: None,
             },
-            pr_url: Some(url),
+            pr_url: Some(url.clone()),
             pr_number: Some(number),
-            publish_pr_state: None,
+            publish_pr_state: recorded_pr_open_at.as_ref().map(|_| "open".to_string()),
+            checked_pr_url: recorded_pr_open_at.as_ref().map(|_| url),
+            publish_pr_checked_at: recorded_pr_open_at,
             work_summary: None,
+            context_sent: None,
+            published_head: None,
         });
     }
     let mut publish_pr_state = None;
@@ -2002,56 +2287,58 @@ async fn publish_job(root: &Path, job: &RunnerJob) -> Result<ExecutionOutcome> {
         onto: &publish.base_branch,
         quest_branch,
     };
-    let pr = match crate::git::github::open_pr_containing_head(
-        &workspace,
-        repo,
-        &publish.base_branch,
-        quest_branch,
-        publish.stack_onto_pr,
-    )
-    .await?
-    {
-        crate::git::github::HeadPr::Extends(pr, head_ref)
-            if ahead && crate::git::github::extends_recorded_pr(publish.pr_number, pr.number) =>
-        {
-            info!(pr = %pr.url, "Work extends an open pull request, pushing to its branch instead of opening another");
-            let extending = crate::git::workspace::PublishTarget { quest_branch: &head_ref, ..target };
-            crate::git::workspace::publish_commits(&workspace, &committed, &extending, &head_ref).await?;
-            Some(pr)
-        }
-        crate::git::github::HeadPr::Own(pr, head) if ahead => {
-            crate::git::workspace::publish_commits(&workspace, &committed, &target, &head).await?;
-            Some(pr)
-        }
-        crate::git::github::HeadPr::Elsewhere(pr) => {
-            info!(pr = %pr.url, "Work already sits in another branch's pull request, not attaching it");
-            publish_pr_state = Some(loka_shared::runners::PUBLISH_ELSEWHERE.to_string());
-            None
-        }
-        crate::git::github::HeadPr::Missing | crate::git::github::HeadPr::Extends(..) if ahead => 'missing: {
-            if !crate::git::workspace::ahead_of_fresh_base(&workspace, &publish.base_branch).await? {
-                info!("The base branch caught up with this work while publishing, not opening a pull request");
-                break 'missing None;
+    let pr = if let Some((branch, body, _)) = &carried {
+        crate::git::workspace::publish_commits(&workspace, &committed.carried(), &target, branch).await?;
+        crate::git::github::create_pr(&workspace, repo, branch, &publish.base_branch, &publish.pr_title, body).await?
+    } else {
+        match crate::git::github::open_pr_containing_head(&workspace, repo, &publish.base_branch, quest_branch, publish.stack_onto_pr).await? {
+            crate::git::github::HeadPr::Extends(pr, head_ref)
+                if ahead
+                    && tracked_pr_matches_workspace
+                    && crate::git::github::extends_recorded_pr(
+                        tracked_pr.map(|tracked| i64::from(tracked.number())),
+                        pr.number,
+                    ) =>
+            {
+                info!(pr = %pr.url, "Work extends an open pull request, pushing to its branch instead of opening another");
+                let extending = crate::git::workspace::PublishTarget { quest_branch: &head_ref, ..target };
+                crate::git::workspace::publish_commits(&workspace, &committed, &extending, &head_ref).await?;
+                Some(pr)
             }
-            let branch =
-                crate::git::workspace::publish_branch(&workspace, Some(quest_branch)).await?;
-            if branch == publish.base_branch {
-                bail!("publish workspace is on the base branch");
+            crate::git::github::HeadPr::Own(pr, head) if ahead => {
+                crate::git::workspace::publish_commits(&workspace, &committed, &target, &head).await?;
+                Some(pr)
             }
-            let into = crate::git::github::stack_base(&workspace, repo, &publish.base_branch, quest_branch, publish.stack_onto_pr).await;
-            let target = crate::git::workspace::PublishTarget { onto: &into, ..target };
-            crate::git::workspace::publish_commits(&workspace, &committed, &target, &branch).await?;
-            crate::git::github::create_pr(
-                &workspace,
-                repo,
-                &branch,
-                &into,
-                &publish.pr_title,
-                &publish.pr_body,
-            )
-            .await?
+            crate::git::github::HeadPr::Elsewhere(pr) => {
+                info!(pr = %pr.url, "Work already sits in another branch's pull request, not attaching it");
+                publish_pr_state = Some(loka_shared::runners::PUBLISH_ELSEWHERE.to_string());
+                None
+            }
+            crate::git::github::HeadPr::Missing | crate::git::github::HeadPr::Extends(..) if ahead => 'missing: {
+                if !crate::git::workspace::ahead_of_fresh_base(&workspace, &publish.base_branch).await? {
+                    info!("The base branch caught up with this work while publishing, not opening a pull request");
+                    break 'missing None;
+                }
+                let branch =
+                    crate::git::workspace::publish_branch(&workspace, Some(quest_branch)).await?;
+                if branch == publish.base_branch {
+                    bail!("publish workspace is on the base branch");
+                }
+                let into = crate::git::github::stack_base(&workspace, repo, &publish.base_branch, quest_branch, publish.stack_onto_pr).await;
+                let target = crate::git::workspace::PublishTarget { onto: &into, ..target };
+                crate::git::workspace::publish_commits(&workspace, &committed, &target, &branch).await?;
+                crate::git::github::create_pr(
+                    &workspace,
+                    repo,
+                    &branch,
+                    &into,
+                    &publish.pr_title,
+                    &publish.pr_body,
+                )
+                .await?
+            }
+            _ => None,
         }
-        _ => None,
     };
     if let Err(error) = run_git(
         &workspace,
@@ -2067,6 +2354,17 @@ async fn publish_job(root: &Path, job: &RunnerJob) -> Result<ExecutionOutcome> {
     {
         warn!(error = %format!("{error:#}"), "Failed to clear build directories after publish");
     }
+    let returned_tracked = pr
+        .as_ref()
+        .and_then(|pr| loka_shared::git_names::TrackedPr::parse(&pr.url));
+    let kept_tracked = tracked_pr.zip(returned_tracked).is_some_and(|(tracked, returned)| tracked.same_identity(returned));
+    let replaced_url = carried.as_ref().filter(|_| pr.is_some()).map(|(_, _, url)| url.clone());
+    let publish_pr_checked_at = recorded_pr_open_at.filter(|_| kept_tracked && replaced_url.is_none());
+    if replaced_url.is_some() {
+        publish_pr_state = Some("replaced".to_string());
+    } else if publish_pr_checked_at.is_some() && publish_pr_state.is_none() {
+        publish_pr_state = Some("open".to_string());
+    }
     Ok(ExecutionOutcome {
         result: crate::cli::CliResult {
             output: pr.as_ref().map_or_else(
@@ -2079,19 +2377,18 @@ async fn publish_job(root: &Path, job: &RunnerJob) -> Result<ExecutionOutcome> {
             usage: crate::cli::Usage::default(),
             checkpoint: None,
         },
+        published_head: match &pr {
+            Some(_) => crate::git::github::head_commit(&workspace).await,
+            None => None,
+        },
         pr_url: pr.as_ref().map(|pr| pr.url.clone()),
-        pr_number: pr.map(|pr| i64::from(pr.number)),
+        pr_number: pr.as_ref().map(|pr| i64::from(pr.number)),
         publish_pr_state,
+        checked_pr_url: replaced_url.or_else(|| publish_pr_checked_at.and_then(|_| returned_tracked.map(|tracked| tracked.url().to_string()))),
+        publish_pr_checked_at,
         work_summary: None,
+        context_sent: None,
     })
-}
-
-fn kept_pr(publish: &RunnerPublish, ahead: bool) -> Option<(String, i64)> {
-    if ahead {
-        return None;
-    }
-    let url = publish.pr_url.as_deref().map(str::trim).filter(|url| !url.is_empty())?;
-    Some((url.to_string(), publish.pr_number?))
 }
 
 const LIVE_USAGE_EVERY: Duration = Duration::from_secs(5);
@@ -2821,26 +3118,26 @@ async fn materialize_files(root: &Path, job: &RunnerJob) -> Result<Option<String
     Ok(loka_shared::media::attached_files_note(&saved, &[]))
 }
 
-fn prompt_with_skills(prompt: &str, skills: &[PathBuf], storage: Option<&RunnerStorage>) -> String {
+fn prompt_with_skills(prompt: &str, skills: &[PathBuf], storage: Option<&RunnerStorage>, sent: &mut SentContext) -> String {
     if prompt == cli::COMPACT_PROMPT {
         return prompt.to_string();
     }
-    let mut sections = vec![prompt.to_string()];
+    let mut catalog = Vec::new();
     if !skills.is_empty() {
         let index = skills
             .iter()
             .map(|path| format!("- {}", path.display()))
             .collect::<Vec<_>>()
             .join("\n");
-        sections.push(format!("[skills]\n{index}"));
+        catalog.push(format!("[skills]\n{index}"));
     }
     if let Some(storage) = storage {
-        sections.push(format!(
+        catalog.push(format!(
             "[persistent memory]\nStore durable notes in {}.",
             storage.memory_dir().display()
         ));
     }
-    sections.join("\n\n")
+    sent.append(prompt, loka_shared::context::SKILLS_BLOCK, &catalog.join("\n\n"))
 }
 
 fn provided_environment() -> BTreeMap<String, String> {
@@ -3038,7 +3335,9 @@ fn capabilities() -> Value {
         "terminal": true,
         "setup_scan": cfg!(target_os = "macos"),
         "vault_refs": cfg!(target_os = "macos"),
+        "room_answer_isolation": true,
         "quick": true,
+        "pr_actions": true,
         "github_feed": github_feed::capability(),
         "provider_keys": loka_shared::providers::server_key_names(),
         "folders": shared_folders_view(),
@@ -3164,6 +3463,8 @@ async fn reconnect_delay() {
 mod tests {
     use super::*;
 
+    static BROWSER_FIXTURES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[test]
     fn a_full_disk_claims_chat_but_no_work_until_there_is_room() {
         let work: Vec<String> = WORK_KINDS.map(String::from).to_vec();
@@ -3176,24 +3477,31 @@ mod tests {
     }
 
     #[test]
-    fn a_recorded_pr_is_kept_when_nothing_is_ahead() {
+    fn recorded_pr_lookup_uses_the_url_repo_not_the_workspace_repo() {
         let publish = |url: Option<&str>, number: Option<i64>| RunnerPublish {
-            repo: "o/r".into(),
+            repo: "o/repo-b".into(),
             branch: "fix-x-dcec4a9d".into(),
+            recovery_branch: Some("fix-x-dcec4a9d".into()),
             base_branch: "main".into(),
             commit_message: "m".into(),
             pr_title: "t".into(),
             pr_body: "b".into(),
             pr_url: url.map(str::to_string),
             pr_number: number,
+            reported_pr_number: None,
             stack_onto_pr: None,
+            other_writer: None,
         };
-        let recorded = publish(Some("https://github.com/o/r/pull/94"), Some(94));
-        assert_eq!(kept_pr(&recorded, false), Some(("https://github.com/o/r/pull/94".to_string(), 94)));
-        assert_eq!(kept_pr(&recorded, true), None);
-        assert_eq!(kept_pr(&publish(None, None), false), None);
-        assert_eq!(kept_pr(&publish(None, Some(94)), false), None);
-        assert_eq!(kept_pr(&publish(Some(" "), Some(94)), false), None);
+        let recorded = publish(Some("https://github.com/o/repo-a/pull/21"), Some(21));
+        let tracked = tracked_publish_pr(&recorded).unwrap().unwrap();
+        assert_eq!((tracked.repo(), tracked.number()), ("o/repo-a", 21));
+        assert!(tracked_publish_pr(&publish(None, None)).unwrap().is_none());
+        assert!(tracked_publish_pr(&publish(Some("https://github.com/o/repo-a/pull/21"), None))
+            .unwrap()
+            .is_some());
+        assert!(tracked_publish_pr(&publish(Some("https://github.com/o/repo-a/pull/21"), Some(22)))
+            .is_err());
+        assert!(tracked_publish_pr(&publish(Some(" "), Some(21))).is_err());
     }
 
     #[test]
@@ -3321,6 +3629,7 @@ mod tests {
             "AUTH_SECRET",
             "WORLD_RUNNER_TOKEN",
             "GITHUB_TOKEN",
+            cli::ROOM_ANSWER_ENV,
         ] {
             let environment = BTreeMap::from([(name.to_string(), "secret".to_string())]);
             assert!(filtered_environment(&environment, false).is_err(), "{name}");
@@ -3385,6 +3694,11 @@ mod tests {
     }
 
     #[test]
+    fn runner_advertises_room_answer_isolation() {
+        assert_eq!(capabilities()["room_answer_isolation"], json!(true));
+    }
+
+    #[test]
     fn failed_runs_only_report_observed_or_existing_session_ids() {
         assert_eq!(
             select_session_id(Some("first".into()), None, false, false).as_deref(),
@@ -3412,6 +3726,53 @@ mod tests {
             "timeout_secs": 60, "effort": null, "fast": false, "mcp_token": "t", "publish": null, "omp_models": null,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn the_skill_catalog_is_sent_once_per_cli_session_and_again_when_it_changes() {
+        use loka_shared::context::{SentContext, SKILLS_BLOCK};
+        let skills = vec![PathBuf::from("/runner/skills/s/notes.md"), PathBuf::from("/runner/skills/s/browser.md")];
+        let mut fresh = SentContext::default();
+        let first = prompt_with_skills("do it", &skills, None, &mut fresh);
+        assert!(first.starts_with("do it\n\n[skills]\n- /runner/skills/s/notes.md"), "{first}");
+        let mut resumed = fresh.clone();
+        assert_eq!(prompt_with_skills("next", &skills, None, &mut resumed), "next", "a resumed session keeps the catalog it got");
+        assert_eq!(resumed, fresh);
+        let mut changed = fresh.clone();
+        let fewer = prompt_with_skills("next", &skills[..1], None, &mut changed);
+        assert!(fewer.contains("[skills]") && !fewer.contains("browser.md"), "{fewer}");
+        assert_ne!(changed.hash(SKILLS_BLOCK), fresh.hash(SKILLS_BLOCK));
+        let mut compacted = fresh.clone();
+        assert_eq!(prompt_with_skills(cli::COMPACT_PROMPT, &skills, None, &mut compacted), cli::COMPACT_PROMPT);
+        let mut none = SentContext::default();
+        assert_eq!(prompt_with_skills("solo", &[], None, &mut none), "solo");
+    }
+
+    #[test]
+    fn a_job_that_has_to_start_fresh_carries_its_instructions_and_resends_the_catalog() {
+        use loka_shared::context::{SentContext, INSTRUCTIONS_BLOCK, SKILLS_BLOCK};
+        let mut job = quest_job("turn");
+        job.resume = true;
+        job.cli_session_id = Some("gone".into());
+        job.prompt = "hello".into();
+        job.fresh_instructions = Some("[rules updated]\nSign every reply.".into());
+        let mut sent = SentContext::default();
+        sent.offer(INSTRUCTIONS_BLOCK, "rules");
+        sent.offer(SKILLS_BLOCK, "[skills]\n- a.md");
+        job.context_sent = sent.clone();
+        let job = started_fresh(job);
+        assert!(!job.resume);
+        assert_eq!(job.prompt, format!("{TRANSCRIPT_GONE}\n\n[rules updated]\nSign every reply.\n\nhello"));
+        assert_eq!(job.context_sent.hash(INSTRUCTIONS_BLOCK), sent.hash(INSTRUCTIONS_BLOCK));
+        assert_eq!(job.context_sent.hash(SKILLS_BLOCK), None, "the new CLI session gets the catalog again");
+
+        let mut task = quest_job("followup");
+        task.prompt = "fix it".into();
+        task.context_sent = SentContext::default();
+        task.context_sent.offer(SKILLS_BLOCK, "[skills]\n- a.md");
+        let task = started_fresh(task);
+        assert_eq!(task.prompt, format!("{TRANSCRIPT_GONE}\n\nfix it"));
+        assert_eq!(task.context_sent, SentContext::default());
     }
 
     #[test]
@@ -3496,6 +3857,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_browser_socket_the_runner_listens_on_is_the_one_jobs_are_given() {
+        let _browser_fixture = BROWSER_FIXTURES.lock().await;
         let base = std::env::temp_dir().join(format!("loka-browser-sock-{}", Uuid::new_v4().simple()));
         let root = base.join("Library").join("Application Support").join("dev.ygpt.loka").join("runner");
         std::fs::create_dir_all(root.join("leases")).unwrap();
@@ -3553,6 +3915,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_runner_decides_the_browser_reach_of_every_run_kind() {
+        let _browser_fixture = BROWSER_FIXTURES.lock().await;
         use crate::browser::Reach;
         let expected = [
             ("task", Some(Reach::Loopback)),

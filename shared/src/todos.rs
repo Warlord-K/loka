@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::FromRow;
+use sqlx::{FromRow, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::world::{NewEvent, WorldStore};
@@ -210,6 +210,15 @@ const ORDER: &str = "ORDER BY (status = 'open') DESC, CASE WHEN status = 'open' 
 
 impl WorldStore {
     pub async fn add_todo(&self, new: NewTodo) -> Result<Todo> {
+        let actor = TodoActor { agent: new.added_by_agent, user: new.added_by_user };
+        let mut tx = self.pool().begin().await?;
+        let todo = Self::add_todo_in(&mut tx, &new).await?;
+        Self::todo_event_in(&mut tx, "todo.added", &todo, actor, None).await?;
+        tx.commit().await?;
+        Ok(todo)
+    }
+
+    pub(crate) async fn add_todo_in(tx: &mut Transaction<'_, Postgres>, new: &NewTodo) -> Result<Todo> {
         let text = new.text.trim();
         if text.is_empty() {
             bail!("a to-do needs text");
@@ -234,10 +243,9 @@ impl WorldStore {
         .bind(new.due_at)
         .bind(nudge_at)
         .bind(new.repeat_nudge.unwrap_or(true))
-        .bind(json!(new.proposals))
-        .fetch_one(self.pool())
+        .bind(json!(&new.proposals))
+        .fetch_one(&mut **tx)
         .await?;
-        self.todo_event("todo.added", &todo, TodoActor { agent: new.added_by_agent, user: new.added_by_user }, None).await?;
         Ok(todo)
     }
 
@@ -457,10 +465,23 @@ impl WorldStore {
     }
 
     async fn todo_event(&self, kind: &str, todo: &Todo, by: TodoActor, wake: Option<Uuid>) -> Result<()> {
+        let mut tx = self.pool().begin().await?;
+        Self::todo_event_in(&mut tx, kind, todo, by, wake).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn todo_event_in(
+        tx: &mut Transaction<'_, Postgres>,
+        kind: &str,
+        todo: &Todo,
+        by: TodoActor,
+        wake: Option<Uuid>,
+    ) -> Result<()> {
         let by_name = match by.user {
             Some(u) => sqlx::query_scalar::<_, Option<String>>("SELECT name FROM users WHERE id = $1")
                 .bind(u)
-                .fetch_optional(self.pool())
+                .fetch_optional(&mut **tx)
                 .await?
                 .flatten(),
             None => None,
@@ -479,7 +500,7 @@ impl WorldStore {
         if let Some(a) = todo.added_by_agent {
             event = event.agent(a);
         }
-        self.emit(event, wake.map(|a| (a, kind))).await?;
+        crate::world::emit_in(tx, &event, wake.map(|a| (a, kind))).await?;
         Ok(())
     }
 }

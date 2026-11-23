@@ -17,7 +17,7 @@ slug = "0.1"
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
 ring = "0.17"
 crypto_box = { version = "0.9", features = ["seal", "std"] }

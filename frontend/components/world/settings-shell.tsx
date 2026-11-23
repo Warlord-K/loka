@@ -36,9 +36,9 @@ export interface SettingsNavItem {
 export const CLOSE_BTN = `grid h-10 w-10 shrink-0 place-items-center rounded-lg border-2 border-w-ink bg-w-card text-w-text shadow-[0_2px_0_rgb(var(--w-ink))] transition-[transform,box-shadow,background-color] ${EASE} hover:bg-w-sand active:translate-y-[2px] active:shadow-none disabled:pointer-events-none disabled:opacity-50 motion-reduce:transform-none ${FOCUS}`;
 export const GHOST_ICON_BTN = `grid h-10 w-10 shrink-0 place-items-center rounded-lg text-w-muted transition-colors ${EASE} hover:bg-w-sand hover:text-w-strong disabled:opacity-50 ${FOCUS} focus-visible:ring-offset-0`;
 
-export function CloseButton({ onClose, label = "Close", className }: { onClose: () => void; label?: string; className?: string }) {
+export function CloseButton({ onClose, label = "Close", title, className }: { onClose: () => void; label?: string; title?: string; className?: string }) {
   return (
-    <button type="button" onClick={onClose} aria-label={label} className={cn(CLOSE_BTN, className)}>
+    <button type="button" onClick={onClose} aria-label={label} title={title} className={cn(CLOSE_BTN, className)}>
       <X size={16} weight="bold" />
     </button>
   );
@@ -51,6 +51,7 @@ export function WindowHeader({
   leading,
   actions,
   onClose,
+  closeTitle,
   className,
 }: {
   title: React.ReactNode;
@@ -59,6 +60,7 @@ export function WindowHeader({
   icon?: Icon;
   actions?: React.ReactNode;
   onClose?: () => void;
+  closeTitle?: string;
   className?: string;
 }) {
   return (
@@ -74,7 +76,7 @@ export function WindowHeader({
         {subtitle && <p className="mt-0.5 line-clamp-2 text-w-xs text-w-muted sm:line-clamp-1">{subtitle}</p>}
       </div>
       {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
-      {onClose && <CloseButton onClose={onClose} />}
+      {onClose && <CloseButton onClose={onClose} title={closeTitle} />}
     </header>
   );
 }

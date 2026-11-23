@@ -2,7 +2,19 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import ts from "typescript";
-import { applyNavigationDestination, consumeMessageFocus, conversationIsForeground, foregroundWindowLayer, guardedDetailLoader, raiseWindowLayer, navigationRequests, resolveMessageJump, resolveExactDestination, revealExactMap, runNavigation } from "./exact-world-navigation.ts";
+import { applyNavigationDestination, consumeMessageFocus, conversationIsForeground, foregroundWindowLayer, guardedDetailLoader, mergeReportCandidates, raiseWindowLayer, navigationRequests, reportCollection, resolveMessageJump, resolveExactDestination, revealExactMap, runNavigation } from "./exact-world-navigation.ts";
+
+test("documents and canvases resolve to separate libraries", () => {
+  assert.equal(reportCollection({ kind: "doc" }), "reports");
+  assert.equal(reportCollection({ kind: "canvas" }), "workspaces");
+});
+
+test("report link candidates merge both libraries and linked details by canonical id", () => {
+  const report = { id: "report", title: "Notes" };
+  const workspace = { id: "workspace", title: "Board" };
+  const linked = { id: "workspace", title: "Board from link" };
+  assert.deepEqual(mergeReportCandidates([report], [workspace], [linked]), [report, linked]);
+});
 
 function calledName(expression) {
   if (ts.isIdentifier(expression)) return expression.text;
@@ -299,6 +311,38 @@ test("controlled detail readers use the guarded API facade", () => {
   assert.deepEqual(detailBoundaryViolations(quest, null, registrations), []);
   assert.deepEqual(detailBoundaryViolations(thread, null, registrations), []);
   assert.deepEqual(detailBoundaryViolations(world, null, collections, ["loadChatUnread"]), []);
+  assert.match(world, /const questRoomOpen = [^;]+;[\s\S]+sideHostRef\.current = [^;]+questRoomOpen;/);
+  assert.match(world, /if \(reports \|\| listsOpen \|\| terminalWindowed \|\| academyHost \|\| questRoomOpen \|\| !side\.auto\) return;/);
+  assert.match(world, /\[reports, listsOpen, terminalWindowed, academyHost, questRoomOpen, side\.auto, side\.id\]/);
+});
+
+test("room message links and search hits share the guarded quest opener", () => {
+  const facade = readFileSync(new URL("./navigation-details.ts", import.meta.url), "utf8");
+  const api = readFileSync(new URL("./world.ts", import.meta.url), "utf8");
+  const world = readFileSync(new URL("../components/world/world-game.tsx", import.meta.url), "utf8");
+  const palette = readFileSync(new URL("../components/world/desktop-command-palette.tsx", import.meta.url), "utf8");
+  const roomBranch = world.indexOf("if (link.task_id)");
+  const channelBranch = world.indexOf("if (link.channel_id && Number.isSafeInteger(messageId))", roomBranch);
+  const agentBranch = world.indexOf("else if (link.agent_id)", channelBranch);
+  assert.ok(roomBranch > 0 && channelBranch > roomBranch && agentBranch > channelBranch);
+  assert.match(world, /target\.kind === "quest"[\s\S]+resolved = \{ kind: "quest", id: page\.task\.id, agentId: page\.task\.assigned_agent_id, page, item: target\.item \}/);
+  assert.match(world, /navigationDetails\.quest\(details, link\.task_id, undefined, undefined, link\.ref\)/);
+  assert.match(world, /id: page\.room\.task_id \?\? page\.task\.id[\s\S]+item: link\.ref/);
+  assert.match(facade, /worldApi\.questRoom\(id, after, since, focus\)/);
+  assert.match(api, /if \(focus\) q\.set\("focus", focus\)/);
+  assert.match(palette, /value={`hit:message:\$\{hit\.ref\}`}[\s\S]+onSelect=\{\(\) => selectRecord\(\(\) => openMessage\(hit\)\)\}/);
+});
+
+test("quest start cards open their room before decisions load", () => {
+  const card = readFileSync(new URL("../components/world/chat-kit.tsx", import.meta.url), "utf8");
+  const taskGuard = card.indexOf("const taskId = typeof meta.task_id");
+  const roomAction = card.indexOf("Open quest room", taskGuard);
+  const summary = card.indexOf("<QuestDecisionSummary", taskGuard);
+  assert.ok(taskGuard > 0 && summary > taskGuard && roomAction > summary);
+  assert.match(card, /taskId \? "Work started\. Open the quest room to follow the crew\."/);
+  assert.match(card, /world:open-quest[\s\S]+detail: \{ taskId, agentId: null \}/);
+  const decisionSummary = card.slice(card.indexOf("function QuestDecisionSummary"), card.indexOf("export function QuestCard"));
+  assert.doesNotMatch(decisionSummary, /onClick=/);
 });
 
 test("detail boundary rejects direct, awaited, aliased and destructured reads", () => {
@@ -513,7 +557,7 @@ for (const [link, read] of [
 
 const foregroundDestinations = [
   { name: "agent", application: { kind: "agent" }, panel: "agent" },
-  { name: "quest", application: { kind: "quest" }, panel: "history" },
+  { name: "quest", application: { kind: "quest" }, panel: "history", keepSideChat: true },
   { name: "report", application: { kind: "report" }, panel: "reports", keepSideChat: true },
   { name: "canvas", application: { kind: "canvas" }, panel: "reports", keepSideChat: true },
   { name: "team", application: { kind: "team" }, panel: "board", board: "teams", closeTerminal: true },
@@ -803,4 +847,73 @@ test("a mounted pick takes over before the missing record lookup resolves", asyn
   missing.resolve("late-record");
   await pending;
   assert.deepEqual(shown, ["already-loaded"]);
+});
+
+test("current navigation failures carry their error into a retry and stale failures stay quiet", async () => {
+  const requests = navigationRequests();
+  const transient = Object.assign(new Error("later"), { status: 503 });
+  let attempts = 0;
+  let retry;
+  const attempt = async (request) => runNavigation(request.current, async () => {
+    attempts += 1;
+    if (attempts === 1) throw transient;
+    return "workspace";
+  }, () => true, (destination) => assert.equal(destination, "workspace"), (error) => {
+    assert.equal(error, transient);
+    retry = () => attempt(request);
+  });
+  const current = requests.begin();
+  await attempt(current);
+  assert.equal(typeof retry, "function");
+  await retry();
+  assert.equal(attempts, 2);
+
+  const delayed = Promise.withResolvers();
+  const stale = requests.begin();
+  let handled = false;
+  const pending = runNavigation(stale.current, () => delayed.promise, () => true, () => assert.fail("failed lookup"), () => { handled = true; });
+  requests.begin();
+  delayed.reject(Object.assign(new Error("later"), { status: 503 }));
+  await pending;
+  assert.equal(handled, false);
+});
+
+test("workspace navigation reserves missing links for 404 and guards transient retries", () => {
+  const source = readFileSync(new URL("../components/world/world-game.tsx", import.meta.url), "utf8");
+  const reports = readFileSync(new URL("../components/world/reports-ui.tsx", import.meta.url), "utf8");
+  assert.match(source, /error instanceof ReportError && error\.status === 404/);
+  assert.match(source, /onClick: \(\) => \{\s+if \(request\.current\(\)\) void navigateRef\.current\(target\);/);
+  assert.match(reports, /error instanceof ReportError && error\.status === 404\) missing\(\);\s+else setPanelFailure\(\{ kind: "link"/);
+});
+
+test("workspace request IDs remain secure on plain HTTP origins", () => {
+  const reports = readFileSync(new URL("./reports.ts", import.meta.url), "utf8");
+  assert.match(reports, /crypto\.getRandomValues\(bytes\)/);
+  assert.match(reports, /new Uint8Array\(16\)[\s\S]*randomValues\(bytes\)[\s\S]*bytes\[6\] = \(bytes\[6\] & 0x0f\) \| 0x40[\s\S]*bytes\[8\] = \(bytes\[8\] & 0x3f\) \| 0x80/);
+});
+
+test("workspace creation keeps one compatible request id until a response arrives", () => {
+  const source = readFileSync(new URL("../components/world/reports-ui.tsx", import.meta.url), "utf8");
+  assert.match(source, /if \(!retry \|\| !workspaceCreationRef\.current\) \{[\s\S]*request_id: secureRequestId\(\),[\s\S]*\}\s+const saved = await reportsApi\.create\(workspaceCreationRef\.current\);\s+workspaceCreationRef\.current = null;/);
+  assert.match(source, /failure\.kind === "workspace"[\s\S]*newWorkspace\(true\)/);
+});
+
+test("workspace collections page fully and expose one feedback state", () => {
+  const source = readFileSync(new URL("../components/world/reports-ui.tsx", import.meta.url), "utf8");
+  assert.match(source, /for \(let offset = 0; ; offset \+= REPORT_PAGE\)[\s\S]*limit: REPORT_PAGE, offset[\s\S]*if \(!current\(\)\) return null[\s\S]*seen\.has\(report\.id\)[\s\S]*page\.length < REPORT_PAGE \|\| added === 0/);
+  assert.match(source, /reports && current\(\) && setAll/);
+  assert.match(source, /const loadSearch = useCallback[\s\S]*searchRequests\.begin\(\)[\s\S]*queryRef\.current\.trim\(\) !== q \|\| scopeKeyRef\.current !== targetScopeKey[\s\S]*window\.clearTimeout\(timeout\)[\s\S]*searchRequests\.begin\(\)/);
+  assert.match(source, /const loadAll = useCallback[\s\S]*listRequests\.begin\(\)[\s\S]*loadSearch\(0\)[\s\S]*readReportCollection/);
+  assert.match(source, /const libraryCollapsed = readerOpen && libraryHidden[\s\S]*libraryCollapsed \? "@2xl:invisible[\s\S]*!libraryCollapsed && !workspaceMode/);
+  assert.match(source, /!query\.trim\(\) && all === null && !listError \?[\s\S]*: !query\.trim\(\) && listError \?[\s\S]*: query\.trim\(\) && searchError \?[\s\S]*: query\.trim\(\) && searchPending \?/);
+  assert.match(source, /query\.trim\(\) \? searchSettled : all !== null[\s\S]*shown\.length === 0/);
+  assert.match(source, /!selected && query\.trim\(\) \?[\s\S]*searchError \?[\s\S]*searchPending \?[\s\S]*: !selected && all === null && !listError \?[\s\S]*: !selected && all === null && listError \?/);
+});
+
+test("missing workspace wiki links navigate to a report draft", () => {
+  const source = readFileSync(new URL("../components/world/reports-ui.tsx", import.meta.url), "utf8");
+  const world = readFileSync(new URL("../components/world/world-game.tsx", import.meta.url), "utf8");
+  assert.match(source, /requestSelection\(\{ id: null, collection: "reports", draft: \{ title, folder:/);
+  assert.match(world, /type ReportTarget = \{[\s\S]*draft\?: \{ title: string; folder: string \}/);
+  assert.match(world, /setReports\(\{[\s\S]*draft: destination\.draft/);
 });

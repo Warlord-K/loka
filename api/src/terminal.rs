@@ -203,6 +203,10 @@ impl TermHub {
         self.forward(session, false, frame).await;
     }
 
+    pub async fn close_session(&self, session: Uuid, reason: &str) {
+        self.on_browser_frame(session, frame_value(&TermFrame::Close { reason: Some(reason.to_string()) })).await;
+        self.on_runner_frame(session, frame_value(&TermFrame::Closed { reason: reason.to_string() })).await;
+    }
 }
 
 const VIEWER_DRAIN_MAX: usize = 256;
@@ -237,7 +241,10 @@ fn frame_value(frame: &TermFrame) -> Value {
 
 pub async fn serve_runner(socket: WebSocket, hub: Arc<TermHub>, world: WorldStore, runner: Uuid, session: TerminalSession) {
     let (conn, _tx, mut rx, _replay) = hub.register(session.id, true);
-    let _ = world.touch_terminal(session.id).await;
+    if matches!(world.touch_terminal(session.id).await, Ok(false)) {
+        hub.unregister(session.id, true, conn);
+        return;
+    }
     hub.on_runner_frame(session.id, frame_value(&TermFrame::Status { state: "live".to_string(), device: None })).await;
     let (mut write, mut read) = socket.split();
     let mut refresh = tokio::time::interval(REFRESH);
@@ -277,7 +284,10 @@ pub async fn serve_runner(socket: WebSocket, hub: Arc<TermHub>, world: WorldStor
                 if !hub.has_runner(session.id) {
                     break;
                 }
-                let _ = world.touch_terminal(session.id).await;
+                if matches!(world.touch_terminal(session.id).await, Ok(false)) {
+                    close_reason = Some("browser_closed".to_string());
+                    break;
+                }
             }
             _ = idle_tick.tick() => {
                 let reason = if hub.idle_for(session.id) > idle_limit {
@@ -304,6 +314,10 @@ pub async fn serve_runner(socket: WebSocket, hub: Arc<TermHub>, world: WorldStor
 
 pub async fn serve_browser(socket: WebSocket, hub: Arc<TermHub>, world: WorldStore, grant: TermGrant, device: String) {
     let (conn, _tx, mut rx, replay) = hub.register(grant.session, false);
+    if !matches!(world.terminal(grant.session).await, Ok(Some(session)) if session.closed_at.is_none()) {
+        hub.unregister(grant.session, false, conn);
+        return;
+    }
     let (mut write, mut read) = socket.split();
     for frame in &replay {
         if write.send(Message::Text(frame.to_string().into())).await.is_err() {

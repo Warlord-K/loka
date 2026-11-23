@@ -1,10 +1,13 @@
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
+use loka_shared::context::SentContext;
 use loka_shared::guests::in_thread;
 use loka_shared::models::AgentTask;
 use loka_shared::world::{
-    AgentSession, Rewind, InboxItem, NewEvent, NewMessage, NewRun, NewSession, ReviewerChoice, RunOutcome, WorldAgent,
+    clarification_continuation_task, AgentSession, InboxItem, NewEvent, NewMessage, NewRun, NewSession, ReviewerChoice, Rewind,
+    RunOutcome, WorldAgent,
 };
 use serde_json::{json, Value};
 use tracing::{info, warn};
@@ -18,6 +21,17 @@ const TURN_BATCH: i64 = 20;
 const TURN_MAX_TURNS: u32 = 8;
 const TURN_TIMEOUT: Duration = Duration::from_secs(600);
 const PROGRESS_THROTTLE: Duration = Duration::from_millis(1500);
+
+#[derive(Debug)]
+struct StartedOver(String);
+
+impl std::fmt::Display for StartedOver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StartedOver {}
 
 pub async fn process(ctx: &Ctx, agent_id: Uuid) -> Result<()> {
     let agent = ctx
@@ -68,11 +82,17 @@ pub async fn process(ctx: &Ctx, agent_id: Uuid) -> Result<()> {
         let _ = ctx.store.set_typing(&agent, &typing, false, None, None).await;
         match result {
             Ok(()) => ctx.store.finish_inbox(&ids, "done", None).await?,
+            Err(e) if e.is::<StartedOver>() => {
+                ctx.store.requeue_inbox_now(&ids, &loka_shared::cli_errors::chain(&e)).await?;
+            }
             Err(e) => {
                 warn!(agent = %agent.slug, error = %e, "Turn failed, requeueing events");
                 ctx.store.requeue_inbox(&ids, &loka_shared::cli_errors::chain(&e)).await?;
+                if let Err(error) = ctx.store.recover_main_overflow(agent_id, &loka_shared::cli_errors::chain(&e), false).await {
+                    warn!(agent = %agent.slug, %error, "Could not shrink the main session after it overflowed");
+                }
                 ctx.store
-                    .set_agent_status(agent_id, "error", Some(&loka_shared::cli_errors::status_detail(&loka_shared::cli_errors::chain(&e))))
+                    .set_agent_status(agent_id, "error", Some(&loka_shared::cli_errors::status_detail_run(&loka_shared::cli_errors::chain(&e), "turn")))
                     .await?;
                 ctx.store.pause_for_rejected_key(&agent, &loka_shared::cli_errors::chain(&e)).await?;
                 return Err(e);
@@ -265,13 +285,23 @@ async fn take_turn(ctx: &Ctx, agent: &WorldAgent, items: &[InboxItem]) -> Result
         .collect::<Vec<_>>()
         .join("\n\n");
     let system = prompts::persona(agent, &ctx.owner);
-    let rules_hash = prompts::rules_hash(&format!("{system}\n{rules_text}"));
     let fresh = main.cli_session_id.is_none();
+    let rewind = Rewind::from(main.rewind.as_ref());
+    let resumes = !fresh || matches!(rewind, Rewind::At { .. });
+    let continues = loka_shared::context::resumes_same_session(resumes, false, !matches!(rewind, Rewind::None));
+    let mut sent = SentContext::carried(main.context_sent.as_ref(), continues);
     let mut prompt = prompts::turn(items, &tasks);
     if loka_shared::quests::owner_spoke(items) {
         let note = loka_shared::quests::waiting_plans_note(&ctx.store.waiting_plans(agent.id).await.unwrap_or_default());
         if !note.is_empty() {
             prompt = format!("{prompt}\n\n{note}");
+        }
+        if prompts::feature_launch_active(loka_shared::features::LaunchScope::Main) {
+            let recent = prompts::recent_feature_exposures(&ctx.store, agent).await;
+            let launch = prompts::main_feature_launch(items, &recent, &ctx.owner);
+            if !launch.is_empty() {
+                prompt = format!("{prompt}\n\n{launch}");
+            }
         }
     }
     if !fresh {
@@ -282,15 +312,8 @@ async fn take_turn(ctx: &Ctx, agent: &WorldAgent, items: &[InboxItem]) -> Result
     }
     let memory = handoff.as_deref().or(main.summary.as_deref());
     prompt = prompts::prepend_memory_handoff(&prompt, memory, fresh);
-    if main.rules_hash.as_deref() != Some(rules_hash.as_str()) {
-        let update = if fresh {
-            rules_text.clone()
-        } else {
-            format!("[instructions updated] These replace your earlier instructions:\n{system}\n\n{rules_text}")
-        };
-        if !update.trim().is_empty() {
-            prompt = format!("[rules updated]\n{update}\n\n{prompt}");
-        }
+    if let Some(update) = prompts::instructions_update(&mut sent, resumes, &system, &rules_text) {
+        prompt = format!("{update}\n\n{prompt}");
     }
     let home = super::agent_home(ctx, &agent.slug);
     tokio::fs::create_dir_all(&home).await?;
@@ -303,7 +326,6 @@ async fn take_turn(ctx: &Ctx, agent: &WorldAgent, items: &[InboxItem]) -> Result
         options.fast = ctx.store.any_urgent(&loka_shared::quests::inbox_task_ids(items)).await.unwrap_or(false);
     }
 
-    let rewind = Rewind::from(main.rewind.as_ref());
     if !matches!(rewind, Rewind::None) {
         ctx.warm.evict(main.id).await;
     }
@@ -399,6 +421,9 @@ async fn take_turn(ctx: &Ctx, agent: &WorldAgent, items: &[InboxItem]) -> Result
         Ok(Err(e)) => {
             let error = redact_secrets(&loka_shared::cli_errors::chain(&e), environment.values());
             finish_failed(ctx, run.id, &error).await;
+            if ctx.store.start_over_lost_session(run.id).await? == loka_shared::context::StartOver::Forgotten {
+                return Err(StartedOver(error).into());
+            }
             if rewind.anchor().is_some() && ctx.store.fall_back_to_replay(main.id).await.unwrap_or(false) {
                 warn!(agent = %agent.slug, error = %error, "CLI rewind failed, restarting from the kept transcript");
             }
@@ -432,11 +457,11 @@ async fn take_turn(ctx: &Ctx, agent: &WorldAgent, items: &[InboxItem]) -> Result
             main.id,
             result.session_id.as_deref().or(sid.as_deref()),
             acc.baseline,
-            runs::context_tokens(&result.usage),
+            runs::context_tokens(&main.backend, &result.usage),
         )
         .await?;
     let _ = ctx.store.announce_context(agent.id).await;
-    ctx.store.set_session_rules_hash(main.id, &rules_hash).await?;
+    ctx.store.set_sent_context(main.id, &sent).await?;
     ctx.store.set_run_checkpoint(run.id, result.checkpoint.as_deref()).await?;
     if !matches!(rewind, Rewind::None) {
         ctx.store.clear_session_rewind(main.id).await?;
@@ -454,8 +479,8 @@ async fn take_turn(ctx: &Ctx, agent: &WorldAgent, items: &[InboxItem]) -> Result
     info!(agent = %agent.slug, events = items.len(), actions = actions.len(), cost = acc.cost_usd, "Turn complete");
     apply_actions(ctx, agent, &main, run.id, items, &tasks, &text, actions, problems).await?;
     log_timing(agent, &main.backend, prep_ms, cli_ms, post_started.elapsed().as_millis() as u64, turn_started, timing.as_ref());
-    let used = if main.backend == "claude" { runs::context_tokens(&result.usage) } else { result.usage.context_tokens as i64 };
-    if let Some(limit) = prompts::compact_threshold().filter(|limit| prompts::compacts(&main.backend) && used > *limit) {
+    let used = runs::context_tokens(&main.backend, &result.usage);
+    if let Some(limit) = prompts::compaction_due(&main.backend, &main.model, used) {
         if ctx.store.should_compact(main.id, run.id, used, limit).await.unwrap_or(true)
             && compact(ctx, agent, &main, used, &environment).await
         {
@@ -521,9 +546,10 @@ fn redact_action(
     let redact = |text: String| redact_secrets(&text, environment.values());
     match action {
         Action::Reply { text, next } => Action::Reply { text: redact(text), next: next.into_iter().map(redact).collect() },
-        Action::StartTask { task_id, brief, review, reviewer, time_limit_minutes, milestones, quest } => Action::StartTask {
+        Action::StartTask { task_id, brief, clarification_source, review, reviewer, time_limit_minutes, milestones, quest } => Action::StartTask {
             task_id,
             brief: brief.map(redact),
+            clarification_source: clarification_source.map(redact),
             review,
             reviewer,
             time_limit_minutes,
@@ -630,7 +656,7 @@ async fn compact(
                 )
                 .await;
             let _ = ctx.store.update_session_after_run(main.id, result.session_id.as_deref(), acc.baseline, 0).await;
-            let _ = ctx.store.set_session_rules_hash(main.id, "").await;
+            let _ = ctx.store.forget_sent_context(main.id).await;
             let _ = ctx.store.set_run_checkpoint(run.id, result.checkpoint.as_deref()).await;
             let _ = ctx
                 .store
@@ -641,6 +667,9 @@ async fn compact(
         Ok(Err(e)) => {
             let error = redact_secrets(&loka_shared::cli_errors::chain(&e), environment.values());
             finish_failed(ctx, run.id, &error).await;
+            if let Err(e) = ctx.store.recover_main_overflow(agent.id, &error, true).await {
+                warn!(agent = %agent.slug, error = %e, "Could not queue a context reset after a compaction that overflowed");
+            }
             false
         }
         Err(_) => {
@@ -664,6 +693,10 @@ async fn apply_actions(
 ) -> Result<()> {
     let mut replied = false;
     let mut started: Vec<Uuid> = Vec::new();
+    let mut retry_continuations = HashSet::new();
+    let mut attempted_continuations = HashSet::new();
+    let clarifying = prompts::clarification_targets(&actions, items, tasks);
+    let single_start = actions.iter().filter(|action| matches!(action, Action::StartTask { .. })).count() == 1;
     let thread = ctx.store.reply_thread(agent, items).await?;
     let root = loka_shared::replies::reply_root(items);
     for action in &actions {
@@ -672,16 +705,53 @@ async fn apply_actions(
                 reply(ctx, agent, main, run_id, text, next, thread, root).await?;
                 replied = true;
             }
-            Action::StartTask { task_id, brief, review, reviewer, time_limit_minutes, milestones, quest } => match super::quests::start_target(&ctx.store, agent, task_id).await {
-                Ok(id) if !started.contains(&id) => {
+            Action::StartTask { task_id, brief, clarification_source, review, reviewer, time_limit_minutes, milestones, quest } => match super::quests::start_target(&ctx.store, agent, task_id).await {
+                Ok(id) if !started.contains(&id) && !clarifying.contains(&id) => {
+                    let continuation = match super::quests::clarification_for_start(
+                        items,
+                        id,
+                        clarification_source.as_deref(),
+                        single_start,
+                    ) {
+                        Ok(continuation) => continuation,
+                        Err(problem) => {
+                            problems.push(problem);
+                            continue;
+                        }
+                    };
+                    if let Some(item) = continuation.filter(|item| clarification_continuation_task(item).is_some()) {
+                        if !ctx.store.clarification_continuation_open(item).await? {
+                            continue;
+                        }
+                    }
+                    if let Some(item) = continuation {
+                        attempted_continuations.insert(item.id);
+                    }
                     if let Err(e) = super::quests::apply_choice(&ctx.store, id, quest).await {
+                        if let Some(item) = continuation {
+                            retry_continuations.insert(item.id);
+                        }
                         problems.push(format!("Could not set the quest options on task {id}: {e}"));
                         continue;
                     }
                     super::quests::seed_milestones(&ctx.store, agent.id, id, milestones).await;
                     let choice = reviewer.as_ref().and_then(ReviewerChoice::from_value);
-                    match runs::start_task(ctx, agent, main, id, brief.as_deref(), review.unwrap_or(false) || choice.is_some(), choice.as_ref()).await {
-                        Ok(outcome) => {
+                    let start_brief = match continuation {
+                        Some(item) => super::quests::StartBrief::Clarification(item),
+                        None => super::quests::StartBrief::Ordinary(brief.as_deref()),
+                    };
+                    match runs::start_task(
+                        ctx,
+                        agent,
+                        main,
+                        id,
+                        start_brief,
+                        review.unwrap_or(false) || choice.is_some(),
+                        choice.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(Some(outcome)) => {
                             info!(agent = %agent.slug, task = %id, resumed = outcome.resumed, session = %outcome.session_id, run = %outcome.run_id, "Start queued a run");
                             started.push(id);
                             if let Some(minutes) = time_limit_minutes {
@@ -690,7 +760,11 @@ async fn apply_actions(
                                 }
                             }
                         }
+                        Ok(None) => {}
                         Err(e) => {
+                            if let Some(item) = continuation {
+                                retry_continuations.insert(item.id);
+                            }
                             warn!(agent = %agent.slug, task = %id, error = %e, "Could not start task");
                             problems.push(format!("Could not start task {id}: {e}"));
                         }
@@ -722,45 +796,64 @@ async fn apply_actions(
                     _ => None,
                 };
                 let clarification = clarify_request.is_some();
-                let msg = ctx
-                    .store
-                    .insert_message(NewMessage {
-                        agent_id: agent.id,
-                        author_kind: "agent",
-                        author_user_id: None,
-                        author_agent_id: Some(agent.id),
-                        body: &text,
-                        session_id: Some(main.id),
-                        run_id: Some(run_id),
-                        meta: if drafts.is_empty() {
-                            json!({ "kind": "ask", "choices": choices, "clarify_request": clarify_request })
-                        } else {
-                            json!({ "kind": "ask", "choices": [], "drafts": drafts })
-                        },
-                    })
-                    .await?;
-                ctx.store
-                    .emit(
-                        NewEvent::new("message.created")
-                            .agent(agent.id)
-                            .session(main.id)
-                            .run(run_id)
-                            .payload(json!({ "message_id": msg.id, "author": agent.name, "author_kind": "agent", "body": text, "ask": true })),
-                        None,
-                    )
-                    .await?;
-                replied = true;
-                ctx.store
-                    .emit(
-                        NewEvent::new("attention.requested")
-                            .agent(agent.id)
-                            .session(main.id)
-                            .run(run_id)
-                            .payload(json!({ "text": text, "agent": agent.name, "message_id": msg.id, "choices": choices, "clarification": clarification })),
-                        None,
-                    )
-                    .await?;
-                ctx.store.set_agent_status(agent.id, "waiting", Some(&truncate(&text, 120))).await?;
+                let message = NewMessage {
+                    agent_id: agent.id,
+                    author_kind: "agent",
+                    author_user_id: None,
+                    author_agent_id: Some(agent.id),
+                    body: &text,
+                    session_id: Some(main.id),
+                    run_id: Some(run_id),
+                    meta: if drafts.is_empty() {
+                        json!({ "kind": "ask", "choices": choices.clone(), "clarify_request": clarify_request })
+                    } else {
+                        json!({ "kind": "ask", "choices": [], "drafts": drafts })
+                    },
+                };
+                if clarification {
+                    let outcome = ctx
+                        .store
+                        .post_main_request_clarification(&agent.name, &choices, message)
+                        .await?;
+                    if outcome == loka_shared::world::MainClarificationPost::Refused {
+                        reply(
+                            ctx,
+                            agent,
+                            main,
+                            run_id,
+                            loka_shared::world::CLARIFICATION_POST_REFUSED,
+                            &[],
+                            thread,
+                            root,
+                        )
+                        .await?;
+                    }
+                    replied = true;
+                } else {
+                    let msg = ctx.store.insert_message(message).await?;
+                    ctx.store
+                        .emit(
+                            NewEvent::new("message.created")
+                                .agent(agent.id)
+                                .session(main.id)
+                                .run(run_id)
+                                .payload(json!({ "message_id": msg.id, "author": agent.name, "author_kind": "agent", "body": text, "ask": true })),
+                            None,
+                        )
+                        .await?;
+                    replied = true;
+                    ctx.store
+                        .emit(
+                            NewEvent::new("attention.requested")
+                                .agent(agent.id)
+                                .session(main.id)
+                                .run(run_id)
+                                .payload(json!({ "text": text, "agent": agent.name, "message_id": msg.id, "choices": choices, "clarification": clarification })),
+                            None,
+                        )
+                        .await?;
+                    ctx.store.set_agent_status(agent.id, "waiting", Some(&truncate(&text, 120))).await?;
+                }
             }
             Action::Status { text } => {
                 ctx.store.set_agent_status(agent.id, "thinking", Some(&truncate(text, 120))).await?;
@@ -778,25 +871,73 @@ async fn apply_actions(
     for item in items.iter().filter(|i| {
         i.kind == "task.assigned" && i.payload.get("subscribed").and_then(Value::as_bool) != Some(true)
     }) {
+        if attempted_continuations.contains(&item.id) {
+            continue;
+        }
         let Some(id) = item.payload.get("task_id").and_then(Value::as_str).and_then(|s| s.parse::<Uuid>().ok()) else {
             continue;
         };
         let resume = item.payload.get("resume").and_then(Value::as_bool) == Some(true);
         if started.contains(&id)
+            || clarifying.contains(&id)
             || (replied && !resume)
             || ctx.store.quest_has_parts(id).await.unwrap_or(false)
             || super::quests::assigned_elsewhere(&ctx.store, id, agent.id).await
         {
             continue;
         }
+        if let Some(continuation) = clarification_continuation_task(item) {
+            if continuation != id || !ctx.store.clarification_continuation_open(item).await? {
+                continue;
+            }
+        }
         let note = item.payload.get("brief").and_then(Value::as_str).filter(|note| !note.trim().is_empty());
-        let brief = note.or((!text.trim().is_empty()).then_some(text));
-        if let Err(e) = runs::start_task(ctx, agent, main, id, brief, false, None).await {
-            warn!(agent = %agent.slug, task = %id, error = %e, "Could not auto-start task");
-            problems.push(format!("Could not start task {id}: {e}"));
+        let continuation = clarification_continuation_task(item).map(|_| item);
+        let start_brief = match continuation {
+            Some(item) => super::quests::StartBrief::Clarification(item),
+            None => super::quests::StartBrief::Ordinary(note.or((!text.trim().is_empty()).then_some(text))),
+        };
+        match runs::start_task(ctx, agent, main, id, start_brief, false, None).await {
+            Ok(_) => {}
+            Err(e) => {
+                if let Some(item) = continuation {
+                    retry_continuations.insert(item.id);
+                }
+                warn!(agent = %agent.slug, task = %id, error = %e, "Could not auto-start task");
+                problems.push(format!("Could not start task {id}: {e}"));
+            }
         }
     }
+    if !retry_continuations.is_empty() {
+        ctx.store
+            .requeue_clarification_starts(&retry_continuations.into_iter().collect::<Vec<_>>())
+            .await?;
+    }
     super::quests::tell_agent(&ctx.store, agent, run_id, items, &problems).await
+}
+
+#[cfg(test)]
+pub(crate) async fn apply_actions_for_contract(
+    ctx: &Ctx,
+    agent: &WorldAgent,
+    main: &AgentSession,
+    run_id: Uuid,
+    item: &InboxItem,
+    task: &AgentTask,
+    action: Action,
+) -> Result<()> {
+    apply_actions(
+        ctx,
+        agent,
+        main,
+        run_id,
+        std::slice::from_ref(item),
+        std::slice::from_ref(task),
+        "",
+        vec![action],
+        Vec::new(),
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -856,7 +997,14 @@ impl TurnOptions {
 }
 
 async fn materialize_uploads(ctx: &Ctx, home: &std::path::Path, items: &[InboxItem]) -> (Vec<std::path::PathBuf>, Option<String>) {
-    let attached = prompts::attached_ids(items.iter().map(|i| &i.payload));
+    materialize_attached_uploads(ctx, home, prompts::attached_ids(items.iter().map(|item| &item.payload))).await
+}
+
+pub(super) async fn materialize_attached_uploads(
+    ctx: &Ctx,
+    home: &std::path::Path,
+    attached: prompts::AttachedIds,
+) -> (Vec<std::path::PathBuf>, Option<String>) {
     if attached.images.is_empty() && attached.files.is_empty() {
         return (Vec::new(), None);
     }

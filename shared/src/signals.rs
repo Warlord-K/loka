@@ -25,6 +25,7 @@ pub fn wire(event: NewEvent, org: Option<Uuid>) -> Result<WorldEvent> {
         payload: event.payload,
         created_at: Utc::now(),
         org_id: org,
+        quest_scope: None,
     })
 }
 

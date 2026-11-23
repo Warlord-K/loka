@@ -304,6 +304,7 @@ mod tests {
             org_id: None,
             payload,
             created_at: chrono::Utc::now(),
+            quest_scope: None,
         }
     }
 

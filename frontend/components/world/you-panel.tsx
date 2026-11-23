@@ -3,7 +3,7 @@
 import { SOLO } from "@/lib/edition";
 import { AgentAvatar, AgentFace, usePortrait } from "./channel-ui";
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
-import { ArrowsClockwise, Broom, Code, Crown, Desktop, GithubLogo, Star, Key, Keyboard, ListChecks, Microphone, Palette, Play, Plus, Scroll, ShareNetwork, SpeakerHigh, UserCircle } from "@phosphor-icons/react";
+import { ArrowsClockwise, Broom, Code, Crown, Desktop, GithubLogo, Star, Key, Keyboard, ListChecks, Microphone, Palette, Play, Plus, Scroll, ShareNetwork, SpeakerHigh, TerminalWindow, UserCircle } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
 import { ShortcutList } from "./shortcuts";
 import { worldApi, type WorldAgent, type WorldRule } from "@/lib/world";
@@ -29,6 +29,8 @@ import { UpdatesPage, useUpdates } from "./updates-ui";
 import { GHOST_ICON_BTN, SEARCH_ROW_FOCUS, SEARCH_ROW_RING, SettingsCard, SettingsGroup, SettingsRow, SettingsShell, Switch, type SettingsNavItem, EmptyState } from "./settings-shell";
 import { runtimeName } from "@/lib/model-names";
 import { escapeTaken } from "@/lib/escape";
+import { CLOSE_CHOICES } from "@/lib/terminal-close";
+import { useCloseChoice } from "./terminal-close";
 
 const SCOPES = [
   { value: "all", label: "Always", hint: "talking and working" },
@@ -178,6 +180,29 @@ function AppearancePage({ newArt, onNewArt }: { newArt: boolean; onNewArt: (on: 
   );
 }
 
+function TerminalPage({ meId }: { meId: string | null }) {
+  const [choice, setChoice] = useCloseChoice(meId);
+  return (
+    <SettingsGroup title="Terminal">
+      <SettingsCard rows>
+        <SettingsRow
+          title="When you close the terminal"
+          description="Minimize keeps your terminals running, and they come back just as they were. Close all ends them. Ask lets you pick each time. Saved on this device."
+          control={
+            <div role="radiogroup" aria-label="When you close the terminal" className={SEGMENT}>
+              {CLOSE_CHOICES.map((c) => (
+                <button key={c.value} type="button" role="radio" aria-checked={choice === c.value} onClick={() => setChoice(c.value)} className={cn(SEGMENT_ITEM, choice === c.value ? SEGMENT_ON : SEGMENT_OFF)}>
+                  {c.label}
+                </button>
+              ))}
+            </div>
+          }
+        />
+      </SettingsCard>
+    </SettingsGroup>
+  );
+}
+
 function SoundsPage() {
   const [prefs, setPrefs] = useSoundPrefs();
   return (
@@ -232,9 +257,19 @@ function SoundsPage() {
 
 function RuleRow({ rule, editable, onChanged, focused }: { rule: WorldRule; editable: boolean; onChanged: () => void; focused: boolean }) {
   const [body, setBody] = useState(rule.body);
-  const dirty = body.trim() !== rule.body;
-  const save = async (patch: { body?: string; scope?: string; enabled?: boolean }) => {
-    await worldApi.updateRule(rule.id, patch).catch(() => {});
+  const savedRepos = (rule.github_repos ?? []).join(", ");
+  const [repos, setRepos] = useState(savedRepos);
+  const repoList = repos.split(/[\s,]+/).map((r) => r.trim()).filter(Boolean);
+  const reposDirty = rule.scope === "allow" && repoList.join(", ") !== savedRepos;
+  const dirty = body.trim() !== rule.body || reposDirty;
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const save = async (patch: { body?: string; scope?: string; enabled?: boolean; github_repos?: string[] }) => {
+    try {
+      await worldApi.updateRule(rule.id, patch);
+      setSaveError(null);
+    } catch (error) {
+      setSaveError(error instanceof Error && error.message && !/^\d{3}\b/.test(error.message) ? error.message : "Could not save this rule. Try again.");
+    }
     onChanged();
   };
   return (
@@ -242,6 +277,21 @@ function RuleRow({ rule, editable, onChanged, focused }: { rule: WorldRule; edit
       <div className={cn(!rule.enabled && "opacity-55")}>
         {editable ? <VoiceField multiline value={body} onChange={setBody} ariaLabel="Rule" /> : <p className="text-w-sm leading-relaxed">{rule.body}</p>}
       </div>
+      {rule.scope === "allow" && (
+        <div className={cn("space-y-1", !rule.enabled && "opacity-55")}>
+          {editable ? (
+            <input className={cn(INPUT, "w-full")} placeholder="owner/repo, owner/other" value={repos} onChange={(e) => setRepos(e.target.value)} aria-label="Repositories for pull request actions" />
+          ) : (
+            savedRepos && <p className="text-w-sm">{savedRepos}</p>
+          )}
+          <p className="text-w-xs text-w-muted">Pull request actions: in these repositories agents may merge their quest&apos;s reviewed pull request, delete its branch, close it or rerun its checks without starting a quest. Loka still checks the review and checks first.</p>
+        </div>
+      )}
+      {saveError && (
+        <p role="alert" className="text-w-sm text-w-danger">
+          {saveError}
+        </p>
+      )}
       <div className="flex flex-wrap items-center gap-2.5">
         {editable ? (
           <WSelect size="sm" className="w-40" ariaLabel="When it applies" value={rule.scope} onChange={(v) => void save({ scope: v })} options={SCOPES} />
@@ -251,7 +301,7 @@ function RuleRow({ rule, editable, onChanged, focused }: { rule: WorldRule; edit
         {!editable && !rule.enabled && <span className={PILL_NEUTRAL}>Off</span>}
         <span className="ml-auto flex items-center gap-2.5">
           {dirty && (
-            <button type="button" onClick={() => void save({ body: body.trim() })} className={cn(BTN, BTN_SM, "bg-w-teal font-semibold text-w-strong hover:bg-w-teal2")}>
+            <button type="button" onClick={() => void save({ body: body.trim(), ...(reposDirty ? { github_repos: repoList } : {}) })} className={cn(BTN, BTN_SM, "bg-w-teal font-semibold text-w-strong hover:bg-w-teal2")}>
               Save
             </button>
           )}
@@ -355,6 +405,7 @@ export function YouPanel({
         canWrite && { id: "storage", label: "Storage", group: "Account", icon: Broom, keywords: "space size cleanup clean delete old disk usage tidy" },
         { id: "appearance", label: "Appearance", group: "Preferences", icon: Palette, keywords: "theme dark light art new art preview style" },
         { id: "sounds", label: "Sounds", group: "Preferences", icon: SpeakerHigh, keywords: "volume audio" },
+        canWrite && { id: "terminal", label: "Terminal", group: "Preferences", icon: TerminalWindow, keywords: "terminal shell close minimize minimise ask running close all" },
         canWrite && { id: "voice", label: "Voice", group: "Preferences", icon: Microphone, keywords: "speech dictate speak" },
         { id: "shortcuts", label: "Shortcuts", group: "Preferences", icon: Keyboard, keywords: "keys keyboard hotkeys" },
         updates.view && { id: "updates", label: "Updates", group: "Preferences", icon: ArrowsClockwise, keywords: "version update upgrade automatic install restart" },
@@ -550,7 +601,7 @@ export function YouPanel({
               <SettingsCard rows>
                 <ul className="divide-y-2 divide-w-line">
                   {mine.map((r) => (
-                    <RuleRow key={`${r.id}:${r.body}:${r.scope}:${r.enabled}`} rule={r} editable={canWrite} onChanged={refresh} focused={focusSection?.id === "world-rules" && focusSection.recordId === r.id} />
+                    <RuleRow key={`${r.id}:${r.body}:${r.scope}:${r.enabled}:${(r.github_repos ?? []).join()}`} rule={r} editable={canWrite} onChanged={refresh} focused={focusSection?.id === "world-rules" && focusSection.recordId === r.id} />
                   ))}
                 </ul>
               </SettingsCard>
@@ -561,7 +612,7 @@ export function YouPanel({
               <SettingsCard rows>
                 <ul className="divide-y-2 divide-w-line">
                   {everyone.map((r) => (
-                    <RuleRow key={`${r.id}:${r.body}:${r.scope}:${r.enabled}`} rule={r} editable={admin} onChanged={refresh} focused={focusSection?.id === "world-rules" && focusSection.recordId === r.id} />
+                    <RuleRow key={`${r.id}:${r.body}:${r.scope}:${r.enabled}:${(r.github_repos ?? []).join()}`} rule={r} editable={admin} onChanged={refresh} focused={focusSection?.id === "world-rules" && focusSection.recordId === r.id} />
                   ))}
                 </ul>
               </SettingsCard>
@@ -627,6 +678,7 @@ export function YouPanel({
       {active === "storage" && canWrite && <StorageSection />}
       {active === "appearance" && <AppearancePage newArt={!!me?.new_art} onNewArt={onNewArt} />}
       {active === "sounds" && <SoundsPage />}
+      {active === "terminal" && canWrite && <TerminalPage meId={me?.id ?? null} />}
       {active === "updates" && <UpdatesPage state={updates} autoNote="Updates to only the server or the web app apply in place, with no restart." />}
 
       {active === "voice" && (

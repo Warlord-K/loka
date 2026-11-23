@@ -44,7 +44,7 @@ import { openReport, reportsApi, type ReportDetail } from "@/lib/reports";
 
 const PracticeView = dynamic(() => import("./practice-view").then((m) => m.PracticeView), {
   ssr: false,
-  loading: () => <Shimmer>Opening the canvas</Shimmer>,
+  loading: () => <Shimmer>Opening the practice workspace</Shimmer>,
 });
 const NewPracticeDialog = dynamic(() => import("./practice-view").then((m) => m.NewPracticeDialog), { ssr: false });
 import { EmptyState } from "./settings-shell";
@@ -252,7 +252,7 @@ function Md({ text, className }: { text: string; className?: string }) {
 }
 
 const DIFFICULTY_TONE: Record<string, string> = { easy: "bg-w-ok/20", medium: "bg-w-warn/25", hard: "bg-w-danger/20" };
-const TYPE_LABEL: Record<string, string> = { dsa: "DSA", design: "System design", quiz: "Quiz", puzzle: "Puzzle", canvas: "Canvas", reading: "Reading" };
+const TYPE_LABEL: Record<string, string> = { dsa: "DSA", design: "System design", quiz: "Quiz", puzzle: "Puzzle", canvas: "Practice workspace", reading: "Reading" };
 
 function title(skill: string): string {
   return skill.split(/[-_ ]/).filter(Boolean).map((w) => w[0].toUpperCase() + w.slice(1)).join(" ") || "General";
@@ -447,7 +447,7 @@ export function AcademySheet({
             Level {progress.level} · {progress.xp} xp
           </span>
         )}
-        <button type="button" onClick={() => { const request = onNavigate(); setResolving(null); setCreating({ request }); }} className={cn(BTN_SECONDARY, !progress && "ml-auto")} title="Write or draw on a canvas and a coach agent checks each attempt">
+        <button type="button" onClick={() => { const request = onNavigate(); setResolving(null); setCreating({ request }); }} className={cn(BTN_SECONDARY, !progress && "ml-auto")} title="Write or draw in a practice workspace and a coach agent checks each attempt">
           <Student size={14} weight="bold" />
           <span className="hidden @md:inline">New practice</span>
         </button>
@@ -475,7 +475,7 @@ export function AcademySheet({
         <EmptyState
           icon={GraduationCap}
           title="No courses yet"
-          description={`Ask your main agent for a course on anything you want to learn, a practice canvas to write or draw on, a coding problem, a system design prompt or a quiz.${progress?.academy_on === false ? " Challenges while you wait are off; turn them on under Progress." : " A mentor may also stop by while a quest runs."}`}
+          description={`Ask your main agent for a course on anything you want to learn, a practice workspace to write or draw in, a coding problem, a system design prompt or a quiz.${progress?.academy_on === false ? " Challenges while you wait are off; turn them on under Progress." : " A mentor may also stop by while a quest runs."}`}
         />
       ) : (
         <div className="space-y-5">
@@ -563,7 +563,7 @@ function LessonCanvas({
       [load, reportId],
     ),
   );
-  if (!detail) return gone ? <p className="text-w-sm text-w-muted">This lesson's canvas is gone.</p> : <Shimmer>Opening the canvas</Shimmer>;
+  if (!detail) return gone ? <p className="text-w-sm text-w-muted">This lesson's practice workspace is gone.</p> : <Shimmer>Opening the practice workspace</Shimmer>;
   return (
     <div className="h-[min(46rem,78vh)] min-h-[28rem] overflow-hidden rounded-xl border-2 border-w-ink bg-w-card">
       <PracticeView embedded detail={detail} agents={agents} meId={meId} focusItem={attempt ? `${ATTEMPT_ITEM}${attempt}` : null} focusRequest={focusRequest} onOpenAgent={onOpenAgent}
@@ -704,7 +704,7 @@ function ChallengeView({
         </p>
         {waitingOn && <p className="rounded-lg border-2 border-dashed border-w-line2 px-3 py-2 text-w-sm text-w-muted">Your agent keeps working on {waitingOn}. You will get a note here when it is done, and your answer stays saved.</p>}
         <div {...quoteProps(`challenge:${card.id}`, card.title)}>
-          <Md text={detail.prompt || (card.type === "canvas" ? "Draw it on the canvas and press Ready. Your coach checks the picture and every stroke." : "Read it, then tell your coach in your own words what it says.")} className="rounded-lg border-2 border-w-ink bg-w-card p-3 text-w-md leading-relaxed" />
+          <Md text={detail.prompt || (card.type === "canvas" ? "Draw it in the practice workspace and press Ready. Your coach checks the picture and every stroke." : "Read it, then tell your coach in your own words what it says.")} className="rounded-lg border-2 border-w-ink bg-w-card p-3 text-w-md leading-relaxed" />
         </div>
         {detail.reading.length > 0 && (
           <div>
@@ -739,7 +739,7 @@ function ChallengeView({
           card.report_id ? (
             <LessonCanvas reportId={card.report_id} attempt={attempt} focusRequest={focusRequest} agents={agents} meId={meId} onOpenAgent={onOpenAgent} onLessonChanged={load} />
           ) : (
-            <p className="text-w-sm text-w-muted">This lesson's canvas is gone.</p>
+            <p className="text-w-sm text-w-muted">This lesson's practice workspace is gone.</p>
           )
         ) : card.type === "quiz" && detail.choices.length > 0 ? (
           <fieldset className="space-y-2">

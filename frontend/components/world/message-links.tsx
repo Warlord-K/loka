@@ -4,8 +4,10 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import { ArrowBendUpLeft, Check, LinkSimple } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
 import { dayLabel, messageTime } from "@/lib/world";
+import type { RoomMessageKind } from "@/lib/quest-board";
 import { scrollWithin } from "@/lib/scroll";
 import { ATTEMPT_ID } from "@/lib/practice";
+import { validFeatureItem } from "@/lib/feature-links";
 
 export type LinkedMessage = {
   ref: string;
@@ -19,6 +21,8 @@ export type LinkedMessage = {
   author_emoji: string | null;
   excerpt: string;
   created_at: string;
+  task_id?: string | null;
+  room_kind?: RoomMessageKind | null;
 };
 
 const REF_SOURCE = "ch\\d{1,18}|[0-9a-fA-F][0-9a-fA-F-]{5,35}";
@@ -50,7 +54,6 @@ const WORLD_LINK_KINDS: WorldLinkKind[] = ["quest", "report", "todo", "practice"
 const EXACT_WORLD_LINK_KINDS = new Set<WorldLinkKind>(["team", "list", "place", "region"]);
 const WORLD_ID = /^[0-9a-fA-F][0-9a-fA-F-]{5,35}$/;
 const EXACT_WORLD_ID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
-const WORLD_ITEM = /^[A-Za-z0-9_-]{1,40}$/;
 
 export function worldUrl(kind: WorldLinkKind, id: string): string {
   return `${window.location.origin}/world?${kind}=${id}`;
@@ -66,7 +69,7 @@ export function worldRefFromHref(href?: string | null): { kind: WorldLinkKind; r
       if (!ref || !(kind === "practice" ? ATTEMPT_ID : EXACT_WORLD_LINK_KINDS.has(kind) ? EXACT_WORLD_ID : WORLD_ID).test(ref)) continue;
       if (EXACT_WORLD_LINK_KINDS.has(kind) && url.origin !== window.location.origin) continue;
       const item = kind === "report" ? url.searchParams.get("item") : null;
-      return item && WORLD_ITEM.test(item) ? { kind, ref: ref.toLowerCase(), item } : { kind, ref: ref.toLowerCase() };
+      return validFeatureItem(item) ? { kind, ref: ref.toLowerCase(), item } : { kind, ref: ref.toLowerCase() };
     }
   } catch {
     return null;

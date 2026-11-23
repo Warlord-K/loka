@@ -126,6 +126,7 @@ pub async fn run(
     handles.push(tokio::spawn(loka_shared::feeds::poll_loop(ctx.store.clone(), bus.feeds.clone())));
     handles.push(tokio::spawn(ctx.warm.clone().reap_loop()));
     handles.push(tokio::spawn(sweep_loop(ctx.clone(), bus.clone(), shutdown.clone())));
+    handles.push(tokio::spawn(carry_on_loop(ctx.clone(), bus.clone(), shutdown.clone())));
 
     while !shutdown.load(Ordering::SeqCst) {
         shutdown_notify.notified().await;
@@ -254,6 +255,18 @@ async fn run_loop(ctx: Arc<Ctx>, bus: Arc<Bus>, slots: Arc<Semaphore>, shutdown:
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
+    }
+}
+
+async fn carry_on_loop(ctx: Arc<Ctx>, bus: Arc<Bus>, shutdown: Arc<AtomicBool>) {
+    while !shutdown.load(Ordering::SeqCst) {
+        let notified = bus.runs.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if let Err(e) = runs::carry_on_withdrawn(&ctx).await {
+            error!(error = %e, "Carrying on work behind withdrawn follow-ups failed");
+        }
+        let _ = tokio::time::timeout(SWEEP_EVERY, notified).await;
     }
 }
 

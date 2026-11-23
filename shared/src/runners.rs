@@ -158,6 +158,8 @@ fn serving(sql: &str) -> String {
     sql.replace("__SERVES__", &serves_sql("a", "w"))
         .replace("__HOME__", RUNS_HERE)
         .replace("__URGENT__", &crate::world::urgent_run_sql("q"))
+        .replace("__FOLDER_FREE_Q__", &crate::world::folder_free_sql("q", "s"))
+        .replace("__FOLDER_FREE_R__", &crate::world::folder_free_sql("r", "s"))
 }
 
 pub const CLOUD_OFFLINE: &str = "No world server is running, so the cloud cannot run agents right now. Pick one of the devices instead.";
@@ -276,6 +278,29 @@ pub struct RunnerPoll {
     pub terminal: bool,
     #[serde(default)]
     pub views: bool,
+    #[serde(default)]
+    pub pr_checks: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunnerPrCheck {
+    pub task_id: Uuid,
+    pub repo: String,
+    pub pr_url: String,
+    pub pr_number: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunnerPrCheckResult {
+    pub task_id: Uuid,
+    pub repo: String,
+    pub pr_url: String,
+    pub pr_number: i64,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -287,6 +312,8 @@ pub struct RunnerPolled {
     pub shell: Option<crate::shell::ShellJob>,
     #[serde(default)]
     pub terminal: Option<crate::terminal::TerminalJob>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_check: Option<RunnerPrCheck>,
     #[serde(default)]
     pub retry: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -336,6 +363,8 @@ pub struct RunnerFile {
 pub struct RunnerPublish {
     pub repo: String,
     pub branch: String,
+    #[serde(default)]
+    pub recovery_branch: Option<String>,
     pub base_branch: String,
     pub commit_message: String,
     pub pr_title: String,
@@ -345,7 +374,11 @@ pub struct RunnerPublish {
     #[serde(default)]
     pub pr_number: Option<i64>,
     #[serde(default)]
+    pub reported_pr_number: Option<i64>,
+    #[serde(default)]
     pub stack_onto_pr: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other_writer: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -375,10 +408,9 @@ pub fn plausible_pr_url(url: &str) -> bool {
 }
 
 pub fn pr_url_matches(url: &str, repo: &str, number: i64) -> bool {
-    plausible_pr_url(url)
-        && url
-            .to_ascii_lowercase()
-            .ends_with(&format!("/{}/pull/{number}", repo.trim_matches('/').to_ascii_lowercase()))
+    crate::git_names::TrackedPr::parse(url).is_some_and(|tracked| {
+        i64::from(tracked.number()) == number && tracked.repo().eq_ignore_ascii_case(repo)
+    })
 }
 
 pub fn plausible_cost(cost_usd: f64) -> bool {
@@ -476,6 +508,8 @@ pub struct RunnerJob {
     pub live_sessions: Option<Vec<String>>,
     #[serde(default)]
     pub world_tools: bool,
+    #[serde(default)]
+    pub room_answer: bool,
     pub omp_models: Option<String>,
     #[serde(default)]
     pub omp_secrets: Vec<String>,
@@ -491,8 +525,16 @@ pub struct RunnerJob {
     pub metered: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_scan: Option<crate::setup_scan::ScanRequest>,
+    #[serde(default)]
+    pub context_sent: crate::context::SentContext,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_action: Option<crate::pr_actions::ActionJob>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compact_first: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -510,6 +552,10 @@ pub struct RunnerCompletion {
     pub pr_number: Option<i64>,
     #[serde(default)]
     pub publish_pr_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_pr_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_pr_checked_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub checkpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -518,6 +564,10 @@ pub struct RunnerCompletion {
     pub retryable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_sent: Option<crate::context::SentContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_head: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -570,13 +620,12 @@ impl PrSync {
     }
 }
 
-pub fn pr_sync_from(state: Option<&str>, dirty: bool, new_commits: bool) -> PrSync {
-    if state == Some("MERGED") {
-        PrSync::Merged
-    } else if dirty || new_commits {
-        PrSync::Changed
-    } else {
-        PrSync::Unchanged
+pub fn pr_sync_from(state: Option<&str>, dirty: bool, new_commits: bool, head_in_pr: bool) -> PrSync {
+    match state {
+        Some("MERGED") if !dirty && head_in_pr => PrSync::Merged,
+        Some("MERGED") => PrSync::Changed,
+        _ if dirty || new_commits => PrSync::Changed,
+        _ => PrSync::Unchanged,
     }
 }
 
@@ -706,6 +755,61 @@ impl RunnerStore {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    pub async fn claim_pr_check(&self, runner_id: Uuid) -> Result<Option<RunnerPrCheck>> {
+        Ok(sqlx::query_as::<_, (Uuid, String, DateTime<Utc>)>(
+            "WITH due AS (
+               SELECT m.id, t.pr_url
+               FROM task_milestones m
+               JOIN agent_tasks t ON t.id = m.task_id
+               JOIN agent_profiles a ON a.id = t.assigned_agent_id
+               JOIN world_runners w ON w.id = $1
+               WHERE m.kind = 'merge' AND m.status = 'active'
+                 AND COALESCE(
+                       CASE WHEN jsonb_typeof(m.data->'runner_next_check_at') = 'number'
+                            THEN (m.data->>'runner_next_check_at')::numeric END,
+                       0
+                     ) <= EXTRACT(EPOCH FROM NOW())
+                 AND t.pr_url IS NOT NULL
+                 AND t.status <> 'cancelled' AND w.status = 'online'
+                 AND a.owner_user_id = w.owner_user_id
+                 AND a.runner_id = w.id AND a.paused_reason IS NULL
+               ORDER BY CASE WHEN jsonb_typeof(m.data->'runner_next_check_at') = 'number'
+                             THEN (m.data->>'runner_next_check_at')::numeric END NULLS FIRST
+               FOR UPDATE OF m SKIP LOCKED
+               LIMIT 1
+             ), bumped AS (
+               UPDATE task_milestones m
+               SET data = (CASE WHEN jsonb_typeof(m.data) = 'object' THEN m.data ELSE '{}'::jsonb END)
+                     || jsonb_build_object(
+                       'runner_next_check_at', EXTRACT(EPOCH FROM NOW() + make_interval(secs => $2)),
+                       'runner_pr_claimed_at', EXTRACT(EPOCH FROM NOW()),
+                       'runner_pr_claimed_url', due.pr_url
+                     ),
+                   updated_at = NOW()
+               FROM due WHERE m.id = due.id
+               RETURNING m.task_id
+             )
+             SELECT t.id, t.pr_url, NOW()
+             FROM bumped b JOIN agent_tasks t ON t.id = b.task_id",
+        )
+        .bind(runner_id)
+        .bind(crate::milestones::check_every_secs() as f64)
+        .fetch_optional(&self.pool)
+        .await?
+        .and_then(|(task_id, pr_url, observed_at)| {
+            let tracked = crate::git_names::TrackedPr::parse(&pr_url)?;
+            let repo = tracked.repo().to_string();
+            let pr_number = i64::from(tracked.number());
+            Some(RunnerPrCheck {
+                task_id,
+                repo,
+                pr_url,
+                pr_number,
+                observed_at: Some(observed_at),
+            })
+        }))
     }
 
     pub async fn register(
@@ -1603,6 +1707,7 @@ impl RunnerStore {
              WHERE q.status = 'queued' AND q.runner_id = $1 AND s.runner_id = $1
                AND (a.runner_id = $1 OR (q.kind = 'direct' AND s.role = 'direct' AND a.owner_user_id = w.owner_user_id))
                AND (q.kind <> 'quick' OR (a.owner_user_id = w.owner_user_id AND COALESCE((w.capabilities->>'quick')::boolean, FALSE)))
+               AND (q.kind <> 'action' OR (a.owner_user_id = w.owner_user_id AND COALESCE((w.capabilities->>'pr_actions')::boolean, FALSE)))
                AND __SERVES__
                AND u.world_role IN ('read', 'write', 'admin')
                AND a.paused_reason IS NULL
@@ -1617,6 +1722,7 @@ impl RunnerStore {
                )
                AND (q.kind <> 'followup' OR s.cli_session_id IS NOT NULL)
                AND (q.not_before IS NULL OR q.not_before <= NOW())
+               AND __FOLDER_FREE_Q__
                AND (cardinality($2::text[]) = 0 OR q.kind = ANY($2))
              ORDER BY __URGENT__ DESC, q.created_at
              FOR UPDATE OF q, s SKIP LOCKED LIMIT 1"),
@@ -2217,11 +2323,24 @@ impl RunnerStore {
     ) -> Result<()> {
         sqlx::query(
             "UPDATE agent_inbox SET status = $2, error = $3, done_at = CASE WHEN $2 = 'done' THEN NOW() ELSE done_at END
-             WHERE id IN (SELECT inbox_id FROM runner_run_inbox WHERE run_id = $1)",
+             WHERE id IN (SELECT inbox_id FROM runner_run_inbox WHERE run_id = $1)
+               AND (status = 'processing' OR NOT (payload ? 'clarification_continuation'))",
         )
         .bind(run_id)
         .bind(status)
         .bind(error)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn requeue_run_inbox_now(&self, run_id: Uuid, error: &str) -> Result<()> {
+        sqlx::query(&crate::world::requeue_inbox_sql(
+            "id IN (SELECT inbox_id FROM runner_run_inbox WHERE run_id = $1)",
+        ))
+        .bind(run_id)
+        .bind(error)
+        .bind(Utc::now())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -2428,6 +2547,7 @@ impl RunnerStore {
                  AND s.runner_id = $1 AND __SERVES__
                  AND (a.runner_id = $1 OR (r.kind = 'direct' AND s.role = 'direct' AND a.owner_user_id = w.owner_user_id))
                  AND (r.kind <> 'quick' OR (a.owner_user_id = w.owner_user_id AND COALESCE((w.capabilities->>'quick')::boolean, FALSE)))
+                 AND (r.kind <> 'action' OR (a.owner_user_id = w.owner_user_id AND COALESCE((w.capabilities->>'pr_actions')::boolean, FALSE)))
                  AND o.world_role IN ('read', 'write', 'admin') AND a.paused_reason IS NULL
                  AND (r.kind <> 'followup' OR s.cli_session_id IS NOT NULL)
                  AND NOT EXISTS (
@@ -2437,6 +2557,7 @@ impl RunnerStore {
                    SELECT 1 FROM runner_leases lease
                    JOIN session_runs leased ON leased.id = lease.run_id
                    WHERE leased.session_id = r.session_id AND lease.status IN ('active', 'finishing'))
+                 AND __FOLDER_FREE_R__
                  AND w.status IN ('online', 'offline') AND u.world_role IN ('write', 'admin')
                UNION ALL
                SELECT 1 FROM agent_profiles a
@@ -2713,13 +2834,16 @@ mod tests {
 
     #[test]
     fn a_followup_needs_a_review_only_when_it_changed_the_pull_request() {
-        assert_eq!(pr_sync_from(Some("MERGED"), true, true), PrSync::Merged);
-        assert_eq!(pr_sync_from(Some("OPEN"), false, false), PrSync::Unchanged);
-        assert_eq!(pr_sync_from(Some("OPEN"), true, false), PrSync::Changed);
-        assert_eq!(pr_sync_from(Some("OPEN"), false, true), PrSync::Changed);
-        assert_eq!(pr_sync_from(Some("CLOSED"), false, false), PrSync::Unchanged);
-        assert_eq!(pr_sync_from(None, false, false), PrSync::Unchanged);
-        assert_eq!(pr_sync_from(None, false, true), PrSync::Changed);
+        assert_eq!(pr_sync_from(Some("MERGED"), false, true, true), PrSync::Merged, "commits the merged PR already holds");
+        assert_eq!(pr_sync_from(Some("MERGED"), false, false, false), PrSync::Changed, "older commits the merged PR never got");
+        assert_eq!(pr_sync_from(Some("MERGED"), false, true, false), PrSync::Changed, "new commits after the merge");
+        assert_eq!(pr_sync_from(Some("MERGED"), true, false, true), PrSync::Changed, "uncommitted work after the merge");
+        assert_eq!(pr_sync_from(Some("OPEN"), false, false, true), PrSync::Unchanged);
+        assert_eq!(pr_sync_from(Some("OPEN"), true, false, true), PrSync::Changed);
+        assert_eq!(pr_sync_from(Some("OPEN"), false, true, false), PrSync::Changed);
+        assert_eq!(pr_sync_from(Some("CLOSED"), false, false, false), PrSync::Unchanged);
+        assert_eq!(pr_sync_from(None, false, false, false), PrSync::Unchanged);
+        assert_eq!(pr_sync_from(None, false, true, false), PrSync::Changed);
         for sync in [PrSync::Merged, PrSync::Unchanged, PrSync::Changed] {
             assert_eq!(PrSync::from_report(sync.report()), sync);
         }
@@ -2736,10 +2860,13 @@ mod tests {
         assert!(usage(10, 0, 5).plausible());
         assert!(!usage(u64::MAX, 0, 0).plausible());
         assert!(pr_url_matches("https://github.com/Acme/App/pull/12", "acme/app", 12));
+        assert!(!pr_url_matches("https://evil.example/acme/app/pull/12", "acme/app", 12));
+        assert!(!pr_url_matches("https://github.com/prefix/acme/app/pull/12", "acme/app", 12));
         assert!(!pr_url_matches("https://evil.example/acme/app/pull/12x", "acme/app", 12));
         assert!(!pr_url_matches("https://github.com/acme/other/pull/12", "acme/app", 12));
         assert!(!pr_url_matches("http://github.com/acme/app/pull/12", "acme/app", 12));
         assert!(!pr_url_matches("https://github.com/acme/app/pull/13", "acme/app", 12));
+        assert!(!pr_url_matches("https://github.com/acme/app/pull/0", "acme/app", 0));
         assert!(!plausible_pr_url("https://x.example/\"<script>/pull/1"));
     }
 
@@ -2861,10 +2988,14 @@ mod tests {
             pr_url: None,
             pr_number: None,
             publish_pr_state: None,
+            checked_pr_url: None,
+            publish_pr_checked_at: None,
             checkpoint: None,
             steered: Vec::new(),
             retryable: false,
             work_summary: None,
+            context_sent: None,
+            published_head: None,
         }
     }
 
@@ -3007,6 +3138,166 @@ mod tests {
             .await
             .unwrap();
         assert!(store.has_work(runner).await.unwrap(), "inbox wakes once the main turn is done");
+    }
+
+    #[tokio::test]
+    async fn pr_checks_follow_the_assigned_agents_owner() {
+        let Some(pool) = pool().await else { return };
+        let _state = global_state().lock().await;
+        let owner = user(&pool).await;
+        let store = RunnerStore::new(pool.clone());
+        let runner = registration(&store, owner, "PR checks").await.runner.id;
+        store.heartbeat(runner, &json!({})).await.unwrap();
+        let agent = agent(&pool, owner).await;
+        store.assign_agent(owner, agent, Some(runner)).await.unwrap();
+        let other_owner = user(&pool).await;
+        let other = registration(&store, other_owner, "Other PR checks").await.runner.id;
+        store.heartbeat(other, &json!({})).await.unwrap();
+        let task: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_tasks (user_id, title, repo, status, assigned_agent_id, pr_url, pr_number)
+             VALUES ($1, 'Watch PR', 'acme/app', 'failed', $2, 'https://github.com/acme/app/pull/12', 12)
+             RETURNING id",
+        )
+        .bind(other_owner)
+        .bind(agent)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM task_milestones WHERE task_id = $1")
+            .bind(task)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO task_milestones (task_id, title, kind, status, data, next_check_at)
+             VALUES ($1, 'PR merged', 'merge', 'active', '{\"runner_next_check_at\": \"bad\"}', NOW() - INTERVAL '1 minute')",
+        )
+        .bind(task)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(store.claim_pr_check(other).await.unwrap().is_none());
+
+        sqlx::query("UPDATE agent_profiles SET paused_reason = 'test' WHERE id = $1")
+            .bind(agent)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(store.claim_pr_check(runner).await.unwrap().is_none());
+        sqlx::query("UPDATE agent_profiles SET paused_reason = NULL WHERE id = $1")
+            .bind(agent)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let claimed = store.claim_pr_check(runner).await.unwrap().expect("owner runner claims the check");
+        assert_eq!(claimed.task_id, task);
+        assert_eq!(claimed.repo, "acme/app");
+        assert_eq!(claimed.pr_url, "https://github.com/acme/app/pull/12");
+        assert_eq!(claimed.pr_number, 12);
+        let claimed_at = claimed.observed_at.expect("server claim time");
+        let (local_due, runner_scheduled): (bool, bool) = sqlx::query_as(
+            "SELECT next_check_at <= NOW(), jsonb_typeof(data->'runner_next_check_at') = 'number'
+             FROM task_milestones WHERE task_id = $1",
+        )
+        .bind(task)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(local_due, "runner claims do not advance the local merge watch");
+        assert!(runner_scheduled, "runner claims keep their own schedule");
+        assert!(store.claim_pr_check(runner).await.unwrap().is_none());
+
+        let milestones = crate::milestones::MilestoneStore::new(pool.clone());
+        assert!(milestones.arm_merge(task).await.unwrap());
+        assert!(store.claim_pr_check(runner).await.unwrap().is_none(), "arming an active milestone preserves the runner schedule");
+        assert!(milestones.check_now(task).await.unwrap());
+        let runner_rearmed: bool = sqlx::query_scalar(
+            "SELECT NOT (data ? 'runner_next_check_at') FROM task_milestones WHERE task_id = $1",
+        )
+        .bind(task)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(runner_rearmed, "manual checks rearm the runner schedule");
+        assert_eq!(store.claim_pr_check(runner).await.unwrap().expect("runner rearmed").task_id, task);
+
+        sqlx::query("UPDATE task_milestones SET status = 'pending', next_check_at = NOW() - INTERVAL '1 minute' WHERE task_id = $1")
+            .bind(task)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(store.claim_pr_check(runner).await.unwrap().is_none());
+        assert!(milestones.arm_merge(task).await.unwrap());
+        assert_eq!(store.claim_pr_check(runner).await.unwrap().expect("pending milestone rearmed").task_id, task);
+        let world = crate::world::WorldStore::new(pool.clone());
+        let pr_url = "https://github.com/acme/app/pull/12";
+        assert!(world.settle_pr_from_runner(task, pr_url, false, runner).await.unwrap());
+        let closed: (String, String) = sqlx::query_as(
+            "SELECT t.status, m.status FROM agent_tasks t
+             JOIN task_milestones m ON m.task_id = t.id AND m.kind = 'merge'
+             WHERE t.id = $1",
+        )
+        .bind(task)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(closed, ("failed".into(), "failed".into()));
+        assert!(milestones.retry_check_now(task).await.unwrap());
+        assert!(!world
+            .settle_pr_from_runner_observed(task, pr_url, false, runner, Some(claimed_at))
+            .await
+            .unwrap());
+        assert!(!world
+            .settle_pr_from_runner_observed(task, pr_url, false, runner, None)
+            .await
+            .unwrap());
+        let active: String = sqlx::query_scalar("SELECT status FROM task_milestones WHERE task_id = $1 AND kind = 'merge'")
+            .bind(task)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(active, "active", "a delayed close from before the retry cannot stop the watch");
+        let retried = store.claim_pr_check(runner).await.unwrap().expect("closed PR check retried");
+        assert_eq!((retried.task_id, retried.repo.as_str(), retried.pr_url.as_str(), retried.pr_number), (task, "acme/app", pr_url, 12));
+        assert!(world
+            .settle_pr_from_runner_observed(task, pr_url, false, runner, None)
+            .await
+            .unwrap());
+        let failed_again: String = sqlx::query_scalar("SELECT status FROM task_milestones WHERE task_id = $1 AND kind = 'merge'")
+            .bind(task)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(failed_again, "failed", "a fresh claim lets an old runner report the current close");
+        assert!(milestones.retry_check_now(task).await.unwrap());
+        let merged_claim = store.claim_pr_check(runner).await.unwrap().expect("merge check retried");
+        assert_ne!(merged_claim.observed_at, Some(claimed_at));
+        assert!(world
+            .settle_pr_from_runner_observed(task, pr_url, true, runner, Some(claimed_at))
+            .await
+            .unwrap());
+        let merged: (String, String) = sqlx::query_as(
+            "SELECT t.status, m.status FROM agent_tasks t
+             JOIN task_milestones m ON m.task_id = t.id AND m.kind = 'merge'
+             WHERE t.id = $1",
+        )
+        .bind(task)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(merged, ("done".into(), "done".into()));
+        sqlx::query("UPDATE task_milestones SET data = data - 'runner_next_check_at' WHERE task_id = $1")
+            .bind(task)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE world_runners SET status = 'paused' WHERE id = $1")
+            .bind(runner)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(store.claim_pr_check(runner).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -5087,5 +5378,111 @@ mod tests {
         let status: String = sqlx::query_scalar("SELECT status FROM agent_sessions WHERE id = $1").bind(session).fetch_one(&pool).await.unwrap();
         assert_eq!(status, "active");
         assert!(world.resume_disk_stranded().await.unwrap().is_empty(), "a second start finds nothing left to do");
+    }
+
+    #[tokio::test]
+    async fn one_writer_holds_a_quest_folder_on_a_runner() {
+        let Some(pool) = pool().await else { return };
+        let owner = user(&pool).await;
+        let store = RunnerStore::new(pool.clone());
+        let runner = registration(&store, owner, "Folder Mac").await.runner.id;
+        let (agent, _, turn) = queued_run(&pool, owner, runner).await;
+        sqlx::query("UPDATE session_runs SET status = 'completed' WHERE id = $1").bind(turn).execute(&pool).await.unwrap();
+        let tag = Uuid::new_v4();
+        let session = |role: &'static str, dir: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Uuid>(
+                    "INSERT INTO agent_sessions (agent_id, role, backend, model, cli_session_id, working_dir)
+                     VALUES ($1, $2, 'codex', 'test-model', 'cli', $3) RETURNING id",
+                )
+                .bind(agent)
+                .bind(role)
+                .bind(dir)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let queue = |session: Uuid, kind: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Uuid>(
+                    "INSERT INTO session_runs (session_id, agent_id, kind, status, prompt, created_at)
+                     VALUES ($1, $2, $3, 'queued', 'work', clock_timestamp()) RETURNING id",
+                )
+                .bind(session)
+                .bind(agent)
+                .bind(kind)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let work_kinds = ["task", "followup", "review", "publish"].map(String::from);
+        let claim_all = || async {
+            let mut claimed = Vec::new();
+            while let Some(run) = store.claim_kinds(runner, &token(&format!("folder-{}", Uuid::new_v4())), &work_kinds).await.unwrap() {
+                claimed.push(run);
+            }
+            claimed
+        };
+        let writer = session("task", format!("tasks/{tag}/world")).await;
+        let resumed = session("task", format!("tasks/{tag}/world")).await;
+        let review = session("review", format!("tasks/{tag}/world")).await;
+        let part = session("task", format!("tasks/{tag}-part/world")).await;
+
+        let first = queue(writer, "task").await;
+        let second = queue(resumed, "followup").await;
+        let reviewing = queue(review, "review").await;
+        let stacked = queue(part, "task").await;
+        let started: Vec<Uuid> = claim_all().await.iter().map(|run| run.run_id).collect();
+        assert!(started.contains(&first) && started.contains(&reviewing) && started.contains(&stacked), "{started:?}");
+        assert!(!started.contains(&second), "a second writer waits for the folder on the device");
+        assert!(!store.has_work(runner).await.unwrap(), "has_work skips the writer the claim skips");
+
+        let mut listener = sqlx::postgres::PgListener::connect(&std::env::var("TEST_DATABASE_URL").unwrap()).await.unwrap();
+        listener.listen(CHANNEL_RUNNER_JOBS).await.unwrap();
+        sqlx::query("UPDATE session_runs SET status = 'completed', finished_at = NOW() WHERE id = $1").bind(first).execute(&pool).await.unwrap();
+        assert_eq!(next_wake(&mut listener).await, runner.to_string(), "the end of a writer wakes the device");
+        assert!(!store.has_work(runner).await.unwrap(), "a lease that has not ended still holds the folder");
+        sqlx::query("UPDATE runner_leases SET status = 'completed', finished_at = NOW() WHERE run_id = $1").bind(first).execute(&pool).await.unwrap();
+        assert_eq!(next_wake(&mut listener).await, runner.to_string(), "the end of its lease wakes the device again");
+        assert!(store.has_work(runner).await.unwrap());
+        let next: Vec<Uuid> = claim_all().await.iter().map(|run| run.run_id).collect();
+        assert_eq!(next, vec![second], "the waiting writer starts once the folder is free");
+
+        let publish = queue(resumed, "publish").await;
+        sqlx::query("UPDATE session_runs SET status = 'completed', finished_at = NOW() WHERE id = $1").bind(second).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE runner_leases SET status = 'completed', finished_at = NOW() WHERE run_id = $1").bind(second).execute(&pool).await.unwrap();
+        let late = queue(writer, "followup").await;
+        let publishing: Vec<Uuid> = claim_all().await.iter().map(|run| run.run_id).collect();
+        assert_eq!(publishing, vec![publish], "a publish holds the folder like any writer");
+        assert!(!publishing.contains(&late));
+        sqlx::query("UPDATE session_runs SET status = 'completed', finished_at = NOW() WHERE id = $1").bind(publish).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE runner_leases SET status = 'completed', finished_at = NOW() WHERE run_id = $1").bind(publish).execute(&pool).await.unwrap();
+
+        let checking: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_sessions (agent_id, role, backend, model, working_dir, parent_session_id)
+             VALUES ($1, 'review', 'codex', 'test-model', $2, $3) RETURNING id",
+        )
+        .bind(agent)
+        .bind(format!("tasks/{tag}/world"))
+        .bind(resumed)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let checks = queue(checking, "review").await;
+        let reviewing: Vec<Uuid> = claim_all().await.iter().map(|run| run.run_id).collect();
+        assert_eq!(reviewing, vec![checks], "another session's writer waits while finished work is under its automatic review");
+        sqlx::query("UPDATE session_runs SET status = 'completed', finished_at = NOW() WHERE id = $1").bind(checks).execute(&pool).await.unwrap();
+        assert!(!store.has_work(runner).await.unwrap(), "a review whose lease is still finishing keeps the folder");
+        sqlx::query("UPDATE runner_leases SET status = 'completed', finished_at = NOW() WHERE run_id = $1").bind(checks).execute(&pool).await.unwrap();
+        let after: Vec<Uuid> = claim_all().await.iter().map(|run| run.run_id).collect();
+        assert_eq!(after, vec![late], "the writer starts once the review is done");
+    }
+
+    async fn next_wake(listener: &mut sqlx::postgres::PgListener) -> String {
+        tokio::time::timeout(std::time::Duration::from_secs(5), listener.recv()).await.unwrap().unwrap().payload().to_string()
     }
 }

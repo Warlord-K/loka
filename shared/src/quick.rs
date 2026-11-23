@@ -430,11 +430,13 @@ impl WorldStore {
              WHERE r.kind = 'quick'
                AND r.status IN ('completed', 'failed', 'timed_out')
                AND (r.status = 'completed' OR r.stop_requested_by IS NULL)
+               AND r.retried_as IS NULL
                AND r.finished_at < NOW() - make_interval(secs => $2::double precision)
                AND r.finished_at > NOW() - INTERVAL '1 hour'
                AND ($1::uuid IS NULL OR r.session_id = $1)
                AND EXISTS (SELECT 1 FROM agent_sessions s WHERE s.id = r.session_id AND s.status <> 'archived')
                AND NOT EXISTS (SELECT 1 FROM agent_messages m WHERE m.run_id = r.id AND m.author_kind <> 'user')
+               AND r.context_note->>'recovered_by' IS NULL
              ORDER BY r.finished_at
              LIMIT 50"
         ))

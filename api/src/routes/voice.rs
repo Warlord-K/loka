@@ -125,7 +125,9 @@ async fn token_or_status(state: &AppState, user: Uuid) -> Result<String, StatusC
 }
 
 fn event_line(ev: &WorldEvent) -> Option<String> {
-    if matches!(ev.event_type.as_str(), "agent.status" | "voice.transcript" | "session.compacted") {
+    if loka_shared::rooms::scoped_event(ev)
+        || matches!(ev.event_type.as_str(), "agent.status" | "voice.transcript" | "session.compacted")
+    {
         return None;
     }
     let p = &ev.payload;
@@ -220,7 +222,7 @@ async fn instructions(state: &AppState, agent: &WorldAgent, user: Uuid, person: 
         .await
         .map_err(internal)?
         .iter()
-        .filter(|e| !loka_shared::event_scope::private_from(e, user, &owned))
+        .filter(|e| !loka_shared::event_scope::private_from(e, user, loka_shared::access::Role::Read, &owned))
         .filter_map(event_line)
         .rev()
         .take(12)
@@ -324,7 +326,7 @@ async fn start_call(state: &AppState, user: Uuid, agent: &WorldAgent, quick: Opt
     let mut text = instructions(state, agent, user, &person, quick).await?;
     if let Some(canvas) = context {
         text.push_str(&format!(
-            "\n\n{person} started this call from a canvas they are looking at. Talk about it when it helps, and refer to items by what they show, not their ids:\n{canvas}\n"
+            "\n\n{person} started this call from a workspace they are looking at. Talk about it when it helps, and refer to items by what they show, not their ids:\n{canvas}\n"
         ));
     }
     let greeting = if greeted { stored_greeting(state, id, &grok_voice(agent)).await?.map(|g| g.phrase) } else { None };
@@ -849,6 +851,34 @@ mod tests {
         assert_eq!(session["type"], "server_vad");
         assert_eq!(session["silence_duration_ms"], 1200);
         assert_eq!(session["prefix_padding_ms"], 333);
+    }
+
+    #[test]
+    fn room_events_stay_out_of_ordinary_voice_context() {
+        let room = Uuid::new_v4();
+        let part = Uuid::new_v4();
+        let event = |event_type: &str, payload: Value| WorldEvent {
+            seq: 1,
+            event_type: event_type.into(),
+            agent_id: Some(Uuid::new_v4()),
+            session_id: None,
+            run_id: None,
+            task_id: Some(room),
+            actor_user_id: None,
+            payload,
+            created_at: Utc::now(),
+            org_id: None,
+            quest_scope: None,
+        };
+        let message = event("message.created", json!({ "body": "private room message", "room": { "task_id": room } }));
+        let answer = event(
+            "question.answered",
+            json!({ "answer": "private part answer", "part_task_id": part, "room": { "task_id": room } }),
+        );
+        let ordinary = event("message.created", json!({ "body": "ordinary update" }));
+        assert!(event_line(&message).is_none());
+        assert!(event_line(&answer).is_none());
+        assert!(event_line(&ordinary).is_some_and(|line| line.contains("ordinary update")));
     }
 
     #[test]

@@ -29,7 +29,7 @@ export const SHORTCUTS: [string | string[], string][] = [
   ["O", "Workshop: work with an agent in a folder"],
   ["L", "Lists"],
   ["R", "Reports"],
-  ["B", "Workspace"],
+  ["B", "Workspaces"],
   ["M", "Map"],
   ["T", "Terminal"],
   ["N", "Notifications"],
@@ -59,7 +59,7 @@ export function ShortcutList({ className }: { className?: string }) {
       <KeyRows rows={SHORTCUTS} />
       <div className="flex flex-col gap-1.5">
         <h3 className="text-w-xs font-semibold text-w-muted">In the terminal</h3>
-        <KeyRows rows={terminalShortcutRows(keyProfile(isDesktopApp()))} />
+        <KeyRows rows={[...terminalShortcutRows(keyProfile(isDesktopApp())), ["Esc", "Close the terminal window (asks while shells run)"]]} />
       </div>
     </div>
   );

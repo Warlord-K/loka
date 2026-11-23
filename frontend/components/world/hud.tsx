@@ -105,10 +105,12 @@ interface Slot {
   image?: Portrait | null;
   group?: number;
   badge?: number;
+  badgeLabel?: string;
   tone?: "gold" | "teal" | "plain" | "live";
   onClick?: () => void;
   onPress?: () => void;
   onRelease?: () => void;
+  onCancel?: () => void;
 }
 
 const SLOT_TONE = {
@@ -122,7 +124,7 @@ export function Hotbar({ slots }: { slots: Slot[] }) {
   return (
     <nav
       aria-label="Hotbar"
-      className="pointer-events-auto relative flex max-w-full items-center gap-0.5 overflow-x-auto overscroll-x-contain rounded-2xl border-2 border-w-ink bg-w-paper/90 px-1.5 pb-1.5 pt-2.5 shadow-[0_4px_0_rgb(var(--w-ink)),0_18px_40px_-16px_rgb(0_0_0/0.55)] backdrop-blur-md [scrollbar-width:none] sm:overflow-visible sm:pt-1.5"
+      className="pointer-events-auto relative flex max-w-full flex-wrap items-center justify-center gap-x-0.5 gap-y-1 rounded-2xl border-2 border-w-ink bg-w-paper/90 px-1.5 pb-1.5 pt-2.5 shadow-[0_4px_0_rgb(var(--w-ink)),0_18px_40px_-16px_rgb(0_0_0/0.55)] backdrop-blur-md sm:pt-1.5"
     >
       <Glide hover=".hotbar-glide" className="rounded-xl bg-w-sand" />
       {slots.map((s, i) => (
@@ -130,7 +132,13 @@ export function Hotbar({ slots }: { slots: Slot[] }) {
           {i > 0 && s.group !== slots[i - 1].group && <span aria-hidden className="mx-1.5 h-8 w-0.5 rounded-full bg-w-line2" />}
           <button
             type="button"
-            onClick={s.onClick}
+            onClick={
+              s.onClick
+                ? (e) => {
+                    if (!s.onPress || e.detail === 0) s.onClick?.();
+                  }
+                : undefined
+            }
             onPointerDown={
               s.onPress
                 ? (e) => {
@@ -140,23 +148,23 @@ export function Hotbar({ slots }: { slots: Slot[] }) {
                 : undefined
             }
             onPointerUp={s.onRelease}
-            onPointerCancel={s.onRelease}
+            onPointerCancel={s.onCancel ?? s.onRelease}
             title={`${s.hint ?? s.label} (${s.key})`}
-            aria-label={`${s.label}${s.badge ? `, ${s.badge} new` : ""}`}
+            aria-label={`${s.label}${s.badge ? `, ${s.badge} ${s.badgeLabel ?? "new"}` : ""}`}
             aria-keyshortcuts={s.key}
             className={cn(
-              "group relative flex h-[3.25rem] w-[3.75rem] flex-col items-center justify-center gap-1 rounded-xl transition-[transform,background-color,color,filter] duration-200 [transition-timing-function:cubic-bezier(0.22,1,0.36,1)] active:scale-[0.96] active:duration-100 motion-reduce:transform-none",
+              "group relative flex min-h-[3.25rem] min-w-[3.75rem] max-w-[10rem] flex-col items-center justify-center gap-1 rounded-xl px-2 py-1.5 transition-[transform,background-color,color,filter] duration-200 [transition-timing-function:cubic-bezier(0.22,1,0.36,1)] active:scale-[0.96] active:duration-100 motion-reduce:transform-none",
               FOCUS,
-              "focus-visible:ring-offset-0",
+              "focus-visible:ring-inset focus-visible:ring-offset-0",
               SLOT_TONE[s.tone ?? "plain"],
             )}
           >
             {s.image ? (
               s.image.url ? <img src={s.image.url} alt="" className={cn("-my-0.5 h-[26px] w-auto transition-transform duration-200 [transition-timing-function:cubic-bezier(0.22,1,0.36,1)] motion-reduce:transform-none", portraitRendering(s.image))} /> : <span className="-my-0.5 inline-block h-[26px] w-[21px]" />
             ) : (
-              <s.icon size={22} weight={s.tone === "live" ? "fill" : "duotone"} className="transition-transform duration-200 [transition-timing-function:cubic-bezier(0.22,1,0.36,1)] motion-reduce:transform-none" />
+              <s.icon size={22} weight={s.tone === "live" ? "fill" : "duotone"} className="shrink-0 transition-transform duration-200 [transition-timing-function:cubic-bezier(0.22,1,0.36,1)] motion-reduce:transform-none" />
             )}
-            <span className="max-w-full truncate px-1 text-w-3xs font-semibold leading-none">{s.label}</span>
+            <span className="max-w-[9rem] whitespace-normal break-words text-center text-w-3xs font-semibold leading-tight [overflow-wrap:anywhere]">{s.label}</span>
             {s.badge ? <span className={BADGE}>{s.badge > 99 ? "99+" : s.badge}</span> : null}
           </button>
         </div>

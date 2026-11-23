@@ -330,8 +330,12 @@ pub(crate) fn run_command(opts: &CliOptions<'_>, launch: &Launch) -> Result<Comm
 
 pub(crate) fn command(opts: &CliOptions<'_>, mcp_config_path: Option<&Path>, launch: &Launch) -> Result<Command> {
     let mut cmd = run_command(opts, launch)?;
+    let room_answer = opts.room_answer();
+    if room_answer && !launch.caps.confirmed("--safe-mode") {
+        anyhow::bail!("Claude Code on this device cannot isolate a quest room answer. Update it with `claude update`, then try again.");
+    }
     let source = user_settings(opts, &cmd);
-    let tool_search = !mcp_server_rules(opts.mcp_config_json.as_deref()).is_empty() && {
+    let tool_search = !room_answer && !mcp_server_rules(opts.mcp_config_json.as_deref()).is_empty() && {
         let facts = crate::world::tool_catalog::ClaudeFacts { version: launch.caps.version.clone(), first_party: detect::ClaudeEnv::of(&cmd, source).first_party_route() };
         crate::world::tool_catalog::delivery_for("claude", opts.model, &facts) == crate::world::tool_catalog::Delivery::Native
     };
@@ -359,6 +363,10 @@ pub(crate) fn command(opts: &CliOptions<'_>, mcp_config_path: Option<&Path>, lau
     let lean_reads = mode == Permission::LeanReads;
     let dont_ask = if launch.caps.mode("dontAsk") { "dontAsk" } else { "default" };
     cmd.arg("-p");
+    if room_answer {
+        cmd.arg("--safe-mode");
+        cmd.env("CLAUDE_CODE_DISABLE_ATTACHMENTS", "1");
+    }
     match mode {
         Permission::LeanReads => {
             cmd.arg("--permission-mode").arg(dont_ask);
@@ -1159,6 +1167,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_compaction_runs_first_only_on_a_resumed_session_of_its_own() {
+        let mut opts = options(false, Vec::new(), false, Approval::Auto, "opus");
+        assert!(!crate::cli::compacts_first(true, &opts), "a fresh session has nothing to compact");
+        opts.session_id = Some("s1");
+        opts.resume = true;
+        assert!(crate::cli::compacts_first(true, &opts));
+        assert!(!crate::cli::compacts_first(false, &opts), "only when the budget asked for it");
+        opts.fork = true;
+        assert!(!crate::cli::compacts_first(true, &opts), "a fork must never compact the session it copies");
+        opts.fork = false;
+        opts.rewind_to = Some("m1");
+        assert!(!crate::cli::compacts_first(true, &opts), "a rewind keeps the history it rewinds into");
+    }
+
+    #[test]
+    fn a_compaction_before_the_request_is_billed_once_on_every_cli() {
+        let result = |cost: f64, tokens: u64| crate::cli::CliResult {
+            output: "ok".into(),
+            session_id: Some("s1".into()),
+            cost_usd: cost,
+            exit_code: 0,
+            usage: crate::cli::Usage { input_tokens: tokens, cached_input_tokens: tokens, output_tokens: tokens, context_tokens: 9 },
+            checkpoint: None,
+        };
+        let per_run = crate::cli::with_compaction("omp", result(0.5, 100), &result(0.25, 40));
+        assert!((per_run.cost_usd - 0.75).abs() < 1e-9, "CLIs that report each run alone add the compaction's spend");
+        assert_eq!((per_run.usage.input_tokens, per_run.usage.cached_input_tokens, per_run.usage.output_tokens, per_run.usage.context_tokens), (140, 140, 140, 9));
+        let cumulative = crate::cli::with_compaction("claude", result(0.5, 100), &result(0.25, 40));
+        assert!((cumulative.cost_usd - 0.5).abs() < 1e-9, "session totals already include the compaction");
+        assert_eq!(cumulative.usage.input_tokens, 100);
+    }
+
     fn args(opts: &CliOptions<'_>, launch: &Launch) -> Vec<String> {
         let cmd = command(opts, None, launch).expect("command builds");
         cmd.as_std().get_args().map(|arg| arg.to_string_lossy().into_owned()).collect()
@@ -1591,6 +1632,35 @@ mod tests {
         assert_eq!(after(&reads, "--permission-mode"), Some("default"));
         let current = args(&work, &Launch::assume("claude"));
         assert_eq!(after(&current, "--effort"), Some("low"));
+    }
+
+    #[test]
+    fn room_answers_require_safe_mode_and_keep_normal_auth() {
+        let help = "--print --output-format --system-prompt --tools --setting-sources --strict-mcp-config --fork-session --safe-mode --permission-mode <mode>";
+        let launch = Launch { caps: Arc::new(Caps::parse(Some("2.1.330".into()), help)), ..Launch::assume("claude") };
+        let mut room = options(true, Vec::new(), false, Approval::Full, "opus");
+        room.working_dir = Path::new("/tmp/loka-session/room-answers/session");
+        room.environment.insert(crate::cli::ROOM_ANSWER_ENV.into(), "1".into());
+        assert!(room.room_answer());
+        assert!(!room.child_environment().contains_key(crate::cli::ROOM_ANSWER_ENV));
+        let built = args(&room, &launch);
+        assert!(built.iter().any(|arg| arg == "--safe-mode"));
+        assert_eq!(after(&built, "--tools"), Some(""));
+        assert_eq!(after(&built, "--setting-sources"), Some(""));
+        assert!(!built.iter().any(|arg| arg == "--bare"));
+        let built_command = command(&room, None, &launch).unwrap();
+        let attachments = built_command.as_std().get_envs().find(|(name, _)| *name == "CLAUDE_CODE_DISABLE_ATTACHMENTS").and_then(|(_, value)| value);
+        assert_eq!(attachments.and_then(|value| value.to_str()), Some("1"));
+        assert!(!built_command.as_std().get_envs().any(|(name, _)| name == crate::cli::ROOM_ANSWER_ENV));
+
+        let mut ordinary = options(true, Vec::new(), false, Approval::Full, "opus");
+        ordinary.working_dir = Path::new("/tmp/repos/room-answers");
+        assert!(!args(&ordinary, &Launch::assume("claude")).iter().any(|arg| arg == "--safe-mode"));
+
+        let old_help = "--print --output-format --system-prompt --tools --setting-sources --strict-mcp-config --fork-session --permission-mode <mode>";
+        let old = Launch { caps: Arc::new(Caps::parse(Some("2.1.0".into()), old_help)), ..Launch::assume("claude") };
+        let error = command(&room, None, &old).expect_err("room answers fail closed without safe mode").to_string();
+        assert!(error.contains("cannot isolate a quest room answer"));
     }
 
     #[test]

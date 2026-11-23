@@ -1,13 +1,116 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use serde::Deserialize;
 use loka_shared::runners::{pr_sync_from, PrSync};
 use std::path::Path;
 use tracing::info;
 
 use crate::cli::workspace_command;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrInfo {
     pub url: String,
     pub number: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedPr {
+    pub info: PrInfo,
+    pub state: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryPr {
+    url: String,
+    number: i64,
+    state: String,
+    head_ref_name: String,
+    is_cross_repository: Option<bool>,
+}
+
+fn verified_recovery(pr: RecoveryPr, repo: &str, branch: &str) -> Option<VerifiedPr> {
+    let number = i32::try_from(pr.number).ok().filter(|number| *number > 0)?;
+    let (url_repo, url_number) = pr.url.strip_prefix("https://github.com/")?.rsplit_once("/pull/")?;
+    if pr.is_cross_repository != Some(false)
+        || pr.head_ref_name.trim() != branch
+        || !url_repo.eq_ignore_ascii_case(repo)
+        || url_number != number.to_string()
+        || !matches!(pr.state.as_str(), "OPEN" | "MERGED" | "CLOSED")
+    {
+        return None;
+    }
+    Some(VerifiedPr {
+        info: PrInfo { url: pr.url, number },
+        state: pr.state,
+    })
+}
+
+fn verified_recovery_view(viewed: &[u8], repo: &str, branch: &str) -> Option<VerifiedPr> {
+    verified_recovery(serde_json::from_slice(viewed).ok()?, repo, branch)
+}
+
+fn unique_verified_recovery(listed: &[u8], repo: &str, branch: &str) -> Option<VerifiedPr> {
+    let mut candidates = serde_json::from_slice::<Vec<RecoveryPr>>(listed).ok()?;
+    if candidates.len() != 1 {
+        return None;
+    }
+    verified_recovery(candidates.pop()?, repo, branch)
+}
+
+pub async fn recover_pr(
+    worktree_path: &Path,
+    repo: &str,
+    branch: &str,
+    reported_number: Option<i64>,
+) -> Result<Option<VerifiedPr>> {
+    let repo = loka_shared::git_names::github_repo(repo)?;
+    loka_shared::git_names::validate_git_ref(branch)?;
+    if let Some(number) = reported_number.filter(|number| *number > 0) {
+        let output = workspace_command("gh", worktree_path)
+            .await
+            .args([
+                "pr",
+                "view",
+                &number.to_string(),
+                "--repo",
+                &repo,
+                "--json",
+                "url,number,state,headRefName,isCrossRepository",
+            ])
+            .output()
+            .await;
+        if let Ok(output) = output {
+            if output.status.success() {
+                if let Some(pr) = verified_recovery_view(&output.stdout, &repo, branch)
+                    .filter(|pr| i64::from(pr.info.number) == number)
+                {
+                    return Ok(Some(pr));
+                }
+            }
+        }
+    }
+    let output = workspace_command("gh", worktree_path)
+        .await
+        .args([
+            "pr",
+            "list",
+            "--repo",
+            &repo,
+            "--head",
+            branch,
+            "--state",
+            "all",
+            "--limit",
+            "2",
+            "--json",
+            "url,number,state,headRefName,isCrossRepository",
+        ])
+        .output()
+        .await;
+    Ok(output
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| unique_verified_recovery(&output.stdout, &repo, branch)))
 }
 
 pub async fn create_pr(
@@ -85,66 +188,174 @@ async fn get_existing_pr(worktree_path: &Path, repo: &str, branch: &str) -> Resu
     })
 }
 
-pub async fn pr_state(worktree_path: &Path, repo: &str, number: i64) -> Result<Option<String>> {
+pub async fn pr_state(
+    worktree_path: &Path,
+    tracked: loka_shared::git_names::TrackedPr<'_>,
+) -> Result<String> {
     let output = workspace_command("gh", worktree_path)
         .await
         .args([
             "pr",
             "view",
-            &number.to_string(),
-            "--repo",
-            repo,
+            tracked.url(),
             "--json",
-            "state",
+            "state,url,number",
         ])
         .output()
         .await
         .context("Failed to run gh pr view")?;
     if !output.status.success() {
-        return Ok(None);
+        return Err(anyhow!(
+            "gh pr view failed for {}#{}: {}",
+            tracked.repo(),
+            tracked.number(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
     let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    Ok(json["state"].as_str().map(str::to_string))
+    tracked_pr_state(&json, tracked)
+}
+
+fn tracked_pr_state(
+    json: &serde_json::Value,
+    tracked: loka_shared::git_names::TrackedPr<'_>,
+) -> Result<String> {
+    let returned = json["url"]
+        .as_str()
+        .and_then(loka_shared::git_names::TrackedPr::parse)
+        .filter(|returned| returned.same_identity(tracked));
+    if returned.is_none() || json["number"].as_i64() != Some(i64::from(tracked.number())) {
+        return Err(anyhow!("gh pr view returned a different pull request"));
+    }
+    match json["state"].as_str() {
+        Some(state @ ("OPEN" | "MERGED" | "CLOSED")) => Ok(state.to_string()),
+        Some(state) => Err(anyhow!("gh pr view returned unknown pull request state {state}")),
+        None => Err(anyhow!("gh pr view did not return a pull request state")),
+    }
 }
 
 pub fn is_final_pr_state(state: &str) -> bool {
     matches!(state, "MERGED" | "CLOSED")
 }
 
+pub enum RecordedPr {
+    Open,
+    Final { state: String, carried: Option<String> },
+}
+
+pub(crate) async fn carry_past_recorded_pr(
+    worktree_path: &Path,
+    base: &str,
+    quest_branch: &str,
+    number: i64,
+    state: Option<&str>,
+    protocols: Option<&str>,
+) -> Result<RecordedPr> {
+    let Some(state) = state.filter(|state| is_final_pr_state(state)) else {
+        return Ok(RecordedPr::Open);
+    };
+    let head = crate::git::workspace::fetch_pr_head(worktree_path, number, protocols).await;
+    let carry = crate::git::workspace::carry_new_work(worktree_path, base, quest_branch, number, head.as_deref(), state == "MERGED", protocols).await?;
+    let state = state.to_lowercase();
+    match carry {
+        crate::git::workspace::Carry::Nothing => Ok(RecordedPr::Final { state, carried: None }),
+        crate::git::workspace::Carry::Branch(branch) => {
+            info!(number, branch, "Pull request is already {state}, carrying the new work onto a new branch");
+            Ok(RecordedPr::Final { state, carried: Some(branch) })
+        }
+        crate::git::workspace::Carry::Conflict { commit, subject, files } => {
+            Err(anyhow!(replay_conflict_error(number, &state, base, &commit, &subject, &files)))
+        }
+    }
+}
+
+pub fn replay_conflict_error(number: i64, state: &str, base: &str, commit: &str, subject: &str, files: &[String]) -> String {
+    let files = match files {
+        [] => String::new(),
+        files => format!(" in {}", files.join(", ")),
+    };
+    format!(
+        "Pull request #{number} is already {state}, and the new work does not apply cleanly on the latest {base}: commit {commit} \"{subject}\" conflicts{files}. Nothing was published. Resume the quest to rebase its new commits onto origin/{base} and resolve the conflict, then Loka opens a new pull request."
+    )
+}
+
+pub fn follow_up_body(body: &str, number: i64, state: &str) -> String {
+    let note = format!("Follows #{number}, which is already {state}.");
+    match body.trim() {
+        "" => note,
+        body => format!("{body}\n\n{note}"),
+    }
+}
+
 pub async fn pr_sync(worktree_path: &Path, since: std::time::SystemTime) -> PrSync {
     pr_sync_checked(worktree_path, since).await.unwrap_or(PrSync::Changed)
 }
 
+pub async fn tracked_pr_sync(
+    worktree_path: &Path,
+    since: std::time::SystemTime,
+    tracked: loka_shared::git_names::TrackedPr<'_>,
+) -> PrSync {
+    tracked_pr_sync_checked(worktree_path, since, tracked).await.unwrap_or(PrSync::Changed)
+}
+
+async fn sync_git(worktree_path: &Path, args: Vec<String>) -> Result<String> {
+    let output = workspace_command("git", worktree_path)
+        .await
+        .args(args)
+        .output()
+        .await
+        .context("Failed to run git")?;
+    anyhow::ensure!(output.status.success(), "git failed");
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 async fn pr_sync_checked(worktree_path: &Path, since: std::time::SystemTime) -> Result<PrSync> {
-    let git = |args: Vec<String>| async move {
-        let output = workspace_command("git", worktree_path)
-            .await
-            .args(args)
-            .output()
-            .await
-            .context("Failed to run git")?;
-        anyhow::ensure!(output.status.success(), "git failed");
-        Ok::<String, anyhow::Error>(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    };
-    let branch = git(vec!["rev-parse".into(), "--abbrev-ref".into(), "HEAD".into()]).await?;
+    let branch = sync_git(worktree_path, vec!["rev-parse".into(), "--abbrev-ref".into(), "HEAD".into()]).await?;
     let mut view = workspace_command("gh", worktree_path).await;
     view.args(["pr", "view"]);
     if !branch.is_empty() && branch != "HEAD" {
         view.arg(&branch);
     }
-    let state = match view.args(["--json", "state"]).output().await {
-        Ok(output) if output.status.success() => serde_json::from_slice::<serde_json::Value>(&output.stdout)
-            .ok()
-            .and_then(|json| json["state"].as_str().map(str::to_string)),
+    let pr = match view.args(["--json", "state,headRefOid"]).output().await {
+        Ok(output) if output.status.success() => serde_json::from_slice::<serde_json::Value>(&output.stdout).ok(),
         _ => None,
     };
-    if state.as_deref() == Some("MERGED") {
-        return Ok(PrSync::Merged);
-    }
-    let dirty = !git(vec!["status".into(), "--porcelain".into(), "--untracked-files=all".into()]).await?.is_empty();
+    let state = pr.as_ref().and_then(|json| json["state"].as_str().map(str::to_string));
+    worktree_pr_sync(worktree_path, since, state.as_deref(), pr.as_ref().and_then(|json| json["headRefOid"].as_str())).await
+}
+
+async fn tracked_pr_sync_checked(
+    worktree_path: &Path,
+    since: std::time::SystemTime,
+    tracked: loka_shared::git_names::TrackedPr<'_>,
+) -> Result<PrSync> {
+    let output = workspace_command("gh", worktree_path)
+        .await
+        .args(["pr", "view", tracked.url(), "--json", "state,headRefOid,url,number"])
+        .output()
+        .await
+        .context("Failed to run gh pr view")?;
+    anyhow::ensure!(output.status.success(), "gh pr view failed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let state = tracked_pr_state(&json, tracked)?;
+    worktree_pr_sync(worktree_path, since, Some(&state), json["headRefOid"].as_str()).await
+}
+
+async fn worktree_pr_sync(
+    worktree_path: &Path,
+    since: std::time::SystemTime,
+    state: Option<&str>,
+    pr_head: Option<&str>,
+) -> Result<PrSync> {
+    let head_in_pr = match pr_head.filter(|head| !head.is_empty() && head.chars().all(|c| c.is_ascii_hexdigit())) {
+        Some(head) => sync_git(worktree_path, vec!["merge-base".into(), "--is-ancestor".into(), "HEAD".into(), head.to_string()]).await.is_ok(),
+        None => false,
+    };
+    let dirty = !sync_git(worktree_path, vec!["status".into(), "--porcelain".into(), "--untracked-files=all".into()]).await?.is_empty();
     let since = chrono::DateTime::<chrono::Utc>::from(since).to_rfc3339();
-    let new_commits = !git(vec!["rev-list".into(), "--max-count=1".into(), format!("--since={since}"), "HEAD".into()]).await?.is_empty();
-    Ok(pr_sync_from(state.as_deref(), dirty, new_commits))
+    let new_commits = !sync_git(worktree_path, vec!["rev-list".into(), "--max-count=1".into(), format!("--since={since}"), "HEAD".into()]).await?.is_empty();
+    Ok(pr_sync_from(state, dirty, new_commits, head_in_pr))
 }
 
 pub fn extends_recorded_pr(recorded: Option<i64>, number: i32) -> bool {
@@ -341,7 +552,7 @@ fn classify_open_prs(
     }
 }
 
-async fn head_commit(worktree_path: &Path) -> Option<String> {
+pub(crate) async fn head_commit(worktree_path: &Path) -> Option<String> {
     let output = workspace_command("git", worktree_path)
         .await
         .args(["rev-parse", "--verify", "HEAD"])
@@ -397,6 +608,42 @@ fn extract_pr_number(url: &str) -> Option<i32> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn recovery_accepts_an_exact_same_repo_branch_after_it_is_gone() {
+        let branch = "fix-quest-c06efa0e";
+        let merged = br#"{"url":"https://github.com/acme/castle/pull/269","number":269,"state":"MERGED","headRefName":"fix-quest-c06efa0e","isCrossRepository":false}"#;
+        let closed = br#"[{"url":"https://github.com/acme/castle/pull/269","number":269,"state":"CLOSED","headRefName":"fix-quest-c06efa0e","isCrossRepository":false}]"#;
+        assert_eq!(
+            verified_recovery_view(merged, "acme/castle", branch),
+            Some(VerifiedPr {
+                info: PrInfo { url: "https://github.com/acme/castle/pull/269".into(), number: 269 },
+                state: "MERGED".into(),
+            })
+        );
+        assert_eq!(unique_verified_recovery(closed, "acme/castle", branch).expect("closed PR").state, "CLOSED");
+    }
+
+    #[test]
+    fn recovery_rejects_a_wrong_repo_branch_pr_or_fork() {
+        let candidate = |url: &str, head: &str, cross: bool| {
+            format!(r#"{{"url":"{url}","number":269,"state":"MERGED","headRefName":"{head}","isCrossRepository":{cross}}}"#)
+        };
+        for viewed in [
+            candidate("https://github.com/Warlord-K/other/pull/269", "fix-quest-c06efa0e", false),
+            candidate("https://github.com/acme/castle/pull/269", "fix-quest-c06efa0f", false),
+            candidate("https://github.com/acme/castle/pull/269", "fix-quest-c06efa0e", true),
+            candidate("https://evil.example/acme/castle/pull/269", "fix-quest-c06efa0e", false),
+            r#"{"url":"https://github.com/acme/castle/pull/269","number":268,"state":"MERGED","headRefName":"fix-quest-c06efa0e","isCrossRepository":false}"#.into(),
+        ] {
+            assert_eq!(verified_recovery_view(viewed.as_bytes(), "acme/castle", "fix-quest-c06efa0e"), None);
+        }
+        let ambiguous = br#"[
+            {"url":"https://github.com/acme/castle/pull/268","number":268,"state":"CLOSED","headRefName":"fix-quest-c06efa0e","isCrossRepository":false},
+            {"url":"https://github.com/acme/castle/pull/269","number":269,"state":"MERGED","headRefName":"fix-quest-c06efa0e","isCrossRepository":false}
+        ]"#;
+        assert_eq!(unique_verified_recovery(ambiguous, "acme/castle", "fix-quest-c06efa0e"), None);
+    }
 
     fn open_pr(number: i32, head_ref: &str, head: &str, contains: bool) -> OpenPr {
         OpenPr {
@@ -617,5 +864,36 @@ mod tests {
         assert!(super::is_final_pr_state("CLOSED"));
         assert!(!super::is_final_pr_state("OPEN"));
         assert!(!super::is_final_pr_state(""));
+    }
+
+    #[test]
+    fn recorded_pr_state_rejects_the_same_number_from_another_repo() {
+        let tracked = loka_shared::git_names::TrackedPr::parse(
+            "https://github.com/acme/repo-a/pull/21",
+        )
+        .unwrap();
+        assert_eq!(
+            tracked_pr_state(
+                &json!({
+                    "url": "https://github.com/acme/repo-a/pull/21",
+                    "number": 21,
+                    "state": "MERGED"
+                }),
+                tracked,
+            )
+            .unwrap(),
+            "MERGED"
+        );
+        assert!(tracked_pr_state(
+                &json!({
+                    "url": "https://github.com/acme/repo-b/pull/21",
+                    "number": 21,
+                    "state": "MERGED"
+                }),
+                tracked,
+            )
+            .is_err());
+        assert!(tracked_pr_state(&json!({ "url": tracked.url(), "number": 21, "state": "UNKNOWN" }), tracked).is_err());
+        assert!(tracked_pr_state(&json!({ "url": tracked.url(), "number": 21 }), tracked).is_err());
     }
 }

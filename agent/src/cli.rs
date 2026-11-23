@@ -102,6 +102,7 @@ pub(crate) const LOKA_APP_PRIVATE: &[&str] = &[
     "Library/Logs/Loka",
 ];
 pub(crate) const MCP_AUTH_DIR: &str = "mcp-auth";
+pub(crate) const ROOM_ANSWER_ENV: &str = "LOKA_ROOM_ANSWER";
 
 pub(crate) fn runner_private_paths() -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = std::env::var_os("WORLD_RUNNER_ROOT")
@@ -274,14 +275,11 @@ pub(crate) fn private_temp_homes() -> Vec<PathBuf> {
     homes
 }
 
-pub(crate) fn private_temp_grants(dir: &Path) -> Vec<PathBuf> {
-    let mut grants = vec![dir.to_path_buf()];
-    if let Ok(real) = std::fs::canonicalize(dir) {
-        if real != dir {
-            grants.push(real);
-        }
-    }
-    grants
+pub(crate) fn both_spellings(path: &Path) -> Vec<PathBuf> {
+    let mut spellings = vec![path.to_path_buf()];
+    let canonical = std::fs::canonicalize(path).ok().or_else(|| Some(std::fs::canonicalize(path.parent()?).ok()?.join(path.file_name()?)));
+    spellings.extend(canonical.filter(|real| real != path));
+    spellings
 }
 
 pub(crate) async fn scope_session_temp<F: std::future::Future>(session: Option<uuid::Uuid>, future: F) -> F::Output {
@@ -320,6 +318,15 @@ pub(crate) fn private_temp_dir(working_dir: &Path) -> Option<PathBuf> {
         None => session_temp_name(SESSION_TEMP.try_with(|id| *id).ok()?),
     };
     Some(private_temp_root().join(name))
+}
+
+pub(crate) fn room_answer_dir(session: uuid::Uuid) -> std::io::Result<PathBuf> {
+    let root = private_temp_root().join(session_temp_name(session));
+    ensure_private_dir(&root)?;
+    mark_private_temp_owner(&root, session, Path::new(""))?;
+    let dir = root.join(loka_shared::world::ROOM_ANSWER_WORKSPACE);
+    ensure_private_dir(&dir)?;
+    Ok(dir)
 }
 
 pub(crate) fn set_temp_env(cmd: &mut tokio::process::Command, dir: &Path) {
@@ -678,6 +685,23 @@ pub(crate) fn launcher_exe() -> Option<String> {
 pub(crate) fn launcher_alias_dir() -> Option<PathBuf> {
     let temp = std::env::temp_dir();
     PathBuf::from(launcher_exe()?).parent().filter(|dir| dir.starts_with(&temp)).map(Path::to_path_buf)
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct GatePaths {
+    pub readable: Vec<PathBuf>,
+    pub sockets: Vec<PathBuf>,
+}
+
+pub(crate) fn gate_paths() -> GatePaths {
+    let root = std::env::var_os("WORLD_RUNNER_ROOT").filter(|root| !root.is_empty()).map(PathBuf::from);
+    gate_paths_for(root.as_deref(), launcher_alias_dir())
+}
+
+pub(crate) fn gate_paths_for(runner_root: Option<&Path>, launcher_alias: Option<PathBuf>) -> GatePaths {
+    let sockets: Vec<PathBuf> = runner_root.and_then(|root| crate::browser::socket_for(root).ok()).map(|socket| both_spellings(&socket)).unwrap_or_default();
+    let readable = launcher_alias.iter().flat_map(|dir| both_spellings(dir)).chain(sockets.iter().cloned()).collect();
+    GatePaths { readable, sockets }
 }
 
 fn shell_safe_exe(exe: &Path, temp: &Path) -> Option<String> {
@@ -1186,7 +1210,12 @@ impl CliOptions<'_> {
     pub fn child_environment(&self) -> BTreeMap<String, String> {
         let mut environment = self.provider_keys.clone();
         environment.extend(self.environment.clone());
+        environment.remove(ROOM_ANSWER_ENV);
         environment
+    }
+
+    pub fn room_answer(&self) -> bool {
+        self.environment.get(ROOM_ANSWER_ENV).map(String::as_str) == Some("1")
     }
 
     pub fn redactor(&self) -> Redactor {
@@ -1688,6 +1717,21 @@ mod environment_tests {
     }
 
     #[test]
+    fn room_answers_get_a_private_neutral_directory() {
+        let session = uuid::Uuid::new_v4();
+        let private_main = std::env::temp_dir().join(format!("private-main-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&private_main).unwrap();
+        std::fs::write(private_main.join("CLAUDE.md"), "private sentinel").unwrap();
+        let room = super::room_answer_dir(session).unwrap();
+        assert!(room.ends_with(loka_shared::world::ROOM_ANSWER_WORKSPACE));
+        assert!(!room.starts_with(&private_main));
+        assert!(!room.ancestors().any(|parent| parent.join("CLAUDE.md").exists() || parent.join("AGENTS.md").exists()));
+        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&room).unwrap().permissions()) & 0o777, 0o700);
+        let _ = std::fs::remove_dir_all(super::private_temp_root().join(super::session_temp_name(session)));
+        let _ = std::fs::remove_dir_all(private_main);
+    }
+
+    #[test]
     fn a_folder_someone_else_made_never_becomes_a_private_temp_dir() {
         let base = std::env::temp_dir().join(format!("private-dir-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&base).unwrap();
@@ -1721,7 +1765,7 @@ mod environment_tests {
             assert_eq!(env[name].as_deref(), Some(dir.to_str().unwrap()), "{name}: every CLI and every shell it starts gets the quest dir");
         }
         assert_eq!(env["CARGO_TARGET_DIR"].as_deref(), Some(dir.join(super::QUEST_TARGET_DIR).to_str().unwrap()));
-        let grants = super::private_temp_grants(&dir);
+        let grants = super::both_spellings(&dir);
         assert!(grants.contains(&dir) && grants.contains(&std::fs::canonicalize(&dir).unwrap()));
 
         let mut claude = json!({ "sandbox": { "filesystem": { "allowWrite": [] }, "network": {} } });
@@ -2053,9 +2097,11 @@ mod environment_tests {
 
     #[test]
     fn child_environment_rejects_reserved_names() {
-        let mut command = tokio::process::Command::new("true");
-        let environment = BTreeMap::from([("WORLD_SECRETS_KEY".to_string(), "value".to_string())]);
-        assert!(configure_child_environment(&mut command, &environment).is_err());
+        for name in ["WORLD_SECRETS_KEY", super::ROOM_ANSWER_ENV] {
+            let mut command = tokio::process::Command::new("true");
+            let environment = BTreeMap::from([(name.to_string(), "value".to_string())]);
+            assert!(configure_child_environment(&mut command, &environment).is_err(), "{name}");
+        }
     }
 }
 
@@ -2092,6 +2138,29 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&moved).unwrap();
         drop(listener);
         let _ = std::fs::remove_file(&moved);
+    }
+
+    #[test]
+    fn gates_list_the_browser_socket_and_launcher_alias_in_both_spellings() {
+        let gates = super::gate_fixture::listening();
+        assert!(!gates.socket.starts_with(&gates.base), "a runner root with a space moves the socket into the temp folder: {}", gates.socket.display());
+        for path in [&gates.socket, &gates.alias] {
+            for spelling in [path.clone(), std::fs::canonicalize(path).unwrap()] {
+                assert!(gates.paths.readable.contains(&spelling), "{} missing in {:?}", spelling.display(), gates.paths.readable);
+            }
+        }
+        assert_eq!(gates.paths.sockets, super::both_spellings(&gates.socket));
+        assert!(!gates.paths.sockets.contains(&gates.alias));
+        assert_eq!(super::gate_paths_for(None, None), super::GatePaths::default());
+    }
+
+    #[test]
+    fn both_spellings_name_a_file_that_is_not_there_yet() {
+        let dir = std::env::temp_dir();
+        let missing = dir.join(format!("loka-missing-{}.sock", uuid::Uuid::new_v4().simple()));
+        let spellings = super::both_spellings(&missing);
+        assert_eq!(spellings[0], missing);
+        assert_eq!(spellings.last().unwrap(), &std::fs::canonicalize(&dir).unwrap().join(missing.file_name().unwrap()));
     }
 
     #[test]
@@ -2151,6 +2220,35 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn every_cli_that_cannot_find_its_session_is_told_apart_from_other_failures() {
+        for (backend, says, wrap, id) in [
+            ("claude", "No conversation found with session ID: 9f1c2e4a-0000-4000-8000-000000000001", "Claude Code exited with code 1: {}", "9f1c2e4a-0000-4000-8000-000000000001"),
+            ("codex", "Error: thread/resume: thread/resume failed: no rollout found for thread id 019a0000-1111-7222-8333-444455556666 (code -32600)", "Codex CLI exited with code 1: {}", "019a0000-1111-7222-8333-444455556666"),
+            ("omp", "Error: Session \"01a21d98-c1f1-7311-ba20-3dde5fef60fa\" not found.\nRun `omp --resume` without an argument to pick from recent sessions, or `omp` to start a new one.", "{}: omp exited before it was ready", "01a21d98-c1f1-7311-ba20-3dde5fef60fa"),
+            ("cursor", "Error: Session \"5d1e0c3a-aaaa-4bbb-8ccc-dddddddddddd\" not found", "Cursor Agent exited with code 1: {}", "5d1e0c3a-aaaa-4bbb-8ccc-dddddddddddd"),
+            ("opencode", "Error: Session not found: ses_7Xy9AbCdEf", "opencode CLI exited with code 1: {}", "ses_7Xy9AbCdEf"),
+        ] {
+            let mut child = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg("printf '%s\\n' \"$SAYS\" >&2; exit 1")
+                .env("SAYS", says)
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let tail = super::stderr_tail(child.stderr.take(), super::Redactor::default());
+            assert!(!child.wait().await.unwrap().success());
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let printed = tail.lock().unwrap().trim().to_string();
+            assert_eq!(printed, says, "{backend}");
+            let error = wrap.replace("{}", &printed);
+            assert!(loka_shared::cli_errors::is_session_missing(&error), "{backend}: {error}");
+            assert_eq!(loka_shared::cli_errors::lost_session_id(&error).as_deref(), Some(id), "{backend}");
+            let other = wrap.replace("{}", "Error: 401 invalid api key");
+            assert!(!loka_shared::cli_errors::is_session_missing(&other), "{backend}");
+        }
+    }
 
     #[tokio::test]
     async fn a_secret_at_the_start_of_the_stderr_window_is_not_left_in_pieces() {
@@ -2278,6 +2376,70 @@ pub const COMPACT_PROMPT: &str = "/compact";
 
 pub fn compaction_run(backend: &str, opts: &CliOptions<'_>) -> bool {
     backend != "claude" && opts.prompt == COMPACT_PROMPT && opts.resume && opts.session_id.is_some()
+}
+
+pub fn compacts_first(compact_first: bool, opts: &CliOptions<'_>) -> bool {
+    resumes_to_compact(compact_first, opts.resume, opts.fork, opts.session_id.is_some(), opts.rewind_to.is_some())
+}
+
+pub fn resumes_to_compact(compact_first: bool, resume: bool, fork: bool, has_session: bool, rewinding: bool) -> bool {
+    compact_first && resume && !fork && has_session && !rewinding
+}
+
+pub async fn run_compacting(backend: &str, opts: CliOptions<'_>, compact_first: bool) -> Result<CliResult> {
+    if compacts_first(compact_first, &opts) {
+        let compaction = CliOptions {
+            working_dir: opts.working_dir,
+            prompt: COMPACT_PROMPT,
+            system_prompt: opts.system_prompt,
+            allowed_tools: opts.allowed_tools,
+            max_turns: 1,
+            model: opts.model,
+            mcp_config_json: opts.mcp_config_json.clone(),
+            session_id: opts.session_id,
+            resume: true,
+            event_tx: None,
+            image_paths: Vec::new(),
+            fork: false,
+            lean: opts.lean,
+            effort: opts.effort,
+            fast: opts.fast,
+            environment: opts.environment.clone(),
+            mcp_has_secrets: opts.mcp_has_secrets,
+            sensitive: opts.sensitive,
+            rewind_to: None,
+            approval: opts.approval,
+            steer: SteerSlot::default(),
+            omp_models: opts.omp_models.clone(),
+            provider_keys: opts.provider_keys.clone(),
+            readable_files: opts.readable_files.clone(),
+        };
+        let compacted = match run(backend, compaction).await {
+            Ok(compacted) => {
+                info!(backend, "Compacted the session before sending the next request");
+                Some(compacted)
+            }
+            Err(error) => {
+                warn!(backend, error = %loka_shared::cli_errors::chain(&error), "Compacting before the next request failed, sending it anyway");
+                None
+            }
+        };
+        return run(backend, opts).await.map(|result| match compacted {
+            Some(compacted) => with_compaction(backend, result, &compacted),
+            None => result,
+        });
+    }
+    run(backend, opts).await
+}
+
+pub fn with_compaction(backend: &str, mut result: CliResult, compaction: &CliResult) -> CliResult {
+    if loka_shared::backends::cost_per_run(backend) {
+        result.cost_usd += compaction.cost_usd;
+        result.usage.input_tokens += compaction.usage.input_tokens;
+        result.usage.cached_input_tokens += compaction.usage.cached_input_tokens;
+        result.usage.output_tokens += compaction.usage.output_tokens;
+    }
+    result
 }
 
 pub fn check_model(model: &str) -> Result<()> {
@@ -2613,6 +2775,42 @@ async fn relay(backend: &str, opts: CliOptions<'_>, mut steer: SteerReceiver) ->
         usage,
         checkpoint,
     })
+}
+
+#[cfg(test)]
+pub(crate) mod gate_fixture {
+    use std::path::PathBuf;
+
+    pub(crate) struct Gates {
+        pub base: PathBuf,
+        pub socket: PathBuf,
+        pub alias: PathBuf,
+        pub paths: super::GatePaths,
+        pub listener: std::os::unix::net::UnixListener,
+    }
+
+    impl Drop for Gates {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.socket);
+            if let Some(dir) = self.socket.parent() {
+                let _ = std::fs::remove_dir(dir);
+            }
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    pub(crate) fn listening() -> Gates {
+        let base = std::env::temp_dir().join(format!("loka-gates-{}", uuid::Uuid::new_v4().simple()));
+        let root = base.join("Application Support").join("runner");
+        let alias = base.join("alias");
+        std::fs::create_dir_all(root.join("leases")).unwrap();
+        std::fs::create_dir_all(&alias).unwrap();
+        let socket = crate::browser::socket_for(&root).unwrap();
+        let _ = std::fs::remove_file(&socket);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let paths = super::gate_paths_for(Some(&root), Some(alias.clone()));
+        Gates { base, socket, alias, paths, listener }
+    }
 }
 
 #[cfg(test)]

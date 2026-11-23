@@ -103,6 +103,7 @@ pub(crate) async fn to_acp(id: &str) -> Result<()> {
         .ok()
         .and_then(|entries| entries.flatten().map(|e| e.path().join(id)).find(|dir| dir.join("store.db").is_file()));
     let Some(chat) = chat else {
+        anyhow::ensure!(acp.join("store.db").is_file(), "Cursor chat {id} was not found on this device");
         return Ok(());
     };
     if acp.join("store.db").is_file() && modified(&acp) >= modified(&chat) {

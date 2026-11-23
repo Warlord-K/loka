@@ -131,7 +131,7 @@ pub fn core(role: Role) -> &'static [&'static str] {
         Role::Main => &[
             "world_agents", "list_tasks", "create_task", "start_task", "message_agent", "my_sessions", "message_session", "find_messages", "list_reports", "get_report", "write_report", "features",
         ],
-        Role::Quest => &["my_quest", "message_agent", "get_report", "write_report", "show_media", "features"],
+        Role::Quest => &["my_quest", "ask_agent", "message_agent", "get_report", "write_report", "show_media", "features"],
         Role::Quick => &["world_agents", "list_tasks", "create_task", "message_agent", "find_messages", "list_reports", "get_report", "write_report", "features"],
         Role::Aside => &["world_agents", "list_tasks", "agent_activity", "find_messages", "list_reports", "get_report", "features"],
         Role::Server => &[],

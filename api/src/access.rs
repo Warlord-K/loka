@@ -61,7 +61,8 @@ pub fn min_role(method: &Method, path: &str) -> Role {
         ["world", "agents", _, "feeds", ..] => Role::Write,
         ["world", "agents", _, "omp-config", ..] => Role::Write,
         ["world", "sessions", ..] | ["world", "runs", ..] => Role::Write,
-        ["world", "tasks", _, "room"] => Role::Write,
+        ["world", "tasks", _, "room"] if get => Role::View,
+        ["world", "tasks", _, "room", "messages"] if *method == Method::POST => Role::View,
         ["world", "channels"] | ["world", "channels", _] if get => Role::Read,
         ["world", "channels", _, "messages"] if get => Role::Read,
         ["world", "channels", _, "read"] => Role::Read,
@@ -103,7 +104,7 @@ pub fn posts_a_message(method: &Method, path: &str) -> bool {
     }
     let path = path.strip_prefix("/api").unwrap_or(path).trim_end_matches('/');
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    matches!(segs.as_slice(), ["world", "agents" | "channels" | "sessions" | "quick", _, "messages"] | ["world", "agents", _, "quick"])
+    matches!(segs.as_slice(), ["world", "agents" | "channels" | "sessions" | "quick", _, "messages"] | ["world", "agents", _, "quick"] | ["world", "tasks", _, "room", "messages"])
 }
 
 pub fn refusal_reason(status: StatusCode) -> &'static str {
@@ -162,11 +163,33 @@ pub async fn role_middleware(State(state): State<AppState>, mut req: Request, ne
     Ok(response)
 }
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 enum Need {
     See,
     Use,
     Manage,
+}
+
+fn world_agent_need(tail: &[&str], get: bool) -> Need {
+    let read_or_manage = if get { Need::Use } else { Need::Manage };
+    match tail {
+        [] => if get { Need::See } else { Need::Manage },
+        ["mcp-servers", ..] | ["skills", ..] | ["subscriptions"] | ["watches", ..] => read_or_manage,
+        ["feeds", ..] | ["handoff"] | ["transfer"] | ["tidy"] | ["reset-context"] | ["omp-config", ..] => Need::Manage,
+        ["schedules", ..] | ["voice", ..] => Need::Manage,
+        ["messages", _, "rewind"] | ["asides"] | ["quick"] => Need::Manage,
+        ["messages", ..] | ["fork"] => Need::Use,
+        ["sessions" | "runs" | "usage" | "kit", ..] => Need::Manage,
+        _ => read_or_manage,
+    }
+}
+
+fn agent_allows(need: &Need, viewer: &Viewer, agent: &loka_shared::world::WorldAgent) -> bool {
+    match need {
+        Need::See => true,
+        Need::Use => loka_shared::access::can_use(viewer, agent),
+        Need::Manage => loka_shared::access::can_manage(viewer, agent),
+    }
 }
 
 pub async fn agent_guard(State(state): State<AppState>, req: Request, next: Next) -> Result<Response, StatusCode> {
@@ -181,18 +204,9 @@ pub async fn agent_guard(State(state): State<AppState>, req: Request, next: Next
         StatusCode::INTERNAL_SERVER_ERROR
     };
     let target = match segs.as_slice() {
-        ["world", "agents", id] => Some((id.parse::<uuid::Uuid>().ok(), if get { Need::See } else { Need::Manage })),
-        ["world", "agents", id, "mcp-servers", ..] | ["world", "agents", id, "skills", ..] | ["world", "agents", id, "subscriptions"] | ["world", "agents", id, "watches", ..] => {
-            Some((id.parse().ok(), if get { Need::Use } else { Need::Manage }))
-        }
-        ["world", "agents", id, "feeds", ..] => Some((id.parse().ok(), Need::Manage)),
-        ["world", "agents", id, "handoff"] | ["world", "agents", id, "tidy"] | ["world", "agents", id, "reset-context"] => Some((id.parse().ok(), Need::Manage)),
-        ["world", "agents", id, "omp-config", ..] => Some((id.parse().ok(), Need::Manage)),
-        ["world", "agents", id, "schedules", ..] | ["world", "agents", id, "voice", ..] => Some((id.parse().ok(), Need::Manage)),
-        ["world", "agents", id, "messages", _, "rewind"] | ["world", "agents", id, "asides"] | ["world", "agents", id, "quick"] => Some((id.parse().ok(), Need::Manage)),
-        ["world", "agents", id, "messages", ..] | ["world", "agents", id, "fork"] => Some((id.parse().ok(), Need::Use)),
-        ["world", "agents", id, "sessions" | "runs" | "usage" | "kit", ..] => Some((id.parse().ok(), Need::Manage)),
-        ["world", "agents", id, ..] => Some((id.parse().ok(), if get { Need::Use } else { Need::Manage })),
+        ["agents", id] => Some((id.parse::<uuid::Uuid>().ok(), if get { Need::See } else { Need::Manage })),
+        ["agents", id, ..] => Some((id.parse::<uuid::Uuid>().ok(), Need::Manage)),
+        ["world", "agents", id, tail @ ..] => Some((id.parse::<uuid::Uuid>().ok(), world_agent_need(tail, get))),
         ["world", "sessions", id, ..] => {
             let agent = match id.parse::<uuid::Uuid>() {
                 Ok(sid) => state.world.get_session(sid).await.map_err(fail)?.map(|s| s.agent_id),
@@ -215,16 +229,39 @@ pub async fn agent_guard(State(state): State<AppState>, req: Request, next: Next
         if !loka_shared::access::can_see(&viewer, &agent) {
             return Err(StatusCode::NOT_FOUND);
         }
-        let ok = match need {
-            Need::See => true,
-            Need::Use => loka_shared::access::can_use(&viewer, &agent),
-            Need::Manage => loka_shared::access::can_manage(&viewer, &agent),
-        };
-        if !ok {
+        if !agent_allows(&need, &viewer, &agent) {
             return Err(StatusCode::FORBIDDEN);
         }
     }
     Ok(next.run(req).await)
+}
+
+#[cfg(test)]
+mod agent_need_tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn the_crew_preview_needs_the_same_access_as_composing_a_quest() {
+        assert_eq!(world_agent_need(&["crew-preview"], true), Need::Use);
+        assert_eq!(world_agent_need(&["messages"], false), Need::Use, "composing a quest is posting to the agent");
+        assert_eq!(world_agent_need(&[], true), Need::See);
+        assert_eq!(world_agent_need(&["skills"], true), Need::Use);
+        assert_eq!(world_agent_need(&["skills"], false), Need::Manage);
+        assert_eq!(world_agent_need(&["messages", "m", "rewind"], false), Need::Manage);
+        let owner = Uuid::new_v4();
+        let org = Uuid::new_v4();
+        let agent: loka_shared::world::WorldAgent = serde_json::from_value(serde_json::json!({
+            "id": Uuid::new_v4(), "slug": "pip", "name": "Pip", "avatar_emoji": "a", "cli": "claude", "model": "opus",
+            "role": "worker", "look": null, "gear": null, "status": "idle", "visibility": "private", "tags": [],
+            "created_at": chrono::Utc::now(), "revoked_powers": [], "is_main": false, "jobs": [], "owner_user_id": owner, "org_id": org
+        }))
+        .unwrap();
+        let viewer = |user: Uuid, role: Role| Viewer { user, org: Some(org), role, org_role: None, instance_admin: false };
+        assert!(agent_allows(&Need::Use, &viewer(owner, Role::Write), &agent));
+        assert!(!agent_allows(&Need::Use, &viewer(Uuid::new_v4(), Role::Write), &agent), "someone who cannot use the agent is refused");
+        assert!(!agent_allows(&Need::Use, &viewer(owner, Role::Read), &agent), "read-only people cannot compose quests");
+    }
 }
 
 #[cfg(test)]
@@ -254,7 +291,10 @@ mod tests {
         assert_eq!(min_role(&Method::GET, "/world/agents/abc/omp-config"), Role::Write);
         assert_eq!(min_role(&Method::POST, "/world/agents/abc/omp-config/equip"), Role::Write);
         assert_eq!(min_role(&Method::POST, "/tasks"), Role::Write);
-        assert_eq!(min_role(&Method::GET, "/api/world/tasks/abc/room"), Role::Write);
+        assert_eq!(min_role(&Method::GET, "/api/world/tasks/abc/room"), Role::View);
+        assert_eq!(min_role(&Method::POST, "/api/world/tasks/abc/room/messages"), Role::View);
+        assert_eq!(min_role(&Method::POST, "/api/world/tasks/abc/room/members"), Role::Write);
+        assert_eq!(min_role(&Method::POST, "/api/world/tasks/abc/resume"), Role::Write);
         assert_eq!(min_role(&Method::GET, "/world/sessions"), Role::Write);
         assert_eq!(min_role(&Method::GET, "/world/agents/abc/feeds"), Role::Write);
         assert_eq!(min_role(&Method::DELETE, "/world/agents/abc/feeds/def"), Role::Write);
@@ -280,5 +320,14 @@ mod tests {
         assert!(!posts_a_message(&Method::POST, "/api/world/agents/abc/messages/def/rewind"));
         assert_eq!(refusal_reason(StatusCode::INSUFFICIENT_STORAGE), "disk full");
         assert_eq!(refusal_reason(StatusCode::UNPROCESSABLE_ENTITY), "unreadable request body");
+    }
+
+    #[test]
+    fn room_message_posts_use_message_rate_limit() {
+        assert!(posts_a_message(&Method::POST, "/world/tasks/abc/room/messages"));
+        assert!(posts_a_message(&Method::POST, "/api/world/tasks/abc/room/messages"));
+        assert!(!posts_a_message(&Method::GET, "/api/world/tasks/abc/room/messages"));
+        assert!(!posts_a_message(&Method::POST, "/api/world/tasks/abc/room/members"));
+        assert!(!posts_a_message(&Method::POST, "/api/world/tasks/abc/room/messages/def"));
     }
 }

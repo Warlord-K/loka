@@ -123,7 +123,7 @@ const DESCRIBED: [LabelledAction, string][] = [
   ["new_tab", "New terminal tab"],
   ["split_right", "Split the terminal right"],
   ["split_down", "Split the terminal down"],
-  ["close", "Close the focused terminal"],
+  ["close", "Close the focused terminal (the last tab asks first)"],
   ["focus_prev", "Previous terminal"],
   ["focus_next", "Next terminal"],
   ["focus_side", "Terminal on that side"],

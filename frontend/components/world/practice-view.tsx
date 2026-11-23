@@ -594,7 +594,7 @@ export function PracticeView({
             {panelAttempt.note && <p className="mt-3 border-t-2 border-dashed border-w-line pt-2 text-w-xs text-w-text2">{readOnly ? "Note" : "Your note"}: {panelAttempt.note}</p>}
           </>
         ) : locked ? (
-          <p className="text-w-sm text-w-text2">Only the person practising can see the attempts on this canvas.</p>
+          <p className="text-w-sm text-w-text2">Only the person practising can see the attempts in this practice workspace.</p>
         ) : readOnly ? (
           <p className="text-w-sm text-w-text2">No attempts yet.</p>
         ) : (

@@ -282,7 +282,7 @@ fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             name: "stop_run",
             write: true,
-            description: "Stop a running quest run of an agent you own. mode run (default) stops the whole run; step only interrupts the current step and lets the agent carry on.",
+            description: "Stop a running quest run of an agent you own, or withdraw a queued one so it never starts. mode run (default) stops or withdraws the whole run; step only interrupts the current step of a running run and lets the agent carry on.",
             schema: object(
                 json!({ "run": s("Run id from get_quest or agent_status"), "mode": { "type": "string", "enum": ["run", "step"] } }),
                 &["run"],
@@ -634,6 +634,8 @@ impl Ctx<'_> {
     }
 
     async fn room(&self, task: &loka_shared::models::AgentTask, after: Option<i64>) -> Result<loka_shared::rooms::QuestRoom, String> {
+        let canonical = self.state.world.room_of(task.id).await.map_err(fail)?;
+        let task = if canonical == task.id { task.clone() } else { self.quest(canonical).await? };
         let usable: Vec<Uuid> = self
             .state
             .world
@@ -645,14 +647,31 @@ impl Ctx<'_> {
             .map(|a| a.id)
             .collect();
         let since = task.created_at.unwrap_or_else(Utc::now) - chrono::Duration::minutes(5);
-        let mut room = self.state.world.quest_room(task.id, since, &usable, self.p.user, after, None).await.map_err(fail)?;
+        let mut room = self.state.world.quest_room(task.id, since, &usable, self.p.user, after, None, None).await.map_err(fail)?;
+        room.members = self.state.world.room_members_for(task.id, &usable).await.map_err(fail)?;
+        let parts = self.state.world.quest_parts(task.id).await.map_err(fail)?;
+        let visible_parts: Vec<Uuid> = parts
+            .iter()
+            .filter(|part| part.assigned_agent_id.is_some_and(|agent| usable.contains(&agent)))
+            .map(|part| part.id)
+            .collect();
+        let open_messages = self
+            .state
+            .world
+            .open_room_messages_for(&room.messages, &self.p.viewer, Some(&visible_parts))
+            .await
+            .map_err(fail)?;
+        room.messages.retain(|message| open_messages.contains(&message.id));
         let owned = self.state.world.owned_agent_ids(self.p.user).await.map_err(fail)?;
         let user = self.p.user;
         room.events.retain(|e| {
+            let scoped = loka_shared::rooms::scoped_event(e);
+            let part = loka_shared::rooms::event_part(e, task.id);
             !loka_shared::slack::hidden_from(e, user)
                 && !loka_shared::loka::hidden_from(e, user)
                 && !loka_shared::shell::hidden_from(e, &owned)
-                && !loka_shared::event_scope::private_from(e, user, &owned)
+                && part.is_none_or(|part| visible_parts.contains(&part))
+                && (scoped || !loka_shared::event_scope::private_from(e, user, self.p.viewer.role, &owned))
         });
         Ok(room)
     }
@@ -898,7 +917,7 @@ impl Ctx<'_> {
         let (_, Json(outcome)) = crate::routes::world::stop_run(State(self.state.clone()), Extension(UserId(self.p.user)), Path(id), Json(body))
             .await
             .map_err(|status| match status {
-                StatusCode::CONFLICT => "That run is not running (chat turns cannot be stopped).".to_string(),
+                StatusCode::CONFLICT => "That run is neither running nor queued (chat turns cannot be stopped, and only running runs stop by step).".to_string(),
                 other => status_fail(other),
             })?;
         info!(run = %id, user = %self.p.user, "run stopped over mcp");

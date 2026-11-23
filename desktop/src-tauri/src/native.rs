@@ -1771,15 +1771,15 @@ mod tests {
     #[test]
     fn repository_parser_accepts_only_github_owner_and_name() {
         assert_eq!(
-            github_repo("git@github.com:Warlord-K/world.git").as_deref(),
-            Some("Warlord-K/world")
+            github_repo("git@github.com:acme/castle.git").as_deref(),
+            Some("acme/castle")
         );
         assert_eq!(
-            github_repo("https://github.com/Warlord-K/world.git").as_deref(),
-            Some("Warlord-K/world")
+            github_repo("https://github.com/acme/castle.git").as_deref(),
+            Some("acme/castle")
         );
-        assert!(github_repo("https://example.com/Warlord-K/world.git").is_none());
-        assert!(github_repo("https://github.com/Warlord-K/world/extra.git").is_none());
+        assert!(github_repo("https://example.com/acme/castle.git").is_none());
+        assert!(github_repo("https://github.com/acme/castle/extra.git").is_none());
     }
 
     #[test]
@@ -1807,7 +1807,7 @@ mod tests {
     #[test]
     fn desktop_path_preserves_existing_order_and_adds_cli_locations() {
         let existing = std::ffi::OsStr::new("/custom/bin:/usr/bin:/bin:/usr/sbin:/sbin");
-        let path = desktop_path(Some(existing), Some(Path::new("/Users/yatharth")));
+        let path = desktop_path(Some(existing), Some(Path::new("/Users/ana")));
         let paths = std::env::split_paths(&path).collect::<Vec<_>>();
         assert_eq!(
             paths,
@@ -1819,8 +1819,8 @@ mod tests {
                 PathBuf::from("/sbin"),
                 PathBuf::from("/opt/homebrew/bin"),
                 PathBuf::from("/usr/local/bin"),
-                PathBuf::from("/Users/yatharth/.local/bin"),
-                PathBuf::from("/Users/yatharth/.cargo/bin"),
+                PathBuf::from("/Users/ana/.local/bin"),
+                PathBuf::from("/Users/ana/.cargo/bin"),
             ]
         );
     }

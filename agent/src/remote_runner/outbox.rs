@@ -538,10 +538,14 @@ mod tests {
             pr_url: None,
             pr_number: None,
             publish_pr_state: None,
+            checked_pr_url: None,
+            publish_pr_checked_at: None,
             checkpoint: None,
             steered: Vec::new(),
             retryable: false,
             work_summary: None,
+            context_sent: None,
+            published_head: None,
         }
     }
 

@@ -1,13 +1,16 @@
 use super::tests::test_ctx;
 use super::{fail_with, session_id_after_run, settle_completed, spawn_activity, Ctx};
+use crate::world::prompts::Action;
 use crate::claude::TurnReader;
 use crate::cli::{CliResult, Redactor, StreamEvent};
 use crate::remote_runner::{errored_completion, map_event, success_completion, ExecutionOutcome};
 use loka_agent::runner_server::RunnerCoordinator;
 use loka_shared::cli_errors::{classify, FailureKind};
+use loka_shared::context_budget::Prepared;
+use loka_shared::context::{SentContext, INSTRUCTIONS_BLOCK, SKILLS_BLOCK};
 use loka_shared::run_recording::EVENT_MAX_CHARS;
 use loka_shared::runners::{BeginCompletion, CreateRunner, RunnerCompletion, RunnerStore};
-use loka_shared::world::{AgentSession, WorldAgent};
+use loka_shared::world::{clone_run, AgentSession, InboxItem, NewEvent, RunClone, WorldAgent};
 use serde_json::{json, Value};
 use std::time::Instant;
 use uuid::Uuid;
@@ -186,6 +189,7 @@ struct Run {
     workspace: String,
     runner: Uuid,
     lease: Option<Uuid>,
+    claimed: Option<loka_shared::runners::ClaimedRun>,
 }
 
 impl Rig {
@@ -194,6 +198,10 @@ impl Rig {
     }
 
     async fn run_of(&self, kind: &str, backend: &str, model: &str, remote: bool) -> anyhow::Result<Run> {
+        self.run_with(kind, backend, model, remote, 0).await
+    }
+
+    async fn run_with(&self, kind: &str, backend: &str, model: &str, remote: bool, context_tokens: i64) -> anyhow::Result<Run> {
         let pool = self.ctx.db.pool();
         let tag = Uuid::new_v4().simple().to_string();
         let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email, world_role) VALUES ($1, 'write') RETURNING id")
@@ -226,6 +234,13 @@ impl Rig {
         if kind == "followup" {
             sqlx::query("UPDATE agent_sessions SET cli_session_id = 'cs-0' WHERE id = $1").bind(session).execute(pool).await?;
         }
+        if context_tokens > 0 {
+            sqlx::query("UPDATE agent_sessions SET cli_session_id = 'cs-0', context_tokens = $2, context_sent = jsonb_build_object('skills', md5('skills')) WHERE id = $1")
+                .bind(session)
+                .bind(context_tokens)
+                .execute(pool)
+                .await?;
+        }
         let run: Uuid = sqlx::query_scalar(
             "INSERT INTO session_runs (session_id, agent_id, kind, status, prompt, started_at)
              VALUES ($1, $2, $4, $3, 'go', CASE WHEN $3 = 'running' THEN NOW() END) RETURNING id",
@@ -236,19 +251,20 @@ impl Rig {
         .bind(kind)
         .fetch_one(pool)
         .await?;
-        let lease = if remote {
+        let claimed = if remote {
             let claim = self
                 .runners
                 .claim_kinds(runner, &format!("mcp-{}", Uuid::new_v4()), &[kind.to_string()])
                 .await?
                 .expect("the run is claimed");
             assert_eq!(claim.run_id, run);
-            Some(claim.lease_id)
+            Some(claim)
         } else {
             None
         };
+        let lease = claimed.as_ref().map(|claim| claim.lease_id);
         let agent = self.ctx.store.get_agent(agent_id).await?.expect("agent");
-        Ok(Run { agent, session, run, workspace, runner, lease })
+        Ok(Run { agent, session, run, workspace, runner, lease, claimed })
     }
 
     async fn session(&self, run: &Run) -> anyhow::Result<AgentSession> {
@@ -256,6 +272,17 @@ impl Rig {
     }
 
     async fn locally(&self, run: &Run, events: Vec<StreamEvent>, result: CliResult, redactor: &Redactor) -> anyhow::Result<()> {
+        self.locally_sending(run, events, result, None, redactor).await
+    }
+
+    async fn locally_sending(
+        &self,
+        run: &Run,
+        events: Vec<StreamEvent>,
+        result: CliResult,
+        sent: Option<SentContext>,
+        redactor: &Redactor,
+    ) -> anyhow::Result<()> {
         let record = self.ctx.store.get_run(run.run).await?.expect("run");
         let (tx, activity) = spawn_activity(self.ctx.store.clone(), record.clone(), redactor.clone());
         for event in events {
@@ -265,7 +292,7 @@ impl Rig {
         activity.await?;
         let session = self.session(run).await?;
         let saved_session_id = session_id_after_run(&session.backend, false, result.session_id.as_deref(), None).map(str::to_string);
-        settle_completed(&self.ctx, &run.agent, session, &record, result, saved_session_id, redactor).await
+        settle_completed(&self.ctx, &run.agent, session, &record, result, super::Kept { cli_session_id: saved_session_id, sent }, redactor).await
     }
 
     async fn show(&self, run: &Run, events: Vec<StreamEvent>, secrets: &Redactor) -> anyhow::Result<()> {
@@ -280,7 +307,7 @@ impl Rig {
 
     async fn remotely(&self, run: &Run, events: Vec<StreamEvent>, result: CliResult, secrets: &Redactor) -> anyhow::Result<()> {
         self.show(run, events, secrets).await?;
-        let outcome = ExecutionOutcome { result, pr_url: None, pr_number: None, publish_pr_state: None, work_summary: None };
+        let outcome = ExecutionOutcome { result, pr_url: None, pr_number: None, publish_pr_state: None, checked_pr_url: None, publish_pr_checked_at: None, work_summary: None, context_sent: None, published_head: None };
         let session_id = outcome.result.session_id.clone();
         self.deliver(run, success_completion(outcome, session_id, run.workspace.clone(), Vec::new())).await
     }
@@ -451,6 +478,464 @@ async fn one_scripted_run_lands_the_same_on_both_workers() -> anyhow::Result<()>
 }
 
 #[tokio::test]
+async fn accepted_chat_clarification_reaches_a_local_quest() -> anyhow::Result<()> {
+    let Some(rig) = rig().await? else {
+        return Ok(());
+    };
+    let turn = rig.run("claude", "sonnet", false).await?;
+    let owner = turn.agent.owner_user_id.expect("owner");
+    let task_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO agent_tasks (user_id, title, status, assigned_agent_id) VALUES ($1, 'Build the canonical store', 'todo', $2) RETURNING id",
+    )
+    .bind(owner)
+    .bind(turn.agent.id)
+    .fetch_one(rig.ctx.db.pool())
+    .await?;
+    let bytes = b"canonical\0answer\xff";
+    let upload = rig.ctx.store.insert_upload("application/octet-stream", "answer.bin", bytes, Some(owner)).await?;
+    let request_tail = "REQUEST_AFTER_5500";
+    let answer_tail = "ANSWER_AFTER_5500";
+    let request = format!("{}{request_tail}", "request ".repeat(800));
+    let answer = format!("{}{answer_tail}", "answer ".repeat(800));
+    let payload = json!({
+        "author": "Ana",
+        "author_kind": "user",
+        "message_id": Uuid::new_v4(),
+        "body": answer,
+        "clarification_continuation": Uuid::new_v4(),
+        "clarification_handoff": {
+            "request": request,
+            "question": "Which database?",
+            "answer": answer
+        },
+        "attachments": [{ "id": upload.id, "name": "answer.bin", "mime": "application/octet-stream" }]
+    });
+    let seq = rig
+        .ctx
+        .store
+        .emit(
+            NewEvent::new("message.created")
+                .agent(turn.agent.id)
+                .actor(Some(owner))
+                .payload(payload),
+            Some((turn.agent.id, "message")),
+        )
+        .await?;
+    let item = sqlx::query_as::<_, InboxItem>(
+        "UPDATE agent_inbox SET status = 'processing' WHERE agent_id = $1 AND event_seq = $2
+         RETURNING id, agent_id, kind, event_seq, payload, status, attempts, created_at",
+    )
+    .bind(turn.agent.id)
+    .bind(seq)
+    .fetch_one(rig.ctx.db.pool())
+    .await?;
+    assert_eq!(item.payload.get("from_owner").and_then(Value::as_bool), Some(true));
+    let main = rig.session(&turn).await?;
+    let task = rig.ctx.db.get_task(task_id).await?.expect("task");
+    let invalid: Action = serde_json::from_value(json!({
+        "type": "start_task",
+        "task_id": task_id,
+        "brief": "must not run",
+        "clarification_source": "msg:missing"
+    }))?;
+    super::super::turn::apply_actions_for_contract(
+        &rig.ctx,
+        &turn.agent,
+        &main,
+        turn.run,
+        &item,
+        &task,
+        invalid,
+    )
+    .await?;
+    let started: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_runs WHERE task_id = $1")
+        .bind(task_id)
+        .fetch_one(rig.ctx.db.pool())
+        .await?;
+    assert_eq!(started, 0);
+    let action: Action = serde_json::from_value(json!({
+        "type": "start_task",
+        "task_id": task_id,
+        "brief": "model supplied the wrong brief"
+    }))?;
+    super::super::turn::apply_actions_for_contract(
+        &rig.ctx,
+        &turn.agent,
+        &main,
+        turn.run,
+        &item,
+        &task,
+        action,
+    )
+    .await?;
+    let (resulting_run, prompt): (Uuid, String) = sqlx::query_as(
+        "SELECT id, prompt FROM session_runs WHERE task_id = $1 AND kind IN ('task', 'followup') ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(task_id)
+    .fetch_one(rig.ctx.db.pool())
+    .await?;
+    assert!(prompt.contains(request_tail));
+    assert!(prompt.contains(answer_tail));
+    assert_eq!(prompt.matches(request_tail).count(), 1);
+    assert_eq!(prompt.matches(answer_tail).count(), 1);
+    assert!(!prompt.contains("model supplied the wrong brief"));
+    let leaked: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+           SELECT 1 FROM agent_messages
+           WHERE agent_id = $1 AND author_kind = 'system'
+             AND (body LIKE $2 OR body LIKE '%answer.bin%')
+         )",
+    )
+    .bind(turn.agent.id)
+    .bind(format!("%{answer_tail}%"))
+    .fetch_one(rig.ctx.db.pool())
+    .await?;
+    assert!(!leaked);
+    let payloads = rig.ctx.store.run_answer_payloads(resulting_run).await?;
+    assert_eq!(payloads.len(), 1);
+    assert_eq!(payloads[0]["attachments"][0]["id"], json!(upload.id));
+    let (_, stored) = rig.ctx.store.get_upload(upload.id, None).await?.expect("upload");
+    assert_eq!(stored, bytes);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_local_clarification_retries_when_plan_handoff_has_not_started() -> anyhow::Result<()> {
+    let Some(rig) = rig().await? else {
+        return Ok(());
+    };
+    let turn = rig.run("claude", "sonnet", false).await?;
+    let owner = turn.agent.owner_user_id.expect("owner");
+    let task_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO agent_tasks (user_id, title, status, assigned_agent_id, plan_first)
+         VALUES ($1, 'Resume after plan', 'in_progress', $2, TRUE) RETURNING id",
+    )
+    .bind(owner)
+    .bind(turn.agent.id)
+    .fetch_one(rig.ctx.db.pool())
+    .await?;
+    let task_session: Uuid = sqlx::query_scalar(
+        "INSERT INTO agent_sessions (agent_id, role, backend, model, cli_session_id, status, task_id, plan_state, working_dir)
+         VALUES ($1, 'task', 'claude', 'sonnet', 'task-thread', 'active', $2, 'awaiting', $3) RETURNING id",
+    )
+    .bind(turn.agent.id)
+    .bind(task_id)
+    .bind(&turn.workspace)
+    .fetch_one(rig.ctx.db.pool())
+    .await?;
+    let item = sqlx::query_as::<_, InboxItem>(
+        "INSERT INTO agent_inbox (agent_id, kind, payload, status, attempts)
+         VALUES ($1, 'task.assigned', $2, 'processing', 1)
+         RETURNING id, agent_id, kind, event_seq, payload, status, attempts, created_at",
+    )
+    .bind(turn.agent.id)
+    .bind(json!({
+        "task_id": task_id,
+        "title": "Resume after plan",
+        "brief": "Original request:\nBuild it\n\nQuestion:\nContinue?\n\nTheir answer:\nYes",
+        "resume": true,
+        "clarification_continuation": Uuid::new_v4(),
+        "clarification_handoff": {
+            "request": "Build it",
+            "question": "Continue?",
+            "answer": "Yes"
+        },
+        "clarification_status": "in_progress",
+        "clarification_resume": false,
+        "attachments": [{ "id": Uuid::new_v4(), "name": "choice.txt", "mime": "text/plain" }],
+    }))
+    .fetch_one(rig.ctx.db.pool())
+    .await?;
+    let task = rig.ctx.db.get_task(task_id).await?.expect("task");
+    let main = rig.session(&turn).await?;
+    let action: Action = serde_json::from_value(json!({ "type": "start_task", "task_id": task_id }))?;
+    super::super::turn::apply_actions_for_contract(
+        &rig.ctx,
+        &turn.agent,
+        &main,
+        turn.run,
+        &item,
+        &task,
+        action,
+    )
+    .await?;
+    rig.ctx.store.finish_inbox(&[item.id], "done", None).await?;
+    let waiting: (String, i32, bool) = sqlx::query_as(
+        "SELECT status, attempts, retry_at = 'infinity' FROM agent_inbox WHERE id = $1",
+    )
+        .bind(item.id)
+        .fetch_one(rig.ctx.db.pool())
+        .await?;
+    assert_eq!(waiting, ("pending".into(), 1, true));
+    let problems: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM world_events WHERE run_id = $1 AND type = 'actions.problem'",
+    )
+    .bind(turn.run)
+    .fetch_one(rig.ctx.db.pool())
+    .await?;
+    assert_eq!(problems, 0);
+    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_runs WHERE task_id = $1")
+        .bind(task_id)
+        .fetch_one(rig.ctx.db.pool())
+        .await?;
+    assert_eq!(before, 0);
+
+    assert!(!rig
+        .ctx
+        .store
+        .take_pending_inbox(turn.agent.id, 20)
+        .await?
+        .iter()
+        .any(|candidate| candidate.id == item.id));
+    let approved = rig.ctx.store.approve_plan(task_id, "owner", "test", "Approve").await?;
+    assert!(matches!(approved, loka_shared::quests::PlanApproval::Approved { .. }));
+    let prompts: Vec<String> = sqlx::query_scalar(
+        "SELECT prompt FROM session_runs WHERE task_id = $1 AND kind = 'followup' ORDER BY created_at",
+    )
+        .bind(task_id)
+        .fetch_all(rig.ctx.db.pool())
+        .await?;
+    let links: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM runner_run_inbox x JOIN session_runs r ON r.id = x.run_id
+         WHERE r.task_id = $1 AND x.inbox_id = $2",
+    )
+    .bind(task_id)
+    .bind(item.id)
+    .fetch_one(rig.ctx.db.pool())
+    .await?;
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].contains("Their answer:\nYes"));
+    assert_eq!(prompts[0].matches("Their answer:\nYes").count(), 1);
+    assert!(prompts[0].contains("choice.txt"));
+    assert_eq!(links, 1);
+    let settled: (String, i32) = sqlx::query_as("SELECT status, attempts FROM agent_inbox WHERE id = $1")
+        .bind(item.id)
+        .fetch_one(rig.ctx.db.pool())
+        .await?;
+    assert_eq!(settled, ("done".into(), 1));
+    assert!(!rig.ctx.store.take_pending_inbox(turn.agent.id, 20).await?.iter().any(|candidate| candidate.id == item.id));
+    let session = rig.ctx.store.get_session(task_session).await?.expect("task session");
+    assert_eq!(session.plan_state.as_deref(), Some("approved"));
+    let failed_item = sqlx::query_as::<_, InboxItem>(
+        "INSERT INTO agent_inbox (agent_id, kind, payload, status, attempts)
+         VALUES ($1, 'task.assigned', $2, 'processing', 1)
+         RETURNING id, agent_id, kind, event_seq, payload, status, attempts, created_at",
+    )
+    .bind(turn.agent.id)
+    .bind(json!({
+        "task_id": task_id,
+        "resume": true,
+        "clarification_continuation": Uuid::new_v4(),
+        "clarification_handoff": { "request": "Build it", "question": "Continue?", "answer": "Yes" },
+        "clarification_status": "in_progress",
+        "clarification_resume": false,
+    }))
+    .fetch_one(rig.ctx.db.pool())
+    .await?;
+    let invalid: Action = serde_json::from_value(json!({
+        "type": "start_task",
+        "task_id": task_id,
+        "plan_first": true,
+        "attempts": 2,
+    }))?;
+    for attempt in 1..=3 {
+        sqlx::query("UPDATE agent_inbox SET status = 'processing', attempts = $2, retry_at = NULL WHERE id = $1")
+            .bind(failed_item.id)
+            .bind(attempt)
+            .execute(rig.ctx.db.pool())
+            .await?;
+        super::super::turn::apply_actions_for_contract(
+            &rig.ctx,
+            &turn.agent,
+            &main,
+            turn.run,
+            &failed_item,
+            &task,
+            invalid.clone(),
+        )
+        .await?;
+        let status: String = sqlx::query_scalar("SELECT status FROM agent_inbox WHERE id = $1")
+            .bind(failed_item.id)
+            .fetch_one(rig.ctx.db.pool())
+            .await?;
+        assert_eq!(status, if attempt == 3 { "failed" } else { "pending" });
+    }
+    let exhausted: (String, i32) = sqlx::query_as("SELECT status, attempts FROM agent_inbox WHERE id = $1")
+        .bind(failed_item.id)
+        .fetch_one(rig.ctx.db.pool())
+        .await?;
+    assert_eq!(exhausted, ("failed".into(), 3));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_local_refused_clarification_is_explained() -> anyhow::Result<()> {
+    let Some(rig) = rig().await? else {
+        return Ok(());
+    };
+    let turn = rig.run("claude", "sonnet", false).await?;
+    let owner = turn.agent.owner_user_id.expect("owner");
+    let main = rig.session(&turn).await?;
+    let task_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO agent_tasks (user_id, title, status, assigned_agent_id)
+         VALUES ($1, 'Closed request', 'todo', $2) RETURNING id",
+    )
+    .bind(owner)
+    .bind(turn.agent.id)
+    .fetch_one(rig.ctx.db.pool())
+    .await?;
+    let seq = rig
+        .ctx
+        .store
+        .emit(
+            NewEvent::new("message.created")
+                .agent(turn.agent.id)
+                .actor(Some(owner))
+                .task(Some(task_id))
+                .payload(json!({
+                    "message_id": Uuid::new_v4(),
+                    "body": "Old request",
+                    "from_owner": true,
+                    "task_id": task_id,
+                })),
+            Some((turn.agent.id, "message")),
+        )
+        .await?;
+    let item = sqlx::query_as::<_, InboxItem>(
+        "UPDATE agent_inbox SET status = 'processing' WHERE agent_id = $1 AND event_seq = $2
+         RETURNING id, agent_id, kind, event_seq, payload, status, attempts, created_at",
+    )
+    .bind(turn.agent.id)
+    .bind(seq)
+    .fetch_one(rig.ctx.db.pool())
+    .await?;
+    sqlx::query("UPDATE agent_tasks SET status = 'done' WHERE id = $1")
+        .bind(task_id)
+        .execute(rig.ctx.db.pool())
+        .await?;
+    sqlx::query("UPDATE agent_tasks SET completed_at = NOW() + INTERVAL '1 second' WHERE id = $1")
+    .bind(task_id)
+    .execute(rig.ctx.db.pool())
+    .await?;
+    let task = rig.ctx.db.get_task(task_id).await?.expect("task");
+    let action: Action = serde_json::from_value(json!({
+        "type": "ask",
+        "text": "Which format?",
+        "choices": ["CSV"],
+        "clarify_request": true,
+    }))?;
+    super::super::turn::apply_actions_for_contract(
+        &rig.ctx,
+        &turn.agent,
+        &main,
+        turn.run,
+        &item,
+        &task,
+        action,
+    )
+    .await?;
+    let replies: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_messages
+         WHERE agent_id = $1 AND run_id = $2 AND body = $3",
+    )
+    .bind(turn.agent.id)
+    .bind(turn.run)
+    .bind(loka_shared::world::CLARIFICATION_POST_REFUSED)
+    .fetch_one(rig.ctx.db.pool())
+    .await?;
+    assert_eq!(replies, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn identical_local_clarifications_are_deduplicated_per_quest_origin() -> anyhow::Result<()> {
+    let Some(rig) = rig().await? else {
+        return Ok(());
+    };
+    let turn = rig.run("claude", "sonnet", false).await?;
+    let owner = turn.agent.owner_user_id.expect("owner");
+    let main = rig.session(&turn).await?;
+    let question = "Which database should this use?";
+    let mut origins = Vec::new();
+    for (title, description, note) in [
+        ("Repair primary export", "Primary CSV drops rows.", "Preserve the primary ordering."),
+        ("Repair archive export", "Archive CSV drops rows.", "Preserve the archive ordering."),
+    ] {
+        let task_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_tasks (user_id, title, description, status, assigned_agent_id)
+             VALUES ($1, $2, $3, 'todo', $4) RETURNING id",
+        )
+        .bind(owner)
+        .bind(title)
+        .bind(description)
+        .bind(turn.agent.id)
+        .fetch_one(rig.ctx.db.pool())
+        .await?;
+        let seq = rig
+            .ctx
+            .store
+            .emit(
+                NewEvent::new("task.assigned")
+                    .agent(turn.agent.id)
+                    .actor(Some(owner))
+                    .task(Some(task_id))
+                    .payload(json!({ "task_id": task_id, "brief": note })),
+                Some((turn.agent.id, "task.assigned")),
+            )
+            .await?;
+        let item = sqlx::query_as::<_, InboxItem>(
+            "UPDATE agent_inbox SET status = 'processing' WHERE agent_id = $1 AND event_seq = $2
+             RETURNING id, agent_id, kind, event_seq, payload, status, attempts, created_at",
+        )
+        .bind(turn.agent.id)
+        .bind(seq)
+        .fetch_one(rig.ctx.db.pool())
+        .await?;
+        let task = rig.ctx.db.get_task(task_id).await?.expect("task");
+        let action: Action = serde_json::from_value(json!({
+            "type": "ask",
+            "text": question,
+            "choices": ["Postgres", "SQLite"],
+            "clarify_request": true,
+            "clarify_source": format!("quest:{task_id}")
+        }))?;
+        let request = format!("{title}\n\n{description}\n\nTheir note: {note}");
+        origins.push((task_id, item, task, action, request));
+    }
+    for _ in 0..2 {
+        for (_, item, task, action, _) in &origins {
+            super::super::turn::apply_actions_for_contract(
+                &rig.ctx,
+                &turn.agent,
+                &main,
+                turn.run,
+                item,
+                task,
+                action.clone(),
+            )
+            .await?;
+        }
+    }
+    let cards: Vec<(String, Value)> = sqlx::query_as(
+        "SELECT body, meta->'clarify_request' FROM agent_messages
+         WHERE agent_id = $1 AND run_id = $2 AND meta ? 'clarify_request'
+         ORDER BY created_at, id",
+    )
+    .bind(turn.agent.id)
+    .bind(turn.run)
+    .fetch_all(rig.ctx.db.pool())
+    .await?;
+    assert_eq!(cards.len(), origins.len());
+    assert!(cards.iter().all(|(body, _)| body == question));
+    for (task_id, item, _, _, request) in &origins {
+        let card = cards.iter().find(|(_, origin)| origin["task_id"] == json!(task_id)).expect("origin card");
+        assert_eq!(card.1["source_inbox_id"], item.id);
+        assert_eq!(card.1["request"], request.as_str());
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn codex_cumulative_usage_is_charged_per_run_on_both_workers() -> anyhow::Result<()> {
     let Some(rig) = rig().await? else {
         return Ok(());
@@ -490,6 +975,7 @@ async fn codex_cumulative_usage_is_charged_per_run_on_both_workers() -> anyhow::
                 workspace: worker.workspace.clone(),
                 runner: worker.runner,
                 lease: if side || round == 0 { worker.lease } else { None },
+                claimed: None,
             };
             let step = if !side && round > 0 {
                 let claim = rig.runners.claim_kinds(step.runner, &format!("mcp-{}", Uuid::new_v4()), &["direct".to_string()]).await?.expect("claimed");
@@ -544,7 +1030,7 @@ async fn a_cli_that_exits_badly_with_nothing_to_say_fails_the_run() -> anyhow::R
     let remote = rig.run("claude", "sonnet", true).await?;
     let (_, mut result) = answered(2);
     result.output = String::new();
-    let outcome = ExecutionOutcome { result, pr_url: None, pr_number: None, publish_pr_state: None, work_summary: None };
+    let outcome = ExecutionOutcome { result, pr_url: None, pr_number: None, publish_pr_state: None, checked_pr_url: None, publish_pr_checked_at: None, work_summary: None, context_sent: None, published_head: None };
     rig.deliver(&remote, success_completion(outcome, None, remote.workspace.clone(), Vec::new())).await?;
     let snapshot = rig.snapshot(&remote).await?;
     assert_eq!(snapshot.status, "failed");
@@ -612,7 +1098,7 @@ async fn a_completion_after_the_run_was_closed_keeps_its_spend_and_never_touches
         let remote = rig.run(backend, model, true).await?;
         assert!(rig.coordinator.stop_run(remote.run, "Tara").await?);
         let (_, result) = scripted();
-        let outcome = ExecutionOutcome { result, pr_url: None, pr_number: None, publish_pr_state: None, work_summary: None };
+        let outcome = ExecutionOutcome { result, pr_url: None, pr_number: None, publish_pr_state: None, checked_pr_url: None, publish_pr_checked_at: None, work_summary: None, context_sent: None, published_head: None };
         let late = rig.deliver(&remote, success_completion(outcome, Some("cs-1".into()), remote.workspace.clone(), Vec::new())).await;
         assert!(late.is_err(), "{backend}: the runner is told its lease is gone");
 
@@ -658,7 +1144,7 @@ impl Rig {
     async fn late_with(&self, run: &Run, remote: bool, events: Vec<StreamEvent>, result: CliResult) -> anyhow::Result<()> {
         if remote {
             let session_id = result.session_id.clone();
-            let outcome = ExecutionOutcome { result, pr_url: None, pr_number: None, publish_pr_state: None, work_summary: None };
+            let outcome = ExecutionOutcome { result, pr_url: None, pr_number: None, publish_pr_state: None, checked_pr_url: None, publish_pr_checked_at: None, work_summary: None, context_sent: None, published_head: None };
             let late = self.deliver(run, success_completion(outcome, session_id, run.workspace.clone(), Vec::new())).await;
             anyhow::ensure!(late.is_err(), "the runner is told its lease is gone");
             Ok(())
@@ -677,11 +1163,12 @@ impl Rig {
         .fetch_one(self.ctx.db.pool())
         .await?;
         if !remote {
-            return Ok(Run { agent: base.agent.clone(), session: base.session, run: id, workspace: base.workspace.clone(), runner: base.runner, lease: None });
+            return Ok(Run { agent: base.agent.clone(), session: base.session, run: id, workspace: base.workspace.clone(), runner: base.runner, lease: None, claimed: None });
         }
         let claim = self.runners.claim_kinds(base.runner, &format!("mcp-{}", Uuid::new_v4()), &["direct".to_string()]).await?.expect("claimed");
         assert_eq!(claim.run_id, id);
-        Ok(Run { agent: base.agent.clone(), session: base.session, run: id, workspace: base.workspace.clone(), runner: base.runner, lease: Some(claim.lease_id) })
+        let lease_id = claim.lease_id;
+        Ok(Run { agent: base.agent.clone(), session: base.session, run: id, workspace: base.workspace.clone(), runner: base.runner, lease: Some(lease_id), claimed: Some(claim) })
     }
 
     async fn newer_run(&self, run: &Run, status: &str) -> anyhow::Result<()> {
@@ -747,7 +1234,7 @@ impl Rig {
     async fn complete_live(&self, run: &Run, remote: bool, result: CliResult) -> anyhow::Result<()> {
         if remote {
             let session_id = result.session_id.clone();
-            let outcome = ExecutionOutcome { result, pr_url: None, pr_number: None, publish_pr_state: None, work_summary: None };
+            let outcome = ExecutionOutcome { result, pr_url: None, pr_number: None, publish_pr_state: None, checked_pr_url: None, publish_pr_checked_at: None, work_summary: None, context_sent: None, published_head: None };
             self.deliver(run, success_completion(outcome, session_id, run.workspace.clone(), Vec::new())).await
         } else {
             self.locally(run, Vec::new(), result, &Redactor::default()).await
@@ -799,7 +1286,7 @@ async fn a_failure_completion_repeated_for_an_already_failed_lease_keeps_its_spe
     let run = rig.run("claude", "sonnet", true).await?;
     rig.close(&run, true).await?;
     let (_, result) = scripted();
-    let outcome = ExecutionOutcome { result, pr_url: None, pr_number: None, publish_pr_state: None, work_summary: None };
+    let outcome = ExecutionOutcome { result, pr_url: None, pr_number: None, publish_pr_state: None, checked_pr_url: None, publish_pr_checked_at: None, work_summary: None, context_sent: None, published_head: None };
     let mut failed = success_completion(outcome, Some("cs-1".into()), run.workspace.clone(), Vec::new());
     failed.exit_code = 1;
     failed.error = Some("the CLI crashed".into());
@@ -824,7 +1311,7 @@ async fn a_late_completion_for_a_publish_run_keeps_no_spend_on_both_workers() ->
         rig.close(&run, remote).await?;
         let (events, result) = scripted();
         if remote {
-            let outcome = ExecutionOutcome { result, pr_url: None, pr_number: None, publish_pr_state: None, work_summary: None };
+            let outcome = ExecutionOutcome { result, pr_url: None, pr_number: None, publish_pr_state: None, checked_pr_url: None, publish_pr_checked_at: None, work_summary: None, context_sent: None, published_head: None };
             assert!(rig.deliver(&run, success_completion(outcome, None, run.workspace.clone(), Vec::new())).await.is_err());
         } else {
             rig.locally(&run, without_session_start(events), result, &Redactor::default()).await?;
@@ -867,7 +1354,7 @@ async fn a_completion_sent_twice_is_applied_once() -> anyhow::Result<()> {
     rig.remotely(&remote, events, result, &secrets).await?;
     let first = rig.snapshot(&remote).await?;
     let (_, again) = answered(0);
-    let outcome = ExecutionOutcome { result: again, pr_url: None, pr_number: None, publish_pr_state: None, work_summary: None };
+    let outcome = ExecutionOutcome { result: again, pr_url: None, pr_number: None, publish_pr_state: None, checked_pr_url: None, publish_pr_checked_at: None, work_summary: None, context_sent: None, published_head: None };
     let second = rig.deliver(&remote, success_completion(outcome, Some("cs-1".into()), remote.workspace.clone(), Vec::new())).await;
     assert!(second.is_ok() || second.is_err(), "the answer to the runner does not matter, the state does");
     let after = rig.snapshot(&remote).await?;
@@ -1072,5 +1559,640 @@ async fn the_local_worker_starts_a_fork_from_its_memory_and_a_new_agent_from_not
         assert!(session.working_dir.as_deref().is_some_and(|dir| !dir.trim().is_empty()), "every main session has a home folder");
     }
     sqlx::query("DELETE FROM agent_profiles WHERE id = ANY($1)").bind(vec![source, fork, fresh]).execute(pool).await?;
+    Ok(())
+}
+
+impl Rig {
+    async fn on_quest(&self, run: &Run, title: &str) -> anyhow::Result<Uuid> {
+        let pool = self.ctx.db.pool();
+        let owner = run.agent.owner_user_id.expect("owner");
+        let quest: Uuid = sqlx::query_scalar("INSERT INTO agent_tasks (user_id, title, status) VALUES ($1, $2, 'in_progress') RETURNING id")
+            .bind(owner)
+            .bind(title)
+            .fetch_one(pool)
+            .await?;
+        sqlx::query("UPDATE agent_sessions SET role = 'task', task_id = $2, context_tokens = 150000 WHERE id = $1")
+            .bind(run.session)
+            .bind(quest)
+            .execute(pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, prompt, output, created_at)
+             VALUES ($1, $2, $3, 'task', 'completed', $4, 'ok', NOW() - INTERVAL '1 hour')",
+        )
+        .bind(run.session)
+        .bind(run.agent.id)
+        .bind(quest)
+        .bind(format!("[task session] {title}"))
+        .execute(pool)
+        .await?;
+        sqlx::query("UPDATE session_runs SET task_id = $2 WHERE id = $1").bind(run.run).bind(quest).execute(pool).await?;
+        Ok(quest)
+    }
+
+    async fn recovery_of(&self, run: &Run) -> anyhow::Result<Option<(String, String, Option<String>, Option<String>)>> {
+        Ok(sqlx::query_as(
+            "SELECT kind, status, retry_cause, context_path FROM session_runs
+             WHERE session_id = $1 AND id <> $2 AND context_note->>'recovers' = $2::text",
+        )
+        .bind(run.session)
+        .bind(run.run)
+        .fetch_optional(self.ctx.db.pool())
+        .await?)
+    }
+}
+
+fn twenty_steps() -> Vec<StreamEvent> {
+    (0..10).flat_map(|_| steps().into_iter().take(1).chain(std::iter::once(StreamEvent::AssistantText("Still going.".into())))).collect()
+}
+
+#[tokio::test]
+async fn a_context_overflow_late_in_a_run_continues_once_in_a_fresh_session_on_both_workers() -> anyhow::Result<()> {
+    let Some(rig) = rig().await? else {
+        return Ok(());
+    };
+    let (secrets, redactor) = no_secrets();
+    let overflow = || anyhow::anyhow!("API Error: 400 prompt is too long: 214000 tokens > 200000 maximum").context("Claude Code exited with code 1");
+    for kind in ["followup", "direct"] {
+        let local = rig.run_of(kind, "claude", "sonnet", false).await?;
+        let remote = rig.run_of(kind, "claude", "sonnet", true).await?;
+        let mut quests = Vec::new();
+        if kind == "followup" {
+            quests.push(rig.on_quest(&local, "Ship the blue widget").await?);
+            quests.push(rig.on_quest(&remote, "Ship the blue widget").await?);
+        }
+        let record = rig.ctx.store.get_run(local.run).await?.expect("run");
+        let (tx, activity) = spawn_activity(rig.ctx.store.clone(), record.clone(), redactor.clone());
+        for event in twenty_steps() {
+            tx.send(event)?;
+        }
+        drop(tx);
+        activity.await?;
+        fail_with(&rig.ctx, &record, &rig.session(&local).await?, &overflow(), &redactor).await?;
+        rig.show(&remote, twenty_steps(), &secrets).await?;
+        rig.deliver(&remote, errored_completion(&overflow(), None, remote.workspace.clone(), false)).await?;
+
+        let expected_kind = if kind == "followup" { "task" } else { kind };
+        for (path, run) in [("local", &local), ("remote", &remote)] {
+            let snapshot = rig.snapshot(run).await?;
+            assert_eq!(snapshot.status, "failed", "{path} {kind}");
+            assert!(!snapshot.announcements.iter().any(|name| name == "run.failed"), "{path} {kind}: {:?}", snapshot.announcements);
+            let recovery = rig.recovery_of(run).await?.unwrap_or_else(|| panic!("{path} {kind}: an overflow after 20 steps continues in a fresh session"));
+            assert_eq!(
+                recovery,
+                (expected_kind.to_string(), "queued".to_string(), Some("context_recovery".to_string()), Some("recovery".to_string())),
+                "{path} {kind}"
+            );
+            let session = rig.session(run).await?;
+            assert_eq!((session.cli_session_id, session.context_tokens), (None, 0), "{path} {kind}: the next run starts a fresh CLI session");
+        }
+        for quest in quests {
+            let status: String = sqlx::query_scalar("SELECT status FROM agent_tasks WHERE id = $1").bind(quest).fetch_one(rig.ctx.db.pool()).await?;
+            assert_eq!(status, "in_progress", "{kind}: the quest is not failed while it recovers");
+        }
+        let (local_view, remote_view) = (rig.snapshot(&local).await?, rig.snapshot(&remote).await?.without_session_banner());
+        assert_eq!(local_view.announcements, remote_view.announcements, "{kind}");
+    }
+    Ok(())
+}
+
+impl Rig {
+    async fn overflow_session(&self, run: &Run, tokens: i64) -> anyhow::Result<()> {
+        sqlx::query("UPDATE agent_sessions SET context_tokens = $2 WHERE id = $1").bind(run.session).bind(tokens).execute(self.ctx.db.pool()).await?;
+        Ok(())
+    }
+
+    async fn path_of(&self, run: Uuid) -> anyhow::Result<Option<String>> {
+        Ok(sqlx::query_scalar("SELECT context_path FROM session_runs WHERE id = $1").bind(run).fetch_one(self.ctx.db.pool()).await?)
+    }
+
+    async fn queue_after(&self, run: &Run, prompt: &str) -> anyhow::Result<Uuid> {
+        let mut tx = self.ctx.db.pool().begin().await?;
+        let later = RunClone { kind: None, fork_from: None, prompt, activity: None, retry_cause: None, not_before: None, retry: false };
+        let id = clone_run(&mut tx, run.run, later).await?.id;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    async fn on_review(&self, run: &Run) -> anyhow::Result<Uuid> {
+        let pool = self.ctx.db.pool();
+        let owner = run.agent.owner_user_id.expect("owner");
+        let quest: Uuid = sqlx::query_scalar("INSERT INTO agent_tasks (user_id, title, status) VALUES ($1, 'Review the widget', 'in_progress') RETURNING id")
+            .bind(owner)
+            .fetch_one(pool)
+            .await?;
+        let task_session: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_sessions (agent_id, role, backend, model, status, task_id, working_dir, cli_session_id, runner_id, summary)
+             SELECT agent_id, 'task', backend, model, 'completed', $2, working_dir, 'task-cs', runner_id,
+                    '{\"status\": \"done\", \"summary\": \"Built the widget.\"}'
+             FROM agent_sessions WHERE id = $1
+             RETURNING id",
+        )
+        .bind(run.session)
+        .bind(quest)
+        .fetch_one(pool)
+        .await?;
+        sqlx::query("UPDATE agent_sessions SET role = 'review', task_id = $2, parent_session_id = $3 WHERE id = $1")
+            .bind(run.session)
+            .bind(quest)
+            .bind(task_session)
+            .execute(pool)
+            .await?;
+        sqlx::query("UPDATE session_runs SET task_id = $2 WHERE id = $1").bind(run.run).bind(quest).execute(pool).await?;
+        Ok(quest)
+    }
+}
+
+#[tokio::test]
+async fn a_session_over_budget_is_compacted_or_checkpointed_the_same_way_on_both_workers() -> anyhow::Result<()> {
+    let Some(rig) = rig().await? else {
+        return Ok(());
+    };
+    for (backend, model, native) in [("claude", "sonnet", true), ("cursor", "composer-2.5", false)] {
+        let local = rig.run_with("followup", backend, model, false, 190_000).await?;
+        let remote = rig.run_with("followup", backend, model, true, 190_000).await?;
+
+        let mut record = rig.ctx.store.get_run(local.run).await?.expect("run");
+        let mut session = rig.session(&local).await?;
+        let prepared = super::prepare_request(&rig.ctx, &mut record, &mut session).await?;
+        let local_compacts = crate::cli::resumes_to_compact(prepared.compact_first(), session.cli_session_id.is_some(), false, session.cli_session_id.is_some(), false);
+
+        let claimed = remote.claimed.clone().expect("claimed");
+        let job = rig.coordinator.build_job(claimed, "token".into()).await?;
+        let remote_compacts = crate::remote_runner::job_compacts_first(&job);
+
+        assert_eq!((local_compacts, remote_compacts), (native, native), "{backend}: native compaction runs first on both workers");
+        assert_eq!(SentContext::carried(session.context_sent.as_ref(), true), SentContext::default(), "{backend}: local starts with nothing marked as sent");
+        assert_eq!(job.context_sent, SentContext::default(), "{backend}: the runner job starts with nothing marked as sent");
+        if native {
+            assert_eq!((record.prompt.as_str(), job.prompt.as_str()), ("go", "go"), "{backend}: the request itself is unchanged");
+            assert_eq!((session.cli_session_id.as_deref(), job.cli_session_id.as_deref()), (Some("cs-0"), Some("cs-0")));
+        } else {
+            for (path, prompt) in [("local", &record.prompt), ("remote", &job.prompt)] {
+                assert!(prompt.starts_with("[context checkpoint]") && prompt.ends_with("Latest message:\ngo"), "{backend} {path}: {prompt}");
+            }
+            assert_eq!(session.cli_session_id, None, "{backend}: the local run starts a fresh CLI session");
+            assert!(!job.resume && job.cli_session_id.is_none() && job.previous_run_id.is_none(), "{backend}: the runner starts a fresh CLI session");
+        }
+        let expected = Some(if native { "native" } else { "checkpoint" }.to_string());
+        assert_eq!((rig.path_of(local.run).await?, rig.path_of(remote.run).await?), (expected.clone(), expected), "{backend}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_recovery_is_claimed_before_anything_queued_after_the_run_that_overflowed() -> anyhow::Result<()> {
+    let Some(rig) = rig().await? else {
+        return Ok(());
+    };
+    let (_, redactor) = no_secrets();
+    let overflow = || anyhow::anyhow!("Prompt is too long");
+    let local = rig.run_of("direct", "claude", "sonnet", false).await?;
+    let local_later = rig.queue_after(&local, "and then this").await?;
+    let record = rig.ctx.store.get_run(local.run).await?.expect("run");
+    fail_with(&rig.ctx, &record, &rig.session(&local).await?, &overflow(), &redactor).await?;
+    let local_recovery = rig.recovery_of(&local).await?.expect("recovered");
+    assert_eq!(local_recovery.0, "direct");
+    let order: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM session_runs WHERE session_id = $1 AND status = 'queued' ORDER BY created_at")
+        .bind(local.session)
+        .fetch_all(rig.ctx.db.pool())
+        .await?;
+    assert_eq!(order.len(), 2);
+    assert_ne!(order[0], local_later, "the local claim order puts the recovery first");
+
+    let remote = rig.run_of("direct", "claude", "sonnet", true).await?;
+    let remote_later = rig.queue_after(&remote, "and then this").await?;
+    rig.deliver(&remote, errored_completion(&overflow(), None, remote.workspace.clone(), false)).await?;
+    let claim = rig.runners.claim_kinds(remote.runner, &format!("mcp-{}", Uuid::new_v4()), &["direct".to_string()]).await?.expect("claimed");
+    assert_ne!(claim.run_id, remote_later, "the runner claims the recovery first");
+    let recovered_by: Option<String> = sqlx::query_scalar("SELECT context_note->>'recovered_by' FROM session_runs WHERE id = $1").bind(remote.run).fetch_one(rig.ctx.db.pool()).await?;
+    assert_eq!(recovered_by, Some(claim.run_id.to_string()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_checkpointed_verdict_reminder_still_settles_its_review_on_both_workers() -> anyhow::Result<()> {
+    let Some(rig) = rig().await? else {
+        return Ok(());
+    };
+    let (secrets, redactor) = no_secrets();
+    let unfinished = || {
+        let (_, mut result) = answered(0);
+        result.output = "Looks fine so far.".into();
+        result
+    };
+    let local = rig.run_with("review", "cursor", "composer-2.5", false, 1_000).await?;
+    let remote = rig.run_with("review", "cursor", "composer-2.5", true, 1_000).await?;
+    let quests = [rig.on_review(&local).await?, rig.on_review(&remote).await?];
+    rig.locally(&local, Vec::new(), unfinished(), &redactor).await?;
+    rig.remotely(&remote, Vec::new(), unfinished(), &secrets).await?;
+
+    let failure = || anyhow::anyhow!("Cursor exited with code 1: unexpected end of stream");
+    let mut nudges = Vec::new();
+    for (path, run) in [("local", &local), ("remote", &remote)] {
+        let nudge: Uuid = sqlx::query_scalar("SELECT id FROM session_runs WHERE session_id = $1 AND status = 'queued' AND nudge = 'verdict'")
+            .bind(run.session)
+            .fetch_one(rig.ctx.db.pool())
+            .await
+            .unwrap_or_else(|error| panic!("{path}: a review without a verdict gets one reminder: {error}"));
+        rig.overflow_session(run, 190_000).await?;
+        if path == "local" {
+            sqlx::query("UPDATE session_runs SET status = 'running', started_at = NOW() WHERE id = $1").bind(nudge).execute(rig.ctx.db.pool()).await?;
+            let mut record = rig.ctx.store.get_run(nudge).await?.expect("nudge");
+            let mut session = rig.session(run).await?;
+            assert!(matches!(super::prepare_request(&rig.ctx, &mut record, &mut session).await?, Prepared::Checkpoint { .. }));
+            let (tx, activity) = spawn_activity(rig.ctx.store.clone(), record.clone(), redactor.clone());
+            for event in steps() {
+                tx.send(event)?;
+            }
+            drop(tx);
+            activity.await?;
+            fail_with(&rig.ctx, &record, &session, &failure(), &redactor).await?;
+        } else {
+            let claim = rig.runners.claim_kinds(run.runner, &format!("mcp-{}", Uuid::new_v4()), &["review".to_string()]).await?.expect("claimed");
+            assert_eq!(claim.run_id, nudge);
+            let lease_id = claim.lease_id;
+            let job = rig.coordinator.build_job(claim, "token".into()).await?;
+            assert!(job.prompt.starts_with("[context checkpoint]"), "{}", job.prompt);
+            let step = Run { lease: Some(lease_id), run: nudge, claimed: None, ..rig_copy(run) };
+            rig.show(&step, steps(), &secrets).await?;
+            rig.deliver(&step, errored_completion(&failure(), None, run.workspace.clone(), false)).await?;
+        }
+        nudges.push(nudge);
+    }
+    for (nudge, quest) in nudges.iter().zip(quests) {
+        let prompt: String = sqlx::query_scalar("SELECT prompt FROM session_runs WHERE id = $1").bind(nudge).fetch_one(rig.ctx.db.pool()).await?;
+        assert!(!prompt.starts_with(loka_shared::world::VERDICT_NUDGE_MARK), "the checkpoint rewrote the reminder's prompt");
+        let retried: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_runs WHERE task_id = $1 AND retry_cause IS NOT NULL").bind(quest).fetch_one(rig.ctx.db.pool()).await?;
+        assert_eq!(retried, 0, "the failure is not one Loka retries, so the reminder rule decides");
+        let status: String = sqlx::query_scalar("SELECT status FROM agent_tasks WHERE id = $1").bind(quest).fetch_one(rig.ctx.db.pool()).await?;
+        let error: Option<String> = sqlx::query_scalar("SELECT error_message FROM agent_tasks WHERE id = $1").bind(quest).fetch_one(rig.ctx.db.pool()).await?;
+        assert_ne!(status, "failed", "a failed verdict reminder settles the review instead of failing the quest: {error:?}");
+    }
+    let statuses: Vec<String> = sqlx::query_scalar("SELECT status FROM agent_tasks WHERE id = ANY($1) ORDER BY id = $2 DESC")
+        .bind(quests.to_vec())
+        .bind(quests[0])
+        .fetch_all(rig.ctx.db.pool())
+        .await?;
+    assert_eq!(statuses[0], statuses[1], "both workers settle it the same way");
+    Ok(())
+}
+
+fn rig_copy(run: &Run) -> Run {
+    Run {
+        agent: run.agent.clone(),
+        session: run.session,
+        run: run.run,
+        workspace: run.workspace.clone(),
+        runner: run.runner,
+        lease: run.lease,
+        claimed: None,
+    }
+}
+
+fn with_output(output: &str) -> (Vec<StreamEvent>, CliResult) {
+    let (events, mut result) = scripted();
+    result.output = output.to_string();
+    (events, result)
+}
+
+impl Rig {
+    async fn take_prework_run(&self, source: &Run, run_id: Uuid, remote: bool) -> anyhow::Result<(Run, String)> {
+        if remote {
+            let claim = self
+                .runners
+                .claim_kinds(source.runner, &format!("mcp-{}", Uuid::new_v4()), &["task".to_string(), "followup".to_string()])
+                .await?
+                .expect("the preparation run is claimed");
+            assert_eq!(claim.run_id, run_id);
+            let lease = claim.lease_id;
+            let job = self.coordinator.build_job(claim, "token".into()).await?;
+            return Ok((Run { run: run_id, lease: Some(lease), ..rig_copy(source) }, job.prompt));
+        }
+        let changed = sqlx::query("UPDATE session_runs SET status = 'running', claimed_by = 'contract', started_at = NOW() WHERE id = $1 AND status = 'queued'")
+            .bind(run_id)
+            .execute(self.ctx.db.pool())
+            .await?
+            .rows_affected();
+        assert_eq!(changed, 1, "the local preparation run is queued exactly once");
+        let mut record = self.ctx.store.get_run(run_id).await?.expect("preparation run");
+        let mut session = self.session(source).await?;
+        super::prepare_request(&self.ctx, &mut record, &mut session).await?;
+        super::super::quests::append_single_prework_policy(&self.ctx.store, session.id, record.id, &mut record.prompt).await?;
+        Ok((Run { run: run_id, lease: None, ..rig_copy(source) }, record.prompt))
+    }
+
+    async fn complete_prework_run(&self, run: &Run, output: &str, remote: bool, secrets: &Redactor) -> anyhow::Result<()> {
+        self.complete_prework_run_with_work(run, output, remote, secrets, None).await
+    }
+
+    async fn complete_prework_run_with_work(
+        &self,
+        run: &Run,
+        output: &str,
+        remote: bool,
+        secrets: &Redactor,
+        work_summary: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let (events, result) = with_output(output);
+        if remote {
+            self.show(run, events, secrets).await?;
+            let session_id = result.session_id.clone();
+            let outcome = ExecutionOutcome {
+                result,
+                pr_url: None,
+                pr_number: None,
+                publish_pr_state: None,
+                checked_pr_url: None,
+                publish_pr_checked_at: None,
+                work_summary: work_summary.map(str::to_string),
+                context_sent: None,
+                published_head: None,
+            };
+            self.deliver(run, success_completion(outcome, session_id, run.workspace.clone(), Vec::new())).await
+        } else {
+            self.locally(run, events, result, secrets).await
+        }
+    }
+}
+
+#[tokio::test]
+async fn queued_followups_inherit_unfinished_prework_on_both_workers() -> anyhow::Result<()> {
+    let Some(rig) = rig().await? else {
+        return Ok(());
+    };
+    let secrets = Redactor::default();
+    let clarification = "<!-- clarify\n{\"text\":\"Which account?\",\"choices\":[\"Team\"]}\nclarify -->";
+    let plan = "<!-- plan {\"summary\":\"Use team\",\"steps\":[],\"checks\":[],\"risks\":[]} plan -->";
+    for (remote, path) in [(false, "local"), (true, "runner")] {
+        for (mode, automatic, first_output) in [
+            ("ask_when_unclear", false, clarification),
+            ("always_show_plan", true, plan),
+        ] {
+            let first = rig.run_of("task", "claude", "sonnet", remote).await?;
+            let task = rig.on_quest(&first, &format!("{path} {mode} preparation")).await?;
+            sqlx::query("UPDATE agent_tasks SET assigned_agent_id = $2 WHERE id = $1")
+                .bind(task)
+                .bind(first.agent.id)
+                .execute(rig.ctx.db.pool())
+                .await?;
+            rig.ctx
+                .store
+                .set_session_asked_by(
+                    first.session,
+                    json!({
+                        "before_big_work": mode,
+                        "before_big_work_phase": "pending",
+                        "before_big_work_automatic": automatic,
+                    }),
+                )
+                .await?;
+            sqlx::query("UPDATE agent_sessions SET review = FALSE WHERE id = $1")
+                .bind(first.session)
+                .execute(rig.ctx.db.pool())
+                .await?;
+            let queued = rig
+                .ctx
+                .store
+                .start_followup(&rig.session(&first).await?, "Keep the public API stable", "Ana", false)
+                .await?;
+
+            rig.complete_prework_run(&first, first_output, remote, &secrets).await?;
+            let phase = loka_shared::quests::single_prework_phase(rig.session(&first).await?.asked_by.as_ref()).map(str::to_string);
+            assert_eq!(phase.as_deref(), Some("pending"), "{path} {mode}: stale output cannot finish preparation");
+            let stale_cards: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM agent_messages WHERE run_id = $1 AND (meta ? 'clarification' OR meta ? 'plan')",
+            )
+            .bind(first.run)
+            .fetch_one(rig.ctx.db.pool())
+            .await?;
+            assert_eq!(stale_cards, 0, "{path} {mode}: stale output cannot ask or plan");
+
+            let (effective, prompt) = rig.take_prework_run(&first, queued.id, remote).await?;
+            let policy = if automatic { "[before big work: always show a plan]" } else { "[before big work: ask when unclear]" };
+            assert!(prompt.contains(policy), "{path} {mode}: {prompt}");
+            if automatic {
+                rig.complete_prework_run(&effective, REPORT, remote, &secrets).await?;
+                assert_eq!(
+                    loka_shared::quests::single_prework_phase(rig.session(&first).await?.asked_by.as_ref()),
+                    Some("planning"),
+                    "{path}: reporting done cannot bypass a mandatory plan"
+                );
+                let plan_run: Uuid = sqlx::query_scalar(
+                    "SELECT id FROM session_runs WHERE session_id = $1 AND status = 'queued' AND kind = 'followup' ORDER BY created_at DESC, id DESC LIMIT 1",
+                )
+                .bind(first.session)
+                .fetch_one(rig.ctx.db.pool())
+                .await?;
+                let (planning, planning_prompt) = rig.take_prework_run(&first, plan_run, remote).await?;
+                assert!(planning_prompt.contains(loka_shared::quests::PLAN_FIRST), "{path}: {planning_prompt}");
+                rig.complete_prework_run(&planning, plan, remote, &secrets).await?;
+                let card: Uuid = sqlx::query_scalar("SELECT id FROM agent_messages WHERE run_id = $1 AND meta ? 'plan'")
+                    .bind(plan_run)
+                    .fetch_one(rig.ctx.db.pool())
+                    .await?;
+                let loka_shared::quests::PlanAnswer::Approved { run_id, .. } = rig.ctx.store.answer_plan(first.agent.id, card, "Approve", "Ana").await?
+                else {
+                    panic!("{path}: the effective plan is approved")
+                };
+                assert_eq!(rig.ctx.store.answer_plan(first.agent.id, card, "Approve", "Ana").await?, loka_shared::quests::PlanAnswer::Stale);
+                let (implementation, implementation_prompt) = rig.take_prework_run(&first, run_id, remote).await?;
+                assert!(implementation_prompt.contains("[plan approved by Ana]"), "{path}: {implementation_prompt}");
+                rig.complete_prework_run(&implementation, REPORT, remote, &secrets).await?;
+                let approvals: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM world_events WHERE task_id = $1 AND type = 'task.plan_approved'",
+                )
+                .bind(task)
+                .fetch_one(rig.ctx.db.pool())
+                .await?;
+                assert_eq!(approvals, 1, "{path}: plan approval advances once");
+            } else {
+                rig.complete_prework_run(&effective, clarification, remote, &secrets).await?;
+                let card: Uuid = sqlx::query_scalar("SELECT id FROM agent_messages WHERE run_id = $1 AND meta ? 'clarification'")
+                    .bind(effective.run)
+                    .fetch_one(rig.ctx.db.pool())
+                    .await?;
+                let owner = first.agent.owner_user_id.expect("owner");
+                let reply = || loka_shared::quests::ClarificationReply {
+                    user_id: owner,
+                    author: "Ana",
+                    text: "Team",
+                    meta: json!({ "answers": card, "task_id": task }),
+                    reply_to: None,
+                    event_payload: json!({ "author": "Ana", "author_kind": "user", "body": "Team", "answer_card": card }),
+                };
+                let (answer, message) = rig.ctx.store.answer_clarification(first.agent.id, card, reply()).await?;
+                let loka_shared::quests::ClarificationAnswer::Answered { run_id, .. } = answer else {
+                    panic!("{path}: the effective question is answered")
+                };
+                assert!(message.is_some());
+                assert_eq!(
+                    rig.ctx.store.answer_clarification(first.agent.id, card, reply()).await?.0,
+                    loka_shared::quests::ClarificationAnswer::Stale
+                );
+                let (implementation, implementation_prompt) = rig.take_prework_run(&first, run_id, remote).await?;
+                assert!(implementation_prompt.contains("[questions answered by Ana]"), "{path}: {implementation_prompt}");
+                rig.complete_prework_run(&implementation, REPORT, remote, &secrets).await?;
+                let cards: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM agent_messages WHERE agent_id = $1 AND meta ? 'clarification' AND meta->'clarification'->>'task_id' = $2",
+                )
+                .bind(first.agent.id)
+                .bind(task.to_string())
+                .fetch_one(rig.ctx.db.pool())
+                .await?;
+                assert_eq!(cards, 1, "{path}: the effective run asks once");
+            }
+            assert_eq!(loka_shared::quests::single_prework_phase(rig.session(&first).await?.asked_by.as_ref()), None, "{path} {mode}");
+            let status: String = sqlx::query_scalar("SELECT status FROM agent_tasks WHERE id = $1")
+                .bind(task)
+                .fetch_one(rig.ctx.db.pool())
+                .await?;
+            assert_eq!(status, "done", "{path} {mode}: normal continuation completes after preparation");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn exhausted_prework_fails_without_reviewing_or_publishing_on_both_workers() -> anyhow::Result<()> {
+    let Some(rig) = rig().await? else {
+        return Ok(());
+    };
+    let secrets = Redactor::default();
+    let invalid = "I inspected the request, but did not return the required plan.";
+    for (remote, path) in [(false, "local"), (true, "runner")] {
+        let first = rig.run_of("task", "claude", "sonnet", remote).await?;
+        let task = rig.on_quest(&first, &format!("{path} exhausted preparation")).await?;
+        sqlx::query("UPDATE agent_tasks SET assigned_agent_id = $2, repo = $3 WHERE id = $1")
+            .bind(task)
+            .bind(first.agent.id)
+            .bind(remote.then_some("acme/app"))
+            .execute(rig.ctx.db.pool())
+            .await?;
+        rig.ctx
+            .store
+            .set_session_asked_by(
+                first.session,
+                json!({
+                    "before_big_work": "always_show_plan",
+                    "before_big_work_phase": "pending",
+                    "before_big_work_automatic": true,
+                }),
+            )
+            .await?;
+        sqlx::query("UPDATE agent_sessions SET review = TRUE WHERE id = $1")
+            .bind(first.session)
+            .execute(rig.ctx.db.pool())
+            .await?;
+
+        rig.complete_prework_run(&first, REPORT, remote, &secrets).await?;
+        assert_eq!(
+            loka_shared::quests::single_prework_phase(rig.session(&first).await?.asked_by.as_ref()),
+            Some("planning"),
+            "{path}: a done report still requires the plan"
+        );
+        let mut exhausted_run = None;
+        for attempt in 0..3 {
+            let run_id: Uuid = sqlx::query_scalar(
+                "SELECT id FROM session_runs WHERE session_id = $1 AND status = 'queued' AND kind = 'followup' ORDER BY created_at, id LIMIT 1",
+            )
+            .bind(first.session)
+            .fetch_one(rig.ctx.db.pool())
+            .await?;
+            let (run, prompt) = rig.take_prework_run(&first, run_id, remote).await?;
+            assert!(prompt.contains(loka_shared::quests::PLAN_FIRST), "{path} retry {attempt}: {prompt}");
+            let work = (remote && attempt == 2).then_some("Changed src/lib.rs before preparation completed.");
+            rig.complete_prework_run_with_work(&run, invalid, remote, &secrets, work).await?;
+            if attempt == 2 {
+                exhausted_run = Some(run_id);
+            }
+            let reminders: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM session_runs WHERE session_id = $1 AND nudge = 'report'",
+            )
+            .bind(first.session)
+            .fetch_one(rig.ctx.db.pool())
+            .await?;
+            assert_eq!(reminders, i64::from((attempt + 1).min(2)), "{path} retry {attempt}");
+        }
+
+        let (status, error): (String, Option<String>) = sqlx::query_as("SELECT status, error_message FROM agent_tasks WHERE id = $1")
+            .bind(task)
+            .fetch_one(rig.ctx.db.pool())
+            .await?;
+        assert_eq!(status, "failed", "{path}: exhausted preparation cannot count as completed: {error:?}");
+        assert!(error.is_some(), "{path}: exhausted preparation explains the failure");
+        let exhausted_status: String = sqlx::query_scalar("SELECT status FROM session_runs WHERE id = $1")
+            .bind(exhausted_run.expect("the final preparation run"))
+            .fetch_one(rig.ctx.db.pool())
+            .await?;
+        assert_eq!(exhausted_status, "failed", "{path}: the terminal preparation run records the failure");
+        let terminal: Vec<(String, Value)> = sqlx::query_as(
+            "SELECT type, payload FROM world_events WHERE run_id = $1 AND type IN ('run.completed', 'run.failed', 'task.finished') ORDER BY seq",
+        )
+        .bind(exhausted_run.expect("the final preparation run"))
+        .fetch_all(rig.ctx.db.pool())
+        .await?;
+        assert_eq!(terminal.iter().map(|event| event.0.as_str()).collect::<Vec<_>>(), ["run.failed", "task.finished"], "{path}");
+        assert_eq!(terminal[0].1.get("error").and_then(Value::as_str), error.as_deref(), "{path}: the run failure is visible");
+        assert_eq!(terminal[1].1.get("error").and_then(Value::as_str), error.as_deref(), "{path}: the quest failure matches it");
+        let closed = rig.session(&first).await?;
+        assert_eq!(closed.status, "archived", "{path}: the exhausted preparation session is closed");
+        assert_eq!(loka_shared::quests::single_prework_phase(closed.asked_by.as_ref()), Some("planning"), "{path}");
+        let escaped: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_runs WHERE task_id = $1 AND kind IN ('review', 'publish')",
+        )
+        .bind(task)
+        .fetch_one(rig.ctx.db.pool())
+        .await?;
+        assert_eq!(escaped, 0, "{path}: unapproved work is neither reviewed nor published");
+        let active: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_runs WHERE session_id = $1 AND kind IN ('task', 'followup') AND status IN ('queued', 'running')",
+        )
+        .bind(first.session)
+        .fetch_one(rig.ctx.db.pool())
+        .await?;
+        assert_eq!(active, 0, "{path}: exhausted preparation leaves no retry loop");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_context_a_run_delivered_is_saved_only_when_the_run_completes_live_on_both_workers() -> anyhow::Result<()> {
+    let Some(rig) = rig().await? else {
+        return Ok(());
+    };
+    let redactor = Redactor::default();
+    let mut sent = SentContext::default();
+    sent.offer(SKILLS_BLOCK, "[skills]\n- notes.md");
+    sent.offer(INSTRUCTIONS_BLOCK, "[rules updated]\nSign every reply.");
+    let stored = |session: AgentSession| SentContext::from_value(session.context_sent.as_ref().unwrap_or(&json!({})));
+
+    let local = rig.run("claude", "sonnet", false).await?;
+    let (events, result) = scripted();
+    rig.locally_sending(&local, events, result, Some(sent.clone()), &redactor).await?;
+    assert_eq!(stored(rig.session(&local).await?), sent, "local: a completed run records what it delivered");
+
+    let remote = rig.run("claude", "sonnet", true).await?;
+    let (events, result) = scripted();
+    rig.show(&remote, events, &redactor).await?;
+    let outcome = ExecutionOutcome { result, pr_url: None, pr_number: None, publish_pr_state: None, checked_pr_url: None, publish_pr_checked_at: None, work_summary: None, context_sent: Some(sent.clone()), published_head: None };
+    rig.deliver(&remote, success_completion(outcome, Some("cs-1".into()), remote.workspace.clone(), Vec::new())).await?;
+    assert_eq!(stored(rig.session(&remote).await?).hash(SKILLS_BLOCK), sent.hash(SKILLS_BLOCK), "remote: a completed run records what it delivered");
+
+    let closed = rig.run("claude", "sonnet", false).await?;
+    sqlx::query("UPDATE session_runs SET status = 'failed', error = 'Stopped', finished_at = NOW() WHERE id = $1")
+        .bind(closed.run)
+        .execute(rig.ctx.db.pool())
+        .await?;
+    let (events, result) = scripted();
+    rig.locally_sending(&closed, without_session_start(events), result, Some(sent.clone()), &redactor).await?;
+    assert_eq!(stored(rig.session(&closed).await?), SentContext::default(), "local: a closed run leaves the session's record alone");
+
+    let stopped = rig.run("claude", "sonnet", true).await?;
+    assert!(rig.coordinator.stop_run(stopped.run, "Tara").await?);
+    let (_, result) = scripted();
+    let outcome = ExecutionOutcome { result, pr_url: None, pr_number: None, publish_pr_state: None, checked_pr_url: None, publish_pr_checked_at: None, work_summary: None, context_sent: Some(sent.clone()), published_head: None };
+    assert!(rig.deliver(&stopped, success_completion(outcome, Some("cs-1".into()), stopped.workspace.clone(), Vec::new())).await.is_err());
+    assert_eq!(stored(rig.session(&stopped).await?), SentContext::default(), "remote: a stopped run leaves the session's record alone");
     Ok(())
 }

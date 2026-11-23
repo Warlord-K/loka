@@ -79,7 +79,7 @@ Everything has a working default.
 | `WORLD_CLAUDE_EFFORT` | `medium` for chat, `high` for work | Claude Code effort when a message does not pick one |
 | `WORLD_REVIEWS` | on | `off` disables independent reviews |
 | `WORLD_MAX_REVIEW_ROUNDS` | 2 | Fix rounds after a review asks for changes |
-| `WORLD_COMPACT_TOKENS` | 120000 | Context size after which a main session compacts |
+| `WORLD_COMPACT_TOKENS` | model window minus 15% (at least 16k) | Context budget for every session: a resumed request over it compacts natively or continues from a checkpoint. A smaller value wins; `0` turns off the after-turn compaction of main sessions |
 | `WORLD_WARM_SESSIONS`, `WORLD_WARM_IDLE_SECS` | sized from CPU and memory, 1800 | Long-lived main-session processes and their idle timeout |
 | `WORLD_INBOX_CONCURRENCY`, `WORLD_RUN_CONCURRENCY` | sized from CPU and memory | Agents answering at once, and tasks running at once |
 | `WORLD_STEER_INTERRUPT_SECS`, `WORLD_TOOL_HANG_SECS` | 180, 900 | When a steer interrupts a running tool, and when a hung tool is stopped |

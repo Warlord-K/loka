@@ -134,18 +134,20 @@ export const wb = {
   homeTermOpen: (cols: number, rows: number, id: string | null, onEvent: (event: TermEvent) => void): Promise<WbTerm> =>
     invokeTauri<WbTerm>("home_term_open", { cols, rows, id, onEvent: channel<TermEvent>(onEvent) }),
   termList: (key: string) => call<WbTerm[]>("term_list", { sessionKey: key }),
+  homeTermList: () => invokeTauri<WbTerm[]>("term_list", { sessionKey: "~home" }),
   termWrite: (id: string, data: string) => call<void>("term_write", { id, data }),
   termResize: (id: string, cols: number, rows: number) => call<void>("term_resize", { id, cols, rows }),
   termClose: (id: string) => call<void>("term_close", { id }),
 };
 
-export type OpenWorkshopDetail = string | { sessionId?: string | null; taskId?: string | null; agentId?: string | null; file?: string | null; line?: number | null };
+export type OpenWorkshopDetail = string | { sessionId?: string | null; taskId?: string | null; agentId?: string | null; file?: string | null; line?: number | null; diff?: boolean };
 
 export interface OpenWorkshop {
   sessionId: string;
   agentId: string;
   runnerId: string | null;
   root: string;
+  openDiff: () => void;
 }
 
 let openWorkshop: OpenWorkshop | null = null;
@@ -159,5 +161,9 @@ export function currentWorkshop(): OpenWorkshop | null {
 }
 
 export function requestWorkshop(detail: OpenWorkshopDetail): void {
+  if (typeof detail === "object" && detail.diff && detail.sessionId && detail.sessionId === openWorkshop?.sessionId) {
+    openWorkshop.openDiff();
+    return;
+  }
   window.dispatchEvent(new CustomEvent<OpenWorkshopDetail>("world:open-workbench", { detail }));
 }

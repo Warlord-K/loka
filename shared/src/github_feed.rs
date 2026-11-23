@@ -319,7 +319,8 @@ impl WorldStore {
         }
         if !out.quests.is_empty() {
             sqlx::query(
-                "UPDATE task_milestones SET next_check_at = NOW(), updated_at = NOW()
+                "UPDATE task_milestones
+                 SET data = data - 'runner_next_check_at', next_check_at = NOW(), updated_at = NOW()
                  WHERE task_id = ANY($1) AND kind = 'merge' AND status = 'active'",
             )
             .bind(&out.quests)
@@ -374,8 +375,8 @@ mod tests {
             "id": "1234567",
             "reason": reason,
             "updated_at": "2026-11-14T10:00:00Z",
-            "repository": { "full_name": "Warlord-K/world" },
-            "subject": { "type": kind, "title": "Fix the bell", "url": url, "latest_comment_url": "https://api.github.com/repos/Warlord-K/world/issues/comments/9" }
+            "repository": { "full_name": "acme/castle" },
+            "subject": { "type": kind, "title": "Fix the bell", "url": url, "latest_comment_url": "https://api.github.com/repos/acme/castle/issues/comments/9" }
         })
     }
 
@@ -399,15 +400,15 @@ mod tests {
 
     #[test]
     fn parses_notifications_and_links() {
-        let pr = from_api(&raw("comment", "PullRequest", "https://api.github.com/repos/Warlord-K/world/pulls/42")).unwrap();
+        let pr = from_api(&raw("comment", "PullRequest", "https://api.github.com/repos/acme/castle/pulls/42")).unwrap();
         assert_eq!(pr.number, Some(42));
-        assert_eq!(pr.url, "https://github.com/Warlord-K/world/pull/42");
+        assert_eq!(pr.url, "https://github.com/acme/castle/pull/42");
         assert!(pr.comment_api_url.is_some());
-        let issue = from_api(&raw("mention", "Issue", "https://api.github.com/repos/Warlord-K/world/issues/7")).unwrap();
-        assert_eq!(issue.url, "https://github.com/Warlord-K/world/issues/7");
+        let issue = from_api(&raw("mention", "Issue", "https://api.github.com/repos/acme/castle/issues/7")).unwrap();
+        assert_eq!(issue.url, "https://github.com/acme/castle/issues/7");
         let ci = from_api(&raw("ci_activity", "CheckSuite", "")).unwrap();
         assert_eq!(ci.number, None);
-        assert_eq!(ci.url, "https://github.com/Warlord-K/world/actions");
+        assert_eq!(ci.url, "https://github.com/acme/castle/actions");
         let mut bad = raw("comment", "PullRequest", "");
         bad["id"] = json!("12; drop");
         assert!(from_api(&bad).is_none());
@@ -422,14 +423,14 @@ mod tests {
         let mut ci = from_api(&raw("ci_activity", "CheckSuite", "")).unwrap();
         ci.title = "CI workflow run failed for loka/fix-bell branch".into();
         let payload = ci.payload(owner);
-        assert_eq!(payload["repo"], json!("warlord-k/world"));
-        assert_eq!(payload["repo_name"], json!("Warlord-K/world"));
+        assert_eq!(payload["repo"], json!("acme/castle"));
+        assert_eq!(payload["repo_name"], json!("acme/castle"));
         assert_eq!(payload["branch"], json!("loka/fix-bell"));
         assert_eq!(payload["owner_user_id"], json!(owner));
         assert!(payload.get("number").is_none());
         assert_eq!(ci_branch("Deploy workflow run cancelled for main branch").as_deref(), Some("main"));
         assert_eq!(ci_branch("Release v1"), None);
-        let mut long = from_api(&raw("comment", "PullRequest", "https://api.github.com/repos/Warlord-K/world/pulls/42")).unwrap();
+        let mut long = from_api(&raw("comment", "PullRequest", "https://api.github.com/repos/acme/castle/pulls/42")).unwrap();
         long.snippet = "x".repeat(5000);
         assert_eq!(long.payload(owner)["snippet"].as_str().unwrap().chars().count(), SNIPPET_MAX);
         assert_eq!(long.payload(owner)["number"], json!(42));
@@ -506,7 +507,7 @@ mod tests {
         .bind(owner)
         .fetch_one(&pool)
         .await?;
-        sqlx::query("INSERT INTO task_milestones (task_id, kind, title, status, position, next_check_at) VALUES ($1, 'merge', 'Merged', 'active', 1, NOW() + INTERVAL '1 hour')")
+        sqlx::query("INSERT INTO task_milestones (task_id, kind, title, status, position, data, next_check_at) VALUES ($1, 'merge', 'Merged', 'active', 1, '{\"runner_next_check_at\": 9999999999}', NOW() + INTERVAL '1 hour')")
             .bind(task)
             .execute(&pool)
             .await?;
@@ -540,11 +541,12 @@ mod tests {
         newer.snippet = "one more thing".into();
         assert_eq!(store.record_github(owner, &[newer]).await?.created, 1, "new activity on the same thread is new");
 
-        let due: bool = sqlx::query_scalar("SELECT next_check_at <= NOW() FROM task_milestones WHERE task_id = $1")
+        let (due, runner_due): (bool, bool) = sqlx::query_as("SELECT next_check_at <= NOW(), NOT (data ? 'runner_next_check_at') FROM task_milestones WHERE task_id = $1")
             .bind(task)
             .fetch_one(&pool)
             .await?;
         assert!(due, "PR activity on a quest checks its merge watch now");
+        assert!(runner_due, "PR activity on a quest checks its runner watch now");
         let in_room: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_events WHERE task_id = $1 AND type = 'github.comment'")
             .bind(task)
             .fetch_one(&pool)

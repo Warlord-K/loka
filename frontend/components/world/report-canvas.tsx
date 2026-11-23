@@ -49,6 +49,7 @@ import {
   UsersThree,
   Quotes,
   GraduationCap,
+  FolderSimple,
   Trash,
   TreeStructure,
   X,
@@ -70,7 +71,7 @@ import { POPOVER_MOTION } from "./motion";
 import { useCopy } from "@/lib/copy";
 import { commitMarkDelete, commitMarkDeleteOnExit, hideMarkDeletes, MARK_UNDO_MS, planMarkDelete, pruneMarkDeletes, settleMarkDelete, type MarkDelete, type MarkDeleteApi } from "@/lib/canvas-marks";
 import { takeEscape } from "@/lib/escape";
-import { worldUrl } from "./message-links";
+import { workspaceHref } from "@/lib/feature-links";
 import { MeaningIcon } from "@/lib/meaning-icons";
 import { CanvasCursors } from "./canvas-cursors";
 import { AgentFace } from "./channel-ui";
@@ -168,10 +169,6 @@ function Caption({ item }: { item: CanvasItem }) {
       )}
     </p>
   );
-}
-
-export function canvasItemUrl(report: string, item: string) {
-  return `${worldUrl("report", report)}&item=${encodeURIComponent(item)}`;
 }
 
 function RefCard({ target }: { target: string }) {
@@ -444,19 +441,22 @@ interface BoardProps {
   onChanged: () => void;
   onHistory: () => void;
   onRename: (title: string) => Promise<void>;
+  folders: string[];
+  onMoveFolder: (folder: string) => Promise<void>;
   onWorkspace?: () => void;
   inWorkspace?: boolean;
   workspaceChannel?: string | null;
   onShowChannel?: (id: string) => void;
 }
 
-function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgent, onChanged, onHistory, onRename, onWorkspace, inWorkspace = false, workspaceChannel = null, onShowChannel }: BoardProps) {
+function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgent, onChanged, onHistory, onRename, folders, onMoveFolder, onWorkspace, inWorkspace = false, workspaceChannel = null, onShowChannel }: BoardProps) {
   const report = detail.report;
   const canEdit = detail.can_edit;
   const flow = useReactFlow<CanvasNode, Edge>();
   const { zoom } = useViewport();
   const wrap = useRef<HTMLDivElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
+  const folderButton = useRef<HTMLButtonElement>(null);
   const [rawDoc, setDoc] = useState<CanvasDoc>(() => report.canvas ?? { items: [], edges: [] });
   const [rawMarks, setMarks] = useState<CanvasMark[]>(detail.marks);
   const [deletes, setDeletes] = useState<Map<string, MarkDelete>>(() => new Map());
@@ -476,6 +476,9 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
   const [picked, setPicked] = useState<string[]>([]);
   const [note, setNote] = useState<string | null>(null);
   const [naming, setNaming] = useState<string | null>(null);
+  const [foldering, setFoldering] = useState<string | null>(null);
+  const [folderError, setFolderError] = useState<string | null>(null);
+  const [movingFolder, setMovingFolder] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [viewing, setViewing] = useState<string | null>(null);
@@ -754,7 +757,7 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
     const label = canvasItemLabel(item);
     sendQuote(MAIN_TARGET, {
       text: (label || canvasItemKind(item)).slice(0, 2000),
-      label: `${canvasItemKind(item)} on canvas "${report.title}"`.slice(0, 120),
+      label: `${canvasItemKind(item)} in workspace "${report.title}"`.slice(0, 120),
       source: `report:${report.id}#${item.id}`,
     });
   };
@@ -794,13 +797,38 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
 
   const quoteCanvas = () =>
     sendQuote(MAIN_TARGET, {
-      text: `Canvas "${report.title}" with ${doc.items.length} ${doc.items.length === 1 ? "item" : "items"}`,
-      label: `Canvas "${report.title}"`.slice(0, 120),
+      text: `Workspace "${report.title}" with ${doc.items.length} ${doc.items.length === 1 ? "item" : "items"}`,
+      label: `Workspace "${report.title}"`.slice(0, 120),
       source: `report:${report.id}`,
     });
 
+  const closeFolder = () => {
+    setFoldering(null);
+    setFolderError(null);
+    window.requestAnimationFrame(() => folderButton.current?.focus());
+  };
+
+  const moveFolder = async () => {
+    if (foldering === null || movingFolder) return;
+    const folder = foldering.trim();
+    if (folder === report.folder) {
+      closeFolder();
+      return;
+    }
+    setMovingFolder(true);
+    setFolderError(null);
+    try {
+      await onMoveFolder(folder);
+      closeFolder();
+    } catch {
+      setFolderError("The workspace did not move. Try again.");
+    } finally {
+      setMovingFolder(false);
+    }
+  };
+
   const linkItem = (item: CanvasItem) => {
-    copy(canvasItemUrl(report.id, item.id));
+    copy(workspaceHref(window.location.origin, report.id, item.id));
     flash("Link to this item copied");
   };
 
@@ -1024,7 +1052,7 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
         )}
 
         <div className="pointer-events-none absolute inset-x-3 top-3 z-20 flex items-start justify-between gap-2">
-          <div className="pointer-events-auto flex min-w-0 items-center gap-2 rounded-lg border-2 border-w-ink bg-w-paper/95 px-3 py-1.5 shadow-[0_3px_0_rgb(var(--w-ink))]">
+          <div className="pointer-events-auto relative flex min-w-0 items-center gap-2 rounded-lg border-2 border-w-ink bg-w-paper/95 px-3 py-1.5 shadow-[0_3px_0_rgb(var(--w-ink))]">
             {naming !== null ? (
               <form
                 className="min-w-0"
@@ -1039,7 +1067,7 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
                   autoFocus
                   value={naming}
                   maxLength={200}
-                  aria-label="Canvas name"
+                  aria-label="Workspace name"
                   onChange={(e) => setNaming(e.target.value)}
                   onBlur={(e) => e.currentTarget.form?.requestSubmit()}
                   onKeyDown={(e) => {
@@ -1053,33 +1081,92 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
                 />
               </form>
             ) : canEdit ? (
-              <button type="button" onClick={() => setNaming(report.title)} title="Rename" className={cn("truncate rounded-md text-left text-w-base font-bold text-w-strong hover:bg-w-sand", FOCUS)}>
+              <button type="button" disabled={movingFolder} onClick={() => { setFoldering(null); setNaming(report.title); }} title="Rename" className={cn("truncate rounded-md text-left text-w-base font-bold text-w-strong hover:bg-w-sand", FOCUS)}>
                 {report.title}
               </button>
             ) : (
               <span className="truncate text-w-base font-bold text-w-strong">{report.title}</span>
             )}
+            {canEdit && (
+              <button
+                ref={folderButton}
+                type="button"
+                disabled={movingFolder}
+                aria-expanded={foldering !== null}
+                aria-label={`Move workspace to folder${report.folder ? `, currently ${report.folder}` : ", currently top level"}`}
+                title="Move workspace to folder"
+                onClick={() => {
+                  setNaming(null);
+                  setFolderError(null);
+                  setFoldering((current) => current === null ? report.folder : null);
+                }}
+                className={cn("flex h-7 min-w-0 items-center gap-1 rounded-md px-1.5 text-w-xs text-w-muted hover:bg-w-sand hover:text-w-text", FOCUS)}
+              >
+                <FolderSimple size={14} weight={foldering !== null ? "fill" : "regular"} className="shrink-0" />
+                <span className="hidden max-w-32 truncate @xl/board:inline">{report.folder || "Top level"}</span>
+              </button>
+            )}
             <span className="hidden shrink-0 text-w-xs text-w-muted @xl/board:inline">
               {doc.items.length} {doc.items.length === 1 ? "item" : "items"} · {openMarks} open {openMarks === 1 ? "mark" : "marks"}
             </span>
+            <AnimatePresence>
+              {foldering !== null && (
+                <motion.form
+                  {...POPOVER_MOTION}
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    void moveFolder();
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape" && !movingFolder) {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      closeFolder();
+                    }
+                  }}
+                  className="absolute left-0 top-full z-30 mt-2 w-72 max-w-[calc(100vw-1.5rem)] space-y-2 rounded-lg border-2 border-w-ink bg-w-paper p-3 shadow-[0_3px_0_rgb(var(--w-ink))]"
+                >
+                  <label htmlFor={`workspace-folder-${report.id}`} className="block text-w-xs font-semibold text-w-text2">Move workspace to folder</label>
+                  <input
+                    id={`workspace-folder-${report.id}`}
+                    list={`workspace-folders-${report.id}`}
+                    autoFocus
+                    value={foldering}
+                    onChange={(e) => setFoldering(e.target.value)}
+                    placeholder="Top level"
+                    aria-describedby={`workspace-folder-help-${report.id}`}
+                    className="h-9 w-full rounded-md border-2 border-w-ink bg-w-field px-2 text-w-sm text-w-text outline-none placeholder:text-w-faint focus:ring-2 focus:ring-w-teal"
+                  />
+                  <datalist id={`workspace-folders-${report.id}`}>
+                    {folders.map((folder) => <option key={folder} value={folder} />)}
+                  </datalist>
+                  <p id={`workspace-folder-help-${report.id}`} className="text-w-2xs text-w-muted">Leave blank for top level.</p>
+                  {folderError && <p role="alert" className="text-w-xs text-w-danger">{folderError}</p>}
+                  <div className="flex justify-end gap-1.5">
+                    <button type="button" disabled={movingFolder} onClick={closeFolder} className={cn(BTN_GHOST, BTN_SM)}>Cancel</button>
+                    <button type="submit" disabled={movingFolder} className={cn(BTN_PRIMARY, BTN_SM)}>{movingFolder ? "Moving" : "Move"}</button>
+                  </div>
+                </motion.form>
+              )}
+            </AnimatePresence>
           </div>
           <div className="pointer-events-auto flex shrink-0 items-center gap-0.5 rounded-lg border-2 border-w-ink bg-w-paper/95 p-0.5 shadow-[0_3px_0_rgb(var(--w-ink))]">
             <ClusterButton icon={ChatCircleDots} label="Marks" active={marksOpen} onClick={() => setMarksOpen((v) => !v)} />
             <ClusterButton
               icon={TreeStructure}
-              label="Links to and from this canvas"
+              label="Links to and from this workspace"
               active={linksOpen}
               onClick={() => {
                 setLinksOpen((v) => !v);
                 setMarksOpen(false);
               }}
             />
-            <ClusterButton icon={Quotes} label="Quote this canvas in chat" onClick={quoteCanvas} />
-            {ownCanvas && <ClusterButton icon={Phone} label="Call your main agent about this canvas" onClick={callAbout} />}
+            <ClusterButton icon={Quotes} label="Quote this workspace in chat" onClick={quoteCanvas} />
+            {ownCanvas && <ClusterButton icon={Phone} label="Call your main agent about this workspace" onClick={callAbout} />}
             {onWorkspace && !inWorkspace && <ClusterButton icon={Layout} label="Open as workspace, with your chat and channels beside it" onClick={onWorkspace} />}
             {ownCanvas && <ClusterButton icon={GraduationCap} label={practice.busy ? "Making the lesson" : practice.error ?? PRACTICE_THIS_HINT} active={practice.busy} onClick={practice.run} />}
             <ClusterButton icon={ClockCounterClockwise} label="History" onClick={onHistory} />
-            <ClusterButton icon={copied ? Check : LinkIcon} label={copied ? "Link copied" : "Copy a link"} onClick={() => copy(worldUrl("report", report.id))} />
+            <ClusterButton icon={copied ? Check : LinkIcon} label={copied ? "Link copied" : "Copy a link"} onClick={() => copy(workspaceHref(window.location.origin, report.id))} />
           </div>
         </div>
 
@@ -1135,7 +1222,7 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
                           <li key={r.id}>
                             <button type="button" onClick={() => openReport(r.id)} className={cn("w-full truncate rounded-md px-2 py-1.5 text-left text-w-sm text-w-text hover:bg-w-sand", EASE)}>
                               {r.title}
-                              {r.kind === "canvas" && <span className="ml-1.5 text-w-2xs text-w-muted">canvas</span>}
+                              {r.kind === "canvas" && <span className="ml-1.5 text-w-2xs text-w-muted">workspace</span>}
                             </button>
                           </li>
                         ))}
@@ -1218,7 +1305,7 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
         {doc.items.length === 0 && canEdit && tool === "select" && (
           <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center p-6">
             <p className="max-w-sm text-balance text-center text-w-sm text-w-muted">
-              An empty canvas. Add a picture (I), a sticky note (S), a quest, report, to-do or message as a card (L), a live terminal or running quest (E), or ask an agent to fill it.
+              An empty workspace. Add a picture (I), a sticky note (S), a quest, report, to-do or message as a card (L), a live terminal or running quest (E), or ask an agent to fill it.
             </p>
           </div>
         )}
@@ -1240,7 +1327,7 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
           <SelectionBar count={chosen.length} agents={agents} actions={guide} channelHint={inWorkspace && workspaceChannel ? "in the open channel" : null} />
         )}
 
-        <div role="toolbar" aria-label="Canvas tools" className="absolute bottom-3 left-1/2 z-20 flex -translate-x-1/2 items-center gap-0.5 rounded-lg border-2 border-w-ink bg-w-paper/95 p-0.5 shadow-[0_3px_0_rgb(var(--w-ink))]">
+        <div role="toolbar" aria-label="Workspace tools" className="absolute bottom-3 left-1/2 z-20 flex -translate-x-1/2 items-center gap-0.5 rounded-lg border-2 border-w-ink bg-w-paper/95 p-0.5 shadow-[0_3px_0_rgb(var(--w-ink))]">
           {tools.map((t) => (
             <ClusterButton key={t.tool} icon={t.icon} label={t.label} hint={t.key} active={t.tool === tool} onClick={() => pick(t.tool)} />
           ))}
@@ -1268,7 +1355,7 @@ const REF = /^(quest|report|todo|msg|agent):([A-Za-z0-9_-]{3,80})$/i;
 function thingsFrom(results: SearchResults): Thing[] {
   return [
     ...results.quests.map((q) => ({ target: `quest:${q.id}`, kind: "Quest", title: q.title, detail: q.status.replace(/_/g, " ") })),
-    ...(results.reports ?? []).map((r) => ({ target: `report:${r.id}`, kind: r.kind === "canvas" ? "Canvas" : "Report", title: r.title, detail: r.folder || undefined })),
+    ...(results.reports ?? []).map((r) => ({ target: `report:${r.id}`, kind: r.kind === "canvas" ? "Workspace" : "Report", title: r.title, detail: r.folder || undefined })),
     ...results.todos.map((t) => ({ target: `todo:${t.id}`, kind: "To-do", title: t.text, detail: t.status })),
     ...results.messages.map((m) => ({ target: `msg:${m.ref}`, kind: "Message", title: m.excerpt, detail: m.kind === "channel" ? `${m.author} in #${m.channel_name ?? "a channel"}` : `${m.author} to ${m.agent_name ?? "an agent"}` })),
     ...results.agents.map((a) => ({ target: `agent:${a.slug}`, kind: "Agent", title: a.name, detail: a.expertise ?? undefined })),

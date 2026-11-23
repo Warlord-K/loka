@@ -13,7 +13,7 @@ pub fn tools(tool: fn(&str, &str, Value, &[&str]) -> Value) -> Vec<Value> {
     let s = |d: &str| json!({ "type": "string", "description": d });
     vec![tool(
         "grade_attempt",
-        "Grade a canvas lesson attempt you were sent as coach (practice.ready). Look at the image and the stroke order first and compare with earlier attempts. It saves your check, grades the attempt in the Academy (a pass earns xp in the skill the first time, keeps the streak and counts toward the course), posts it in your person's chat with you (with a practice:<id> card) and notifies them, so do not also reply with the same text. Each attempt gets one grade.",
+        "Grade a practice workspace lesson attempt you were sent as coach (practice.ready). Look at the image and the stroke order first and compare with earlier attempts. It saves your check, grades the attempt in the Academy (a pass earns xp in the skill the first time, keeps the streak and counts toward the course), posts it in your person's chat with you (with a practice:<id> card) and notifies them, so do not also reply with the same text. Each attempt gets one grade.",
         json!({
             "attempt": s("The attempt id from practice.ready (practice:<id> or its first characters)"),
             "right": s("What is right in this attempt, specific: name strokes, shapes or proportions"),
@@ -54,12 +54,12 @@ pub fn check_args(args: &Value) -> Result<CheckArgs> {
 }
 
 async fn find(store: &WorldStore, owner: Uuid, org: Uuid, key: Option<&str>) -> Result<(Report, Practice)> {
-    let key = key.ok_or_else(|| anyhow!("canvas is required"))?;
-    let report = store.find_report(owner, org, key).await?.ok_or_else(|| anyhow!("no practice canvas matches {key}; see list_practice"))?;
+    let key = key.ok_or_else(|| anyhow!("workspace is required"))?;
+    let report = store.find_report(owner, org, key).await?.ok_or_else(|| anyhow!("no practice workspace matches {key}; see list_practice"))?;
     if report.owner_user_id != owner {
         bail!("\"{}\" belongs to someone else", report.title);
     }
-    let practice = Practice::of(&report).ok_or_else(|| anyhow!("\"{}\" is not a practice canvas; make one with create_practice", report.title))?;
+    let practice = Practice::of(&report).ok_or_else(|| anyhow!("\"{}\" is not a practice workspace; make one with create_practice", report.title))?;
     Ok((report, practice))
 }
 
@@ -118,13 +118,13 @@ pub fn grade_line(status: Option<&str>, xp: i32) -> String {
 pub async fn read(store: &WorldStore, owner: Uuid, org: Uuid, canvas: Option<&str>, attempt: Option<&str>, strokes: bool) -> Result<String> {
     if let Some(key) = attempt {
         let attempt = store.find_practice_attempt(owner, org, key).await?.ok_or_else(|| anyhow!("no attempt matches {key}"))?;
-        let report = store.get_report(attempt.report_id).await?.ok_or_else(|| anyhow!("that practice canvas is gone"))?;
-        return Ok(format!("Practice canvas report:{} \"{}\" ({})\n{}", report.id, report.title, attempt.subject, attempt_detail(&attempt, strokes)));
+        let report = store.get_report(attempt.report_id).await?.ok_or_else(|| anyhow!("that practice workspace is gone"))?;
+        return Ok(format!("Practice workspace report:{} \"{}\" ({})\n{}", report.id, report.title, attempt.subject, attempt_detail(&attempt, strokes)));
     }
     let (report, practice) = find(store, owner, org, canvas).await?;
     let attempts = store.practice_attempts(report.id, 30, false).await?;
     let mut out = format!(
-        "Practice canvas report:{} \"{}\": subject {}, coach {}, {} attempts shown.",
+        "Practice workspace report:{} \"{}\": subject {}, coach {}, {} attempts shown.",
         report.id,
         report.title,
         practice.subject,
@@ -158,7 +158,7 @@ pub async fn call(store: &WorldStore, caller: &WorldAgent, quest: Option<Uuid>, 
             };
             let report = store.create_practice(owner, org, by, &subject, arg("title"), Some(coach), quest).await?;
             Ok(format!(
-                "Made practice canvas report:{} \"{}\" for {subject}, coached by {}. Tell your person in a line and put report:{} on its own line so it shows as a card; they draw on it and press Ready.",
+                "Made practice workspace report:{} \"{}\" for {subject}, coached by {}. Tell your person in a line and put report:{} on its own line so it shows as a card; they draw in it and press Ready.",
                 report.id,
                 report.title,
                 coach_name(store, Some(coach)).await,
@@ -176,13 +176,13 @@ pub async fn call(store: &WorldStore, caller: &WorldAgent, quest: Option<Uuid>, 
                 bail!("give coach, subject or title to change");
             }
             let report = store.update_practice(&report, by, arg("subject"), coach, arg("title")).await?;
-            let practice = Practice::of(&report).ok_or_else(|| anyhow!("that is not a practice canvas any more"))?;
+            let practice = Practice::of(&report).ok_or_else(|| anyhow!("that is not a practice workspace any more"))?;
             Ok(format!("Updated report:{} \"{}\": subject {}, coach {}.", report.id, report.title, practice.subject, coach_name(store, practice.coach_agent_id).await))
         }
         "list_practice" => {
             let found = store.list_practice(owner, org, arg("subject"), arg("query"), 50).await?;
             if found.is_empty() {
-                return Ok("No practice canvases yet; create_practice makes one.".into());
+                return Ok("No practice workspaces yet; create_practice makes one.".into());
             }
             let mut lines = Vec::new();
             for p in found {

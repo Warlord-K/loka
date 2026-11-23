@@ -4,6 +4,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::git_names::TrackedPr;
 use crate::models::{
     AgentLog, AgentProfile, AgentTask, Policy, PrReview, PrReviewFinding, PrReviewLog, RepoProfile,
     Schedule, ScheduledRun, ScheduledRunLog, TaskAttachment,
@@ -15,8 +16,49 @@ pub struct LogCursor {
     pub id: Uuid,
 }
 
+#[derive(Debug)]
+pub enum UpdateTaskError {
+    InvalidPullRequest,
+    PullRequestConflict,
+    InvalidSettings,
+}
+
+impl std::fmt::Display for UpdateTaskError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidPullRequest => f.write_str("invalid pull request"),
+            Self::PullRequestConflict => f.write_str("pull request conflicts with the quest"),
+            Self::InvalidSettings => f.write_str("invalid quest settings"),
+        }
+    }
+}
+
+impl std::error::Error for UpdateTaskError {}
+
 const LEGACY_TASK_ACCESS: &str =
     "(user_id = $2 OR ($3 AND org_id = $4 AND assigned_agent_id IS NULL AND assignee_user_id IS NULL))";
+
+async fn set_pr_in(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, id: Uuid, pr_url: &str, pr_number: i32, promote: bool) -> Result<bool> {
+    let changed = sqlx::query(
+        "UPDATE agent_tasks SET pr_url = COALESCE(pr_url, $1), pr_number = COALESCE(pr_number, $2),
+                status = CASE WHEN $4 AND (pr_url IS NULL OR pr_number IS NULL) AND status NOT IN ('done', 'cancelled') THEN 'review' ELSE status END
+         WHERE id = $3 AND status <> 'cancelled'
+           AND (pr_url IS NULL OR lower(pr_url) = lower($1))
+           AND (pr_number IS NULL OR pr_number = $2)",
+    )
+    .bind(pr_url)
+    .bind(pr_number)
+    .bind(id)
+    .bind(promote)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected()
+        > 0;
+    if changed {
+        crate::milestones::arm_merge_in(tx, id).await?;
+    }
+    Ok(changed)
+}
 
 #[derive(Clone)]
 pub struct Database {
@@ -292,6 +334,17 @@ impl Database {
         user_id: Uuid,
         updates: &std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<u64> {
+        self.update_task_with_settings(id, user_id, updates, None, None).await
+    }
+
+    pub async fn update_task_with_settings(
+        &self,
+        id: Uuid,
+        user_id: Uuid,
+        updates: &std::collections::HashMap<String, serde_json::Value>,
+        time_limit: Option<Option<i64>>,
+        quest: Option<&crate::quests::ValidChoice>,
+    ) -> Result<u64> {
         let allowed = [
             "title",
             "description",
@@ -301,8 +354,6 @@ impl Database {
             "priority",
             "position",
             "branch",
-            "pr_url",
-            "pr_number",
             "plan_content",
             "result_content",
             "feedback",
@@ -350,7 +401,28 @@ impl Database {
             }
         }
 
-        if set_clauses.is_empty() {
+        let pr_url = updates.get("pr_url");
+        let pr_number = updates.get("pr_number");
+        let pr = match (pr_url, pr_number) {
+            (None, None) => None,
+            (Some(serde_json::Value::String(url)), Some(serde_json::Value::Number(number))) => {
+                let number = number
+                    .as_i64()
+                    .and_then(|number| i32::try_from(number).ok())
+                    .filter(|number| *number > 0)
+                    .ok_or(UpdateTaskError::InvalidPullRequest)?;
+                Some((url.as_str(), number))
+            }
+            _ => return Err(UpdateTaskError::InvalidPullRequest.into()),
+        };
+        let time_limit_secs = time_limit
+            .map(crate::world::task_time_limit_secs)
+            .transpose()
+            .map_err(|_| UpdateTaskError::InvalidSettings)?;
+        let quest = quest.filter(|choice| !choice.is_empty());
+        let has_settings = time_limit_secs.is_some() || quest.is_some();
+
+        if set_clauses.is_empty() && pr.is_none() && !has_settings {
             return Ok(0);
         }
 
@@ -369,44 +441,237 @@ impl Database {
             )
         };
 
-        let mut query = sqlx::query(&sql);
-        for val in &values {
-            if val.is_empty() {
-                query = query.bind(None::<String>);
-            } else {
-                query = query.bind(val);
+        if pr.is_none() && !has_settings {
+            let mut query = sqlx::query(&sql);
+            for val in &values {
+                if val.is_empty() {
+                    query = query.bind(None::<String>);
+                } else {
+                    query = query.bind(val);
+                }
             }
-        }
-        if self.shared_workspace {
-            query = query.bind(id);
-        } else {
-            query = query.bind(id).bind(user_id);
+            if self.shared_workspace {
+                query = query.bind(id);
+            } else {
+                query = query.bind(id).bind(user_id);
+            }
+            let rows = query.execute(&self.pool).await?.rows_affected();
+            return Ok(rows);
         }
 
-        let result = query.execute(&self.pool).await?;
-        Ok(result.rows_affected())
+        let mut tx = self.pool.begin().await?;
+        let stored_repo = if self.shared_workspace {
+            sqlx::query_scalar::<_, Option<String>>("SELECT repo FROM agent_tasks WHERE id = $1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?
+        } else {
+            sqlx::query_scalar::<_, Option<String>>("SELECT repo FROM agent_tasks WHERE id = $1 AND user_id = $2 FOR UPDATE")
+                .bind(id)
+                .bind(user_id)
+                .fetch_optional(&mut *tx)
+                .await?
+        };
+        let Some(stored_repo) = stored_repo else {
+            return Ok(0);
+        };
+        if let Some((pr_url, pr_number)) = pr {
+            let effective_repo = match updates.get("repo") {
+                Some(serde_json::Value::String(repo)) => Some(repo.clone()),
+                Some(_) => None,
+                None => stored_repo,
+            }
+            .and_then(|repo| crate::git_names::github_repo(&repo).ok())
+            .ok_or(UpdateTaskError::InvalidPullRequest)?;
+            if !crate::runners::pr_url_matches(pr_url, &effective_repo, i64::from(pr_number)) {
+                return Err(UpdateTaskError::InvalidPullRequest.into());
+            }
+        }
+
+        let rows = if set_clauses.is_empty() {
+            1
+        } else {
+            let mut query = sqlx::query(&sql);
+            for val in &values {
+                if val.is_empty() {
+                    query = query.bind(None::<String>);
+                } else {
+                    query = query.bind(val);
+                }
+            }
+            if self.shared_workspace {
+                query = query.bind(id);
+            } else {
+                query = query.bind(id).bind(user_id);
+            }
+            query.execute(&mut *tx).await?.rows_affected()
+        };
+        if let Some((pr_url, pr_number)) = pr {
+            if !set_pr_in(&mut tx, id, pr_url, pr_number, false).await? {
+                return Err(UpdateTaskError::PullRequestConflict.into());
+            }
+        }
+        if let Some(secs) = time_limit_secs {
+            crate::world::set_task_time_limit_in(&mut tx, id, secs).await?;
+        }
+        if let Some(choice) = quest {
+            if let Err(error) = crate::quests::set_quest_options_in(&mut tx, id, choice).await {
+                if error.downcast_ref::<crate::quests::InvalidQuestOptions>().is_some() {
+                    return Err(UpdateTaskError::InvalidSettings.into());
+                }
+                return Err(error);
+            }
+        }
+        tx.commit().await?;
+        Ok(rows)
     }
 
     pub async fn delete_task(&self, id: Uuid, user_id: Uuid) -> Result<u64> {
-        let result = sqlx::query(&format!("DELETE FROM agent_tasks WHERE id = $1 AND {LEGACY_TASK_ACCESS}"))
+        let mut tx = self.pool.begin().await?;
+        let org = sqlx::query_scalar::<_, Uuid>(&format!("SELECT org_id FROM agent_tasks WHERE id = $1 AND {LEGACY_TASK_ACCESS}"))
             .bind(id)
             .bind(user_id)
             .bind(self.shared_workspace)
             .bind(crate::orgs::DEFAULT_ORG)
-            .execute(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
-        Ok(result.rows_affected())
+        let Some(org) = org else {
+            tx.rollback().await?;
+            return Ok(0);
+        };
+        if !crate::orgs::lock_org_parent(&mut tx, org).await? {
+            tx.rollback().await?;
+            return Ok(0);
+        }
+        let allowed = sqlx::query_scalar::<_, Uuid>(&format!(
+            "SELECT id FROM agent_tasks WHERE id = $1 AND {LEGACY_TASK_ACCESS} FOR UPDATE"
+        ))
+        .bind(id)
+        .bind(user_id)
+        .bind(self.shared_workspace)
+        .bind(crate::orgs::DEFAULT_ORG)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if allowed.is_none() {
+            tx.rollback().await?;
+            return Ok(0);
+        }
+        let task_ids = sqlx::query_scalar::<_, Uuid>(
+            "WITH RECURSIVE descendants(id) AS (
+               SELECT $1::uuid
+               UNION
+               SELECT child.id FROM agent_tasks child JOIN descendants parent ON child.parent_task_id = parent.id
+             )
+             SELECT task.id FROM agent_tasks task JOIN descendants ON descendants.id = task.id
+             ORDER BY task.id FOR UPDATE OF task",
+        )
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut clarification_agents = crate::world::settle_deleted_task_clarifications(&mut tx, &task_ids, "Quest deleted").await?;
+        for task_id in task_ids {
+            clarification_agents.extend(crate::world::settle_task_closure(&mut tx, task_id, None, "Quest deleted").await?);
+        }
+        clarification_agents.sort_unstable();
+        clarification_agents.dedup();
+        let deleted = sqlx::query("DELETE FROM agent_tasks WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        let _ = crate::world::WorldStore::new(self.pool.clone())
+            .clear_clarification_waiting(&clarification_agents)
+            .await;
+        Ok(deleted)
     }
 
     pub async fn update_status(&self, id: Uuid, status: &str) -> Result<bool> {
-        let changed = sqlx::query("UPDATE agent_tasks SET status = $1 WHERE id = $2 AND status <> 'cancelled'")
-            .bind(status)
+        let mut tx = self.pool.begin().await?;
+        let previous = sqlx::query_scalar::<_, String>("SELECT status FROM agent_tasks WHERE id = $1 FOR UPDATE")
             .bind(id)
-            .execute(&self.pool)
-            .await?
-            .rows_affected()
-            > 0;
+            .fetch_optional(&mut *tx)
+            .await?;
+        let changed = previous
+            .as_deref()
+            .is_some_and(|previous| previous != "cancelled" && (previous != "done" || status == "done"));
+        if changed {
+            sqlx::query("UPDATE agent_tasks SET status = $1 WHERE id = $2")
+                .bind(status)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let mut clarification_agents = Vec::new();
+        if changed && previous.as_deref() != Some(status) && matches!(status, "done" | "failed" | "cancelled") {
+            let note = match status {
+                "done" => "Quest finished",
+                "failed" => "Quest failed",
+                _ => "Quest cancelled",
+            };
+            clarification_agents.extend(crate::world::settle_task_closure(&mut tx, id, None, note).await?);
+        }
+        tx.commit().await?;
+        let _ = crate::world::WorldStore::new(self.pool.clone())
+            .clear_clarification_waiting(&clarification_agents)
+            .await;
         Ok(changed)
+    }
+
+    pub async fn settle_current_pr(&self, id: Uuid, pr_url: &str, merged: bool) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let current = sqlx::query_scalar::<_, bool>(
+            "SELECT TRUE FROM agent_tasks WHERE id = $1 AND pr_url = $2 FOR UPDATE",
+        )
+        .bind(id)
+        .bind(pr_url)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+        if !current {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let (status, detail) = if merged {
+            ("done", "Merged")
+        } else {
+            ("failed", "Closed without merging")
+        };
+        sqlx::query(
+            "UPDATE task_milestones
+             SET status = $2, detail = $3, done_at = NOW(), next_check_at = NULL, updated_at = NOW()
+             WHERE task_id = $1 AND kind = 'merge' AND status IN ('pending', 'active')",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(detail)
+        .execute(&mut *tx)
+        .await?;
+        if merged {
+            let open: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM task_milestones WHERE task_id = $1 AND status IN ('pending', 'active')",
+            )
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if open == 0 {
+                sqlx::query("UPDATE agent_tasks SET status = 'done' WHERE id = $1 AND status <> 'cancelled'")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        } else {
+            sqlx::query(
+                "UPDATE agent_tasks
+                 SET error_message = 'The pull request was closed without merging', status = 'failed'
+                 WHERE id = $1 AND status <> 'cancelled'",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
     }
 
     pub async fn set_plan(&self, id: Uuid, plan: &str) -> Result<()> {
@@ -439,26 +704,84 @@ impl Database {
     }
 
     pub async fn set_pr(&self, id: Uuid, pr_url: &str, pr_number: i32) -> Result<()> {
-        sqlx::query(
-            "UPDATE agent_tasks SET pr_url = $1, pr_number = $2,
-                    status = CASE WHEN status = 'cancelled' THEN status ELSE 'review' END
-             WHERE id = $3",
-        )
-        .bind(pr_url)
-        .bind(pr_number)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        let mut tx = self.pool.begin().await?;
+        set_pr_in(&mut tx, id, pr_url, pr_number, true).await?;
+        tx.commit().await?;
         Ok(())
     }
 
-    pub async fn set_error(&self, id: Uuid, error_message: &str) -> Result<()> {
-        sqlx::query("UPDATE agent_tasks SET error_message = $1, status = 'failed' WHERE id = $2 AND status <> 'cancelled'")
-            .bind(error_message)
+    pub async fn replace_current_pr(
+        &self,
+        task_id: Uuid,
+        expected_old_url: &str,
+        expected_old_number: i32,
+        new_url: &str,
+        new_number: i32,
+    ) -> Result<bool> {
+        let Some(old_pr) = TrackedPr::parse(expected_old_url) else {
+            return Ok(false);
+        };
+        let Some(new_pr) = TrackedPr::parse(new_url) else {
+            return Ok(false);
+        };
+        if old_pr.number() != expected_old_number
+            || new_pr.number() != new_number
+            || !old_pr.repo().eq_ignore_ascii_case(new_pr.repo())
+            || old_pr.same_identity(new_pr)
+        {
+            return Ok(false);
+        }
+        let old_url = old_pr.url();
+        let new_url = new_pr.url();
+        let mut tx = self.pool.begin().await?;
+        let changed = sqlx::query(
+            "UPDATE agent_tasks
+             SET pr_url = $4, pr_number = $5, status = 'review', error_message = NULL
+             WHERE id = $1 AND status <> 'cancelled'
+               AND lower(pr_url) = lower($2) AND (pr_number IS NULL OR pr_number = $3)
+               AND lower(regexp_replace(trim(trailing '/' from regexp_replace(trim(COALESCE(repo, '')), '^https?://github\\.com/', '', 'i')), '\\.git$', '')) = lower($6)",
+        )
+        .bind(task_id)
+        .bind(old_url)
+        .bind(expected_old_number)
+        .bind(new_url)
+        .bind(new_number)
+        .bind(old_pr.repo())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        if changed {
+            crate::milestones::arm_merge_in(&mut tx, task_id).await?;
+        }
+        tx.commit().await?;
+        Ok(changed)
+    }
+
+    pub async fn set_error(&self, id: Uuid, error_message: &str) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let previous = sqlx::query_scalar::<_, String>("SELECT status FROM agent_tasks WHERE id = $1 FOR UPDATE")
             .bind(id)
-            .execute(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
-        Ok(())
+        let changed = previous.as_deref().is_some_and(|status| !matches!(status, "done" | "cancelled"));
+        if changed {
+            sqlx::query("UPDATE agent_tasks SET error_message = $1, status = 'failed' WHERE id = $2")
+                .bind(error_message)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let clarification_agents = if changed && previous.as_deref() != Some("failed") {
+            crate::world::settle_task_closure(&mut tx, id, None, "Quest failed").await?
+        } else {
+            Vec::new()
+        };
+        tx.commit().await?;
+        let _ = crate::world::WorldStore::new(self.pool.clone())
+            .clear_clarification_waiting(&clarification_agents)
+            .await;
+        Ok(changed)
     }
 
     pub async fn clear_feedback(&self, id: Uuid) -> Result<()> {
@@ -490,15 +813,24 @@ impl Database {
         Ok(())
     }
 
-    pub async fn find_task_by_branch(&self, repo: &str, branch: &str) -> Result<Option<AgentTask>> {
+    pub async fn find_task_by_branch(&self, repo: &str, branch: &str, pr_url: Option<&str>) -> Result<Option<AgentTask>> {
+        let pr_url = pr_url.and_then(TrackedPr::parse).map(TrackedPr::url);
         let task = sqlx::query_as::<_, AgentTask>(
             "SELECT * FROM agent_tasks
-             WHERE branch = $1
-               AND lower(regexp_replace(regexp_replace(COALESCE(repo, ''), '^https?://github\\.com/', ''), '\\.git$', '')) = lower($2)
+             WHERE ($3::text IS NOT NULL AND lower(pr_url) = lower($3))
+               OR branch = $1
+                 AND ($3::text IS NULL OR pr_url IS NULL)
+                 AND lower(regexp_replace(regexp_replace(COALESCE(repo, ''), '^https?://github\\.com/', ''), '\\.git$', '')) = lower($2)
+             ORDER BY CASE
+               WHEN $3::text IS NOT NULL AND lower(pr_url) = lower($3) AND branch = $1 THEN 0
+               WHEN $3::text IS NOT NULL AND lower(pr_url) = lower($3) THEN 1
+               ELSE 2
+             END
              LIMIT 1",
         )
         .bind(branch)
         .bind(repo)
+        .bind(pr_url)
         .fetch_optional(&self.pool)
         .await?;
         Ok(task)
@@ -1745,11 +2077,8 @@ impl Database {
     }
 
     pub async fn delete_agent_profile(&self, id: Uuid) -> Result<u64> {
-        let result = sqlx::query("DELETE FROM agent_profiles WHERE id = $1")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        Ok(result.rows_affected())
+        let deleted = crate::world::WorldStore::new(self.pool.clone()).delete_agent(id).await?;
+        Ok(deleted)
     }
 
 

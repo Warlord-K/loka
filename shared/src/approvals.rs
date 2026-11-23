@@ -39,7 +39,7 @@ mod tests {
     use uuid::Uuid;
 
     fn rule(scope: &str, body: &str, enabled: bool) -> WorldRule {
-        WorldRule { id: Uuid::new_v4(), user_id: None, scope: scope.into(), body: body.into(), enabled, position: 0, created_at: Utc::now(), updated_at: Utc::now() }
+        WorldRule { id: Uuid::new_v4(), user_id: None, scope: scope.into(), body: body.into(), enabled, position: 0, created_at: Utc::now(), updated_at: Utc::now(), github_repos: Vec::new(), model: None }
     }
 
     #[test]

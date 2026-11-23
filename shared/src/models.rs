@@ -226,6 +226,9 @@ pub struct AgentTask {
     #[sqlx(default)]
     #[serde(default)]
     pub org_id: Option<Uuid>,
+    #[sqlx(default)]
+    #[serde(default)]
+    pub past_prs: Option<serde_json::Value>,
 }
 
 impl AgentTask {

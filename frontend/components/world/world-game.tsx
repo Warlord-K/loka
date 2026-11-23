@@ -43,6 +43,7 @@ import { navigationCollections, navigationDetails } from "@/lib/navigation-detai
 import { OPEN_ACADEMY, type AcademyTarget } from "@/lib/loka";
 import { questNeedsYou } from "@/lib/quest-status";
 import { EMPTY_STORE, OPEN_WORKSPACE, layoutFor, layoutKey as workspaceLayoutKey, readStore, remember, type WorkspaceLayout, type WorkspaceStore } from "@/lib/workspace-layout";
+import { validFeatureItem } from "@/lib/feature-links";
 import { targetKey, LokaEngine, type Target, type TimeOfDay } from "./engine";
 import { arrivalFor, buildWorld, HEARTH, type World } from "./world";
 import { buildWorld as buildClassicWorld } from "./world-classic";
@@ -74,7 +75,7 @@ import { TeamsView } from "./teams-ui";
 import { StarterTeamCard } from "./starter-team-ui";
 import { TEAMS_CHANGED, TeamRequestError, teamsApi, useTeams, type Team } from "@/lib/teams";
 import { newerSeq, resyncHead, streamUrl } from "@/lib/stream-resume";
-import { REPORTS_STALE, reportsApi, type ReportDetail } from "@/lib/reports";
+import { REPORTS_STALE, ReportError, reportCollection, reportsApi, type ReportCollection, type ReportDetail } from "@/lib/reports";
 import { ATTEMPT_ID, ATTEMPT_ITEM, openPractice, practiceApi, PRACTICE_VOICE } from "@/lib/practice";
 import { OPEN_CHANGELOG, primeChangelog, unseenChangelog } from "@/lib/changelog";
 import { everyoneNow, ownsAgent, ScopeToggle, useEveryone } from "./scope";
@@ -88,7 +89,8 @@ import { callReducer, isCallOf, NO_CALL } from "@/lib/call-state";
 import { CALL_ABOUT_EVENT, readAbout } from "@/lib/canvas-quote";
 import { EquipCard, OmpModelsSection } from "./omp-models";
 import { ContextButton, ContextMeter, useAgentContext } from "./context-control";
-import { ApprovalRow, QuestContextRow, ReviewerRow, KitSection, MainAgentRow, PowersSection, ResetContextRow, TidyHistoryRow, UsageSection, RemoveAgentButton, ArchiveAgentRow, SchedulesSection, SubscriptionsSection, FeedsSection, TagChips } from "./agent-manage";
+import { ApprovalRow, AskingRow, QuestContextRow, ReviewerRow, KitSection, MainAgentRow, PowersSection, ResetContextRow, TidyHistoryRow, UsageSection, RemoveAgentButton, ArchiveAgentRow, SchedulesSection, SubscriptionsSection, FeedsSection, TagChips } from "./agent-manage";
+import { isDesktopApp } from "@/lib/desktop";
 import { AgentRunnerSelector, DesktopStatusButton } from "./desktop-devices";
 import { OfflineBanner } from "./offline-banner";
 import { DesktopCommandPalette } from "./desktop-command-palette";
@@ -100,6 +102,7 @@ import { pinClippedScroll } from "@/lib/scroll";
 import { escapeTaken, takeEscape } from "@/lib/escape";
 import { installTextScaleKeys } from "@/lib/text-scale";
 import { ShortcutSheet } from "./shortcuts";
+import { LiveQuestsProvider, useLiveQuests, useSetLiveQuests } from "./live-quests";
 import {
   AskChoices,
   DraftQueue,
@@ -134,10 +137,11 @@ import { SEEN_EVENT } from "./seen";
 import { ShellRunCard } from "./shell-run";
 import { useDraft } from "./drafts";
 import { ChangelogPanel, CreateAgentDialog, FolderWorkshop, preloadPanels, QuestRoom, ReportsPanel, TerminalPanel, UiCard, YouPanel } from "./lazy";
-import type { TerminalCommand, TerminalPlace, TerminalReader, TerminalRequest } from "./terminal";
+import type { TerminalCloser, TerminalCommand, TerminalPlace, TerminalReader, TerminalRequest } from "./terminal";
 import type { TerminalPaletteCommand } from "./desktop-command-palette";
-import { DOCK_SIZE, deviceChoices, layoutKey, loadLayout } from "@/lib/terminal-layout";
+import { DOCK_SIZE, deviceChoices, layoutKey, loadLayout, publishTerminals, runningTerminals, savedSummaries, terminalSummaries, watchTerminals, type TerminalSummary } from "@/lib/terminal-layout";
 import type { TypedReport } from "@/lib/terminal-type";
+import { nextPresence, presenceMounted } from "@/lib/terminal-close";
 
 const QUOTE_KEEP_MS = 10 * 60_000;
 import { attachesByDefault } from "@/lib/terminal-context";
@@ -153,16 +157,19 @@ import { AgentAvatar, AgentFace, PersonAvatar, startsGroup, usePortrait } from "
 import { FindBar } from "./find-bar";
 import { PaneResizer, usePaneWidth } from "./pane-resizer";
 import { cliName, modelName, runtimeName } from "@/lib/model-names";
+import { mixProblem, roomAsk, type MixSlot } from "@/lib/quest-board";
+import { askingServed, cleanVariants, CREW_SIZES, DEFAULT_CREW } from "@/lib/quest-room-api";
+import { CrewMix } from "./crew-ui";
 import { SEND_RETRY_DELAYS, notSent, sendFailure } from "@/lib/send-failure";
 import { chooseNewArt, newArtOn, retryDelay, showNewArt } from "./sprites";
 
-type ReportTarget = { id: string | null; item?: string | null; title?: string; missing?: () => void; loaded?: boolean; detail?: ReportDetail; request?: number; workspace?: boolean };
+type ReportTarget = { id: string | null; item?: string | null; title?: string; missing?: () => void; loaded?: boolean; detail?: ReportDetail; request?: number; workspace?: boolean; collection?: ReportCollection; draft?: { title: string; folder: string } };
 
 type NavigationTarget =
   | { kind: "surface"; show: (request: NavigationRequest) => void; keepSideChat?: boolean; preservePanels?: boolean }
   | { kind: "assistant" }
   | { kind: "agent"; id: string; agent?: WorldAgent; tab?: "work" }
-  | { kind: "quest"; id: string; agentId?: string | null; loaded?: boolean; page?: QuestRoomPage }
+  | { kind: "quest"; id: string; agentId?: string | null; loaded?: boolean; page?: QuestRoomPage; item?: string | null }
   | ({ kind: "report" | "canvas" } & ReportTarget)
   | { kind: "academy"; target: AcademyTarget }
   | { kind: "practice"; id: string }
@@ -198,6 +205,8 @@ const TIMES: { id: TimeOfDay; label: string; Icon: typeof Sun }[] = [
 ];
 
 const NOOP = () => {};
+const NO_TERMINAL_SUMMARIES: TerminalSummary[] = [];
+const noTerminalSummaries = () => NO_TERMINAL_SUMMARIES;
 const SIDE_KEY = "world.sidechat";
 const useForegroundState = useState;
 const useForegroundAction = useCallback;
@@ -225,7 +234,14 @@ const QUEST_CONTEXT_CHOICES = [
   ...QUEST_CONTEXTS.map((c) => ({ value: c.value, label: `${c.label} context`, hint: c.hint.toLowerCase() })),
 ];
 
-function approachOptions(approach: string): QuestOptions {
+const ASKING_APPROACHES = [
+  { value: "ask", label: "Ask the agent first", hint: "it answers instead of you" },
+  { value: "crew", label: "Start with a crew", hint: "helpers split the work" },
+];
+
+function approachOptions(approach: string, crew?: { size: number; variants: MixSlot[] }): QuestOptions {
+  if (approach === "crew" && crew) return { asking: "crew", crew_size: crew.size, crew_variants: cleanVariants(crew.variants, crew.size) };
+  if (approach === "ask") return { asking: "ask_agent" };
   if (approach === "quick" || approach === "urgent") return { pace: approach };
   if (approach === "plan") return { plan_first: true };
   if (approach === "2" || approach === "3") return { attempts: Number(approach) };
@@ -274,6 +290,9 @@ function bellWorthy(ev: WorldEvent, me: string | undefined): boolean {
     case "agent.status":
       return p.status === "error";
     case "runner.disk_low":
+    case "action.ran":
+    case "action.skipped":
+    case "action.failed":
       return true;
     default:
       return false;
@@ -359,9 +378,11 @@ function notificationSound(e: WorldEvent, talkingTo: string | null): SoundKind |
     case "task.finished":
       return e.payload.error ? "failed" : "done";
     case "task.merged":
+    case "action.ran":
       return "done";
     case "task.pr_closed":
     case "agent.status":
+    case "action.failed":
       return "failed";
     case "message.created":
       return e.agent_id && e.agent_id === talkingTo ? null : "notify";
@@ -383,6 +404,10 @@ function describe(e: WorldEvent, names: Map<string, string>): string | null {
       return `${who}'s pull request was merged: ${p.title ?? "a quest"}`;
     case "task.pr_closed":
       return `${who}'s pull request was closed without merging`;
+    case "action.ran":
+    case "action.skipped":
+    case "action.failed":
+      return `${who}: ${p.line ?? "a pull request action finished"}`;
     case "task.review_feedback":
       return `${who} is working through review comments on ${p.title ?? "a quest"}`;
     case "task.ci_failed":
@@ -608,13 +633,12 @@ function AgentDialog({
     return [...loadedMessages, exactMessage].sort((a, b) => a.created_at.localeCompare(b.created_at));
   }, [exactMessage, loadedMessages]);
   const [historyFor, setHistoryFor] = useState<string | null>(() => (MESSAGE_CACHE.has(agent.id) ? agent.id : null));
-  const [tasks, setTasks] = useState<TaskBrief[]>(() => TASK_CACHE.get(agent.id) ?? []);
+  const liveTasks = useLiveQuests(access.read);
+  const tasks = useMemo(() => (liveTasks ?? []).filter((task) => task.assigned_agent_id === agent.id).slice(0, 12), [liveTasks, agent.id]);
+  const setTasks = useSetLiveQuests(access.read);
   useEffect(() => {
     if (historyFor === agent.id) MESSAGE_CACHE.set(agent.id, loadedMessages.slice(-150));
   }, [loadedMessages, historyFor, agent.id]);
-  useEffect(() => {
-    TASK_CACHE.set(agent.id, tasks);
-  }, [tasks, agent.id]);
   const [input, setInput] = useDraft(`agent:${agent.id}:${tab === "aside" ? "aside" : "talk"}`);
   const [dictated, setDictated] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -627,6 +651,9 @@ function AgentDialog({
   const [waitForMerge, setWaitForMerge] = useState(true);
   const [timeLimit, setTimeLimit] = useState("");
   const [approach, setApproach] = useState("");
+  const [crewSize, setCrewSize] = useState(DEFAULT_CREW);
+  const [crewMix, setCrewMix] = useState<MixSlot[]>([]);
+  const crewServed = askingServed(agent);
   const [questContext, setQuestContext] = useState("");
   const [fixCi, setFixCi] = useState(false);
   const [editing, setEditing] = useState<string | null>(null);
@@ -706,26 +733,16 @@ function AgentDialog({
         .finally(() => setHistoryFor(agent.id));
   }, [agent.id, access.use]);
 
-  const refresh = useCallback(() => {
-    refreshMessages();
-    if (!access.read) return;
-    worldApi
-      .tasks()
-      .then((all) => setTasks(all.filter((t) => t.assigned_agent_id === agent.id).slice(0, 12)))
-      .catch(() => {});
-  }, [agent.id, access.read, refreshMessages]);
-
   useEffect(() => {
-    refresh();
+    refreshMessages();
     const onEvent = (e: Event) => {
       const ev = (e as CustomEvent<WorldEvent>).detail;
-      if (ev.type === "voice.transcript" && ev.agent_id === agent.id) refreshMessages();
-      else if ((ev.agent_id === agent.id && ev.type !== "agent.progress" && ev.type !== "agent.context") || (ev.type === "task.updated" && ev.payload.from_agent_id === agent.id)) refresh();
+      if ((ev.agent_id === agent.id && ev.type !== "agent.progress" && ev.type !== "agent.context") || (ev.type === "task.updated" && ev.payload.from_agent_id === agent.id)) refreshMessages();
     };
     window.addEventListener("world-event", onEvent);
     return () => window.removeEventListener("world-event", onEvent);
-  }, [agent.id, refresh, refreshMessages]);
-  useRefetchOnResume(refresh);
+  }, [agent.id, refreshMessages]);
+  useRefetchOnResume(refreshMessages);
 
   const lastId = messages[messages.length - 1]?.id;
   const follow = useFollowBottom(endRef, lastId, tab);
@@ -754,7 +771,7 @@ function AgentDialog({
     const attachments = (message.meta?.attachments ?? []).map((a) => a.id);
     await worldApi.rewind(agent.id, message.id, { body: text, attachments, options: turn.effective });
     setEditing(null);
-    refresh();
+    refreshMessages();
   };
 
   const rewindTo = async (message: AgentMessage) => {
@@ -763,7 +780,7 @@ function AgentDialog({
     try {
       await worldApi.rewind(agent.id, message.id);
       setInput(message.body);
-      refresh();
+      refreshMessages();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not rewind. Try again.");
     }
@@ -812,7 +829,7 @@ function AgentDialog({
     setError(null);
     try {
       await worldApi.send(agent.id, choice, [], turn.effective, askId);
-      refresh();
+      refreshMessages();
       return true;
     } catch (err) {
       setError(`That did not go through. ${sendFailure(err).reason} Try again.`);
@@ -855,7 +872,7 @@ function AgentDialog({
       setDictated(false);
       if (talking) files.clear();
       if (access.use) await worldApi.messages(agent.id).then(setMessages).catch(() => {});
-      refresh();
+      refreshMessages();
     } catch (err) {
       if (talking) {
         setInput((cur) => (cur.trim() ? `${text}\n${cur}` : text));
@@ -882,7 +899,7 @@ function AgentDialog({
     follow.stick();
     try {
       await worldApi.send(agent.id, text, [], turn.effective);
-      refresh();
+      refreshMessages();
     } catch (err) {
       setWaiting(null);
       setError(`That did not go through. ${sendFailure(err).reason} Try again.`);
@@ -894,11 +911,11 @@ function AgentDialog({
 
   const assign = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!title.trim() || !description.trim()) return;
+    if (!title.trim() || !description.trim() || (approach === "crew" && mixProblem(crewMix, crewSize))) return;
     setBusy(true);
     setError(null);
     try {
-      await worldApi.assign(agent.id, title.trim(), description.trim(), repo.trim() || null, draftsFrom(steps), waitForMerge && !!repo.trim(), timeLimit ? Number(timeLimit) : null, { ...approachOptions(approach), ...(questContext ? { context: questContext as QuestContext } : {}), ...(fixCi && waitForMerge && repo.trim() ? { ci_feedback: true } : {}) });
+      await worldApi.assign(agent.id, title.trim(), description.trim(), repo.trim() || null, draftsFrom(steps), waitForMerge && !!repo.trim(), timeLimit ? Number(timeLimit) : null, { ...approachOptions(approach, { size: crewSize, variants: crewMix }), ...(questContext ? { context: questContext as QuestContext } : {}), ...(fixCi && waitForMerge && repo.trim() ? { ci_feedback: true } : {}) });
       setTitle("");
       setApproach("");
       setQuestContext("");
@@ -906,7 +923,7 @@ function AgentDialog({
       setDescription("");
       setRepo("");
       setSteps([]);
-      refresh();
+      refreshMessages();
     } catch {
       setError("Could not hand over that quest.");
     } finally {
@@ -926,8 +943,8 @@ function AgentDialog({
   const ownsAgent = !!meId && agent.owner_user_id === meId;
   const afterRun = useCallback(() => {
     follow.stick();
-    refresh();
-  }, [follow, refresh]);
+    refreshMessages();
+  }, [follow, refreshMessages]);
   const runCommand = useRunCommand(agent, meId, { onRan: afterRun });
   const usage = formatUsage(agent.cost_usd, agent.tokens);
   const { context, refresh: refreshContext } = useAgentContext(agent.id, access.use, agent.status);
@@ -1149,6 +1166,7 @@ function AgentDialog({
               <div className="space-y-4">
                 <ApprovalRow agent={agent} canChange={access.manage} onUpdated={onAgentUpdated} />
                 <QuestContextRow agent={agent} canChange={access.manage} onUpdated={onAgentUpdated} />
+                <AskingRow agent={agent} canChange={access.manage} onUpdated={onAgentUpdated} />
                 <ReviewerRow agent={agent} canChange={access.manage} onUpdated={onAgentUpdated} />
                 <PowersSection agent={agent} onUpdated={onAgentUpdated} />
               </div>
@@ -1204,13 +1222,22 @@ function AgentDialog({
                   onChange={setTimeLimit}
                   options={QUEST_TIME_LIMITS}
                 />
-                <WSelect ariaLabel="How to approach it" className="w-auto shrink-0 whitespace-nowrap" value={approach} onChange={setApproach} options={QUEST_APPROACHES} />
+                <WSelect ariaLabel="How to approach it" className="w-auto shrink-0 whitespace-nowrap" value={approach} onChange={setApproach} options={crewServed ? [...QUEST_APPROACHES, ...ASKING_APPROACHES] : QUEST_APPROACHES} />
                 <WSelect ariaLabel="Context for this quest" className="w-auto shrink-0 whitespace-nowrap" value={questContext} onChange={setQuestContext} options={QUEST_CONTEXT_CHOICES} />
-                <button type="submit" disabled={busy || !title.trim() || !description.trim()} className={cn(BTN_PRIMARY, "ml-auto")}>
+                <button type="submit" disabled={busy || !title.trim() || !description.trim() || (approach === "crew" && !!mixProblem(crewMix, crewSize))} className={cn(BTN_PRIMARY, "ml-auto")}>
                   <Sword size={14} weight="bold" />
                   Hand it over
                 </button>
               </div>
+              {approach === "crew" && crewServed && (
+                <div className="space-y-2 rounded-lg border-2 border-w-line bg-w-paper/60 p-3">
+                  <div className="flex flex-wrap items-center gap-2 text-w-xs text-w-text2">
+                    <span className="min-w-0 flex-1">{agent.name} leads and splits the work. Helpers ask {agent.name} instead of guessing, and only taste, keys, money or anything that can&apos;t be undone comes to you.</span>
+                    <WSelect size="sm" ariaLabel="How many helpers" className="w-auto whitespace-nowrap" value={String(crewSize)} onChange={(v) => setCrewSize(Number(v))} options={CREW_SIZES.map((n) => ({ value: String(n), label: `${n} helpers` }))} />
+                  </div>
+                  <CrewMix size={crewSize} value={crewMix} standing={agent.crew_variants ?? []} agent={agent} onChange={setCrewMix} />
+                </div>
+              )}
             </form>}
             <AgentQuestList
               active={active}
@@ -1220,7 +1247,7 @@ function AgentDialog({
               viewer={viewer}
               canUse={access.use}
               onOpen={(id) => onHistory({ taskId: id })}
-              onChanged={refresh}
+              onChanged={refreshMessages}
             />
           </div>
         ) : visible.length || (tab === "talk" && (outgoing || waiting)) ? (
@@ -1594,7 +1621,7 @@ function AgentDialog({
             send={async (text, spoken, attachments, quote) => {
               await worldApi.send(agent.id, text, attachments, turn.effective, undefined, spoken || undefined, undefined, thread, quote);
               if (spoken) onVoiceSent(agent.id);
-              refresh();
+              refreshMessages();
             }}
             canPost={access.use}
             handles={handles}
@@ -1915,7 +1942,7 @@ function AgentQuestList({
                   </button>
                   <span className="min-w-0 flex-1 font-medium">{t.title}</span>
                   {questNeedsYou(t) ? (
-                    <span className="rounded-md bg-w-warn/20 px-1.5 py-0.5 text-w-2xs font-semibold text-w-warn" title="The plan is waiting for your approval in chat">Needs you</span>
+                    <span className="rounded-md bg-w-warn/20 px-1.5 py-0.5 text-w-2xs font-semibold text-w-warn" title="This quest is waiting for you">Needs you</span>
                   ) : t.plan_first && t.status !== "done" ? (
                     <span className="text-w-2xs text-w-muted">Plan first</span>
                   ) : null}
@@ -1952,6 +1979,7 @@ function AgentQuestList({
                       taskId={t.id}
                       milestones={t.milestones ?? []}
                       editable={canUse}
+                      retryable={!!t.pr_url && !["cancelled", "done"].includes(t.status)}
                       onChanged={onChanged}
                       className="mt-2 border-t border-dashed border-w-line pt-2"
                     />
@@ -2232,7 +2260,6 @@ function SelfAvatar({ id, name }: { id: string; name: string }) {
 }
 
 const MESSAGE_CACHE = new Map<string, AgentMessage[]>();
-const TASK_CACHE = new Map<string, TaskBrief[]>();
 
 const HUD_FADE = "transition-[opacity,visibility] duration-200 [transition-timing-function:cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none";
 
@@ -2342,6 +2369,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
   const [history, setHistory] = useForegroundState<string | null | false>(false);
   const [quick, setQuick] = useForegroundState<{ agentId?: string; sessionId?: string } | false>(false);
   const [historyFocus, setHistoryFocus] = useState<(SessionFocus & { page?: QuestRoomPage; request?: number }) | null>(null);
+  const questRoomOpen = history !== false && !!historyFocus?.taskId && !historyFocus.sessionId;
   const [notesOpen, setNotesOpen] = useForegroundState(false);
   const [notes, setNotes] = useState<Notifications>({ events: [], unread: 0 });
   const [windowLayers, setWindowLayers] = useForegroundState<WindowLayer[]>(["terminal", "agent", "chat"]);
@@ -2407,13 +2435,26 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       updateWorldLink("place", null);
     });
   }, [commitForeground, updateWorldLink]);
-  const [terminalOpen, setTerminalOpen] = useForegroundState(false);
+  const [terminalPresence, moveTerminal] = useReducer(nextPresence, "closed");
+  const terminalOpen = terminalPresence === "open";
+  const terminalsRunning = runningTerminals(useSyncExternalStore(watchTerminals, terminalSummaries, noTerminalSummaries));
   const [terminalPlace, setTerminalPlace] = useState<TerminalPlace>({ dock: "window", size: DOCK_SIZE });
   const [terminalCommand, setTerminalCommand] = useState<TerminalCommand | null>(null);
   const meIdForTerminal = initialMe?.id ?? null;
   useEffect(() => {
     const saved = loadLayout(window.localStorage, layoutKey(meIdForTerminal));
     if (saved) setTerminalPlace({ dock: saved.dock, size: saved.size });
+    if (!saved || !isDesktopApp() || !Object.values(saved.panes).some((pane) => pane.native)) return;
+    let gone = false;
+    void import("./workbench/bridge")
+      .then(({ wb }) => wb.homeTermList())
+      .then((live) => {
+        if (!gone && !terminalSummaries().length) publishTerminals(savedSummaries(saved, live));
+      })
+      .catch(() => {});
+    return () => {
+      gone = true;
+    };
   }, [meIdForTerminal]);
   const terminalDocked = terminalOpen && terminalPlace.dock !== "window";
   const terminalWindowed = terminalOpen && !terminalDocked;
@@ -2423,7 +2464,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
   terminalPlaceRef.current = terminalPlace;
   const showTerminal = useForegroundAction(() => {
     raiseLayer("terminal");
-    setTerminalOpen(true);
+    moveTerminal("open");
     setTerminalCommand({ id: Date.now(), action: "focus" });
   }, [raiseLayer]);
   const [terminalRequest, setTerminalRequest] = useState<TerminalRequest | null>(null);
@@ -2446,6 +2487,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     if (!pending.wide) setTerminalTalk(pending.writer);
   }, []);
   const terminalReader = useRef<TerminalReader | null>(null);
+  const terminalCloser = useRef<TerminalCloser | null>(null);
   const terminalHolder = useRef<HTMLDivElement>(null);
   const [terminalNode, setTerminalNode] = useState<HTMLDivElement | null>(null);
   useLayoutEffect(() => {
@@ -2466,14 +2508,14 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     } catch {}
   }, []);
   useEffect(() => {
-    if (reports || listsOpen || terminalWindowed || academyHost || !side.auto) return;
+    if (reports || listsOpen || terminalWindowed || academyHost || questRoomOpen || !side.auto) return;
     try {
       const saved = JSON.parse(window.localStorage.getItem(SIDE_KEY) ?? "null") as { id?: unknown; open?: unknown; v?: unknown } | null;
       setSideState({ id: typeof saved?.id === "string" ? saved.id : side.id, open: saved?.open === true && saved.v === 2 });
     } catch {
       setSideState({ id: side.id, open: false });
     }
-  }, [reports, listsOpen, terminalWindowed, academyHost, side.auto, side.id]);
+  }, [reports, listsOpen, terminalWindowed, academyHost, questRoomOpen, side.auto, side.id]);
   useEffect(() => {
     try {
       const saved = JSON.parse(window.localStorage.getItem(SIDE_KEY) ?? "null") as { id?: unknown; open?: unknown; v?: unknown } | null;
@@ -2783,13 +2825,13 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     };
     window.addEventListener("world:open-report", onOpenReport);
     const onOpenWorkspace = (e: Event) => {
-      const id = (e as CustomEvent<{ id?: string | null } | undefined>).detail?.id ?? workspaceStoreRef.current.last;
+      const detail = (e as CustomEvent<{ id?: string | null; item?: string | null } | undefined>).detail;
+      const id = detail?.id ?? null;
       if (id) {
-        void navigateRef.current({ kind: "report", id, workspace: true });
+        void navigateRef.current({ kind: "report", id, item: detail?.item ?? null, workspace: true });
         return;
       }
-      void navigateRef.current({ kind: "report", id: null, loaded: true });
-      pushToast({ id: Date.now(), text: "Open a canvas, then press Open as workspace in its toolbar." });
+      void navigateRef.current({ kind: "report", id: null, loaded: true, collection: "workspaces" });
     };
     window.addEventListener(OPEN_WORKSPACE, onOpenWorkspace);
     const onOpenChangelog = () => void navigateRef.current({ kind: "surface", show: () => setChangelogOpen(true) });
@@ -3310,7 +3352,8 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       if (ev.type.startsWith("report.") || ev.type.startsWith("canvas.")) window.dispatchEvent(new CustomEvent(REPORTS_STALE, { detail: ev.payload }));
       if (ev.type === "report.created" && ev.agent_id && !ev.payload.quiet && ev.payload.owner_user_id === meRef.current?.id) {
         const id = String(ev.payload.report_id ?? "");
-        pushToast({ id: ev.seq, kind: "report.created", target: "reports", bell: true, text: `New report: ${String(ev.payload.title ?? "")}`, onClick: () => void navigateRef.current({ kind: "report", id }) });
+        const noun = ev.payload.report_kind === "canvas" ? "workspace" : "report";
+        pushToast({ id: ev.seq, kind: "report.created", target: "reports", bell: true, text: `New ${noun}: ${String(ev.payload.title ?? "")}`, onClick: () => void navigateRef.current({ kind: "report", id }) });
       }
       if (ev.type === "practice.checked" && ev.payload.owner_user_id === meRef.current?.id && typeof ev.payload.attempt_id === "string") {
         const reportId = String(ev.payload.report_id ?? "");
@@ -3386,8 +3429,12 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
           card: typeof ev.payload.message_id === "string" ? ev.payload.message_id : undefined,
           linkedOnly: ev.payload.clarification === true,
           bell: true,
-          text: `${(ev.payload.agent as string) ?? "An agent"} needs your decision: ${(ev.payload.text as string).slice(0, 140)}`,
-          onClick: () => { if (agentId) void navigateRef.current({ kind: "agent", id: agentId }); },
+          text: `${(ev.payload.agent as string) ?? "An agent"} needs your decision: ${String(ev.payload.text ?? ev.payload.why ?? "").slice(0, 140)}`,
+          onClick: () => {
+            const ask = roomAsk(ev);
+            if (ask) void navigateRef.current({ kind: "quest", id: ask.taskId, agentId, item: ask.focus });
+            else if (agentId) void navigateRef.current({ kind: "agent", id: agentId });
+          },
         });
       }
       if (ev.type === "message.created" && ev.agent_id && ev.payload.author_kind === "user" && askingAgent?.owner_user_id === mine) {
@@ -3682,17 +3729,22 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       } else if (target.kind === "quest") {
         if (target.loaded) resolved = target;
         else {
-          const page = await exact(navigationDetails.quest(details, target.id));
-          resolved = { kind: "quest", id: page.task.id, agentId: page.task.assigned_agent_id, page };
+          const page = await exact(navigationDetails.quest(details, target.id, undefined, undefined, target.item ?? undefined));
+          resolved = { kind: "quest", id: page.task.id, agentId: page.task.assigned_agent_id, page, item: target.item };
         }
       } else if (target.kind === "report" || target.kind === "canvas") {
         const id = target.title ? (await exact(navigationDetails.reportFind(details, target.title))).id : target.id;
         if (!request.current()) return null;
-        if (!id || target.loaded) resolved = { ...target, id };
+        if (!id) resolved = { ...target, id, collection: target.collection ?? "reports" };
+        else if (target.detail) {
+          const kind = target.detail.report.kind === "canvas" ? "canvas" : "report";
+          resolved = { ...target, kind, id, collection: reportCollection(target.detail.report) };
+        } else if (target.loaded) resolved = { ...target, id, collection: target.collection ?? (target.kind === "canvas" ? "workspaces" : "reports") };
         else {
           const detail = await exact(navigationDetails.report(details, id));
           if (!request.current()) return null;
-          resolved = { kind: detail.report.kind === "canvas" ? "canvas" : "report", id: detail.report.id, item: target.item, detail, workspace: target.workspace };
+          const kind = detail.report.kind === "canvas" ? "canvas" : "report";
+          resolved = { kind, id: detail.report.id, item: target.item, detail, workspace: target.workspace, collection: reportCollection(detail.report) };
         }
       } else if (target.kind === "practice") {
         const attempt = await exact(navigationDetails.practiceAttempt(details, target.id));
@@ -3729,14 +3781,19 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
         const link = await exact(navigationDetails.message(details, target.ref));
         if (!request.current()) return null;
         if (!link) throw new Error("unavailable");
-        const messageId = link.kind === "channel" ? Number(/^ch(\d+)$/.exec(link.ref)?.[1]) : NaN;
-        if (link.channel_id && Number.isSafeInteger(messageId)) {
-          const jump = await resolveMessageJump(link.channel_id, messageId, (id, root) => exact(navigationDetails.channelReplies(details, id, root)));
-          resolved = { kind: "message", link, ...jump };
-        } else if (link.agent_id) {
-          const jump = await resolveMessageJump(link.agent_id, link.ref, (id, root) => exact(navigationDetails.messageReplies(details, id, root)));
-          resolved = { kind: "message", link, agentMessage: jump.message, agentThread: jump.thread };
-        } else return null;
+        if (link.task_id) {
+          const page = await exact(navigationDetails.quest(details, link.task_id, undefined, undefined, link.ref));
+          resolved = { kind: "quest", id: page.room.task_id ?? page.task.id, agentId: page.task.assigned_agent_id, page, item: link.ref };
+        } else {
+          const messageId = link.kind === "channel" ? Number(/^ch(\d+)$/.exec(link.ref)?.[1]) : NaN;
+          if (link.channel_id && Number.isSafeInteger(messageId)) {
+            const jump = await resolveMessageJump(link.channel_id, messageId, (id, root) => exact(navigationDetails.channelReplies(details, id, root)));
+            resolved = { kind: "message", link, ...jump };
+          } else if (link.agent_id) {
+            const jump = await resolveMessageJump(link.agent_id, link.ref, (id, root) => exact(navigationDetails.messageReplies(details, id, root)));
+            resolved = { kind: "message", link, agentMessage: jump.message, agentThread: jump.thread };
+          } else return null;
+        }
       } else return null;
       return resolved;
     }, async () => {
@@ -3763,7 +3820,8 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
         closePanels: (keepConversations) => closePanelsForNavigation(keepConversations, request),
         showSideChat,
         closeTerminal: () => {
-          if (!terminalDockedRef.current) setTerminalOpen(false);
+          if (terminalDockedRef.current) return;
+          moveTerminal("cover");
         },
         showBoard: setBoard,
         prepare: () => {
@@ -3787,7 +3845,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
         },
         quest: (destination) => {
           setHistory(destination.agentId ?? null);
-          setHistoryFocus({ taskId: destination.id, page: destination.page, request: request.request });
+          setHistoryFocus({ taskId: destination.id, page: destination.page, request: request.request, item: destination.item ?? null });
         },
         reports: (destination) => {
           closeCoveringPanels(request);
@@ -3804,7 +3862,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
           if (rest !== before) window.history.replaceState(null, "", `${window.location.pathname}${rest ? `?${rest}` : ""}${window.location.hash}`);
           if (destination.workspace !== undefined) rememberWorkspaceRef.current(destination.id, { workspace: destination.workspace });
           const workspace = destination.workspace ?? layoutFor(workspaceStoreRef.current, destination.id).workspace;
-          setReports({ id: destination.id, item: destination.item, detail: destination.detail, request: request.request, workspace });
+          setReports({ id: destination.id, item: destination.item, detail: destination.detail, request: request.request, workspace, collection: destination.collection, draft: destination.draft });
         },
         academy: (destination) => {
           setAcademyHost(true);
@@ -3880,25 +3938,53 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
         messageTarget: resolved.kind === "message" ? resolved.link.kind === "agent" && resolved.link.agent_id ? "agent" : resolved.link.channel_id ? "channel" : undefined : undefined,
         threadedMessage: resolved.kind === "message" && Boolean(resolved.thread || resolved.agentThread),
       });
-    }, () => {
-      if ((target.kind === "report" || target.kind === "canvas") && target.missing) target.missing();
-      else pushToast({ id: Date.now(), text: target.kind === "practice" ? "That practice attempt was not found." : "That link is no longer available." });
+    }, (error) => {
+      if (target.kind === "report" || target.kind === "canvas") {
+        if (error instanceof ReportError && error.status === 404) {
+          if (target.missing) target.missing();
+          else pushToast({ id: Date.now(), text: "That link is no longer available." });
+          return;
+        }
+        pushToast({
+          id: Date.now(),
+          text: `Could not open that ${target.kind === "canvas" ? "workspace" : "report"}. Click to try again.`,
+          onClick: () => {
+            if (request.current()) void navigateRef.current(target);
+          },
+        });
+        return;
+      }
+      pushToast({ id: Date.now(), text: target.kind === "practice" ? "That practice attempt was not found." : "That link is no longer available." });
     });
   }, [cancelPendingNavigation, closeCoveringPanels, closePanelsForNavigation, load, navigationDetailLoader, reloadMe, setSide, storeAgent, updateWorldLink]);
   navigateRef.current = navigate;
   const navigateSurface = (show: (request: NavigationRequest) => void, keepSideChat?: boolean, navigation?: NavigationRequest) => void navigate({ kind: "surface", show, keepSideChat }, navigation);
+  useEffect(() => {
+    const onOpenSchedule = (event: Event) => {
+      const detail = (event as CustomEvent<{ agentId?: string; id?: string }>).detail;
+      const agentId = detail?.agentId;
+      if (!agentId || !detail.id) return;
+      if (!agentsRef.current.some((a) => a.id === agentId)) {
+        pushToast({ id: Date.now(), text: "That link is no longer available." });
+        return;
+      }
+      void navigateRef.current({ kind: "surface", show: () => setSheet({ kind: "agents", surface: "schedules", agentId, focusId: detail.id }) });
+    };
+    window.addEventListener("world:open-schedule", onOpenSchedule);
+    return () => window.removeEventListener("world:open-schedule", onOpenSchedule);
+  }, [pushToast, setSheet]);
   const openTerminal = (command?: TerminalCommand["action"], tab?: string, device?: string) => {
     const next = { id: Date.now(), action: command ?? "focus", tab, device } satisfies TerminalCommand;
     if (terminalPlaceRef.current.dock !== "window") {
       commitForeground(() => {
-        setTerminalOpen(true);
+        moveTerminal("open");
         setTerminalCommand(next);
       });
       return;
     }
     navigateSurface(() => {
       raiseLayer("terminal");
-      setTerminalOpen(true);
+      moveTerminal("open");
       setTerminalCommand(next);
     });
   };
@@ -3909,14 +3995,14 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
         setTerminalPlace((prev) => ({ ...prev, dock }));
         navigateSurface(() => {
           raiseLayer("terminal");
-          setTerminalOpen(true);
+          moveTerminal("open");
           setTerminalCommand({ id: Date.now(), action: "focus" });
         });
         return;
       }
       commitForeground(() => {
         setTerminalPlace((prev) => ({ ...prev, dock }));
-        setTerminalOpen(true);
+        moveTerminal("open");
         setTerminalCommand({ id: Date.now(), action: "focus" });
       });
       return;
@@ -3985,7 +4071,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       if (kind === "msg") void navigate({ kind: "message", ref: id });
       else if (kind === "report") {
         const item = params.get("item");
-        void navigate({ kind, id, item: item && /^[A-Za-z0-9_-]{1,40}$/.test(item) ? item : null, workspace: params.get("workspace") === "1" ? true : undefined });
+        void navigate({ kind, id, item: validFeatureItem(item) ? item : null, workspace: params.get("workspace") === "1" ? true : undefined });
       } else if (kind === "practice") {
         if (!ATTEMPT_ID.test(id)) continue;
         void navigate({ kind, id: id.toLowerCase() });
@@ -4036,7 +4122,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       const asked = (event as CustomEvent<OpenTerminal | undefined>).detail;
       if (terminalPlaceRef.current.dock !== "window") {
         commitForeground(() => {
-          setTerminalOpen(true);
+          moveTerminal("open");
           if (!asked?.command) {
             setTerminalCommand({ id: Date.now(), action: "focus" });
             return;
@@ -4096,9 +4182,9 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       if (link) void navigate({ kind: "message", ref: link.ref });
     };
     const onOpenQuest = (event: Event) => {
-      const detail = (event as CustomEvent<{ taskId: string; agentId: string | null; loaded?: boolean }>).detail;
+      const detail = (event as CustomEvent<{ taskId: string; agentId: string | null; loaded?: boolean; focus?: string | null }>).detail;
       if (!detail) return;
-      void navigate({ kind: "quest", id: detail.taskId, agentId: detail.agentId, loaded: detail.loaded && atLeast(meRef.current, "write") });
+      void navigate({ kind: "quest", id: detail.taskId, agentId: detail.agentId, loaded: detail.loaded && atLeast(meRef.current, "write"), item: detail.focus ?? null });
     };
     const onOpenChannel = (event: Event) => {
       const detail = (event as CustomEvent<{ id: string; loaded?: boolean }>).detail;
@@ -4214,9 +4300,17 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       const el = e.target as HTMLElement | null;
       if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable)) return;
       if (e.metaKey || e.ctrlKey || e.altKey || !started) return;
+      const k = e.key.toLowerCase();
       if (e.key === "?" && !paletteOpen && !workbench) {
         e.preventDefault();
         showAuxiliary(() => setShortcutsOpen(true));
+        return;
+      }
+      const shortcutUncovered = !paletteOpen && !workbench && !notesOpen && !shortcutsOpen;
+      const foregroundWorkspaces = Boolean(reports && (reports.collection === "workspaces" || reports.workspace) && reportsVisible.current);
+      if (k === "b" && canRead && shortcutUncovered && (!overlay || foregroundWorkspaces)) {
+        e.preventDefault();
+        window.dispatchEvent(new CustomEvent(OPEN_WORKSPACE));
         return;
       }
       if (overlay) return;
@@ -4225,7 +4319,6 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
         engineRef.current.leaveRoom();
         return;
       }
-      const k = e.key.toLowerCase();
       if (k === "q" && canRead) {
         navigateSurface(() => setBoard("quests"));
       } else if (k === "c" && canRead) {
@@ -4246,8 +4339,6 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
         navigateSurface(() => setListsOpen(true));
       } else if (k === "r" && canRead) {
         void navigate({ kind: "report", id: null, loaded: true });
-      } else if (k === "b" && canRead) {
-        window.dispatchEvent(new CustomEvent(OPEN_WORKSPACE));
       } else if (k === "t" && canWrite && terminalFeature?.state !== "unavailable") {
         openTerminal();
       } else if (k === "o" && canWrite) {
@@ -4263,7 +4354,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [commitForeground, navigate, notesOpen, overlay, showAuxiliary, showTerminal, started, canRead, canWrite, isAdmin, terminalFeature?.state, paletteOpen, workbench]);
+  }, [commitForeground, navigate, notesOpen, overlay, showAuxiliary, showTerminal, started, canRead, canWrite, isAdmin, terminalFeature?.state, paletteOpen, workbench, reports, shortcutsOpen]);
 
   const openNotes = () => {
     if (notesOpen) commitForeground(() => setNotesOpen(false));
@@ -4308,7 +4399,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
   }, [openSlug]);
   const terminalFront = windowKey === "terminal";
   reportsVisible.current = windowKey === "reports";
-  sideHostRef.current = !!reports || listsOpen || terminalFront || loka?.kind === "academy";
+  sideHostRef.current = !!reports || listsOpen || terminalFront || loka?.kind === "academy" || questRoomOpen;
 
   const closeDialog = useCallback(() => {
     const request = cancelPendingNavigation();
@@ -4421,19 +4512,19 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
   const callAboutRef = useRef<(about: string) => void>(() => {});
   callAboutRef.current = (about) => {
     if (!mainId) {
-      pushToast({ id: Date.now(), text: "Set up your main agent first, then you can call it about a canvas." });
+      pushToast({ id: Date.now(), text: "Set up your main agent first, then you can call it about a workspace." });
       return;
     }
     const name = agents.find((a) => a.id === mainId)?.name ?? "your main agent";
     if (isCallOf(call, mainId, null)) {
       callDispatch({ type: "restore" });
-      if (call.about !== about) pushToast({ id: Date.now(), text: `You are already on a call with ${name}. Hang up and call again from this canvas to share it.` });
+      if (call.about !== about) pushToast({ id: Date.now(), text: `You are already on a call with ${name}. Hang up and call again from this workspace to share it.` });
       return;
     }
     const live = engineChoice() === "live";
     if (live) primeLiveAudio();
     callDispatch({ type: "start", agentId: mainId, about });
-    if (!live) pushToast({ id: Date.now(), text: `${name} sees the canvas only on Live calls. Switch the call to Live to share it.` });
+    if (!live) pushToast({ id: Date.now(), text: `${name} sees the workspace only on Live calls. Switch the call to Live to share it.` });
   };
   useEffect(() => {
     const onCall = (e: Event) => {
@@ -4583,10 +4674,10 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     }
     const shown = (sideAgent?.id === id && wide) || (dialog?.kind === "resident" && dialog.id === id && !reports && !listsOpen && !terminalFront);
     if (shown) return;
-    if (wide && (reports || listsOpen || terminalFront || loka?.kind === "academy") && side.open && chatAgents.some((a) => a.id === id)) setSide({ id, open: true, auto: side.auto });
+    if (wide && (reports || listsOpen || terminalFront || loka?.kind === "academy" || questRoomOpen) && side.open && chatAgents.some((a) => a.id === id)) setSide({ id, open: true, auto: side.auto });
     else openAgent(id);
   };
-  sideFrom.current = reports || listsOpen || terminalFront || loka?.kind === "academy" ? null : lowerWindow === "agent" ? dialogAgent?.id ?? null : lowerWindow === "chat" ? chatLast.agentId : null;
+  sideFrom.current = reports || listsOpen || terminalFront || loka?.kind === "academy" || questRoomOpen ? null : lowerWindow === "agent" ? dialogAgent?.id ?? null : lowerWindow === "chat" ? chatLast.agentId : null;
   const sideAgent = side.open ? chatAgents.find((a) => a.id === side.id) ?? chatAgents.find((a) => a.id === mainId) ?? chatAgents[0] ?? null : null;
   const sideToggle = chatAgents.length ? (
     <button
@@ -4940,8 +5031,10 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
   };
 
 
+  const questIdentity = me?.id ?? null;
   return (
     <MotionConfig reducedMotion="user">
+    <LiveQuestsProvider identity={questIdentity}>
     <>
     {terminalDocked && (
       <div
@@ -5059,9 +5152,26 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
         />
       )}
 
-      {canRead && (
-        <div aria-hidden={overlay || undefined} className={cn("pointer-events-none absolute inset-x-0 bottom-3 z-20 flex justify-center px-3 sm:bottom-4", HUD_FADE, hudHide)}>
-          <Hotbar
+      {(offer || canRead) && (
+        <div className="pointer-events-none absolute inset-x-0 bottom-3 flex flex-col items-center gap-2 px-3 sm:bottom-4">
+          {offer && (
+            <div aria-hidden={overlay || undefined} className={cn("relative z-30 flex justify-center", HUD_FADE, hudHide)}>
+              <OfferCard
+                title={offer.title}
+                minutes={offer.minutes}
+                from={assistant?.name ?? "A mentor"}
+                onDismiss={dismissOffer}
+                onAccept={() => {
+                  const challengeId = offer.challengeId;
+                  dismissOffer();
+                  void navigate({ kind: "academy", target: { challengeId } });
+                }}
+              />
+            </div>
+          )}
+          {canRead && (
+            <div aria-hidden={overlay || undefined} className={cn("relative z-20 flex max-w-full justify-center", HUD_FADE, hudHide)}>
+              <Hotbar
             slots={[
               { key: "Q", label: "Quests", group: 0, icon: HOTBAR_ICONS.Quests, badge: agents.reduce((n, a) => n + (a.jobs?.length ?? 0), 0), onClick: () => navigateSurface(() => setBoard("quests")) },
               { key: "C", label: "Chat", group: 0, icon: HOTBAR_ICONS.Chat, badge: chatUnread, onClick: () => navigateSurface(() => { raiseLayer("chat"); setChatOpen(true); }) },
@@ -5069,11 +5179,11 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
                 ? [{ key: "L", label: "Lists", group: 0, icon: HOTBAR_ICONS.Lists, badge: items.filter((i) => i.kind === "timer" && i.status === "active").length, onClick: () => navigateSurface(() => setListsOpen(true)) }]
                 : []),
               { key: "R", label: "Reports", group: 0, icon: HOTBAR_ICONS.Reports, onClick: () => void navigate({ kind: "report", id: null, loaded: true }) },
-              { key: "B", label: "Workspace", hint: "A canvas with your chat and channels beside it", group: 0, icon: HOTBAR_ICONS.Workspace, onClick: () => window.dispatchEvent(new CustomEvent(OPEN_WORKSPACE)) },
+              { key: "B", label: "Workspaces", hint: "Shared boards with your chat and channels beside them", group: 0, icon: HOTBAR_ICONS.Workspace, onClick: () => window.dispatchEvent(new CustomEvent(OPEN_WORKSPACE)) },
               ...(canWrite ? [{ key: "P", label: assistant ? assistant.name : "Main agent", hint: assistant ? `${assistant.name}, your main agent` : "Summon your main agent", group: 1, icon: HOTBAR_ICONS.Main, image: assistant ? assistantPortrait : undefined, tone: "gold" as const, onClick: () => void summonAssistant() }] : []),
               ...(canWrite ? [{ key: "K", label: "Quick chat", hint: "A side chat with an agent's memory", group: 1, icon: HOTBAR_ICONS.Quick, onClick: () => navigateSurface(() => setQuick({})) }] : []),
               ...(canWrite ? [{ key: "O", label: "Workshop", group: 2, icon: HOTBAR_ICONS.Workshop, onClick: () => navigateSurface(() => setFolderShop(true)) }] : []),
-              ...(canWrite && terminalFeature?.state !== "unavailable" ? [{ key: "T", label: "Terminal", group: 2, icon: HOTBAR_ICONS.Terminal, onClick: () => openTerminal() }] : []),
+              ...(canWrite && terminalFeature?.state !== "unavailable" ? [{ key: "T", label: "Terminal", hint: !terminalOpen && terminalsRunning ? `Terminal, ${terminalsRunning} still running` : undefined, group: 2, icon: HOTBAR_ICONS.Terminal, badge: terminalOpen ? 0 : terminalsRunning, badgeLabel: "running", onClick: () => openTerminal() }] : []),
               ...(canWrite
                 ? [
                     {
@@ -5083,21 +5193,31 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
                       group: 3,
                       icon: HOTBAR_ICONS.Talk,
                       tone: talk.state === "listening" ? ("live" as const) : ("plain" as const),
+                      onClick: () => openVoice(),
                       onPress: () => {
                         talkPressedAt.current = Date.now();
                         talkNavigation.current = cancelPendingNavigation();
                         talk.start();
                       },
                       onRelease: () => {
-                        const tap = Date.now() - talkPressedAt.current < 300;
+                        const pressedAt = talkPressedAt.current;
+                        talkPressedAt.current = 0;
+                        const tap = pressedAt > 0 && Date.now() - pressedAt < 300;
                         void talk.stop();
                         if (tap) openVoice();
+                      },
+                      onCancel: () => {
+                        talkPressedAt.current = 0;
+                        talkNavigation.current = null;
+                        talk.cancel();
                       },
                     },
                   ]
                 : []),
             ]}
-          />
+              />
+            </div>
+          )}
         </div>
       )}
 
@@ -5260,22 +5380,6 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
         )}
       </div>
 
-      {offer && (
-        <div aria-hidden={overlay || undefined} className={cn("pointer-events-none absolute inset-x-0 bottom-16 z-30 flex justify-center px-3 sm:bottom-20", HUD_FADE, hudHide)}>
-          <OfferCard
-            title={offer.title}
-            minutes={offer.minutes}
-            from={assistant?.name ?? "A mentor"}
-            onDismiss={dismissOffer}
-            onAccept={() => {
-              const challengeId = offer.challengeId;
-              dismissOffer();
-              void navigate({ kind: "academy", target: { challengeId } });
-            }}
-          />
-        </div>
-      )}
-
       {started && scene && (
         <div aria-hidden={overlay || undefined} className={cn("pointer-events-none absolute inset-x-0 top-[4.25rem] z-20 flex justify-center px-3 sm:top-[4.5rem]", HUD_FADE, hudHide)}>
           <div className="pointer-events-auto flex items-center gap-2 rounded-lg border-2 border-w-ink bg-w-paper/95 py-1 pl-3 pr-1 text-w-sm shadow-[0_3px_0_rgb(var(--w-ink))]">
@@ -5327,7 +5431,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
             else if (windowKey === "create") commitForeground(() => setCreatingAgent(false));
             else if (windowKey.startsWith("loka:")) commitForeground(() => setLoka(null));
             else if (windowKey === "sheet") commitForeground(() => setSheet(null));
-            else if (terminalFront) commitForeground(() => setTerminalOpen(false));
+            else if (terminalFront) terminalCloser.current?.("outside");
             else closeDialog();
           }}
         >
@@ -5481,11 +5585,14 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
                 onCallSlot={onCallSlot}
               />
             ) : history !== false && historyFocus?.taskId && !historyFocus.sessionId ? (
+              withSide(
               <QuestRoom
                 key={historyFocus.taskId}
                 taskId={historyFocus.taskId}
                 initial={historyFocus.page}
                 initialRequest={historyFocus.request}
+                focus={historyFocus.item}
+                sideToggle={sideToggle}
                 agents={agents}
                 meId={me?.id ?? null}
                 onOpenAgent={openAgent}
@@ -5501,7 +5608,9 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
                     setHistoryFocus(null);
                   });
                 }}
-              />
+              />,
+              !reports,
+              )
             ) : history !== false ? (
               <HistoryPanel
                 key={`${history}:${historyFocus?.sessionId ?? historyFocus?.taskId ?? ""}`}
@@ -5616,6 +5725,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
                 <ReportsPanel
                   agents={agents}
                   meId={me?.id ?? null}
+                  canWrite={canWrite}
                   selection={reports}
                   workspace={{
                     channelsOpen: workspaceLayout.channels,
@@ -5667,7 +5777,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       </AnimatePresence>
 
       <div ref={terminalHolder} hidden />
-      {terminalOpen &&
+      {presenceMounted(terminalPresence) &&
         terminalNode &&
         createPortal(
           <TerminalPanel
@@ -5684,10 +5794,12 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
             command={terminalCommand}
             sideToggle={sideToggle}
             readerRef={terminalReader}
+            closerRef={terminalCloser}
             request={terminalRequest}
             notice={terminalTalkNote}
             onTyped={onTerminalTyped}
-            onClose={() => commitForeground(() => setTerminalOpen(false))}
+            onMinimize={() => commitForeground(() => moveTerminal("minimize"))}
+            onClose={() => commitForeground(() => moveTerminal("close"))}
           />,
           terminalNode,
         )}
@@ -5836,6 +5948,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       </AnimatePresence>
     </div>
     </>
+    </LiveQuestsProvider>
     </MotionConfig>
   );
 }

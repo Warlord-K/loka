@@ -12,9 +12,6 @@
       "actor_user_id": null,
       "payload": {
         "task_id": "0f8e2c1a-3b4d-4e5f-8a9b-0c1d2e3f4a5b",
-        "status": "in_progress",
-        "title": "Fix the drawer",
-        "changed": "status",
         "quiet": true
       },
       "created_at": "2026-11-27T10:00:00Z",
@@ -70,12 +67,51 @@
       "seq": 4,
       "type": "task.deleted",
       "agent_id": "a1b2c3d4-0000-4000-8000-0000000000a1",
-      "task_id": "0f8e2c1a-3b4d-4e5f-8a9b-0c1d2e3f4a5b",
+      "task_id": null,
       "run_id": null,
       "session_id": null,
       "actor_user_id": null,
       "payload": {
-        "title": "Fix the drawer"
+        "task_id": "0f8e2c1a-3b4d-4e5f-8a9b-0c1d2e3f4a5b",
+        "quiet": true
+      },
+      "created_at": "2026-11-27T10:00:00Z",
+      "org_id": null
+    }
+  },
+  {
+    "refresh": true,
+    "why": "a routing-only quest change reaches a previous viewer",
+    "event": {
+      "seq": 13,
+      "type": "task.changed",
+      "agent_id": null,
+      "task_id": null,
+      "run_id": null,
+      "session_id": null,
+      "actor_user_id": null,
+      "payload": {
+        "task_id": "7c6b5a49-3827-4610-9fed-cba987654321",
+        "quiet": true
+      },
+      "created_at": "2026-11-27T10:00:00Z",
+      "org_id": null
+    }
+  },
+  {
+    "refresh": true,
+    "why": "a routing-only deletion reaches a previous viewer",
+    "event": {
+      "seq": 14,
+      "type": "task.deleted",
+      "agent_id": null,
+      "task_id": null,
+      "run_id": null,
+      "session_id": null,
+      "actor_user_id": null,
+      "payload": {
+        "task_id": "7c6b5a49-3827-4610-9fed-cba987654321",
+        "quiet": true
       },
       "created_at": "2026-11-27T10:00:00Z",
       "org_id": null

@@ -734,6 +734,12 @@ pub struct PublishCommit {
     leftover: Option<String>,
 }
 
+impl PublishCommit {
+    pub fn carried(&self) -> PublishCommit {
+        PublishCommit { api: self.api, leftover: None }
+    }
+}
+
 pub struct PublishTarget<'a> {
     pub repo: &'a str,
     pub base: &'a str,
@@ -741,22 +747,55 @@ pub struct PublishTarget<'a> {
     pub quest_branch: &'a str,
 }
 
-pub async fn commit_for_publish(worktree_path: &Path, repo: &str, message: &str) -> Result<PublishCommit> {
+pub fn changes_of_another_writer(writer: &str) -> String {
+    format!(
+        "Publish stopped: the quest folder holds uncommitted changes that this session did not make. The last work in the folder came from {writer}, so publishing now would sweep its changes into this pull request. Let that session commit or discard its changes, then publish again."
+    )
+}
+
+pub async fn commit_for_publish(worktree_path: &Path, repo: &str, message: &str, other_writer: Option<&str>) -> Result<PublishCommit> {
+    if let Some(writer) = other_writer {
+        if !pending_changes(worktree_path, "--untracked-files=all").await?.trim().is_empty() {
+            bail!(changes_of_another_writer(writer));
+        }
+    }
     if !super::api_commits::available(worktree_path, repo).await {
         commit_signed(worktree_path, message).await?;
         return Ok(PublishCommit { api: false, leftover: None });
     }
-    let leftover = commit_unsigned(worktree_path, message).await?.then(|| message.to_string());
+    let leftover = match commit_unsigned(worktree_path, message).await? {
+        true => Some(run_git_checked_output(worktree_path, &["rev-parse", "HEAD"]).await?.trim().to_string()),
+        false => None,
+    };
     Ok(PublishCommit { api: true, leftover })
 }
 
+enum CommitText {
+    Message(String),
+    ReusedFrom(String),
+}
+
+impl CommitText {
+    fn args(&self) -> [&str; 2] {
+        match self {
+            Self::Message(message) => ["-m", message],
+            Self::ReusedFrom(commit) => ["-C", commit],
+        }
+    }
+}
+
 async fn commit_unsigned(worktree_path: &Path, message: &str) -> Result<bool> {
+    commit_unsigned_text(worktree_path, &CommitText::Message(without_coauthors(message))).await
+}
+
+async fn commit_unsigned_text(worktree_path: &Path, text: &CommitText) -> Result<bool> {
     let status = pending_changes(worktree_path, "--untracked-files=all").await?;
     if status.trim().is_empty() {
         return Ok(false);
     }
+    let [flag, value] = text.args();
     stage_all(worktree_path).await?;
-    if let Err(error) = run_git(worktree_path, &["-c", "commit.gpgsign=false", "commit", "-m", &without_coauthors(message)]).await {
+    if let Err(error) = run_git(worktree_path, &["-c", "commit.gpgsign=false", "commit", flag, value]).await {
         unstage(worktree_path).await?;
         return Err(error);
     }
@@ -775,13 +814,22 @@ pub async fn publish_commits(worktree_path: &Path, committed: &PublishCommit, ta
             }
             Err(error) => warn!(branch, "Publishing through the GitHub API failed, using a signed push instead: {error:#}"),
         }
-        if let Some(message) = &committed.leftover {
-            undo_head_commit(worktree_path).await?;
-            commit_signed(worktree_path, message).await?;
-        }
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        sign_leftover_in_place(worktree_path, committed, home.as_deref(), None).await?;
     }
     ensure_signed_commits(worktree_path, target.base).await?;
     push_quest_branch(worktree_path, branch, target.quest_branch).await
+}
+
+async fn sign_leftover_in_place(worktree_path: &Path, committed: &PublishCommit, home: Option<&Path>, gnupg_home: Option<&Path>) -> Result<()> {
+    let Some(leftover) = committed.leftover.as_deref() else {
+        return Ok(());
+    };
+    let head = run_git_checked_output(worktree_path, &["rev-parse", "HEAD"]).await?;
+    if head.trim() != leftover {
+        bail!("Publish stopped: the commit it made for the uncommitted changes ({leftover}) is no longer the newest commit, so it was not signed. Publish again.");
+    }
+    sign_new_commit(worktree_path, home, gnupg_home).await
 }
 
 pub async fn commit_signed(worktree_path: &Path, message: &str) -> Result<bool> {
@@ -795,44 +843,43 @@ async fn commit_signed_with_home(
     home: Option<&Path>,
     gnupg_home: Option<&Path>,
 ) -> Result<bool> {
-    let status = pending_changes(worktree_path, "--untracked-files=all").await?;
-    if status.trim().is_empty() {
+    commit_signed_text(worktree_path, CommitText::Message(without_coauthors(message)), home, gnupg_home).await
+}
+
+async fn commit_signed_text(
+    worktree_path: &Path,
+    text: CommitText,
+    home: Option<&Path>,
+    gnupg_home: Option<&Path>,
+) -> Result<bool> {
+    if !commit_unsigned_text(worktree_path, &text).await? {
         return Ok(false);
     }
-    let message = without_coauthors(message);
+    sign_new_commit(worktree_path, home, gnupg_home).await?;
+    Ok(true)
+}
+
+async fn sign_new_commit(worktree_path: &Path, home: Option<&Path>, gnupg_home: Option<&Path>) -> Result<()> {
     let git = GitSigning::from_config_list(&run_git_output(worktree_path, &["config", "--list", "-z"]).await?);
     let path = std::env::var_os("PATH");
     let flags: Vec<String> = match signing_choice(&git, home, path.as_deref()) {
         Signing::Unset if git.gpgsign => {
+            undo_head_commit(worktree_path).await?;
             bail!("{UNSIGNED_LEFTOVERS} {SIGNING_SETUP}");
         }
-        Signing::Unset => {
-            stage_all(worktree_path).await?;
-            if let Err(error) = run_git(worktree_path, &["commit", "-m", &message]).await {
-                unstage(worktree_path).await?;
-                return Err(error);
-            }
-            return Ok(true);
-        }
+        Signing::Unset => return Ok(()),
         Signing::Configured => Vec::new(),
         Signing::Loka(path) => loka_key_config(&path).into_iter().flat_map(|(name, value)| ["-c".to_string(), format!("{name}={value}")]).collect(),
     };
     let mut args = flags.clone();
-    args.extend(["commit", "-S", "-m"].map(String::from));
-    args.push(message);
+    args.extend(["commit", "--amend", "--no-edit", "--allow-empty", "-S"].map(String::from));
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    stage_all(worktree_path).await?;
     let failure = match run_signing_git(worktree_path, &args, gnupg_home, SIGNING_LIMIT).await {
-        Err(error) => {
-            unstage(worktree_path).await?;
-            format!("{error:#}")
-        }
-        Ok(()) if commit_is_signed(worktree_path, "HEAD").await? => return Ok(true),
-        Ok(()) => {
-            undo_head_commit(worktree_path).await?;
-            "the commit came out without a signature".to_string()
-        }
+        Err(error) => format!("{error:#}"),
+        Ok(()) if commit_is_signed(worktree_path, "HEAD").await? => return Ok(()),
+        Ok(()) => "the commit came out without a signature".to_string(),
     };
+    undo_head_commit(worktree_path).await?;
     let key = &git.key;
     if key.is_empty() && flags.is_empty() {
         bail!("{UNSIGNED_LEFTOVERS} Details: {failure}");
@@ -922,12 +969,24 @@ async fn unstage(worktree_path: &Path) -> Result<()> {
 }
 
 async fn undo_head_commit(worktree_path: &Path) -> Result<()> {
+    let head = run_git_checked_output(worktree_path, &["rev-list", "--parents", "--no-walk", "HEAD"]).await?;
+    let parents: Vec<String> = head.split_whitespace().skip(2).map(str::to_string).collect();
     if has_rev(worktree_path, "HEAD~1").await {
         run_git(worktree_path, &["reset", "-q", "--soft", "HEAD~1"]).await?;
     } else {
         run_git(worktree_path, &["update-ref", "-d", "HEAD"]).await?;
     }
-    unstage(worktree_path).await
+    unstage(worktree_path).await?;
+    if parents.is_empty() {
+        Ok(())
+    } else {
+        resume_merge(worktree_path, &parents).await
+    }
+}
+
+async fn resume_merge(worktree_path: &Path, parents: &[String]) -> Result<()> {
+    let path = run_git_checked_output(worktree_path, &["rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD"]).await?;
+    tokio::fs::write(path.trim(), format!("{}\n", parents.join("\n"))).await.context("Could not restore the merge in progress after undoing its commit")
 }
 
 async fn commit_is_signed(worktree_path: &Path, rev: &str) -> Result<bool> {
@@ -1093,6 +1152,34 @@ pub async fn unused_branch_name(repo_path: &Path, branch: &str) -> String {
     name
 }
 
+async fn unused_carry_branch_name(repo_path: &Path, branch: &str, protocols: Option<&str>) -> Result<String> {
+    let pattern = format!("refs/heads/{branch}*");
+    let mut command = workspace_command("git", repo_path).await;
+    if let Some(protocols) = protocols {
+        command.env("GIT_ALLOW_PROTOCOL", protocols);
+    }
+    let output = command
+        .args(["ls-remote", "--heads", "origin", &pattern])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await?;
+    if !output.status.success() {
+        bail!("Could not inspect origin branches before carrying new work: {}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    let remote: std::collections::HashSet<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .map(str::to_string)
+        .collect();
+    let mut name = branch.to_string();
+    let mut attempt = 1;
+    while remote.contains(&format!("refs/heads/{name}")) || run_git(repo_path, &["show-ref", "--quiet", &name]).await.is_ok() {
+        attempt += 1;
+        name = format!("{branch}-{attempt}");
+    }
+    Ok(name)
+}
+
 pub async fn ensure_signed_commits(worktree_path: &Path, base_branch: &str) -> Result<()> {
     if !gpgsign_enabled(worktree_path).await? {
         return Ok(());
@@ -1132,6 +1219,151 @@ async fn refresh_base_over(worktree_path: &Path, base: &str, protocols: Option<&
 
 pub async fn ahead_of_fresh_base(worktree_path: &Path, base: &str) -> Result<bool> {
     ahead_of_fresh_base_over(worktree_path, base, None).await
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Carry {
+    Nothing,
+    Branch(String),
+    Conflict { commit: String, subject: String, files: Vec<String> },
+}
+
+pub async fn fetch_pr_head(worktree_path: &Path, number: i64, protocols: Option<&str>) -> Option<String> {
+    let private = format!("refs/loka-pr/{number}");
+    let spec = format!("+refs/pull/{number}/head:{private}");
+    let mut command = workspace_command("git", worktree_path).await;
+    if let Some(protocols) = protocols {
+        command.env("GIT_ALLOW_PROTOCOL", protocols);
+    }
+    match command.args(["fetch", "--no-tags", "--refmap=", "origin", &spec]).stdin(std::process::Stdio::null()).output().await {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            warn!(number, "Could not fetch the head of pull request #{number}: {}", String::from_utf8_lossy(&output.stderr).trim());
+            return None;
+        }
+        Err(error) => {
+            warn!(number, "Could not fetch the head of pull request #{number}: {error}");
+            return None;
+        }
+    }
+    run_git_checked_output(worktree_path, &["rev-parse", "--verify", "--quiet", &format!("{private}^{{commit}}")])
+        .await
+        .ok()
+        .map(|sha| sha.trim().to_string())
+        .filter(|sha| !sha.is_empty())
+}
+
+async fn revisions_not_in(worktree_path: &Path, excluded: &[&str], filter: Option<&str>) -> Result<Vec<String>> {
+    let mut args = vec!["rev-list", "--reverse"];
+    if let Some(filter) = filter {
+        args.push(filter);
+    }
+    args.extend(["HEAD", "--not"]);
+    args.extend(excluded);
+    let list = run_git_checked_output(worktree_path, &args).await?;
+    Ok(list.lines().map(str::trim).filter(|sha| !sha.is_empty()).map(str::to_string).collect())
+}
+
+pub async fn carry_new_work(
+    worktree_path: &Path,
+    base: &str,
+    quest_branch: &str,
+    pr_number: i64,
+    pr_head: Option<&str>,
+    landed: bool,
+    protocols: Option<&str>,
+) -> Result<Carry> {
+    if !ahead_of_fresh_base_over(worktree_path, base, protocols).await? {
+        return Ok(Carry::Nothing);
+    }
+    let Some(pr_head) = pr_head else {
+        bail!("Could not fetch the head of pull request #{pr_number}, so Loka did not carry its work onto a new branch");
+    };
+    let base_ref = format!("origin/{base}");
+    let mut seen = vec![base_ref.as_str()];
+    seen.push(pr_head);
+    if revisions_not_in(worktree_path, &seen, None).await?.is_empty() {
+        return Ok(Carry::Nothing);
+    }
+    let marker = format!("{pr_number}:{pr_head}");
+    let started_on = current_branch(worktree_path).await?;
+    if started_on != "HEAD" && is_quest_branch(&started_on, quest_branch) {
+        let key = format!("branch.{started_on}.loka-carried-from-pr");
+        if run_git_checked_output(worktree_path, &["config", "--local", "--get", &key])
+            .await
+            .is_ok_and(|value| value.trim() == marker)
+        {
+            return Ok(Carry::Branch(started_on));
+        }
+    }
+    let excluded = if landed { &seen[..] } else { &seen[..1] };
+    let carried = revisions_not_in(worktree_path, excluded, Some("--no-merges")).await?;
+    for commit in revisions_not_in(worktree_path, excluded, Some("--merges")).await? {
+        let parents = run_git_checked_output(worktree_path, &["rev-list", "--parents", "-n", "1", &commit]).await?;
+        if parents.split_whitespace().count() > 3 {
+            bail!(
+                "Merge commit {} has more than two parents and cannot be carried safely. Nothing was published",
+                commit.chars().take(12).collect::<String>()
+            );
+        }
+        let diff = run_git_checked_output(
+            worktree_path,
+            &["show", "--remerge-diff", "--format=", "--no-ext-diff", "--no-textconv", &commit],
+        )
+        .await?;
+        if !diff.trim().is_empty() {
+            bail!(
+                "Merge commit {} contains manual changes that cannot be carried safely. Nothing was published",
+                commit.chars().take(12).collect::<String>()
+            );
+        }
+    }
+    let started_at = run_git_checked_output(worktree_path, &["rev-parse", "HEAD"]).await?.trim().to_string();
+    let branch = unused_carry_branch_name(worktree_path, quest_branch, protocols).await?;
+    run_git(worktree_path, &["switch", "--quiet", "--no-track", "-c", &branch, &base_ref]).await?;
+    let back = |conflict: Option<Carry>| {
+        let started_on = started_on.clone();
+        let started_at = started_at.clone();
+        let branch = branch.clone();
+        async move {
+            let _ = run_git(worktree_path, &["cherry-pick", "--quit"]).await;
+            run_git(worktree_path, &["reset", "--quiet", "--hard"]).await?;
+            if started_on == "HEAD" {
+                run_git(worktree_path, &["switch", "--quiet", "--detach", &started_at]).await?;
+            } else {
+                run_git(worktree_path, &["switch", "--quiet", &started_on]).await?;
+            }
+            run_git(worktree_path, &["branch", "--quiet", "-D", &branch]).await?;
+            Ok::<Carry, anyhow::Error>(conflict.unwrap_or(Carry::Nothing))
+        }
+    };
+    for commit in &carried {
+        if run_git(worktree_path, &["cherry-pick", "--no-commit", commit]).await.is_err() {
+            let files = run_git_output(worktree_path, &["diff", "--name-only", "--diff-filter=U"]).await.unwrap_or_default();
+            let subject = run_git_output(worktree_path, &["log", "-1", "--format=%s", commit]).await.unwrap_or_default();
+            let conflict = Carry::Conflict {
+                commit: commit.chars().take(12).collect(),
+                subject: subject.trim().to_string(),
+                files: files.lines().map(str::trim).filter(|file| !file.is_empty()).map(str::to_string).collect(),
+            };
+            return back(Some(conflict)).await;
+        }
+        let _ = run_git(worktree_path, &["cherry-pick", "--quit"]).await;
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        if let Err(error) = commit_signed_text(worktree_path, CommitText::ReusedFrom(commit.clone()), home.as_deref(), None).await {
+            back(None).await?;
+            return Err(error);
+        }
+    }
+    if run_git_checked_output(worktree_path, &["rev-parse", "HEAD"]).await? == run_git_checked_output(worktree_path, &["rev-parse", &base_ref]).await? {
+        return back(None).await;
+    }
+    let key = format!("branch.{branch}.loka-carried-from-pr");
+    if let Err(error) = run_git(worktree_path, &["config", "--local", &key, &marker]).await {
+        back(None).await?;
+        return Err(error);
+    }
+    Ok(Carry::Branch(branch))
 }
 
 async fn ahead_of_fresh_base_over(worktree_path: &Path, base: &str, protocols: Option<&str>) -> Result<bool> {
@@ -1607,6 +1839,232 @@ mod tests {
         assert!(has_commits_ahead(&repo.0, "main").await?, "the last fetched main predates the squash");
 
         assert!(!ahead_of_fresh_base_over(&repo.0, "main", Some(TEST_PROTOCOLS)).await?);
+        Ok(())
+    }
+
+    async fn merged_pr(repo: &Path, number: u32, squash: bool) -> Result<()> {
+        commit(repo, "feature").await?;
+        test_git(repo, &["push", "origin", &format!("HEAD:refs/pull/{number}/head")]).await?;
+        if squash {
+            run_git(repo, &["switch", "main"]).await?;
+            tokio::fs::write(repo.join("feature"), "feature").await?;
+            run_git(repo, &["add", "feature"]).await?;
+            run_git(repo, &["commit", "-m", &format!("feature (#{number})")]).await?;
+            test_git(repo, &["push", "origin", "main:main"]).await?;
+            run_git(repo, &["switch", "task"]).await?;
+        }
+        Ok(())
+    }
+
+    async fn after_pr(repo: &Path, state: &str) -> Result<super::super::github::RecordedPr> {
+        super::super::github::carry_past_recorded_pr(repo, "main", "task", 7, Some(state), Some(TEST_PROTOCOLS)).await
+    }
+
+    async fn subjects_on_top_of_main(repo: &Path) -> Result<Vec<String>> {
+        let log = run_git_checked_output(repo, &["log", "--reverse", "--format=%s", "origin/main..HEAD"]).await?;
+        Ok(log.lines().map(str::to_string).collect())
+    }
+
+    #[tokio::test]
+    async fn new_work_after_a_merged_pr_moves_onto_fresh_main_alone() -> Result<()> {
+        let (_remote, repo) = repo_with_remote().await?;
+        merged_pr(&repo.0, 7, true).await?;
+        commit(&repo.0, "tweak").await?;
+        let super::super::github::RecordedPr::Final { state, carried } = after_pr(&repo.0, "MERGED").await? else {
+            bail!("a merged pull request is final");
+        };
+        assert_eq!((state.as_str(), carried.as_deref()), ("merged", Some("task-2")));
+        assert_eq!(current_branch(&repo.0).await?, "task-2");
+        assert_eq!(subjects_on_top_of_main(&repo.0).await?, ["tweak"], "only the commit the merged PR lacked is carried");
+        let parent = run_git_checked_output(&repo.0, &["rev-parse", "HEAD~1"]).await?;
+        assert_eq!(parent, run_git_checked_output(&repo.0, &["rev-parse", "origin/main"]).await?);
+        assert_eq!(tokio::fs::read_to_string(repo.0.join("tweak")).await?, "tweak");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn carried_commits_are_signed_with_the_configured_key() -> Result<()> {
+        let (_remote, repo) = repo_with_remote().await?;
+        merged_pr(&repo.0, 7, true).await?;
+        commit(&repo.0, "tweak").await?;
+        let key = repo.0.join("signing-key");
+        ssh_key(&key).await?;
+        run_git(&repo.0, &["config", "gpg.format", "ssh"]).await?;
+        run_git(&repo.0, &["config", "user.signingkey", &key.to_string_lossy()]).await?;
+        run_git(&repo.0, &["config", "commit.gpgsign", "true"]).await?;
+        assert!(matches!(after_pr(&repo.0, "MERGED").await?, super::super::github::RecordedPr::Final { carried: Some(_), .. }));
+        assert!(commit_is_signed(&repo.0, "HEAD").await?);
+        ensure_signed_commits(&repo.0, "main").await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn new_work_after_a_closed_pr_carries_the_unmerged_work_too() -> Result<()> {
+        let (_remote, repo) = repo_with_remote().await?;
+        merged_pr(&repo.0, 7, false).await?;
+        commit(&repo.0, "tweak").await?;
+        let super::super::github::RecordedPr::Final { state, carried } = after_pr(&repo.0, "CLOSED").await? else {
+            bail!("a closed pull request is final");
+        };
+        assert_eq!((state.as_str(), carried.as_deref()), ("closed", Some("task-2")));
+        assert_eq!(subjects_on_top_of_main(&repo.0).await?, ["feature", "tweak"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retrying_a_carry_reuses_the_same_branch() -> Result<()> {
+        let (_remote, repo) = repo_with_remote().await?;
+        merged_pr(&repo.0, 7, true).await?;
+        commit(&repo.0, "tweak").await?;
+        let super::super::github::RecordedPr::Final { carried, .. } = after_pr(&repo.0, "MERGED").await? else {
+            bail!("a merged pull request is final");
+        };
+        assert_eq!(carried.as_deref(), Some("task-2"));
+        let first_head = run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?;
+        let marker = run_git_checked_output(&repo.0, &["config", "--local", "--get", "branch.task-2.loka-carried-from-pr"]).await?;
+        let pr_head = run_git_checked_output(&repo.0, &["rev-parse", "refs/loka-pr/7"]).await?;
+        assert_eq!(marker.trim(), format!("7:{}", pr_head.trim()));
+
+        let super::super::github::RecordedPr::Final { carried, .. } = after_pr(&repo.0, "MERGED").await? else {
+            bail!("a merged pull request is final");
+        };
+        assert_eq!(carried.as_deref(), Some("task-2"));
+        assert_eq!(current_branch(&repo.0).await?, "task-2");
+        assert_eq!(run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?, first_head);
+        assert!(run_git(&repo.0, &["show-ref", "--quiet", "refs/heads/task-3"]).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn carrying_avoids_a_remote_only_branch() -> Result<()> {
+        let (_remote, repo) = repo_with_remote().await?;
+        merged_pr(&repo.0, 7, true).await?;
+        commit(&repo.0, "tweak").await?;
+        test_git(&repo.0, &["push", "origin", "main:refs/heads/task-2"]).await?;
+
+        let super::super::github::RecordedPr::Final { carried, .. } = after_pr(&repo.0, "MERGED").await? else {
+            bail!("a merged pull request is final");
+        };
+        assert_eq!(carried.as_deref(), Some("task-3"));
+        assert_eq!(current_branch(&repo.0).await?, "task-3");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_missing_pr_head_ignores_a_stale_cached_ref_and_does_not_carry() -> Result<()> {
+        let (_remote, repo) = repo_with_remote().await?;
+        commit(&repo.0, "feature").await?;
+        run_git(&repo.0, &["update-ref", "refs/loka-pr/7", "HEAD"]).await?;
+        let head = run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?;
+
+        let error = match after_pr(&repo.0, "CLOSED").await {
+            Ok(_) => bail!("a missing pull request head must fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Could not fetch the head of pull request #7"), "{error}");
+        assert_eq!(current_branch(&repo.0).await?, "task");
+        assert_eq!(run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?, head);
+        assert!(run_git(&repo.0, &["show-ref", "--quiet", "refs/heads/task-2"]).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_clean_merge_can_be_carried() -> Result<()> {
+        let (_remote, repo) = repo_with_remote().await?;
+        merged_pr(&repo.0, 7, false).await?;
+        run_git(&repo.0, &["switch", "-c", "side"]).await?;
+        commit(&repo.0, "side-work").await?;
+        run_git(&repo.0, &["switch", "task"]).await?;
+        run_git(&repo.0, &["merge", "--no-ff", "side", "-m", "merge side"]).await?;
+
+        let super::super::github::RecordedPr::Final { carried, .. } = after_pr(&repo.0, "CLOSED").await? else {
+            bail!("a closed pull request is final");
+        };
+        assert_eq!(carried.as_deref(), Some("task-2"));
+        assert_eq!(tokio::fs::read_to_string(repo.0.join("side-work")).await?, "side-work");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_merge_with_manual_changes_is_not_carried() -> Result<()> {
+        let (_remote, repo) = repo_with_remote().await?;
+        merged_pr(&repo.0, 7, false).await?;
+        run_git(&repo.0, &["switch", "-c", "side"]).await?;
+        commit(&repo.0, "side-work").await?;
+        run_git(&repo.0, &["switch", "task"]).await?;
+        run_git(&repo.0, &["merge", "--no-commit", "--no-ff", "side"]).await?;
+        tokio::fs::write(repo.0.join("merge-only"), "manual").await?;
+        run_git(&repo.0, &["add", "merge-only"]).await?;
+        run_git(&repo.0, &["commit", "-m", "merge side manually"]).await?;
+        let head = run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?;
+
+        let error = match after_pr(&repo.0, "CLOSED").await {
+            Ok(_) => bail!("a merge with manual changes must fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("contains manual changes that cannot be carried safely"), "{error}");
+        assert!(error.contains("Nothing was published"), "{error}");
+        assert_eq!(current_branch(&repo.0).await?, "task");
+        assert_eq!(run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?, head);
+        assert_eq!(tokio::fs::read_to_string(repo.0.join("merge-only")).await?, "manual");
+        assert!(run_git(&repo.0, &["show-ref", "--quiet", "refs/heads/task-2"]).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_final_pr_without_new_work_publishes_nothing() -> Result<()> {
+        for (state, squash) in [("MERGED", true), ("CLOSED", false)] {
+            let (_remote, repo) = repo_with_remote().await?;
+            merged_pr(&repo.0, 7, squash).await?;
+            let head = run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?;
+            let super::super::github::RecordedPr::Final { carried, .. } = after_pr(&repo.0, state).await? else {
+                bail!("{state} is final");
+            };
+            assert_eq!(carried, None, "{state}");
+            assert_eq!(current_branch(&repo.0).await?, "task", "{state}");
+            assert_eq!(run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?, head, "{state}");
+            assert!(run_git(&repo.0, &["show-ref", "--quiet", "refs/heads/task-2"]).await.is_err(), "{state}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_open_pr_keeps_the_usual_publish() -> Result<()> {
+        let (_remote, repo) = repo_with_remote().await?;
+        merged_pr(&repo.0, 7, false).await?;
+        commit(&repo.0, "tweak").await?;
+        for state in [Some("OPEN"), None] {
+            assert!(matches!(
+                super::super::github::carry_past_recorded_pr(&repo.0, "main", "task", 7, state, Some(TEST_PROTOCOLS)).await?,
+                super::super::github::RecordedPr::Open
+            ));
+        }
+        assert_eq!(current_branch(&repo.0).await?, "task");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_replay_conflict_fails_loudly_and_leaves_the_quest_branch_alone() -> Result<()> {
+        let (_remote, repo) = repo_with_remote().await?;
+        merged_pr(&repo.0, 7, true).await?;
+        run_git(&repo.0, &["switch", "main"]).await?;
+        tokio::fs::write(repo.0.join("feature"), "changed on main").await?;
+        run_git(&repo.0, &["commit", "-am", "main edit"]).await?;
+        test_git(&repo.0, &["push", "origin", "main:main"]).await?;
+        run_git(&repo.0, &["switch", "task"]).await?;
+        tokio::fs::write(repo.0.join("feature"), "changed by the quest").await?;
+        run_git(&repo.0, &["commit", "-am", "quest edit"]).await?;
+        let head = run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?;
+        let error = match after_pr(&repo.0, "MERGED").await {
+            Ok(_) => bail!("a conflicting replay must fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("Pull request #7 is already merged") && error.contains("\"quest edit\" conflicts in feature"), "{error}");
+        assert!(error.contains("Nothing was published"), "{error}");
+        assert_eq!(current_branch(&repo.0).await?, "task");
+        assert_eq!(run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?, head);
+        assert!(pending_changes(&repo.0, "--untracked-files=all").await?.trim().is_empty());
+        assert!(run_git(&repo.0, &["show-ref", "--quiet", "refs/heads/task-2"]).await.is_err());
         Ok(())
     }
 
@@ -2435,6 +2893,161 @@ mod tests {
             bail!("git for-each-ref failed: {}", String::from_utf8_lossy(&output.stderr));
         }
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    async fn merging_main(home: &Path) -> Result<TestRepo> {
+        let repo = test_repo().await?;
+        run_git(&repo.0, &["config", "user.signingkey", ""]).await?;
+        tokio::fs::create_dir_all(home.join(".ssh")).await?;
+        ssh_key(&home.join(LOKA_SIGNING_KEY)).await?;
+        tokio::fs::write(repo.0.join("quest"), "quest").await?;
+        run_git(&repo.0, &["add", "quest"]).await?;
+        run_git(&repo.0, &["commit", "-m", "quest work"]).await?;
+        run_git(&repo.0, &["switch", "-q", "-c", "upstream", "main"]).await?;
+        tokio::fs::write(repo.0.join("main-only"), "main").await?;
+        run_git(&repo.0, &["add", "main-only"]).await?;
+        run_git(&repo.0, &["commit", "-m", "main moved"]).await?;
+        run_git(&repo.0, &["update-ref", "refs/remotes/origin/main", "HEAD"]).await?;
+        run_git(&repo.0, &["switch", "-q", "task"]).await?;
+        run_git(&repo.0, &["merge", "--no-commit", "--no-ff", "origin/main"]).await?;
+        tokio::fs::write(repo.0.join("leftover"), "after the merge").await?;
+        Ok(repo)
+    }
+
+    async fn parents(repo: &Path) -> Result<Vec<String>> {
+        Ok(run_git_checked_output(repo, &["log", "-1", "--format=%P"]).await?.split_whitespace().map(String::from).collect())
+    }
+
+    #[tokio::test]
+    async fn a_merge_with_main_keeps_both_parents_when_publish_signs_it() -> Result<()> {
+        let home = std::env::temp_dir().join(format!("loka-merge-home-{}", Uuid::new_v4()));
+        let repo = merging_main(&home).await?;
+        let quest = run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?;
+        assert!(commit_isolated(&repo.0, "feat: quest", Some(&home)).await?);
+        assert!(commit_is_signed(&repo.0, "HEAD").await?);
+        let main = run_git_checked_output(&repo.0, &["rev-parse", "origin/main"]).await?;
+        assert_eq!(parents(&repo.0).await?, vec![quest.trim().to_string(), main.trim().to_string()]);
+        assert!(!has_rev(&repo.0, "MERGE_HEAD").await);
+        let _ = std::fs::remove_dir_all(&home);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_api_fallback_signs_the_unsigned_merge_in_place() -> Result<()> {
+        let home = std::env::temp_dir().join(format!("loka-merge-home-{}", Uuid::new_v4()));
+        let repo = merging_main(&home).await?;
+        assert!(commit_unsigned(&repo.0, "feat: quest").await?);
+        let unsigned = run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?.trim().to_string();
+        let before = parents(&repo.0).await?;
+        let tree = run_git_checked_output(&repo.0, &["rev-parse", "HEAD^{tree}"]).await?;
+        assert_eq!(before.len(), 2);
+        assert!(!commit_is_signed(&repo.0, "HEAD").await?);
+        let committed = PublishCommit { api: true, leftover: Some(unsigned) };
+        let gnupg = repo.0.join(".git/gnupg");
+        tokio::fs::create_dir_all(&gnupg).await?;
+        sign_leftover_in_place(&repo.0, &committed, Some(&home), Some(&gnupg)).await?;
+        assert!(commit_is_signed(&repo.0, "HEAD").await?);
+        assert_eq!(parents(&repo.0).await?, before, "signing in place keeps the merge parent");
+        assert_eq!(run_git_checked_output(&repo.0, &["rev-parse", "HEAD^{tree}"]).await?, tree);
+        let message = run_git_checked_output(&repo.0, &["log", "-1", "--format=%s"]).await?;
+        assert_eq!(message.trim(), "feat: quest");
+        let moved = PublishCommit { api: true, leftover: Some(before[0].clone()) };
+        let error = sign_leftover_in_place(&repo.0, &moved, Some(&home), Some(&gnupg)).await.unwrap_err();
+        assert!(error.to_string().contains("no longer the newest commit"), "{error:#}");
+        let _ = std::fs::remove_dir_all(&home);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_merge_that_cannot_be_signed_stays_in_progress() -> Result<()> {
+        let home = std::env::temp_dir().join(format!("loka-merge-home-{}", Uuid::new_v4()));
+        let repo = merging_main(&home).await?;
+        let quest = run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?;
+        let main = run_git_checked_output(&repo.0, &["rev-parse", "origin/main"]).await?;
+        run_git(&repo.0, &["config", "gpg.format", "ssh"]).await?;
+        run_git(&repo.0, &["config", "user.signingkey", &repo.0.join("missing-key").to_string_lossy()]).await?;
+        let error = commit_isolated(&repo.0, "feat: quest", Some(&home)).await.unwrap_err();
+        assert!(error.to_string().contains("could not sign"), "{error:#}");
+        assert_eq!(run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?, quest);
+        assert_eq!(run_git_checked_output(&repo.0, &["rev-parse", "MERGE_HEAD"]).await?, main, "the merge is still in progress");
+        assert!(staged(&repo.0).await?.is_empty());
+        assert!(repo.0.join("leftover").is_file() && repo.0.join("main-only").is_file());
+
+        run_git(&repo.0, &["config", "user.signingkey", ""]).await?;
+        assert!(commit_isolated(&repo.0, "feat: quest", Some(&home)).await?);
+        assert!(commit_is_signed(&repo.0, "HEAD").await?);
+        assert_eq!(parents(&repo.0).await?, vec![quest.trim().to_string(), main.trim().to_string()]);
+        let _ = std::fs::remove_dir_all(&home);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_octopus_merge_that_cannot_be_signed_keeps_every_parent() -> Result<()> {
+        let home = std::env::temp_dir().join(format!("loka-octopus-home-{}", Uuid::new_v4()));
+        let repo = test_repo().await?;
+        let quest = run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?;
+        run_git(&repo.0, &["switch", "-c", "side-one"]).await?;
+        commit(&repo.0, "one").await?;
+        let one = run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?;
+        run_git(&repo.0, &["switch", "task"]).await?;
+        run_git(&repo.0, &["switch", "-c", "side-two"]).await?;
+        commit(&repo.0, "two").await?;
+        let two = run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?;
+        run_git(&repo.0, &["switch", "task"]).await?;
+        let tree = run_git_checked_output(&repo.0, &["rev-parse", "HEAD^{tree}"]).await?;
+        let octopus = run_git_checked_output(
+            &repo.0,
+            &["commit-tree", tree.trim(), "-p", quest.trim(), "-p", one.trim(), "-p", two.trim(), "-m", "octopus"],
+        )
+        .await?;
+        run_git(&repo.0, &["update-ref", "HEAD", octopus.trim()]).await?;
+        run_git(&repo.0, &["config", "gpg.format", "ssh"]).await?;
+        run_git(&repo.0, &["config", "user.signingkey", &repo.0.join("missing-key").to_string_lossy()]).await?;
+
+        assert!(sign_new_commit(&repo.0, Some(&home), None).await.is_err());
+        assert_eq!(run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?, quest);
+        let merge_head = run_git_checked_output(&repo.0, &["rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD"]).await?;
+        let heads: Vec<String> = tokio::fs::read_to_string(merge_head.trim()).await?.lines().map(str::to_string).collect();
+        assert_eq!(heads, [one.trim(), two.trim()]);
+        assert!(staged(&repo.0).await?.is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_refuses_changes_another_session_left_behind() -> Result<()> {
+        let repo = test_repo().await?;
+        let before = run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?;
+        tokio::fs::write(repo.0.join("theirs"), "someone else").await?;
+        let error = commit_for_publish(&repo.0, "o/r", "feat: mine", Some("a follow-up (50c87771) of another session of this quest (984d02ea)"))
+            .await
+            .err()
+            .expect("publish refuses");
+        assert!(error.to_string().contains("did not make") && error.to_string().contains("50c87771"), "{error:#}");
+        assert_eq!(run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?, before);
+        assert!(staged(&repo.0).await?.is_empty());
+        assert!(repo.0.join("theirs").is_file());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_quest_on_another_quests_branch_gets_its_own_worktree() -> Result<()> {
+        let repo = test_repo().await?;
+        tokio::fs::write(repo.0.join("first"), "first quest").await?;
+        run_git(&repo.0, &["add", "first"]).await?;
+        run_git(&repo.0, &["commit", "-m", "first quest"]).await?;
+        run_git(&repo.0, &["update-ref", "refs/remotes/origin/task", "HEAD"]).await?;
+        let tip = run_git_checked_output(&repo.0, &["rev-parse", "HEAD"]).await?;
+        let second = std::env::temp_dir().join(format!("loka-dependent-{}", Uuid::new_v4()));
+        create_worktree(&repo.0, &second, "second-quest", "task").await?;
+        assert_ne!(second, repo.0);
+        assert_eq!(run_git_checked_output(&second, &["rev-parse", "HEAD"]).await?, tip, "the dependent quest starts from the other quest's branch");
+        assert_eq!(current_branch(&second).await?, "second-quest");
+        assert_eq!(current_branch(&repo.0).await?, "task", "the first quest's folder keeps its own branch");
+        tokio::fs::write(second.join("second"), "second quest").await?;
+        assert!(pending_changes(&repo.0, "--untracked-files=all").await?.trim().is_empty(), "work in one folder never shows in the other");
+        let _ = run_git(&repo.0, &["worktree", "remove", "--force", &second.to_string_lossy()]).await;
+        Ok(())
     }
 
     #[tokio::test]

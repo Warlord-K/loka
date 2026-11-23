@@ -4,6 +4,8 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { bindTerminalKeys, type KeyProfile, type TerminalAction } from "@/lib/terminal-keys";
 import type { TerminalQuote } from "@/lib/terminal-context";
+import { settleRemoteOpen } from "@/lib/terminal-close";
+import { NativeShellLifecycle, type NativeAttachLease, type NativeCloseResult } from "@/lib/terminal-lifecycle";
 import type { ShellPhase, Typed } from "@/lib/terminal-type";
 import { worldApi } from "@/lib/world";
 import { wb, type TermEvent, type WbTerm } from "./workbench/bridge";
@@ -51,11 +53,17 @@ export function workshopShell(sessionKey: string): LocalOpener {
 
 export type ShellState = { phase: ShellPhase; detail: string; device: string | null; title: string };
 
-const holders = new Map<string, Shell>();
+const nativeShells = new NativeShellLifecycle();
 
-export function shellHeld(native: string): boolean {
-  return holders.has(native);
+export function shellHeld(native: string, owner?: Shell): boolean {
+  return nativeShells.occupied(native, owner);
 }
+
+export function closeUnownedNative(native: string): Promise<NativeCloseResult> {
+  return nativeShells.close(native, null, wb.termClose);
+}
+
+export type ShellCloseResult = { status: "closed" | "protected" | "failed"; error?: string };
 
 export class Shell {
   readonly id: string;
@@ -65,7 +73,14 @@ export class Shell {
   private readonly events: ShellEvents;
   private readonly cleanups: (() => void)[] = [];
   private socket: WebSocket | null = null;
+  private remoteSessionId: string | null = null;
+  private remoteOpening: ReturnType<typeof worldApi.openTerminal> | null = null;
   private nativeId: string | null = null;
+  private pendingNativeId: string | null = null;
+  private localOpening: Promise<WbTerm> | null = null;
+  private localOpener: LocalOpener | null = null;
+  private protectedCloseNative: string | null = null;
+  private closing: Promise<ShellCloseResult> | null = null;
   private generation = 0;
   private typing = 0;
   private waiting: { command: string; generation: number; done: (result: Typed | null) => void } | null = null;
@@ -149,7 +164,15 @@ export class Shell {
   }
 
   get native(): string | null {
-    return this.nativeId;
+    return this.nativeId ?? this.pendingNativeId;
+  }
+
+  get pendingNative(): string | null {
+    return this.pendingNativeId;
+  }
+
+  get closingNow(): boolean {
+    return this.closing !== null;
   }
 
   fit() {
@@ -174,6 +197,10 @@ export class Shell {
     this.fit();
   }
 
+  showElsewhere() {
+    if (this.phase === "idle") this.set("elsewhere", "");
+  }
+
   read(selectionOnly: boolean, place: string): TerminalQuote | null {
     return readTerminal(this.term, selectionOnly, place);
   }
@@ -191,6 +218,7 @@ export class Shell {
   }
 
   private send(data: string) {
+    if (this.closing) return;
     if (this.nativeId) {
       void wb.termWrite(this.nativeId, data).catch(() => {});
       return;
@@ -207,53 +235,89 @@ export class Shell {
   }
 
   private detach() {
-    if (this.nativeId && holders.get(this.nativeId) === this) holders.delete(this.nativeId);
+    if (this.nativeId) nativeShells.release(this.nativeId, this);
+    if (this.pendingNativeId) nativeShells.release(this.pendingNativeId, this);
     this.generation += 1;
+    if (this.remoteSessionId && this.socket?.readyState !== WebSocket.OPEN) void worldApi.closeTerminal(this.remoteSessionId).catch(() => {});
     this.socket?.close();
     this.socket = null;
+    this.remoteSessionId = null;
     this.nativeId = null;
+    this.pendingNativeId = null;
   }
 
   async openLocal(open: LocalOpener, reattach: string | null, device: string | null) {
+    if (this.closing) return;
     this.detach();
     const mine = this.generation;
+    this.localOpener = open;
+    this.pendingNativeId = reattach;
+    let lease: NativeAttachLease | null = null;
+    if (reattach) lease = await nativeShells.claim(reattach, this);
+    if (mine !== this.generation || this.disposed || this.closing) {
+      lease?.done();
+      return;
+    }
     this.device = device;
     this.title = "";
     this.liveSince = 0;
     this.term.reset();
     this.set("starting", "");
+    let opening: Promise<WbTerm> | null = null;
     try {
-      const info = await open(this.term.cols, this.term.rows, reattach, (event) => {
+      opening = open(this.term.cols, this.term.rows, reattach, (event) => {
         if (mine !== this.generation) return;
         if (event.type === "data") {
           this.term.write(event.data);
           return;
         }
+        if (this.nativeId) nativeShells.release(this.nativeId, this);
         this.nativeId = null;
         this.events.native(this.id, null);
         this.term.writeln(`\r\n\x1b[2m[${closeLabel("shell_exited")}]\x1b[0m`);
         this.set("ended", "shell_exited");
       });
+      this.localOpening = opening;
+      const info = await opening;
       if (mine !== this.generation) {
-        if (!reattach || reattach !== info.id) void wb.termClose(info.id).catch(() => {});
+        if (this.pendingNativeId !== info.id && (!reattach || reattach !== info.id)) void nativeShells.close(info.id, this, wb.termClose);
+        else {
+          const owner = nativeShells.holder(info.id);
+          if (owner instanceof Shell && !nativeShells.contended(info.id, lease)) owner.restoreLocal(info.id);
+        }
         return;
       }
+      if (this.protectedCloseNative === info.id) {
+        const owner = nativeShells.holder(info.id);
+        this.pendingNativeId = null;
+        this.set("elsewhere", "");
+        if (owner instanceof Shell && !nativeShells.contended(info.id, lease)) owner.restoreLocal(info.id);
+        return;
+      }
+      this.pendingNativeId = null;
       this.nativeId = info.id;
-      const before = holders.get(info.id);
-      holders.set(info.id, this);
-      if (before && before !== this) before.handOver();
+      const before = nativeShells.confirm(info.id, this, info.id === reattach ? lease ?? undefined : undefined);
+      if (before instanceof Shell && before !== this) before.handOver();
       this.events.native(this.id, info.id);
       if (info.exited) {
+        nativeShells.release(info.id, this);
         this.nativeId = null;
         this.events.native(this.id, null);
         this.set("ended", "shell_exited");
       } else this.set("live");
     } catch (error) {
-      if (mine === this.generation) this.set("error", error instanceof Error ? error.message : "could not open a shell");
+      if (mine === this.generation) {
+        this.pendingNativeId = null;
+        this.set("error", error instanceof Error ? error.message : "could not open a shell");
+      }
+    } finally {
+      if (this.localOpening === opening) this.localOpening = null;
+      lease?.done();
     }
   }
 
   async openRemote(device: string) {
+    if (this.closing) return;
     this.detach();
     const mine = this.generation;
     this.device = device;
@@ -261,73 +325,150 @@ export class Shell {
     this.liveSince = 0;
     this.term.reset();
     this.set("starting", "");
+    let opening: ReturnType<typeof worldApi.openTerminal> | null = null;
     try {
-      const opened = await worldApi.openTerminal(device, this.term.cols, this.term.rows);
-      if (mine !== this.generation || this.disposed) return;
-      const ws = new WebSocket(opened.socket);
-      this.socket = ws;
-      ws.onopen = () => {
-        if (mine !== this.generation) return;
-        this.sendSize(this.term.cols, this.term.rows);
-        this.set("connecting");
-      };
-      ws.onmessage = (event) => {
-        if (mine !== this.generation) return;
-        let frame: { type?: string; [key: string]: string | undefined };
-        try {
-          frame = JSON.parse(String(event.data));
-        } catch {
-          return;
-        }
-        switch (frame.type) {
-          case "status":
-            this.set(frame.state === "live" ? "live" : "connecting");
-            break;
-          case "out":
-            this.term.write(b64ToBytes(frame.data ?? ""));
-            break;
-          case "error":
-            this.term.writeln(`\x1b[31m${frame.message}\x1b[0m`);
-            break;
-          case "bye":
-            this.term.writeln(`\r\n\x1b[2m[${frame.reason}]\x1b[0m`);
-            this.set("ended", frame.reason ?? "");
-            break;
-          case "closed":
-            this.term.writeln(`\r\n\x1b[2m[${closeLabel(frame.reason ?? "")}]\x1b[0m`);
-            this.set("ended", frame.reason ?? "");
-            break;
-        }
-      };
-      ws.onclose = () => {
-        if (mine === this.generation && (this.phase === "live" || this.phase === "connecting")) this.set("ended");
-      };
-      ws.onerror = () => {
-        if (mine === this.generation && (this.phase === "starting" || this.phase === "connecting")) this.set("error", this.detail || "could not reach the API socket");
-      };
+      opening = worldApi.openTerminal(device, this.term.cols, this.term.rows);
+      this.remoteOpening = opening;
+      await settleRemoteOpen(
+        opening,
+        () => mine === this.generation && !this.disposed,
+        worldApi.closeTerminal,
+        (opened) => {
+          this.remoteSessionId = opened.session_id;
+          if (this.closing) return;
+          const ws = new WebSocket(opened.socket);
+          this.socket = ws;
+          ws.onopen = () => {
+            if (mine !== this.generation) return;
+            this.sendSize(this.term.cols, this.term.rows);
+            this.set("connecting");
+          };
+          ws.onmessage = (event) => {
+            if (mine !== this.generation) return;
+            let frame: { type?: string; [key: string]: string | undefined };
+            try {
+              frame = JSON.parse(String(event.data));
+            } catch {
+              return;
+            }
+            switch (frame.type) {
+              case "status":
+                this.set(frame.state === "live" ? "live" : "connecting");
+                break;
+              case "out":
+                this.term.write(b64ToBytes(frame.data ?? ""));
+                break;
+              case "error":
+                this.term.writeln(`\x1b[31m${frame.message}\x1b[0m`);
+                break;
+              case "bye":
+                this.term.writeln(`\r\n\x1b[2m[${frame.reason}]\x1b[0m`);
+                this.set("ended", frame.reason ?? "");
+                break;
+              case "closed":
+                this.term.writeln(`\r\n\x1b[2m[${closeLabel(frame.reason ?? "")}]\x1b[0m`);
+                this.set("ended", frame.reason ?? "");
+                break;
+            }
+          };
+          ws.onclose = () => {
+            if (mine !== this.generation) return;
+            const remoteSessionId = this.remoteSessionId;
+            this.remoteSessionId = null;
+            if (this.phase === "starting") {
+              if (remoteSessionId) void worldApi.closeTerminal(remoteSessionId).catch(() => {});
+              this.set("error", this.detail || "could not reach the API socket");
+            } else if (this.phase === "live" || this.phase === "connecting") this.set("ended");
+          };
+          ws.onerror = () => {
+            if (mine !== this.generation || (this.phase !== "starting" && this.phase !== "connecting")) return;
+            if (this.remoteSessionId && ws.readyState !== WebSocket.OPEN) {
+              void worldApi.closeTerminal(this.remoteSessionId).catch(() => {});
+              this.remoteSessionId = null;
+            }
+            this.set("error", this.detail || "could not reach the API socket");
+          };
+        },
+      );
     } catch (error) {
-      if (mine === this.generation) this.set("error", error instanceof Error ? error.message : "could not open a session");
+      if (mine === this.generation) {
+        if (this.remoteSessionId) void worldApi.closeTerminal(this.remoteSessionId).catch(() => {});
+        this.remoteSessionId = null;
+        this.set("error", error instanceof Error ? error.message : "could not open a session");
+      }
+    } finally {
+      if (this.remoteOpening === opening) this.remoteOpening = null;
     }
+  }
+
+  private restoreLocal(native: string) {
+    if (!this.localOpener || this.disposed) return;
+    void this.openLocal(this.localOpener, native, this.device);
   }
 
   private handOver() {
     this.generation += 1;
+    if (this.nativeId) nativeShells.release(this.nativeId, this);
     this.nativeId = null;
     this.set("elsewhere", "");
   }
 
-  kill() {
-    if (this.nativeId) {
-      void wb.termClose(this.nativeId).catch(() => {});
-      this.events.native(this.id, null);
+  close(savedNative: string | null = null): Promise<ShellCloseResult> {
+    if (this.closing) return this.closing;
+    this.dropWaiting();
+    this.typing += 1;
+    const closing = this.closeCurrent(savedNative)
+      .catch((error): ShellCloseResult => {
+        this.protectedCloseNative = null;
+        return { status: "failed", error: error instanceof Error && error.message ? error.message : "could not close the shell" };
+      })
+      .finally(() => {
+        if (this.closing === closing) this.closing = null;
+      });
+    this.closing = closing;
+    return closing;
+  }
+
+  private async closeCurrent(savedNative: string | null): Promise<ShellCloseResult> {
+    const nativeAtStart = this.nativeId ?? this.pendingNativeId ?? savedNative;
+    const protectedAtStart = !!nativeAtStart && nativeShells.occupied(nativeAtStart, this);
+    this.protectedCloseNative = protectedAtStart ? nativeAtStart : null;
+    let openedNative: WbTerm | null = null;
+    let openedRemote: Awaited<ReturnType<typeof worldApi.openTerminal>> | null = null;
+    try {
+      if (this.localOpening) openedNative = await this.localOpening;
+    } catch {
+      openedNative = null;
     }
     try {
-      this.socket?.send(JSON.stringify({ type: "close" }));
+      if (this.remoteOpening) openedRemote = await this.remoteOpening;
     } catch {
-      void 0;
+      openedRemote = null;
     }
+    const native = this.nativeId ?? openedNative?.id ?? this.pendingNativeId ?? savedNative;
+    const protectedNative = protectedAtStart && native === nativeAtStart;
+    const nativeResult = native && !protectedNative ? await nativeShells.close(native, this, wb.termClose) : protectedNative && native ? { id: native, status: "protected" as const } : null;
+    const remote = this.remoteSessionId ?? openedRemote?.session_id ?? null;
+    let remoteError: string | null = null;
+    if (remote) {
+      try {
+        await worldApi.closeTerminal(remote);
+      } catch (error) {
+        remoteError = error instanceof Error && error.message ? error.message : "could not close the remote shell";
+      }
+    }
+    const failed = nativeResult?.status === "failed" || remoteError !== null;
+    const error = nativeResult?.status === "failed" ? nativeResult.error || "could not close the shell" : remoteError;
+    if (failed) {
+      this.protectedCloseNative = null;
+      return { status: "failed", error: error ?? "could not close the shell" };
+    }
+    if (nativeResult?.status === "closed") this.events.native(this.id, null);
+    this.remoteSessionId = null;
     this.detach();
     this.set("idle", "");
+    this.protectedCloseNative = null;
+    return { status: nativeResult?.status === "protected" ? "protected" : "closed" };
   }
 
   private flushWaiting() {
@@ -345,6 +486,7 @@ export class Shell {
   }
 
   type(command: string): Promise<Typed | null> {
+    if (this.closing) return Promise.resolve(null);
     this.dropWaiting();
     if (this.phase === "live") return this.typeNow(command);
     return new Promise((done) => {
@@ -357,13 +499,17 @@ export class Shell {
     const turn = (this.typing += 1);
     return typeCommand(this.term, (data) => this.send(data), command, {
       liveSince: this.liveSince,
-      alive: () => !this.disposed && this.generation === mine && this.typing === turn && this.phase === "live",
+      alive: () => !this.disposed && !this.closing && this.generation === mine && this.typing === turn && this.phase === "live",
     });
   }
 
-  dispose(end: boolean) {
+  dispose() {
     if (this.disposed) return;
-    if (end) this.kill();
+    this.destroy();
+  }
+
+  private destroy() {
+    if (this.disposed) return;
     this.dropWaiting();
     this.disposed = true;
     this.detach();

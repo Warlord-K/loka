@@ -63,11 +63,11 @@ pub fn no_room_to_start_message(free: f64, freed: u64) -> String {
 }
 
 pub fn shows_activity(kind: &str) -> bool {
-    !matches!(kind, "aside" | "publish")
+    !matches!(kind, "aside" | "publish" | "action")
 }
 
 pub fn accounts_spend(kind: &str) -> bool {
-    kind != "publish"
+    !matches!(kind, "publish" | "action")
 }
 
 pub fn waits_for_space(kind: &str, error: &str) -> bool {

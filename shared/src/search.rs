@@ -37,6 +37,12 @@ pub struct MessageHit {
     #[serde(rename = "excerpt")]
     pub body: String,
     pub created_at: DateTime<Utc>,
+    #[sqlx(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<Uuid>,
+    #[sqlx(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]
@@ -47,6 +53,9 @@ pub struct QuestHit {
     pub assigned_agent_id: Option<Uuid>,
     pub updated_at: Option<DateTime<Utc>>,
     pub plan_waiting: bool,
+    #[sqlx(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decisions: Option<crate::quest_questions::DecisionSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]
@@ -292,18 +301,43 @@ impl WorldStore {
         };
 
         let messages = async {
-            let mut messages = if read {
-                sqlx::query_as::<_, MessageHit>(&format!(
+            let room_access = crate::rooms::room_access_sql("room", "lead", "$1", "$2", "$3");
+            let canonical = crate::rooms::canonical_room_sql("source", "parent", "parent_lead");
+            let origin = crate::rooms::room_origin_part_with_question_sql(
+                "m",
+                "q",
+                ("source", "parent", "parent_lead"),
+                ("question_source", "question_parent", "question_parent_lead"),
+            );
+            let part_access = crate::rooms::task_access_sql("part", "part_lead", "$1", "$2", "$3");
+            let mut messages = sqlx::query_as::<_, MessageHit>(&format!(
                 "SELECT * FROM (
                    SELECT m.id::text AS reference, 'agent' AS kind, m.agent_id, t.name AS agent_name, t.avatar_emoji AS agent_emoji,
                           NULL::uuid AS channel_id, NULL::text AS channel_name, NULL::text AS channel_kind,
                           {AUTHOR} AS author, m.author_kind, au.avatar_emoji AS author_emoji,
-                          left(m.body, 4000) AS body, m.created_at
+                          left(m.body, 4000) AS body, m.created_at,
+                          CASE WHEN m.meta ? 'room_only' THEN {canonical} END AS task_id,
+                          CASE WHEN m.meta ? 'room_only' THEN m.kind END AS room_kind
                    FROM agent_messages m
                    JOIN agent_profiles t ON t.id = m.agent_id
                    LEFT JOIN agent_profiles au ON au.id = m.author_agent_id
                    LEFT JOIN users u ON u.id = m.author_user_id
-                   WHERE $3 AND t.org_id = $7 AND ($2 OR t.visibility = 'public' OR t.owner_user_id = $1) AND {thread}
+                   LEFT JOIN agent_tasks source ON source.id::text = m.meta->>'task_id'
+                   LEFT JOIN agent_tasks parent ON parent.id = source.parent_task_id
+                   LEFT JOIN agent_profiles parent_lead ON parent_lead.id = parent.assigned_agent_id
+                   LEFT JOIN agent_tasks room ON room.id = {canonical}
+                   LEFT JOIN agent_profiles lead ON lead.id = room.assigned_agent_id
+                   LEFT JOIN agent_messages q ON q.id::text = COALESCE(m.meta->>'answers_question', m.meta->>'answers')
+                   LEFT JOIN agent_tasks question_source ON question_source.id::text = q.meta->>'task_id'
+                   LEFT JOIN agent_tasks question_parent ON question_parent.id = question_source.parent_task_id
+                   LEFT JOIN agent_profiles question_parent_lead ON question_parent_lead.id = question_parent.assigned_agent_id
+                   LEFT JOIN agent_tasks part ON part.id::text = {origin}
+                   LEFT JOIN agent_profiles part_lead ON part_lead.id = part.assigned_agent_id
+                   WHERE t.org_id = $7
+                     AND ((NOT (m.meta ? 'room_only') AND $3
+                           AND ($2 OR t.visibility = 'public' OR t.owner_user_id = $1) AND {thread})
+                       OR (m.meta ? 'room_only' AND room.org_id = $7 AND {room_access}
+                           AND ({origin} IS NULL OR part.org_id = $7 AND {part_access})))
                      AND COALESCE(m.meta->>'voice_request', 'false') <> 'true'
                      AND (t.owner_user_id = $1 OR (
                        COALESCE(m.meta->>'kind', '') <> 'shell'
@@ -314,12 +348,12 @@ impl WorldStore {
                    SELECT 'ch' || m.id::text AS reference, 'channel' AS kind, NULL::uuid AS agent_id, NULL::text AS agent_name, NULL::text AS agent_emoji,
                           c.id AS channel_id, c.name AS channel_name, c.kind AS channel_kind,
                           {AUTHOR} AS author, m.author_kind, au.avatar_emoji AS author_emoji,
-                          left(m.body, 4000) AS body, m.created_at
+                          left(m.body, 4000) AS body, m.created_at, NULL::uuid AS task_id, NULL::text AS room_kind
                    FROM channel_messages m
                    JOIN channels c ON c.id = m.channel_id
                    LEFT JOIN agent_profiles au ON au.id = m.author_agent_id
                    LEFT JOIN users u ON u.id = m.author_user_id
-                   WHERE {message_body} ILIKE $5 AND c.org_id = $7
+                   WHERE $4 AND {message_body} ILIKE $5 AND c.org_id = $7
                      AND CASE WHEN c.kind <> 'channel'
                               THEN EXISTS (SELECT 1 FROM channel_members cm WHERE cm.channel_id = c.id AND cm.member_kind = 'user' AND cm.member_id = $1)
                               ELSE $4 END
@@ -334,10 +368,7 @@ impl WorldStore {
             .bind(limit)
             .bind(org)
             .fetch_all(pool)
-            .await?
-            } else {
-                Vec::new()
-            };
+            .await?;
             for m in &mut messages {
                 m.body = snippet(&m.body, query, SNIPPET_CHARS);
             }
@@ -364,6 +395,7 @@ impl WorldStore {
             .fetch_all(pool)
             .await?;
             for r in &mut reports {
+                crate::reports::normalize_workspace_summary(&r.kind, &mut r.excerpt);
                 r.excerpt = snippet(&plain_markdown(&r.excerpt), query, SNIPPET_CHARS);
             }
             Ok::<_, anyhow::Error>(reports)
@@ -628,7 +660,7 @@ impl WorldStore {
             .fetch_all(pool),
         );
 
-        let ((agents, messages, reports, quests, todos, lists, channels), (schedules, feeds, teams, regions, places, rules, kit, devices, people)) = futures_util::try_join!(
+        let ((agents, messages, reports, mut quests, todos, lists, channels), (schedules, feeds, teams, regions, places, rules, kit, devices, people)) = futures_util::try_join!(
             async {
                 futures_util::try_join!(
                     async { agents.await.map_err(anyhow::Error::from) },
@@ -654,6 +686,12 @@ impl WorldStore {
                 )
             },
         )?;
+        let quest_ids: Vec<Uuid> = quests.iter().map(|quest| quest.id).collect();
+        let viewer = crate::access::Viewer { user, org: Some(org), role, org_role: None, instance_admin: false };
+        let mut decisions = self.decision_summaries_for(&quest_ids, &viewer).await?;
+        for quest in &mut quests {
+            quest.decisions = decisions.remove(&quest.id);
+        }
         Ok(SearchResults { agents, messages, reports, quests, todos, lists, channels, schedules, feeds, teams, regions, places, rules, kit, devices, people })
     }
 }
@@ -779,6 +817,65 @@ mod tests {
                 .execute(&pool)
                 .await?;
         }
+        let public_quest: Uuid = sqlx::query_scalar("SELECT id FROM agent_tasks WHERE title = $1 AND assigned_agent_id = $2")
+            .bind(format!("quest {word}"))
+            .bind(public)
+            .fetch_one(&pool)
+            .await?;
+        sqlx::query("UPDATE agent_tasks SET asking = 'crew' WHERE id = $1").bind(public_quest).execute(&pool).await?;
+        let hidden_part: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_tasks (user_id, title, assigned_agent_id, parent_task_id) VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(alice)
+        .bind(format!("hidden-part-{}", Uuid::new_v4().simple()))
+        .bind(private)
+        .bind(public_quest)
+        .fetch_one(&pool)
+        .await?;
+        for (status, part) in [("open", None), ("answered", None), ("open", Some(hidden_part)), ("answered", Some(hidden_part))] {
+            sqlx::query(
+                "INSERT INTO agent_messages (agent_id, author_kind, author_agent_id, body, meta, kind, decision_status, answered_by)
+                 VALUES ($1, 'agent', $1, 'decision count', jsonb_build_object(
+                   'room_only', true, 'task_id', $2::text, 'question', jsonb_strip_nulls(jsonb_build_object('part_id', $3::text))
+                 ), 'question', $4, CASE WHEN $4 = 'answered' THEN jsonb_build_object('kind', 'person', 'id', $5::text) END)",
+            )
+            .bind(public)
+            .bind(public_quest)
+            .bind(part.map(|id| id.to_string()))
+            .bind(status)
+            .bind(alice)
+            .execute(&pool)
+            .await?;
+        }
+        let edge_word = format!("edge{tag}");
+        let private_parent: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_tasks (user_id, title, assigned_agent_id, asking) VALUES ($1, $2, $3, 'crew') RETURNING id",
+        )
+        .bind(alice)
+        .bind(format!("private parent {}", Uuid::new_v4().simple()))
+        .bind(private)
+        .fetch_one(&pool)
+        .await?;
+        let public_child: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_tasks (user_id, title, assigned_agent_id, parent_task_id) VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(alice)
+        .bind(format!("public child {edge_word}"))
+        .bind(public)
+        .bind(private_parent)
+        .fetch_one(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO agent_messages (agent_id, author_kind, author_agent_id, body, meta, kind, decision_status)
+             VALUES ($1, 'agent', $1, 'parent-private decision', jsonb_build_object(
+               'room_only', true, 'task_id', $2::text, 'question', jsonb_build_object('part_id', $3::text)
+             ), 'question', 'open')",
+        )
+        .bind(public)
+        .bind(private_parent)
+        .bind(public_child)
+        .execute(&pool)
+        .await?;
         sqlx::query("INSERT INTO world_todos (owner_user_id, text) VALUES ($1, $2)")
             .bind(alice)
             .bind(format!("todo {word}"))
@@ -920,6 +1017,12 @@ mod tests {
         assert_eq!(mine.messages.iter().filter(|m| m.kind == "channel").count(), 2);
         assert!(mine.messages.iter().any(|m| m.reference.starts_with("ch")));
         assert_eq!(mine.quests.len(), 3);
+        let mine_quest = mine.quests.iter().find(|quest| quest.id == public_quest).unwrap();
+        assert_eq!(mine_quest.decisions.as_ref().map(|summary| (summary.open, summary.answered_by_person)), Some((2, 2)));
+        let mine_edge = store.search(alice, Role::Write, crate::orgs::DEFAULT_ORG, &edge_word, 20).await?;
+        assert_eq!(mine_edge.quests.first().map(|quest| (quest.id, quest.decisions.as_ref().map(|summary| summary.open))), Some((public_child, Some(1))));
+        let hidden_edge = store.search(bob, Role::Write, crate::orgs::DEFAULT_ORG, &edge_word, 20).await?;
+        assert_eq!(hidden_edge.quests.first().map(|quest| (quest.id, quest.decisions.is_none())), Some((public_child, true)));
         assert_eq!(mine.todos.len(), 1);
         assert_eq!(mine.lists.iter().filter(|l| l.kind == "list").count(), 1);
         assert_eq!(mine.channels.len(), 1);
@@ -958,6 +1061,7 @@ mod tests {
         assert_eq!(theirs.messages.len(), 2);
         assert!(theirs.quests.iter().all(|q| q.assigned_agent_id != Some(private)));
         assert_eq!(theirs.quests.len(), 1);
+        assert_eq!(theirs.quests[0].decisions.as_ref().map(|summary| (summary.open, summary.answered_by_person)), Some((1, 1)));
         assert!(theirs.todos.is_empty() && theirs.lists.is_empty());
         assert!(theirs.schedules.is_empty() && theirs.feeds.is_empty() && theirs.teams.is_empty());
         assert_eq!(theirs.regions.iter().map(|r| r.visibility.as_str()).collect::<Vec<_>>(), vec!["public"]);

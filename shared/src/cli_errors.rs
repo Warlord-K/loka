@@ -15,6 +15,7 @@ pub enum FailureKind {
     Permissions,
     Vault,
     DiskFull,
+    SessionMissing,
 }
 
 impl FailureKind {
@@ -33,6 +34,7 @@ impl FailureKind {
             FailureKind::Permissions => "permissions",
             FailureKind::Vault => "vault",
             FailureKind::DiskFull => "disk_full",
+            FailureKind::SessionMissing => "session_missing",
         }
     }
 
@@ -65,6 +67,10 @@ impl CliFailure {
     }
 
     pub fn summary(&self) -> String {
+        self.summary_for(None)
+    }
+
+    pub fn summary_for(&self, run_kind: Option<&str>) -> String {
         let resets = self
             .resets_at
             .map(|at| format!(" It resets at {} UTC.", at.format("%b %-d %H:%M")))
@@ -106,6 +112,7 @@ impl CliFailure {
             FailureKind::DiskFull => {
                 "The disk on the device that ran this work is full, so nothing could be written. Loka clears the build output of quests that are not running and closed quest folders on its own when space runs low, and holds new runs back until 5 GB are free, then starts them by itself, but this one ran out of space while it was working. Retry it once the device has room; if it stays low, the bell says what is left for you to do.".to_string()
             }
+            FailureKind::SessionMissing => format!("{LOST_SESSION_KEPT} {}", restart_advice(run_kind)),
             FailureKind::Vault => {
                 "A key the agent uses is a 1Password reference (op://) that could not be read. Vault references are read only on your own Mac: install the 1Password CLI there (brew install 1password-cli), turn on 1Password > Settings > Developer > Integrate with 1Password CLI, unlock 1Password, check the reference in Settings > Keys, then retry.".to_string()
             }
@@ -114,6 +121,50 @@ impl CliFailure {
 }
 
 const VAULT_FAILURE: &str = "Vault reference for ";
+
+const LOST_SESSION: &[(&str, &str, &str)] = &[
+    ("no conversation found with session id", "", ""),
+    ("no rollout found for thread id", "", ""),
+    ("session ", "", " not found"),
+    ("cursor chat ", "", " was not found on this device"),
+    ("session not found: ", "ses_", ""),
+];
+
+const LOST_SESSION_FILE: (&str, &str) = ("resource not found: ", "/session/");
+
+pub const LOST_SESSION_KEPT: &str =
+    "The CLI could not find the conversation it was asked to continue, because it was never saved or is gone from that device, and Loka could not start this run over by itself.";
+
+pub fn restart_advice(run_kind: Option<&str>) -> &'static str {
+    match run_kind {
+        Some("task" | "followup" | "review" | "publish") => "Resume the quest to continue in a fresh conversation.",
+        Some("quick" | "aside" | "direct") => "Send your message again to continue in a fresh conversation.",
+        Some(_) => "Reset the agent's context to continue in a fresh conversation.",
+        None => "Try again to continue in a fresh conversation.",
+    }
+}
+
+pub const LOST_SESSION_RESTARTED: &str =
+    "The CLI could not find the conversation it was asked to continue, so Loka started this work over in a fresh conversation from the agent's notes.";
+
+fn lost_session_shape(error: &str) -> Option<Option<String>> {
+    let lower = error.to_ascii_lowercase();
+    let named = LOST_SESSION.iter().find_map(|(head, prefix, tail)| {
+        lower.match_indices(head).find_map(|(at, _)| {
+            let start = at + head.len();
+            let rest = &error[start..];
+            let opened = rest.trim_start_matches([':', ' ', '"', '\'']);
+            let id: String = opened.chars().take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')).collect();
+            let after = opened[id.len()..].trim_start_matches(['"', '\'']).to_ascii_lowercase();
+            (!id.is_empty() && id.to_ascii_lowercase().starts_with(prefix) && after.starts_with(tail)).then_some(id)
+        })
+    });
+    let (file_head, file_tail) = LOST_SESSION_FILE;
+    match named {
+        Some(id) => Some(Some(id)),
+        None => lower.match_indices(file_head).any(|(at, _)| lower[at + file_head.len()..].contains(file_tail)).then_some(None),
+    }
+}
 
 pub fn classify(error: &str) -> Option<CliFailure> {
     let raw = error.split(FRIENDLY_MARK).last().unwrap_or(error);
@@ -124,6 +175,8 @@ pub fn classify(error: &str) -> Option<CliFailure> {
         FailureKind::Vault
     } else if has(&["no space left on device", "enospc", "os error 28", "disk quota exceeded"]) {
         FailureKind::DiskFull
+    } else if lost_session_shape(raw).is_some() {
+        FailureKind::SessionMissing
     } else if has(&["is not installed on this device", "env: node: no such file or directory", "claude: command not found"]) {
         FailureKind::CliMissing
     } else if has(&["is too old for loka", "error: unknown option '--"]) {
@@ -219,16 +272,32 @@ pub fn is_context_too_long(error: &str) -> bool {
     classify(error).is_some_and(|failure| failure.kind == FailureKind::ContextTooLong)
 }
 
+pub fn is_session_missing(error: &str) -> bool {
+    classify(error).is_some_and(|failure| failure.kind == FailureKind::SessionMissing)
+}
+
+pub fn lost_session_id(error: &str) -> Option<String> {
+    lost_session_shape(error.split(FRIENDLY_MARK).last().unwrap_or(error)).flatten()
+}
+
 pub fn is_rejected_key(error: &str) -> bool {
     classify(error).is_some_and(|failure| matches!(failure.kind, FailureKind::Auth | FailureKind::MissingScope))
 }
 
 pub fn describe(error: &str) -> String {
+    describe_for(error, None)
+}
+
+pub fn describe_run(error: &str, run_kind: &str) -> String {
+    describe_for(error, Some(run_kind))
+}
+
+fn describe_for(error: &str, run_kind: Option<&str>) -> String {
     if error.contains(FRIENDLY_MARK) {
         return error_text(error);
     }
     match classify(error) {
-        Some(failure) => format!("{}{FRIENDLY_MARK}{}", failure.summary(), error_text(error.trim())),
+        Some(failure) => format!("{}{FRIENDLY_MARK}{}", failure.summary_for(run_kind), error_text(error.trim())),
         None => error_text(error),
     }
 }
@@ -246,8 +315,16 @@ pub fn failure_payload(task_id: Option<uuid::Uuid>, error: &str, session_id: uui
 }
 
 pub fn status_detail(error: &str) -> String {
+    status_detail_for(error, None)
+}
+
+pub fn status_detail_run(error: &str, run_kind: &str) -> String {
+    status_detail_for(error, Some(run_kind))
+}
+
+fn status_detail_for(error: &str, run_kind: Option<&str>) -> String {
     match classify(error) {
-        Some(failure) => failure.summary(),
+        Some(failure) => failure.summary_for(run_kind),
         None => clip(error, STATUS_DETAIL_MAX),
     }
 }
@@ -364,6 +441,48 @@ mod tests {
         assert_eq!(unknown.retry_at(now), Some(now + Duration::minutes(5)));
         let auth = CliFailure { kind: FailureKind::Auth, resets_at: None };
         assert_eq!(auth.retry_at(now), None);
+    }
+
+    #[test]
+    fn every_cli_saying_its_session_is_gone_is_a_lost_session() {
+        for (cli, raw, id) in [
+            ("claude", "Claude Code exited with code 1: No conversation found with session ID: 9f1c2e4a-0000-4000-8000-000000000001", "9f1c2e4a-0000-4000-8000-000000000001"),
+            ("codex", "Codex CLI exited with code 1: Error: thread/resume: thread/resume failed: no rollout found for thread id 019a0000-1111-7222-8333-444455556666 (code -32600)", "019a0000-1111-7222-8333-444455556666"),
+            ("codex app-server", "codex thread/fork failed: no rollout found for thread id 019a0000-1111-7222-8333-444455556666", "019a0000-1111-7222-8333-444455556666"),
+            ("omp", "Error: Session \"01a21d98-c1f1-7311-ba20-3dde5fef60fa\" not found.\nRun `omp --resume` without an argument to pick from recent sessions, or `omp` to start a new one.: omp exited before it was ready", "01a21d98-c1f1-7311-ba20-3dde5fef60fa"),
+            ("cursor", "Cursor Agent exited with code 1: Error: Session \"5d1e0c3a-aaaa-4bbb-8ccc-dddddddddddd\" not found", "5d1e0c3a-aaaa-4bbb-8ccc-dddddddddddd"),
+            ("cursor copy", "Cursor chat 5d1e0c3a-aaaa-4bbb-8ccc-dddddddddddd was not found on this device", "5d1e0c3a-aaaa-4bbb-8ccc-dddddddddddd"),
+            ("cursor acp", "ACP session/load failed: Session \"5d1e0c3a-aaaa-4bbb-8ccc-dddddddddddd\" not found", "5d1e0c3a-aaaa-4bbb-8ccc-dddddddddddd"),
+            ("acp unquoted", "ACP session/load failed: Session 5d1e0c3a-aaaa-4bbb-8ccc-dddddddddddd not found", "5d1e0c3a-aaaa-4bbb-8ccc-dddddddddddd"),
+            ("opencode", "opencode CLI exited with code 1: Error: Session not found: ses_7Xy9AbCdEf", "ses_7Xy9AbCdEf"),
+        ] {
+            assert!(is_session_missing(raw), "{cli}: {raw}");
+            assert!(is_session_missing(&describe(raw)), "{cli}");
+            assert_eq!(lost_session_id(raw).as_deref(), Some(id), "{cli}");
+            assert_eq!(lost_session_id(&describe(raw)).as_deref(), Some(id), "{cli}");
+        }
+        let lost = "ACP session/load failed: Session 5d1e0c3a-aaaa-4bbb-8ccc-dddddddddddd not found";
+        for (kind, advice) in [("task", "Resume the quest"), ("followup", "Resume the quest"), ("quick", "Send your message again"), ("aside", "Send your message again"), ("turn", "Reset the agent's context")] {
+            let shown = describe_run(lost, kind);
+            assert!(shown.starts_with(LOST_SESSION_KEPT) && shown.contains(advice), "{kind}: {shown}");
+            assert_eq!(status_detail_run(&shown, kind), format!("{LOST_SESSION_KEPT} {}", restart_advice(Some(kind))));
+        }
+        assert!(!describe_run(lost, "quick").contains("quest") && !status_detail_run(lost, "turn").contains("quest"), "no quest advice where there is no quest");
+        assert!(LOST_SESSION_RESTARTED.contains("started this work over") && !LOST_SESSION_RESTARTED.contains("could not start"));
+        let storage = "opencode CLI exited with code 1: NotFoundError: Resource not found: /home/a/.local/share/opencode/storage/session/info/ses_1.json";
+        assert!(is_session_missing(storage));
+        assert_eq!(lost_session_id(storage), None, "a path is no session id");
+        for near_miss in [
+            "session not found",
+            "Subagent session not found: worker-2",
+            "Worker session hook command was not found.",
+            "Task not found: 12",
+            "Cannot enqueue prompt: session \"abc\" is busy",
+            "Session load rejected: not authenticated",
+            "ACP session/load failed: Authentication required.",
+        ] {
+            assert!(!is_session_missing(near_miss), "{near_miss}");
+        }
     }
 
     #[test]

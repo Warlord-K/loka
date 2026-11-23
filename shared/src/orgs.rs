@@ -83,6 +83,15 @@ pub(crate) async fn lock_org(tx: &mut Transaction<'_, Postgres>, org: Uuid) -> R
     Ok(())
 }
 
+pub(crate) async fn lock_org_parent(tx: &mut Transaction<'_, Postgres>, org: Uuid) -> Result<bool> {
+    lock_org(tx, org).await?;
+    Ok(sqlx::query_scalar::<_, Uuid>("SELECT id FROM orgs WHERE id = $1 FOR KEY SHARE")
+        .bind(org)
+        .fetch_optional(&mut **tx)
+        .await?
+        .is_some())
+}
+
 pub(crate) async fn audit_in(tx: &mut Transaction<'_, Postgres>, org: Uuid, actor: Option<Uuid>, action: &str, target: Option<String>, detail: Value) -> Result<()> {
     sqlx::query("INSERT INTO org_audit (org_id, actor_user_id, action, target, detail) VALUES ($1, $2, $3, $4, $5)")
         .bind(org)

@@ -21,6 +21,8 @@ import { cliName, modelName } from "@/lib/model-names";
 import { RunCommandContext, TerminalTargetContext, openInTerminal, useAppRunner, useOwnDevices } from "./run-command";
 import { defaultDevice, devicePickerShown, devicesLoading } from "@/lib/run-device";
 import { Shimmer } from "./shimmer";
+import { useLiveQuests } from "./live-quests";
+import { summaryText } from "@/lib/quest-board";
 
 function handleOf(name: string): string {
   return name.replace(/[^A-Za-z0-9]/g, "").toLowerCase();
@@ -1218,6 +1220,20 @@ export function DraftQueue({ drafts, answered, onAnswer }: { drafts: Draft[]; an
   );
 }
 
+function QuestDecisionSummary({ taskId, handles }: { taskId: string; handles: Map<string, WorldAgent> }) {
+  const quests = useLiveQuests();
+  const quest = quests?.find((q) => q.id === taskId);
+  if (!quest?.decisions) return null;
+  const lead = [...handles.values()].find((a) => a.id === quest.assigned_agent_id)?.name;
+  const text = summaryText(quest.decisions, lead);
+  if (!text) return null;
+  return (
+    <p className={cn("mt-1 text-w-sm", quest.decisions.passed_up ? "font-semibold text-w-alert" : "text-w-text2")}>
+      {text}
+    </p>
+  );
+}
+
 export function QuestCard({
   meta,
   body,
@@ -1235,6 +1251,7 @@ export function QuestCard({
 }) {
   const failed = meta.status === "failed" || Boolean(meta.error);
   const started = meta.status === "started";
+  const taskId = typeof meta.task_id === "string" ? meta.task_id : null;
   const label = failed
     ? "needs attention"
     : started
@@ -1262,8 +1279,13 @@ export function QuestCard({
         )}
       </p>
       <p className="mt-1 font-semibold">{meta.title}</p>
-      {started && !body && !live && <p className="mt-0.5 text-w-sm text-w-text2">Work started. Open the session to follow along.</p>}
+      {started && !body && !live && (
+        <p className="mt-0.5 text-w-sm text-w-text2">
+          {taskId ? "Work started. Open the quest room to follow the crew." : "Work started. Open the session to follow along."}
+        </p>
+      )}
       {live}
+      {taskId && <QuestDecisionSummary taskId={taskId} handles={handles} />}
       {meta.watching && <p className="mt-0.5 text-w-sm text-w-text2">The PR is checked every 30 minutes. Review comments go back to the quest, and it finishes once the PR merges.</p>}
       {body && <RichText text={body} handles={handles} onOpenAgent={onOpenAgent} className="mt-1 text-w-base text-w-text" />}
       {meta.cause && (
@@ -1274,6 +1296,15 @@ export function QuestCard({
       {meta.error && meta.error !== meta.reason && <p className="mt-1 text-w-sm text-w-danger">{meta.error}</p>}
       <div className="mt-2 flex flex-wrap gap-2">
         {meta.pr_url && <PrChip url={meta.pr_url} />}
+        {taskId && (
+          <button
+            type="button"
+            onClick={() => window.dispatchEvent(new CustomEvent("world:open-quest", { detail: { taskId, agentId: null } }))}
+            className={BTN_SECONDARY_SM}
+          >
+            Open quest room
+          </button>
+        )}
         {meta.session_id && onOpenSession && (
           <button type="button" onClick={() => onOpenSession(meta.session_id as string)} className={BTN_SECONDARY_SM}>
             {started ? "Open the session" : "See the session"}

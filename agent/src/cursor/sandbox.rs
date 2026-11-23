@@ -61,13 +61,17 @@ fn existing(paths: impl IntoIterator<Item = PathBuf>) -> Vec<String> {
 }
 
 pub(crate) fn policy(mode: Mode, working_dir: &Path, readable: &[PathBuf], temp: Option<&Path>) -> Option<Value> {
+    policy_with_gates(mode, working_dir, readable, temp, crate::cli::gate_paths())
+}
+
+fn policy_with_gates(mode: Mode, working_dir: &Path, readable: &[PathBuf], temp: Option<&Path>, gates: crate::cli::GatePaths) -> Option<Value> {
     if mode == Mode::Off {
         return None;
     }
     let home = home();
     let mut read: Vec<PathBuf> = readable.to_vec();
-    read.extend(crate::cli::launcher_alias_dir());
-    let mut write: Vec<PathBuf> = temp.map(crate::cli::private_temp_grants).unwrap_or_default();
+    read.extend(gates.readable);
+    let mut write: Vec<PathBuf> = temp.map(crate::cli::both_spellings).unwrap_or_default();
     if let Some(home) = &home {
         read.extend(HOME_TOOLCHAINS.iter().map(|rel| home.join(rel)));
         write.extend(crate::claude::sandbox::writable_in(home));
@@ -131,6 +135,27 @@ mod tests {
         assert!(dir.is_dir() && dir.to_string_lossy().contains("loka-cursor-tmp-"));
         drop(temp);
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn cursor_reads_every_gate_in_both_spellings_and_never_writes_it() {
+        let gates = crate::cli::gate_fixture::listening();
+        let work = gates.base.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let listed = policy_with_gates(Mode::Auto, &work, &[], None, gates.paths.clone()).unwrap();
+        let strings = |key: &str| -> Vec<PathBuf> { listed[key].as_array().unwrap().iter().filter_map(Value::as_str).map(PathBuf::from).collect() };
+        let read = strings("additionalReadPaths");
+        let write = strings("additionalReadwritePaths");
+        for path in [&gates.socket, &gates.alias] {
+            let spellings = crate::cli::both_spellings(path);
+            if cfg!(target_os = "macos") {
+                assert_eq!(spellings.len(), 2, "temp folders on a Mac have a /private spelling: {spellings:?}");
+            }
+            for spelling in spellings {
+                assert!(read.contains(&spelling), "{} missing in {read:?}", spelling.display());
+                assert!(!write.iter().any(|w| spelling.starts_with(w)), "{} must not be writable: {write:?}", spelling.display());
+            }
+        }
     }
 
     #[test]

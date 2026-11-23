@@ -148,6 +148,17 @@ fn public_origin(headers: &HeaderMap) -> String {
     format!("{proto}://{host}")
 }
 
+pub async fn close_session(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserId>,
+    Path(session_id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    if state.world.close_owned_shell(session_id, user.0, "browser_closed").await.map_err(internal)? {
+        state.term.close_session(session_id, "browser_closed").await;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 fn socket_url(origin: &str, ticket: &str) -> String {
     let ws = if let Some(rest) = origin.strip_prefix("https://") {
         format!("wss://{rest}")

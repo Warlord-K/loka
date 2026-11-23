@@ -14,6 +14,22 @@ pub fn reply_root(items: &[InboxItem]) -> Option<Uuid> {
     roots.all(|r| r == Some(first)).then_some(first)
 }
 
+pub fn reply_note(payload: &Value) -> String {
+    let Some(root) = payload.get("reply_to").and_then(Value::as_str).filter(|root| !root.is_empty()) else {
+        return String::new();
+    };
+    let reference = if root.starts_with("ch") {
+        root.to_string()
+    } else {
+        root.replace('-', "").chars().take(8).collect()
+    };
+    let thread = payload.get("thread").and_then(Value::as_str).filter(|thread| !thread.trim().is_empty());
+    format!(
+        "\n\n(This is a reply in the thread under msg:{reference}. Your reply goes into the same thread.{})",
+        thread.map(|thread| format!(" The thread so far:\n{thread}")).unwrap_or_default()
+    )
+}
+
 pub fn channel_reply_ref(text: &str) -> Option<i64> {
     let text = text.trim().trim_start_matches("msg:").trim_start_matches("ch").trim_start_matches('#');
     text.parse::<i64>().ok().filter(|id| *id > 0)

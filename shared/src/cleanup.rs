@@ -307,10 +307,15 @@ impl WorldStore {
         }
         let mut tx = self.pool().begin().await?;
         sqlx::query("SET LOCAL loka.cleanup = 'on'").execute(&mut *tx).await?;
+        let mut clarification_agents = Vec::new();
         let (rows, bytes) = match request.kind {
             CleanupKind::RunLogs => run_logs(&mut tx, &request, apply).await?,
             CleanupKind::Chats => chats(&mut tx, &request, apply).await?,
-            CleanupKind::Quests => quests(&mut tx, &request, apply).await?,
+            CleanupKind::Quests => {
+                let (rows, bytes, agents) = quests(&mut tx, &request, apply).await?;
+                clarification_agents = agents;
+                (rows, bytes)
+            }
             CleanupKind::Activity => activity(&mut tx, &request, apply).await?,
             CleanupKind::QuestFolders | CleanupKind::Caches => unreachable!("device cleanups are handled before the transaction"),
         };
@@ -330,6 +335,7 @@ impl WorldStore {
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
+            let _ = self.clear_clarification_waiting(&clarification_agents).await;
         } else {
             tx.rollback().await?;
         }
@@ -429,7 +435,14 @@ async fn chats(tx: &mut Transaction<'_, Postgres>, r: &CleanupRequest, apply: bo
     Ok(measured)
 }
 
-async fn quests(tx: &mut Transaction<'_, Postgres>, r: &CleanupRequest, apply: bool) -> Result<(i64, i64)> {
+async fn quests(tx: &mut Transaction<'_, Postgres>, r: &CleanupRequest, apply: bool) -> Result<(i64, i64, Vec<Uuid>)> {
+    if apply {
+        if let Some(org) = r.org {
+            if !crate::orgs::lock_org_parent(tx, org).await? {
+                return Ok((0, 0, Vec::new()));
+            }
+        }
+    }
     targets(
         tx,
         "CREATE TEMP TABLE cleanup_tasks (id UUID PRIMARY KEY) ON COMMIT DROP",
@@ -474,11 +487,16 @@ async fn quests(tx: &mut Transaction<'_, Postgres>, r: &CleanupRequest, apply: b
           JOIN session_runs x ON x.id = e.run_id WHERE x.session_id IN (SELECT id FROM cleanup_sessions)",
     )
     .await?;
+    let mut clarification_agents = Vec::new();
     if apply {
+        let task_ids = sqlx::query_scalar::<_, Uuid>("SELECT id FROM cleanup_tasks ORDER BY id")
+            .fetch_all(&mut **tx)
+            .await?;
+        clarification_agents = crate::world::settle_deleted_task_clarifications(tx, &task_ids, "Quest deleted").await?;
         sqlx::query("DELETE FROM agent_sessions WHERE id IN (SELECT id FROM cleanup_sessions)").execute(&mut **tx).await?;
         sqlx::query("DELETE FROM agent_tasks WHERE id IN (SELECT id FROM cleanup_tasks)").execute(&mut **tx).await?;
     }
-    Ok((tasks + sessions + runs + steps, task_bytes + session_bytes + run_bytes + step_bytes))
+    Ok((tasks + sessions + runs + steps, task_bytes + session_bytes + run_bytes + step_bytes, clarification_agents))
 }
 
 async fn activity(tx: &mut Transaction<'_, Postgres>, r: &CleanupRequest, apply: bool) -> Result<(i64, i64)> {
@@ -551,6 +569,14 @@ mod tests {
         let mine = agent(format!("keep-{tag}"), owner).await?;
         let theirs = agent(format!("their-{tag}"), other).await?;
         let org: Option<Uuid> = sqlx::query_scalar("SELECT org_id FROM agent_profiles WHERE id = $1").bind(mine).fetch_one(&pool).await?;
+        sqlx::query("INSERT INTO org_members (org_id, user_id, role) VALUES ($1, $2, 'member') ON CONFLICT DO NOTHING")
+            .bind(org)
+            .bind(owner)
+            .execute(&pool)
+            .await?;
+        let subscriber = agent(format!("clean-watch-{tag}"), owner).await?;
+        store.subscribe(subscriber, &["task.deleted"]).await?;
+        store.subscribe(theirs, &["task.deleted"]).await?;
 
         for (a, age) in [(mine, 100), (mine, 1), (theirs, 100)] {
             sqlx::query("INSERT INTO agent_messages (agent_id, author_kind, body, created_at) VALUES ($1, 'agent', 'hello', NOW() - make_interval(days => $2))")
@@ -575,6 +601,19 @@ mod tests {
             .bind(quest)
             .execute(&pool)
             .await?;
+        sqlx::query("UPDATE agent_profiles SET status = 'waiting', status_detail = $2 WHERE id = $1")
+            .bind(mine)
+            .bind(crate::quests::CLARIFICATION_WAITING_DETAIL)
+            .execute(&pool)
+            .await?;
+        let contextual_card: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_messages (agent_id, author_kind, author_agent_id, body, meta)
+             VALUES ($1, 'agent', $1, 'Which archived detail?', $2) RETURNING id",
+        )
+        .bind(mine)
+        .bind(serde_json::json!({ "kind": "ask", "clarify_request": { "context_task_id": quest } }))
+        .fetch_one(&pool)
+        .await?;
         let main: Uuid = sqlx::query_scalar("INSERT INTO agent_sessions (agent_id, role, backend, model) VALUES ($1, 'main', 'claude', 'haiku') RETURNING id")
             .bind(mine)
             .fetch_one(&pool)
@@ -623,7 +662,7 @@ mod tests {
         let preview = store.clean_up(request(CleanupKind::Chats), false).await?;
         assert_eq!((preview.rows, preview.applied), (1, false));
         let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_messages WHERE agent_id = $1").bind(mine).fetch_one(&pool).await?;
-        assert_eq!(left, 2, "a preview deletes nothing");
+        assert_eq!(left, 3, "a preview deletes nothing");
         assert!(store.clean_up(request(CleanupKind::Chats), true).await?.applied);
         let counts: (i64, i64) = sqlx::query_as(
             "SELECT (SELECT COUNT(*) FROM agent_messages WHERE agent_id = $1), (SELECT COUNT(*) FROM agent_messages WHERE agent_id = $2)",
@@ -632,7 +671,7 @@ mod tests {
         .bind(theirs)
         .fetch_one(&pool)
         .await?;
-        assert_eq!(counts, (1, 1), "only my old message goes");
+        assert_eq!(counts, (2, 1), "only my old message goes");
 
         let logs = store.clean_up(request(CleanupKind::RunLogs), true).await?;
         assert_eq!(logs.rows, 6);
@@ -656,15 +695,46 @@ mod tests {
         .fetch_one(&pool)
         .await?;
         assert_eq!(gone, (false, false, false, true), "the quest goes with its session and runs, the main session stays");
+        let contextual_answers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_messages WHERE meta->>'answers' = $1")
+            .bind(contextual_card.to_string())
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(contextual_answers, 1);
+        assert_eq!(store.get_agent(mine).await?.expect("agent").status, "idle");
+        let deleted: (Option<Uuid>, Option<Uuid>, Value) = sqlx::query_as(
+            "SELECT task_id, org_id, payload FROM world_events WHERE type = 'task.deleted' AND payload->>'task_id' = $1::text",
+        )
+        .bind(quest)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(deleted.0, None, "the event survives after its quest row is gone");
+        assert_eq!(deleted.1, org);
+        assert_eq!(deleted.2, serde_json::json!({ "task_id": quest }));
+        let inbox: Value = sqlx::query_scalar(
+            "SELECT payload FROM agent_inbox WHERE agent_id = $1 AND kind = 'task.deleted' AND payload->>'task_id' = $2::text",
+        )
+        .bind(subscriber)
+        .bind(quest)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(inbox["task_id"], serde_json::json!(quest));
+        let peer_inbox: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_inbox WHERE agent_id = $1 AND kind = 'task.deleted' AND payload->>'task_id' = $2::text",
+        )
+        .bind(theirs)
+        .bind(quest)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(peer_inbox, 0);
         assert_eq!(total().await?, before, "lifetime cost is unchanged");
 
         assert_eq!(store.clean_up(request(CleanupKind::Activity), true).await?.rows, 1);
         let report = store.storage_report(owner, org).await?;
-        assert_eq!(report.agents.len(), 1);
-        assert_eq!(report.agents[0].messages, 1);
+        assert_eq!(report.agents.len(), 2);
+        assert_eq!(report.agents.iter().find(|agent| agent.agent_id == mine).expect("cleaned agent").messages, 3);
         assert_eq!(report.cleanups.len(), 4);
 
-        sqlx::query("DELETE FROM agent_profiles WHERE id = ANY($1)").bind(vec![mine, theirs]).execute(&pool).await?;
+        sqlx::query("DELETE FROM agent_profiles WHERE id = ANY($1)").bind(vec![mine, theirs, subscriber]).execute(&pool).await?;
         sqlx::query("DELETE FROM users WHERE id = ANY($1)").bind(vec![owner, other]).execute(&pool).await?;
         Ok(())
     }

@@ -216,12 +216,13 @@ impl WorldStore {
             .await?)
     }
 
-    pub async fn touch_terminal(&self, id: Uuid) -> Result<()> {
-        sqlx::query("UPDATE terminal_sessions SET last_activity_at = NOW() WHERE id = $1 AND closed_at IS NULL")
+    pub async fn touch_terminal(&self, id: Uuid) -> Result<bool> {
+        Ok(sqlx::query("UPDATE terminal_sessions SET last_activity_at = NOW() WHERE id = $1 AND closed_at IS NULL")
             .bind(id)
             .execute(self.pool())
-            .await?;
-        Ok(())
+            .await?
+            .rows_affected()
+            > 0)
     }
 
     pub async fn stale_open_terminals(&self, stale_secs: i64) -> Result<Vec<Uuid>> {
@@ -233,18 +234,28 @@ impl WorldStore {
         .await?)
     }
 
-    pub async fn close_terminal(&self, id: Uuid, reason: &str) -> Result<bool> {
+    async fn close_terminal_scope(&self, id: Uuid, owner: Option<Uuid>, kind: Option<&str>, reason: &str) -> Result<bool> {
         Ok(sqlx::query_scalar::<_, i64>(
             "WITH done AS (
-               UPDATE terminal_sessions SET status = 'closed', close_reason = $2, closed_at = NOW()
-               WHERE id = $1 AND closed_at IS NULL RETURNING id
+               UPDATE terminal_sessions SET status = 'closed', close_reason = $4, closed_at = NOW()
+               WHERE id = $1 AND ($2::uuid IS NULL OR owner_user_id = $2) AND ($3::text IS NULL OR kind = $3) AND closed_at IS NULL RETURNING id
              ) SELECT COUNT(*) FROM done",
         )
         .bind(id)
+        .bind(owner)
+        .bind(kind)
         .bind(reason)
         .fetch_one(self.pool())
         .await?
             > 0)
+    }
+
+    pub async fn close_terminal(&self, id: Uuid, reason: &str) -> Result<bool> {
+        self.close_terminal_scope(id, None, None, reason).await
+    }
+
+    pub async fn close_owned_shell(&self, id: Uuid, owner: Uuid, reason: &str) -> Result<bool> {
+        self.close_terminal_scope(id, Some(owner), Some(SHELL), reason).await
     }
 }
 
@@ -388,6 +399,55 @@ mod tests {
         assert!(mismatched.is_err(), "a browser view always names its agent");
         let shell_with_quest = sqlx::query("INSERT INTO terminal_sessions (owner_user_id, runner_id, kind, task_id) VALUES ($1, $2, 'shell', $3)").bind(ann).bind(mac).bind(quest).execute(&pool).await;
         assert!(shell_with_quest.is_err(), "only browser views watch a quest");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_owner_closes_only_their_shell_and_frees_pending_and_claimed_slots() -> Result<()> {
+        let Some((pool, world, runners, tag)) = connect().await? else { return Ok(()) };
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email, name) VALUES ($1, $1) RETURNING id")
+            .bind(format!("owner-{tag}@terminal.test"))
+            .fetch_one(&pool)
+            .await?;
+        let foreign: Uuid = sqlx::query_scalar("INSERT INTO users (email, name) VALUES ($1, $1) RETURNING id")
+            .bind(format!("foreign-{tag}@terminal.test"))
+            .fetch_one(&pool)
+            .await?;
+        crate::orgs::join_default_for_tests(&pool, owner, None).await?;
+        let org = crate::orgs::DEFAULT_ORG;
+        let runner: Uuid = sqlx::query_scalar(
+            "INSERT INTO world_runners (owner_user_id, name, platform, token_hash, status, last_seen_at, capabilities) VALUES ($1, 'mac', 'macos', $2, 'online', NOW(), '{\"browser_view\": true}') RETURNING id",
+        )
+        .bind(owner)
+        .bind([*Uuid::new_v4().as_bytes(), *Uuid::new_v4().as_bytes()].concat())
+        .fetch_one(&pool)
+        .await?;
+        let agent: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id, org_id) VALUES ($1, $1, 'claude', 'sonnet', $2, $3) RETURNING id",
+        )
+        .bind(format!("terminal-{tag}"))
+        .bind(owner)
+        .bind(org)
+        .fetch_one(&pool)
+        .await?;
+
+        let NewTerminal::Created(pending) = world.create_terminal(owner, runner, None, 80, 24, 1).await? else { panic!("pending shell refused") };
+        assert!(!world.close_owned_shell(pending.id, foreign, "browser_closed").await?);
+        assert!(!world.close_owned_shell(Uuid::new_v4(), owner, "browser_closed").await?);
+        assert!(world.close_owned_shell(pending.id, owner, "browser_closed").await?);
+        assert!(!world.close_owned_shell(pending.id, owner, "browser_closed").await?);
+        assert!(!world.touch_terminal(pending.id).await?);
+
+        let NewTerminal::Created(claimed) = world.create_terminal(owner, runner, None, 80, 24, 1).await? else { panic!("claimed shell refused") };
+        assert_eq!(runners.claim_terminal(runner, TerminalRoom::SHELLS).await?.expect("claimed shell").id, claimed.id);
+        assert!(world.close_owned_shell(claimed.id, owner, "browser_closed").await?);
+        let NewTerminal::Created(replacement) = world.create_terminal(owner, runner, None, 80, 24, 1).await? else { panic!("closed shell kept its slot") };
+
+        let NewTerminal::Created(view) = world.create_terminal(owner, runner, Some(Watched { agent, quest: None }), 80, 24, 1).await? else { panic!("view refused") };
+        assert!(!world.close_owned_shell(view.id, owner, "browser_closed").await?);
+        assert!(world.terminal(view.id).await?.is_some_and(|session| session.closed_at.is_none()));
+        assert!(world.close_terminal(replacement.id, "test_done").await?);
+        assert!(world.close_terminal(view.id, "test_done").await?);
         Ok(())
     }
 

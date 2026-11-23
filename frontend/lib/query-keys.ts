@@ -17,6 +17,7 @@ export const qk = {
     feeds: (id: string) => ["world", "agent", id, "feeds"] as const,
     schedules: (id: string) => ["world", "agent", id, "schedules"] as const,
     usage: (id: string) => ["world", "agent", id, "usage"] as const,
+    crewPreview: (id: string, runnerId: string | null, cli: string, model: string) => ["world", "agent", id, "crew-preview", runnerId, cli, model] as const,
     kit: (id: string) => ["world", "agent", id, "kit"] as const,
     context: (id: string) => ["world", "agent", id, "context"] as const,
   },

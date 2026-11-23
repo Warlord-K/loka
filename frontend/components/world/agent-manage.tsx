@@ -2,19 +2,23 @@
 
 import { RelativeTime } from "./relative-time";
 import { parseTokens, tokenText } from "@/lib/budgets";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { qk } from "@/lib/query-keys";
-import { Archive, ArrowCounterClockwise, Broom, Stack, Star, Globe, HandArrowUp, LockSimple, MagnifyingGlass, Plus, ShieldCheck, Trash, X, Rss, CalendarBlank, Plugs, BookOpen, ChartBar, GithubLogo } from "@phosphor-icons/react";
+import { Archive, ArrowCounterClockwise, Broom, Stack, Star, Globe, HandArrowUp, LockSimple, MagnifyingGlass, Plus, ShieldCheck, Trash, X, Rss, CalendarBlank, Plugs, BookOpen, ChartBar, GithubLogo, UsersThree } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
-import { APPROVAL_MODES, QUEST_CONTEXTS, cliOptions, compactNumber, formatUsage, reviewerLabel, type AgentUsageRow, type BackendModels, POWERS, SUBSCRIPTION_EVENTS, worldApi, type AgentFeed, type FeedSecret, type AgentSchedule, type AgentWatch, type AgentUsage, type ApprovalMode, type QuestContext, type McpServer, type Person, type Skill, type WorldAgent } from "@/lib/world";
+import { APPROVAL_MODES, QUEST_CONTEXTS, cliOptions, compactNumber, formatUsage, reviewerLabel, type AgentUsageRow, type BackendModels, POWERS, SUBSCRIPTION_EVENTS, worldApi, WorldApiError, type AgentFeed, type FeedSecret, type AgentSchedule, prActionState, type AgentWatch, type WorldEvent, type AgentUsage, type ApprovalMode, type QuestContext, type McpServer, type Person, type Skill, type WorldAgent } from "@/lib/world";
 import { BTN, BTN_MD, BTN_PRIMARY, BTN_SECONDARY, BTN_SECONDARY_SM, CHUNKY, INPUT } from "./styles";
 import { ConfirmDelete, WCombobox, WSelect } from "./controls";
 import { VoiceField } from "./voice-ui";
-import { SlackMark } from "./panels";
+import { SlackMark, useWorldRefresh } from "./panels";
 import { modelName } from "@/lib/model-names";
 import { EmptyState, SEARCH_ROW_FOCUS, SEARCH_ROW_RING } from "./settings-shell";
 import { CornerCopy } from "./chat-kit";
+import { CrewMix } from "./crew-ui";
+import { ASKING_MODES, askingServed, cleanVariants, MAX_CREW } from "@/lib/quest-room-api";
+import { mixProblem } from "@/lib/quest-board";
+import type { Asking, MixSlot } from "@/lib/quest-board";
 
 const LABEL = "mb-1.5 block text-w-sm font-medium text-w-text2";
 const SECTION = "space-y-3 rounded-xl border-2 border-w-line bg-w-card/70 p-4";
@@ -214,6 +218,56 @@ export function QuestContextRow({ agent, canChange, onUpdated }: { agent: WorldA
         onChange={(v) => void pick(v as QuestContext)}
         options={QUEST_CONTEXTS.map((c) => ({ value: c.value, label: c.label, hint: c.hint }))}
       />
+    </section>
+  );
+}
+
+export function AskingRow({ agent, canChange, onUpdated }: { agent: WorldAgent; canChange: boolean; onUpdated: (agent: WorldAgent) => void }) {
+  const [busy, setBusy] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const saved = JSON.stringify(cleanVariants(agent.crew_variants ?? [], MAX_CREW));
+  const [mix, setMix] = useState<MixSlot[]>(() => JSON.parse(saved) as MixSlot[]);
+  useEffect(() => setMix(JSON.parse(saved) as MixSlot[]), [saved]);
+  if (!canChange || !askingServed(agent)) return null;
+  const mode: Asking = agent.asking ?? "off";
+  const save = async (patch: { asking?: Asking; crew_variants?: MixSlot[] }) => {
+    setBusy(true);
+    setFailed(false);
+    try {
+      onUpdated(await worldApi.update(agent.id, patch));
+    } catch {
+      setFailed(true);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const dirty = JSON.stringify(cleanVariants(mix, MAX_CREW)) !== saved;
+  return (
+    <section className={SECTION}>
+      <div className="flex flex-wrap items-center gap-3">
+        <UsersThree size={20} weight="bold" className="text-w-teal" />
+        <span className="min-w-0 flex-1 text-w-sm text-w-text2">
+          {failed ? "Could not change access." : `Who ${agent.name}'s quests ask when they are missing something.`}
+          <span className="block text-w-xs text-w-muted">{ASKING_MODES.find((m) => m.value === mode)?.hint}. Only taste, keys, money or anything that can&apos;t be undone reaches you.</span>
+        </span>
+        <WSelect
+          ariaLabel="Access"
+          className="w-44"
+          value={mode}
+          disabled={busy}
+          onChange={(v) => v !== mode && void save({ asking: v as Asking })}
+          options={ASKING_MODES.map((m) => ({ value: m.value, label: m.label, hint: m.hint }))}
+        />
+      </div>
+      {mode === "crew" && (
+        <div className="space-y-2">
+          <p className="text-w-xs text-w-muted">What each helper runs on by default. Loka picks a mix of the coding tools on your devices unless you choose. The fourth slot applies to quests with four helpers, and a quest can still change the mix in Start with a crew.</p>
+          <CrewMix size={MAX_CREW} value={mix} agent={agent} onChange={setMix} disabled={busy} />
+          <button type="button" disabled={busy || !dirty || !!mixProblem(mix, MAX_CREW)} onClick={() => void save({ crew_variants: cleanVariants(mix, MAX_CREW) })} className={cn(BTN, BTN_MD, "bg-w-gold hover:bg-w-gold2")}>
+            {busy ? "Saving" : "Save"}
+          </button>
+        </div>
+      )}
     </section>
   );
 }
@@ -1153,6 +1207,43 @@ function HeartbeatPanel({ agentId, agentName, beat, onChanged, focused }: { agen
   );
 }
 
+const ACTION_TONES = { ok: "text-w-ok", warn: "text-w-warn", danger: "text-w-danger", muted: "text-w-muted" } as const;
+
+function PrActions({ agentId, agentName, actions, focusId, onChanged }: { agentId: string; agentName: string; actions: AgentSchedule[]; focusId?: string; onChanged: () => void }) {
+  const newestFirst = [...actions].reverse();
+  return (
+    <div className="space-y-1.5 border-t-2 border-dashed border-w-line pt-3">
+      <p className="text-w-sm font-semibold text-w-strong">Pull request actions</p>
+      <p className="text-w-xs text-w-muted">Merges, branch clean-ups, closes and check reruns {agentName} asked Loka to do without AI. Loka checks the rules again right before each one and skips it when anything changed.</p>
+      <ul className="space-y-1.5">
+        {newestFirst.map((s) => {
+          const state = prActionState(s);
+          const open = !s.outcome;
+          return (
+            <li key={s.id} {...(focusId === s.id ? SEARCH_ROW_FOCUS : {})} className={cn("flex items-start gap-2 rounded-md border border-w-line bg-w-field/70 px-2.5 py-1.5", SEARCH_ROW_RING)}>
+              <span className="min-w-0 flex-1">
+                <span className="block font-medium">{s.name}</span>
+                <span className={cn("block text-w-xs", ACTION_TONES[state.tone])}>{state.text}</span>
+                {s.prompt !== s.name && <span className="line-clamp-2 block text-w-xs text-w-text2">{s.prompt}</span>}
+              </span>
+              {s.task_id && (
+                <button
+                  type="button"
+                  onClick={() => window.dispatchEvent(new CustomEvent("world:open-quest", { detail: { taskId: s.task_id, agentId } }))}
+                  className={BTN_SECONDARY_SM}
+                >
+                  Quest
+                </button>
+              )}
+              <ConfirmDelete label={open ? `Cancel ${s.name}` : `Remove ${s.name}`} onConfirm={() => void worldApi.deleteSchedule(agentId, s.id).then(onChanged)} />
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
 export function SchedulesSection({ agentId, agentName, focusId }: { agentId: string; agentName: string; focusId?: string }) {
   const queryClient = useQueryClient();
   const list: AgentSchedule[] = useQuery({ queryKey: qk.agent.schedules(agentId), queryFn: () => worldApi.schedules(agentId) }).data ?? EMPTY_SCHEDULES;
@@ -1163,6 +1254,9 @@ export function SchedulesSection({ agentId, agentName, focusId }: { agentId: str
   const [at, setAt] = useState("");
   const [error, setError] = useState<string | null>(null);
   const refresh = () => void queryClient.invalidateQueries({ queryKey: qk.agent.schedules(agentId) });
+  const reload = useCallback(() => void queryClient.invalidateQueries({ queryKey: qk.agent.schedules(agentId) }), [queryClient, agentId]);
+  const ownScheduleChanged = useCallback((e: WorldEvent) => e.agent_id === agentId && (e.type.startsWith("action.") || e.type === "schedule.updated"), [agentId]);
+  useWorldRefresh(reload, ownScheduleChanged);
 
   const add = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -1183,7 +1277,8 @@ export function SchedulesSection({ agentId, agentName, focusId }: { agentId: str
     }
   };
 
-  const routines = list.filter((s) => s.kind !== "heartbeat");
+  const routines = list.filter((s) => s.kind !== "heartbeat" && s.kind !== "action");
+  const actions = list.filter((s) => s.kind === "action");
   const beat = list.find((s) => s.kind === "heartbeat");
   const ready = name.trim() && prompt.trim() && (repeat === "once" ? Boolean(at) : repeat !== "custom" || cron.trim());
 
@@ -1219,6 +1314,7 @@ export function SchedulesSection({ agentId, agentName, focusId }: { agentId: str
           </li>
         ))}
       </ul>
+      {actions.length > 0 && <PrActions agentId={agentId} agentName={agentName} actions={actions} focusId={focusId} onChanged={refresh} />}
       <form onSubmit={add} className="space-y-2 border-t-2 border-dashed border-w-line pt-3">
         <div className="flex gap-2">
           <input className={INPUT} placeholder="Morning standup" value={name} onChange={(e) => setName(e.target.value)} aria-label="Routine name" />

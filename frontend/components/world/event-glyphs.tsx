@@ -54,6 +54,12 @@ export function eventGlyph(type: string, error = false): EventGlyph {
       return { icon: GitMerge, tone: "ok", label: "Merged" };
     case "task.pr_closed":
       return { icon: GitPullRequest, tone: "danger", label: "Pull request closed" };
+    case "action.ran":
+      return { icon: GitMerge, tone: "ok", label: "Pull request action ran" };
+    case "action.skipped":
+      return { icon: GitPullRequest, tone: "warn", label: "Pull request action skipped" };
+    case "action.failed":
+      return { icon: GitPullRequest, tone: "danger", label: "Pull request action failed" };
     case "task.plan_ready":
       return { icon: MapTrifold, tone: "warn", label: "Plan ready" };
     case "run.failed":

@@ -19,7 +19,7 @@ export const navigationDetails = {
   team: (intent: DetailIntent, id: string) => readNavigationDetail(intent, () => teamsApi.get(id)),
   item: (intent: DetailIntent, id: string) => readNavigationDetail(intent, () => worldApi.item(id)),
   region: (intent: DetailIntent, id: string) => readNavigationDetail(intent, () => lokaApi.region(id)),
-  quest: (intent: DetailIntent, id: string, after?: number, since?: string) => readNavigationDetail(intent, () => worldApi.questRoom(id, after, since)),
+  quest: (intent: DetailIntent, id: string, after?: number, since?: string, focus?: string) => readNavigationDetail(intent, () => worldApi.questRoom(id, after, since, focus)),
   reportFind: (intent: DetailIntent, title: string) => readNavigationDetail(intent, () => reportsApi.find(title)),
   report: (intent: DetailIntent, id: string) => readNavigationDetail(intent, () => reportsApi.get(id)),
   reportRevisions: (intent: DetailIntent, id: string) => readNavigationDetail(intent, () => reportsApi.revisions(id)),

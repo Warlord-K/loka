@@ -1,4 +1,5 @@
 import { EMBEDS, type CanvasEmbed } from "./canvas-embeds";
+export { reportCollection, type ReportCollection } from "./exact-world-navigation";
 
 export interface ReportBrief {
   id: string;
@@ -179,15 +180,26 @@ const send = (url: string, method: string, body?: unknown, opts: SendOptions = {
 
 export const REPORTS_STALE = "world:reports-stale";
 
+export type ReportListFilter = { query?: string; folder?: string; tag?: string; kind?: ReportKind; limit?: number; offset?: number };
+
+export function secureRequestId(randomValues: (bytes: Uint8Array) => void = (bytes) => { crypto.getRandomValues(bytes); }): string {
+  const bytes = new Uint8Array(16);
+  randomValues(bytes);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 export const reportsApi = {
-  list: (filter: { query?: string; folder?: string; tag?: string } = {}) => {
+  list: (filter: ReportListFilter = {}) => {
     const q = new URLSearchParams();
-    for (const [k, v] of Object.entries(filter)) if (v) q.set(k, v);
+    for (const [k, v] of Object.entries(filter)) if (v !== undefined && v !== "") q.set(k, String(v));
     return fetch(`/api/world/reports?${q}`, { cache: "no-store" }).then((r) => json<ReportBrief[]>(r));
   },
   find: (key: string) => fetch(`/api/world/reports/find?key=${encodeURIComponent(key)}`, { cache: "no-store" }).then((r) => json<ReportBrief>(r)),
   get: (id: string) => fetch(`/api/world/reports/${id}`, { cache: "no-store" }).then((r) => json<ReportDetail>(r)),
-  create: (body: { title: string; body: string; folder?: string; tags?: string[]; canvas?: CanvasDoc }) => send("/api/world/reports", "POST", body).then((r) => json<Report>(r)),
+  create: (body: { title: string; body: string; folder?: string; tags?: string[]; canvas?: CanvasDoc; request_id?: string }) => send("/api/world/reports", "POST", body).then((r) => json<Report>(r)),
   changeCanvas: (id: string, ops: CanvasOp[], opts?: SendOptions) => send(`/api/world/reports/${id}/canvas`, "POST", { ops }, opts).then((r) => json<Report>(r)),
   addMark: (id: string, mark: { item_id?: string | null; x: number; y: number; kind: "pin" | "sticky"; body: string }) =>
     send(`/api/world/reports/${id}/marks`, "POST", mark).then((r) => json<CanvasMark>(r)),

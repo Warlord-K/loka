@@ -11,12 +11,12 @@ test("several selected items become one quote with every item in its source", ()
   ]);
   assert.deepEqual(quote, {
     text: "- Note: Cart\n- Image",
-    label: '2 items on canvas "Checkout redesign"',
+    label: '2 items on workspace "Checkout redesign"',
     source: `report:${report.id}#cart+pay`,
   });
   assert.deepEqual(quoteItems(report, [{ id: "cart", kind: "Note", label: "Cart" }]), {
     text: "Note: Cart",
-    label: 'Note on canvas "Checkout redesign"',
+    label: 'Note on workspace "Checkout redesign"',
     source: `report:${report.id}#cart`,
   });
   assert.equal(quoteItems(report, []), null);

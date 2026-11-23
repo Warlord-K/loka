@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::collections::HashSet;
 use std::time::Duration;
 
 use axum::{
@@ -344,6 +345,12 @@ pub(crate) async fn apply_agent_update(
     if body.quest_context.as_deref().is_some_and(|c| loka_shared::context::QuestContext::parse(c).is_err()) {
         return Err(reject(StatusCode::BAD_REQUEST, "invalid_quest_context", Some(loka_shared::context::QUEST_CONTEXT_ERROR)));
     }
+    if body.asking.as_deref().is_some_and(|a| loka_shared::quest_questions::Asking::parse(a).is_err()) {
+        return Err(reject(StatusCode::BAD_REQUEST, "invalid_asking", Some(loka_shared::quest_questions::ASKING_ERROR)));
+    }
+    if let Some(Err(error)) = body.crew_variants.as_deref().map(|v| loka_shared::quest_questions::clean_crew_variants(v, None)) {
+        return Err(reject(StatusCode::BAD_REQUEST, "invalid_crew_variants", Some(&error)));
+    }
     if body.handle.as_deref().is_some_and(|h| loka_shared::world::normalize_handle(h).is_none()) {
         return Err(reject(StatusCode::BAD_REQUEST, "invalid_handle", Some("Handles use lowercase letters, digits and dashes")));
     }
@@ -586,6 +593,8 @@ pub struct PostMessage {
     run_on: Option<Uuid>,
     #[serde(default)]
     quote: Option<Value>,
+    #[serde(default)]
+    changes: Option<Uuid>,
 }
 
 #[derive(Deserialize, Serialize, Default)]
@@ -740,8 +749,11 @@ async fn can_open_link(state: &AppState, viewer: &Viewer, link: &LinkedMessage) 
         let Ok(id) = link.reference.parse::<Uuid>() else {
             return Ok(false);
         };
-        if !state.world.sees_message(id, viewer.user).await.map_err(internal)? {
+        if !state.world.sees_message_as(id, viewer).await.map_err(internal)? {
             return Ok(false);
+        }
+        if link.task_id.is_some() {
+            return Ok(true);
         }
         return Ok(state
             .world
@@ -769,6 +781,250 @@ async fn visible_links(state: &AppState, viewer: &Viewer, text: &str) -> Result<
         }
     }
     Ok(json!(out))
+}
+
+fn private_clarification_handoff(source: &Value) -> Option<&Value> {
+    source.get("clarification_continuation")?.as_str()?.parse::<Uuid>().ok()?;
+    let handoff = source.get("clarification_handoff")?;
+    let fields = handoff.as_object()?;
+    fields.get("request")?.as_str()?;
+    fields.get("question")?.as_str()?;
+    fields.get("answer")?.as_str()?;
+    Some(handoff)
+}
+
+async fn clarification_source_resources(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    origin: &Value,
+    agent_id: Uuid,
+    user_id: Uuid,
+    org_id: Option<Uuid>,
+    task_id: Option<Uuid>,
+) -> Result<Value, sqlx::Error> {
+    let inbox_id = origin.get("source_inbox_id").and_then(Value::as_i64);
+    let supplied_message_id = origin.get("message_id").filter(|value| !value.is_null());
+    let message_reference = supplied_message_id.and_then(|value| match value {
+        Value::String(id) => Some(id.clone()),
+        Value::Number(id) => Some(id.to_string()),
+        _ => None,
+    });
+    let invalid_message_reference = supplied_message_id.is_some() && message_reference.is_none();
+    let message_id = message_reference.as_deref().and_then(|id| Uuid::parse_str(id).ok());
+    let channel_route = origin.get("clarification_channel").filter(|route| route.is_object());
+    let source = if invalid_message_reference {
+        None
+    } else if let (Some(inbox_id), Some(route)) = (inbox_id, channel_route) {
+        if !loka_shared::world::clarification_channel_allowed(tx, agent_id, route).await? {
+            None
+        } else {
+            sqlx::query_scalar::<_, Value>(
+                "SELECT i.payload
+                 FROM agent_inbox i
+                 JOIN world_events e ON e.seq = i.event_seq
+                 WHERE i.id = $1 AND i.agent_id = $2 AND e.actor_user_id = $3
+                   AND e.org_id IS NOT DISTINCT FROM $4
+                   AND i.payload->>'task_id' IS NULL
+                   AND ($6::text IS NULL OR i.payload->>'message_id' = $6)
+                   AND (
+                     (i.kind = 'channel.mention'
+                       AND i.payload->>'channel_id' = ($5::jsonb)->>'channel_id'
+                       AND i.payload->>'message_id' = ($5::jsonb)->>'message_id'
+                       AND COALESCE(i.payload->>'reply_to', i.payload->>'message_id') = ($5::jsonb)->>'root_id')
+                     OR
+                     (i.kind = 'message'
+                       AND i.payload->'clarification_channel' = $5::jsonb
+                       AND world_safe_uuid(i.payload->>'clarification_continuation') IS NOT NULL
+                       AND jsonb_typeof(i.payload->'clarification_handoff') = 'object'
+                       AND jsonb_typeof(i.payload->'clarification_handoff'->'request') = 'string'
+                       AND jsonb_typeof(i.payload->'clarification_handoff'->'question') = 'string'
+                       AND jsonb_typeof(i.payload->'clarification_handoff'->'answer') = 'string')
+                   )",
+            )
+            .bind(inbox_id)
+            .bind(agent_id)
+            .bind(user_id)
+            .bind(org_id)
+            .bind(route)
+            .bind(message_reference)
+            .fetch_optional(&mut **tx)
+            .await?
+        }
+    } else if channel_route.is_some() {
+        None
+    } else if let Some(inbox_id) = inbox_id {
+        sqlx::query_scalar::<_, Value>(
+            "SELECT i.payload
+             FROM agent_inbox i
+             JOIN world_events e ON e.seq = i.event_seq
+             WHERE i.id = $1 AND i.agent_id = $2 AND e.actor_user_id = $3
+               AND e.org_id IS NOT DISTINCT FROM $4
+               AND i.kind IN ('message', 'task.assigned')
+               AND i.payload->>'task_id' IS NOT DISTINCT FROM $5::uuid::text
+               AND ($6::text IS NULL OR i.payload->>'message_id' = $6)",
+        )
+        .bind(inbox_id)
+        .bind(agent_id)
+        .bind(user_id)
+        .bind(org_id)
+        .bind(task_id)
+        .bind(message_reference)
+        .fetch_optional(&mut **tx)
+        .await?
+    } else if let Some(message_id) = message_id {
+        let snapshots = sqlx::query_as::<_, (Value, Option<Value>, bool)>(
+            "SELECT e.payload, i.payload,
+                    e.actor_user_id IS NOT DISTINCT FROM $3
+                    AND e.org_id IS NOT DISTINCT FROM $4
+                    AND m.author_user_id IS NOT DISTINCT FROM $3
+                    AND (i.id IS NULL OR i.payload->>'task_id' IS NOT DISTINCT FROM $5::uuid::text)
+                    AND (
+                      (e.task_id IS NOT DISTINCT FROM $5
+                        AND m.meta->>'task_id' IS NOT DISTINCT FROM $5::uuid::text)
+                      OR COALESCE(
+                        i.id IS NOT NULL
+                        AND world_safe_uuid(i.payload->>'clarification_continuation') IS NOT NULL
+                        AND jsonb_typeof(i.payload->'clarification_handoff') = 'object'
+                        AND jsonb_typeof(i.payload->'clarification_handoff'->'request') = 'string'
+                        AND jsonb_typeof(i.payload->'clarification_handoff'->'question') = 'string'
+                        AND jsonb_typeof(i.payload->'clarification_handoff'->'answer') = 'string'
+                        AND m.meta->>'answers' = i.payload->>'clarification_continuation',
+                        FALSE
+                      )
+                    )
+                    AND (i.id IS NULL OR i.payload->>'message_id' IS NOT DISTINCT FROM e.payload->>'message_id')
+                    AND ($6::uuid IS NULL OR e.payload->>'message_id' = $6::text) AS scoped
+             FROM world_events e
+             JOIN agent_messages m ON m.id::text = e.payload->>'message_id'
+               AND m.agent_id = e.agent_id AND m.author_kind = 'user'
+             LEFT JOIN agent_inbox i ON i.event_seq = e.seq AND i.agent_id = $2 AND i.kind = 'message'
+             WHERE e.agent_id = $2 AND e.type = 'message.created'
+               AND e.payload->>'message_id' = $1::text
+             LIMIT 2",
+        )
+        .bind(message_id)
+        .bind(agent_id)
+        .bind(user_id)
+        .bind(org_id)
+        .bind(task_id)
+        .bind(message_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        if snapshots.len() == 1 && snapshots[0].2 {
+            Some(snapshots[0].1.clone().unwrap_or_else(|| snapshots[0].0.clone()))
+        } else if snapshots.is_empty() {
+            sqlx::query_scalar::<_, Value>(
+                "SELECT m.meta || jsonb_build_object('body', m.body)
+                 FROM agent_messages m
+                 JOIN agent_profiles a ON a.id = m.agent_id
+                 WHERE m.id = $1 AND m.agent_id = $2 AND m.author_kind = 'user'
+                   AND m.author_user_id = $3 AND a.org_id IS NOT DISTINCT FROM $4
+                   AND m.meta->>'task_id' IS NOT DISTINCT FROM $5::uuid::text",
+            )
+            .bind(message_id)
+            .bind(agent_id)
+            .bind(user_id)
+            .bind(org_id)
+            .bind(task_id)
+            .fetch_optional(&mut **tx)
+            .await?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let Some(mut source) = source else {
+        return Ok(json!({}));
+    };
+    if let Some(route) = channel_route {
+        let source_message = route.get("message_id").and_then(Value::as_i64).unwrap_or_default();
+        let root = route.get("root_id").and_then(Value::as_i64).unwrap_or_default();
+        let entry = format!(
+            "[msg:ch{source_message}] {}: {}",
+            source.get("author").and_then(Value::as_str).unwrap_or("?"),
+            source.get("body").and_then(Value::as_str).unwrap_or_default()
+        );
+        let transcript = source.get("transcript").and_then(Value::as_str).unwrap_or_default();
+        let thread = match transcript.rfind(&entry) {
+            Some(start) => format!("{}{}", &transcript[..start], &transcript[start + entry.len()..]).trim().to_string(),
+            None => transcript.trim().to_string(),
+        };
+        source["reply_to"] = json!(format!("ch{root}"));
+        source["thread"] = json!(thread);
+        source["clarification_channel"] = route.clone();
+    }
+    let private_handoff = private_clarification_handoff(&source);
+    let source_limit = if private_handoff.is_some() { 2 } else { 1 };
+    let mut requested = Vec::new();
+    for id in source
+        .get("attachments")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|attachment| attachment.get("id").and_then(Value::as_str).and_then(|id| Uuid::parse_str(id).ok()))
+    {
+        if !requested.contains(&id) && requested.len() < loka_shared::media::MAX_PER_CALL * source_limit {
+            requested.push(id);
+        }
+    }
+    let allowed = sqlx::query_as::<_, (Uuid, String, String)>(
+        "SELECT id, mime, name FROM world_uploads
+         WHERE id = ANY($1) AND uploaded_by = $2 AND org_id IS NOT DISTINCT FROM $3",
+    )
+    .bind(&requested)
+    .bind(user_id)
+    .bind(org_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let attachments: Vec<Value> = requested
+        .iter()
+        .filter_map(|id| {
+            allowed.iter().find(|(found, _, _)| found == id).map(|(_, mime, name)| {
+                json!({ "id": id, "mime": mime, "name": name, "url": format!("/api/world/uploads/{id}") })
+            })
+        })
+        .collect();
+    let files: Vec<Value> = source
+        .get("files")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|file| {
+            file.get("id")
+                .and_then(Value::as_str)
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .is_some_and(|id| allowed.iter().any(|(found, _, _)| *found == id))
+        })
+        .take(loka_shared::media::MAX_ATTACHED_FILES * source_limit)
+        .cloned()
+        .collect();
+    Ok(json!({
+        "body": source.get("body").cloned().unwrap_or(Value::Null),
+        "attachments": attachments,
+        "files": files,
+        "links": source.get("links").cloned().unwrap_or_else(|| json!([])),
+        "quote": source.get("quote").cloned().unwrap_or(Value::Null),
+        "reply_to": source.get("reply_to").cloned().unwrap_or(Value::Null),
+        "thread": source.get("thread").cloned().unwrap_or(Value::Null),
+        "clarification_handoff": private_handoff.cloned().unwrap_or(Value::Null),
+        "clarification_channel": source.get("clarification_channel").cloned().unwrap_or(Value::Null),
+    }))
+}
+
+fn merge_resource_list(answer: &Value, source: &Value, field: &str, identity: &str, limit: usize) -> Value {
+    let mut merged = Vec::new();
+    for item in answer
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(source.get(field).and_then(Value::as_array).into_iter().flatten())
+    {
+        let duplicate = item.get(identity).is_some_and(|value| merged.iter().any(|existing: &Value| existing.get(identity) == Some(value)));
+        if !duplicate && merged.len() < limit {
+            merged.push(item.clone());
+        }
+    }
+    Value::Array(merged)
 }
 
 pub async fn resolve_message_link(
@@ -822,6 +1078,27 @@ pub async fn slack_embed(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MessageRoute<'a> {
+    Structured,
+    Shell(&'a str),
+    Plain,
+}
+
+pub(crate) fn message_route(answers: Option<Uuid>, changes: Option<Uuid>, text: &str) -> MessageRoute<'_> {
+    if answers.is_some() || changes.is_some() {
+        return MessageRoute::Structured;
+    }
+    match text.strip_prefix('!') {
+        Some(command) => MessageRoute::Shell(command.trim()),
+        None => MessageRoute::Plain,
+    }
+}
+
+fn correction_agent_allowed(agent_id: Uuid, question: &loka_shared::quest_questions::ChangeableQuestion) -> bool {
+    agent_id == question.agent_id || question.lead_agent_id == Some(agent_id)
+}
+
 pub async fn post_message(
     State(state): State<AppState>,
     Extension(user): Extension<UserId>,
@@ -834,18 +1111,15 @@ pub async fn post_message(
     if text.is_empty() && body.attachments.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    if body.answers.is_none() {
-        if let Some(command) = text.strip_prefix('!') {
-            let command = command.trim();
-            if command.is_empty() {
-                return Err(StatusCode::BAD_REQUEST);
-            }
-            let agent = load(&state, id).await?;
-            let msg = crate::routes::shell::start_shell(&state, user.0, &agent, command, body.share_output, body.run_on)
-                .await
-                .map_err(|(status, _)| status)?;
-            return Ok((StatusCode::CREATED, Json(msg)));
+    if let MessageRoute::Shell(command) = message_route(body.answers, body.changes, text) {
+        if command.is_empty() {
+            return Err(StatusCode::BAD_REQUEST);
         }
+        let agent = load(&state, id).await?;
+        let msg = crate::routes::shell::start_shell(&state, user.0, &agent, command, body.share_output, body.run_on)
+            .await
+            .map_err(|(status, _)| status)?;
+        return Ok((StatusCode::CREATED, Json(msg)));
     }
     load(&state, id).await?;
     if let Some(card) = body.answers {
@@ -853,8 +1127,57 @@ pub async fn post_message(
             return Err(StatusCode::FORBIDDEN);
         }
     }
+    let changes = match body.changes {
+        Some(decision) => {
+            let question = state.world.changeable_question_context(decision, user.0).await.map_err(internal)?.ok_or(StatusCode::FORBIDDEN)?;
+            if !correction_agent_allowed(id, &question) {
+                return Err(StatusCode::FORBIDDEN);
+            }
+            if let Some(task_id) = body.task_id {
+                let supplied_room = state.world.room_of(task_id).await.map_err(internal)?;
+                if question.task_id != Some(supplied_room) {
+                    return Err(StatusCode::FORBIDDEN);
+                }
+            }
+            Some(question)
+        }
+        None => None,
+    };
+    if changes.is_some() && text.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let clarification_origin = match body.answers {
+        Some(card) => sqlx::query_scalar::<_, Option<Value>>(&format!(
+            "SELECT meta->'clarify_request' FROM agent_messages m WHERE m.id = $1 AND m.agent_id = $2 AND {}",
+            loka_shared::guests::thread_filter("$2", "$3")
+        ))
+        .bind(card)
+        .bind(id)
+        .bind(user.0)
+        .fetch_optional(state.world.pool())
+        .await
+        .map_err(|e| internal(e.into()))?
+        .flatten(),
+        None => None,
+    };
+    let clarification_task = clarification_origin
+        .as_ref()
+        .filter(|origin| origin.is_object())
+        .and_then(loka_shared::world::main_clarification_task);
+    let clarification_context = clarification_origin
+        .as_ref()
+        .filter(|origin| origin.is_object())
+        .and_then(loka_shared::world::main_clarification_context_task);
+    if clarification_task.is_some() && clarification_context.is_some() {
+        return Err(StatusCode::CONFLICT);
+    }
     if let Some(task) = body.task_id {
-        quest_task(&state, &viewer, task).await?;
+        if clarification_task.or(clarification_context).is_some_and(|scope| scope != task) {
+            return Err(StatusCode::CONFLICT);
+        }
+        if clarification_context != Some(task) {
+            quest_task(&state, &viewer, task).await?;
+        }
     }
     let reply_to = match body.reply_to {
         Some(root) => Some(state.world.agent_thread_root(id, root, user.0).await.map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?),
@@ -887,7 +1210,47 @@ pub async fn post_message(
         None => String::new(),
     };
     if let Some(ask) = body.answers {
+        let origin = clarification_origin;
+        let card_task = clarification_task;
+        let context_task = clarification_context;
+        let resumed = origin.as_ref().is_some_and(loka_shared::world::main_clarification_resumes);
         let mut tx = state.world.pool().begin().await.map_err(|e| internal(e.into()))?;
+        if let Some(task_id) = context_task {
+            let valid = sqlx::query_scalar::<_, bool>(
+                "SELECT TRUE FROM agent_tasks
+                 WHERE id = $1 AND status = 'done' AND assigned_agent_id = $2 AND org_id IS NOT DISTINCT FROM $3
+                 FOR UPDATE",
+            )
+            .bind(task_id)
+            .bind(id)
+            .bind(viewer.org)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| internal(e.into()))?
+            .unwrap_or(false);
+            if !valid {
+                return Err(StatusCode::CONFLICT);
+            }
+        }
+        let clarification_status = if let Some(task_id) = card_task {
+            let task = sqlx::query_as::<_, (String, Option<Uuid>, Option<Uuid>)>(
+                "SELECT status, assigned_agent_id, org_id FROM agent_tasks WHERE id = $1 FOR NO KEY UPDATE",
+            )
+            .bind(task_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| internal(e.into()))?;
+            match task {
+                Some((status, assigned, org))
+                    if org == viewer.org && loka_shared::world::main_clarification_open(&status, assigned, id, resumed) =>
+                {
+                    Some(status)
+                }
+                _ => return Err(StatusCode::CONFLICT),
+            }
+        } else {
+            None
+        };
         let card = sqlx::query_as::<_, (String, Option<Value>)>(&format!(
             "SELECT body, meta->'clarify_request' FROM agent_messages m WHERE m.id = $1 AND m.agent_id = $2 AND {} FOR UPDATE",
             loka_shared::guests::thread_filter("$2", "$3")
@@ -899,13 +1262,27 @@ pub async fn post_message(
         .await
         .map_err(|e| internal(e.into()))?;
         if let Some((question, Some(origin @ Value::Object(_)))) = card {
-            let card_task = origin.get("task_id").and_then(Value::as_str).and_then(|task| task.parse().ok());
-            let answered_task = card_task.or(body.task_id);
+            let locked_task = loka_shared::world::main_clarification_task(&origin);
+            let locked_context = loka_shared::world::main_clarification_context_task(&origin);
+            if locked_task != card_task
+                || locked_context != context_task
+                || loka_shared::world::main_clarification_resumes(&origin) != resumed
+            {
+                return Err(StatusCode::CONFLICT);
+            }
+            if let Some(task_id) = card_task {
+                let current = loka_shared::world::quest_clarification_with(&mut tx, task_id, id, user.0)
+                    .await
+                    .map_err(internal)?;
+                if current.as_ref().map(|card| card.id) != Some(ask) {
+                    return Err(StatusCode::CONFLICT);
+                }
+            }
+            let answered_task = if context_task.is_some() { None } else { card_task.or(body.task_id) };
             let answered = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS (SELECT 1 FROM agent_messages WHERE agent_id = $1 AND author_kind = 'user' AND author_user_id = $2 AND meta->>'answers' = $3)",
+                "SELECT EXISTS (SELECT 1 FROM agent_messages WHERE agent_id = $1 AND meta->>'answers' = $2)",
             )
             .bind(id)
-            .bind(user.0)
             .bind(ask.to_string())
             .fetch_one(&mut *tx)
             .await
@@ -913,6 +1290,79 @@ pub async fn post_message(
             if answered {
                 return Err(StatusCode::CONFLICT);
             }
+            let source_resources = clarification_source_resources(
+                &mut tx,
+                &origin,
+                id,
+                user.0,
+                viewer.org,
+                card_task.or(context_task),
+            )
+                .await
+                .map_err(|e| internal(e.into()))?;
+            let canonical_source = source_resources.get("body").is_some();
+            if origin.get("clarification_channel").is_some() && !canonical_source {
+                return Err(StatusCode::CONFLICT);
+            }
+            let clarification_channel = source_resources
+                .get("clarification_channel")
+                .filter(|route| route.is_object())
+                .cloned();
+            let mut visible_origin = origin.clone();
+            if let Some(fields) = visible_origin.as_object_mut() {
+                fields.remove("clarification_channel");
+            }
+            let question: String = question.chars().take(1200).collect();
+            let source_quote = loka_shared::quotes::render(&source_resources);
+            let source_quote = source_quote.trim_end();
+            let prior_handoff = source_resources.get("clarification_handoff").and_then(Value::as_object).and_then(|handoff| {
+                Some((
+                    handoff.get("request")?.as_str()?,
+                    handoff.get("question")?.as_str()?,
+                    handoff.get("answer")?.as_str()?,
+                ))
+            });
+            let handoff_request = if let Some((request, prior_question, prior_answer)) = prior_handoff {
+                let prior_answer = [prior_answer, source_quote]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                format!("{request}\n\nQuestion:\n{prior_question}\n\nTheir answer:\n{prior_answer}")
+            } else {
+                let request = source_resources
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|body| !body.is_empty())
+                    .or_else(|| origin.get("request").and_then(Value::as_str))
+                    .unwrap_or_default();
+                let source_thread = loka_shared::replies::reply_note(&source_resources);
+                [request, source_quote, source_thread.trim()]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            };
+            let clarification_handoff = json!({ "request": handoff_request, "question": question, "answer": text });
+            let continuation_attachments = merge_resource_list(
+                &attachments,
+                &source_resources,
+                "attachments",
+                "id",
+                loka_shared::media::MAX_PER_CALL * 2,
+            );
+            let continuation_files = merge_resource_list(
+                &files,
+                &source_resources,
+                "files",
+                "id",
+                loka_shared::media::MAX_ATTACHED_FILES * 2,
+            );
+            let continuation_links = merge_resource_list(&links, &source_resources, "links", "ref", 16);
+            let private_continuation = card_task.is_none()
+                && canonical_source
+                && origin.get("onboarding").and_then(Value::as_bool) != Some(true);
             let msg = state
                 .world
                 .insert_reply_with(
@@ -933,6 +1383,9 @@ pub async fn post_message(
                             if let Some(task) = answered_task {
                                 meta["task_id"] = json!(task);
                             }
+                            if let Some(task) = context_task {
+                                meta["context_task_id"] = json!(task);
+                            }
                             if let Some(quote) = &quote {
                                 meta["quote"] = quote.clone();
                             }
@@ -946,7 +1399,7 @@ pub async fn post_message(
             let event = NewEvent::new("message.created")
                 .agent(id)
                 .actor(Some(user.0))
-                .task(answered_task)
+                .task(answered_task.or(context_task))
                 .payload(json!({
                     "message_id": msg.id,
                     "author": author,
@@ -956,17 +1409,100 @@ pub async fn post_message(
                     "files": files,
                     "links": links,
                     "options": options,
-                    "answers": question.chars().take(1200).collect::<String>(),
-                    "clarify_origin": origin,
+                    "answers": question,
+                    "clarify_origin": visible_origin,
                     "spoken": body.spoken,
                     "quote": quote,
                     "reply_to": reply_to,
                     "thread": thread,
                     "answer_card": ask,
                 }));
-            loka_shared::world::emit_in(&mut tx, &event, Some((id, "message"))).await.map_err(internal)?;
+            let seq = loka_shared::world::emit_in(
+                &mut tx,
+                &event,
+                (card_task.is_none() && !private_continuation).then_some((id, "message")),
+            )
+            .await
+            .map_err(internal)?;
+            if private_continuation {
+                let mut continuation = json!({
+                    "message_id": msg.id,
+                    "author": author,
+                    "author_kind": "user",
+                    "body": text,
+                    "task_id": card_task,
+                    "attachments": continuation_attachments,
+                    "files": continuation_files,
+                    "links": continuation_links,
+                    "options": options,
+                    "answers": question,
+                    "clarify_origin": origin,
+                    "clarification_continuation": ask,
+                    "clarification_handoff": clarification_handoff,
+                    "spoken": body.spoken,
+                    "quote": quote,
+                    "reply_to": reply_to,
+                    "thread": thread,
+                    "answer_card": ask,
+                });
+                if let Some(route) = clarification_channel {
+                    continuation["clarification_channel"] = route;
+                }
+                sqlx::query(
+                    "INSERT INTO agent_inbox (agent_id, kind, event_seq, payload)
+                     VALUES ($1, 'message', $2, $3)",
+                )
+                .bind(id)
+                .bind(seq)
+                .bind(continuation)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| internal(e.into()))?;
+            }
+            if let (Some(task_id), Some(status)) = (card_task, clarification_status) {
+                let brief = format!("Original request:\n{handoff_request}\n\nQuestion:\n{question}\n\nTheir answer:\n{text}");
+                sqlx::query(
+                    "INSERT INTO agent_inbox (agent_id, kind, event_seq, payload)
+                     VALUES ($1, 'task.assigned', $2, $3)",
+                )
+                .bind(id)
+                .bind(seq)
+                .bind(json!({
+                    "task_id": task_id,
+                    "title": origin.get("title").and_then(Value::as_str).unwrap_or_default(),
+                    "brief": brief,
+                    "resume": true,
+                    "clarification_continuation": ask,
+                    "clarification_handoff": clarification_handoff,
+                    "clarification_status": status,
+                    "clarification_resume": resumed,
+                    "attachments": continuation_attachments,
+                    "files": continuation_files,
+                    "links": continuation_links,
+                    "quote": quote,
+                }))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| internal(e.into()))?;
+                loka_shared::world::settle_task_clarification_siblings(
+                    &mut tx,
+                    task_id,
+                    id,
+                    ask,
+                    None,
+                    "Answered another clarification",
+                )
+                .await
+                .map_err(internal)?;
+                loka_shared::world::adopt_saved_clarifications_into_queued_run(&mut tx, id, task_id)
+                    .await
+                    .map_err(internal)?;
+            }
             tx.commit().await.map_err(|e| internal(e.into()))?;
             return Ok((StatusCode::CREATED, Json(msg)));
+        }
+        if origin.is_some_and(|origin| origin.is_object()) {
+            return Err(StatusCode::CONFLICT);
         }
     }
     let question = match body.answers {
@@ -983,7 +1519,7 @@ pub async fn post_message(
         .map(|(body, task)| (body.chars().take(1200).collect::<String>(), task)),
         None => None,
     };
-    let answered_task = body.task_id.or_else(|| question.as_ref().and_then(|(_, task)| *task));
+    let answered_task = body.task_id.or_else(|| changes.as_ref().and_then(|question| question.task_id)).or_else(|| question.as_ref().and_then(|(_, task)| *task));
     let setup_card = match text.is_empty() {
         true => None,
         false => crate::routes::setup_scan::card_kind(&state, id, body.answers).await?,
@@ -994,8 +1530,14 @@ pub async fn post_message(
     };
     let apps_card = quest_card.is_some();
     let clarification = match body.answers {
-        Some(ask) if !text.is_empty() && setup_card.is_none() && !apps_card => {
-            let mut meta = json!({ "attachments": attachments.clone(), "options": options.clone(), "answers": ask });
+        Some(ask) if (!text.is_empty() || !body.attachments.is_empty()) && setup_card.is_none() && !apps_card => {
+            let mut meta = json!({
+                "attachments": attachments.clone(),
+                "files": files.clone(),
+                "links": links.clone(),
+                "options": options.clone(),
+                "answers": ask,
+            });
             if body.spoken {
                 meta["spoken"] = json!(true);
             }
@@ -1108,6 +1650,7 @@ pub async fn post_message(
                     "reply_to": reply_to,
                     "thread": thread,
                     "answer_card": body.answers,
+                    "task_id": body.task_id,
                 })),
             (!onboarding && !plan_answered && !clarification_answered && setup_card.is_none() && !apps_card).then_some((id, "message")),
         )
@@ -1118,6 +1661,10 @@ pub async fn post_message(
     }
     if let (Some(kind), Some(card)) = (quest_card, body.answers) {
         state.world.answer_quest_card(id, card, kind, text, &author).await.map_err(internal)?;
+    }
+    if let Some(question) = changes {
+        let sources = quote.as_ref().and_then(|q| q.get("source")).and_then(Value::as_str).map(|s| vec![s.to_string()]).unwrap_or_default();
+        state.world.change_decision(question.question_id, user.0, &author, text, sources).await.map_err(internal)?;
     }
     if let (Some(kind), Some(card)) = (setup_card, body.answers) {
         crate::routes::setup_scan::answer(&state, &user, id, card, kind, text).await?;
@@ -1388,6 +1935,22 @@ pub async fn list_schedules(
     Ok(Json(state.world.list_agent_schedules(id).await.map_err(internal)?))
 }
 
+pub async fn get_schedule(
+    State(state): State<AppState>,
+    Extension(viewer): Extension<Viewer>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, StatusCode> {
+    let schedule = state.world.schedule_by_id(id).await.map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
+    let agent = state
+        .world
+        .get_agent(schedule.agent_id)
+        .await
+        .map_err(internal)?
+        .filter(|agent| access::can_manage(&viewer, agent))
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(json!({ "schedule": schedule, "agent": { "id": agent.id, "name": agent.name } })))
+}
+
 #[derive(Deserialize)]
 pub struct ScheduleToggle {
     enabled: Option<bool>,
@@ -1458,19 +2021,49 @@ pub async fn list_events(
     let hidden = state.world.hidden_agents(&viewer).await.map_err(internal)?;
     let owned = state.world.owned_agent_ids(user.0).await.map_err(internal)?;
     let channels = state.world.hidden_channels_among(Some(user.0), None, &events).await.map_err(internal)?;
+    let room_ids: Vec<Uuid> = events.iter().filter_map(loka_shared::rooms::scoped_room).collect();
+    let part_ids: Vec<Uuid> = events.iter().filter_map(loka_shared::rooms::scoped_part).collect();
+    let open_rooms = state.world.open_rooms(&room_ids, &viewer).await.map_err(internal)?;
+    let open_parts = state.world.open_tasks(&part_ids, &viewer).await.map_err(internal)?;
     Ok(Json(
         events
             .into_iter()
-            .filter(|e| {
-                !e.agent_id.is_some_and(|a| hidden.contains(&a))
-                    && !loka_shared::slack::hidden_from(e, user.0)
-                    && !loka_shared::loka::hidden_from(e, user.0)
-                    && !loka_shared::shell::hidden_from(e, &owned)
-                    && !loka_shared::event_scope::private_from(e, user.0, &owned)
-                    && !e.in_channel(&channels)
+            .filter_map(|event| {
+                visible_event(event, user.0, &hidden, &owned, viewer.role == Role::Admin, &channels, &open_rooms, &open_parts)
             })
             .collect(),
     ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn visible_event(
+    event: WorldEvent,
+    viewer: Uuid,
+    hidden: &[Uuid],
+    owned: &HashSet<Uuid>,
+    admin: bool,
+    channels: &HashSet<Uuid>,
+    open_rooms: &HashSet<Uuid>,
+    open_parts: &HashSet<Uuid>,
+) -> Option<WorldEvent> {
+    let room = loka_shared::rooms::scoped_room(&event);
+    let part = loka_shared::rooms::scoped_part(&event);
+    let hidden_subject = event.agent_id.is_some_and(|agent| hidden.contains(&agent));
+    let routes_card = loka_shared::event_scope::audience_scoped_card_invalidation(&event)
+        && event.quest_scope.is_some()
+        && loka_shared::event_scope::quest_scope_allows(&event, viewer);
+    if (hidden_subject && room.is_none() && !routes_card && !loka_shared::event_scope::creator_can_refresh(&event, viewer))
+        || room.is_some_and(|room| !open_rooms.contains(&room))
+        || part.is_some_and(|part| !open_parts.contains(&part))
+        || loka_shared::slack::hidden_from(&event, viewer)
+        || loka_shared::loka::hidden_from(&event, viewer)
+        || loka_shared::shell::hidden_from(&event, owned)
+        || (room.is_none() && loka_shared::event_scope::private_from_admin(&event, viewer, owned, admin))
+        || event.in_channel(channels)
+    {
+        return None;
+    }
+    Some(loka_shared::event_scope::card_invalidation_for_viewer(event, viewer, hidden_subject, admin))
 }
 
 fn last_seen(after: Option<i64>, headers: &axum::http::HeaderMap) -> Option<i64> {
@@ -1569,11 +2162,38 @@ pub async fn stream(
                             continue;
                         }
                     };
-                    for event in events {
-                        cursor = event.seq;
-                        if event.agent_id.is_some_and(|a| hidden.contains(&a)) || loka_shared::slack::hidden_from(&event, viewer) || loka_shared::loka::hidden_from(&event, viewer) || loka_shared::shell::hidden_from(&event, &owned) || loka_shared::event_scope::private_from(&event, viewer, &owned) || event.in_channel(&channels) {
+                    let room_ids: Vec<Uuid> = events.iter().filter_map(loka_shared::rooms::scoped_room).collect();
+                    let part_ids: Vec<Uuid> = events.iter().filter_map(loka_shared::rooms::scoped_part).collect();
+                    let open_rooms = match store.open_rooms(&room_ids, &current).await {
+                        Ok(rooms) => rooms,
+                        Err(e) => {
+                            warn!(error = %e, "world stream room scope failed");
+                            tokio::time::sleep(Duration::from_secs(2)).await;
                             continue;
                         }
+                    };
+                    let open_parts = match store.open_tasks(&part_ids, &current).await {
+                        Ok(tasks) => tasks,
+                        Err(e) => {
+                            warn!(error = %e, "world stream part scope failed");
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            continue;
+                        }
+                    };
+                    for event in events {
+                        cursor = event.seq;
+                        let Some(event) = visible_event(
+                            event,
+                            viewer,
+                            &hidden,
+                            &owned,
+                            current.role == Role::Admin,
+                            &channels,
+                            &open_rooms,
+                            &open_parts,
+                        ) else {
+                            continue;
+                        };
                         if let Some(data) = wire_event(&event, replay_until) {
                             yield Ok::<Event, Infallible>(
                                 Event::default().event("world").id(event.seq.to_string()).data(data),
@@ -1646,6 +2266,7 @@ async fn live_signal(
 ) -> Live {
     let scoped = loka_shared::signals::needs_scope(event);
     let mut current = None;
+    let mut send = event.clone();
     if scoped || member_checked.elapsed() > MEMBER_RECHECK {
         match store.role_in_org(viewer, Some(org)).await {
             Ok(Some(role)) => {
@@ -1667,15 +2288,26 @@ async fn live_signal(
         ) else {
             return Live::Skip;
         };
-        if event.agent_id.is_some_and(|a| hidden.contains(&a))
-            || loka_shared::shell::hidden_from(event, &owned)
-            || loka_shared::event_scope::private_from(event, viewer, &owned)
-            || event.in_channel(&channels)
-        {
+        let rooms: Vec<Uuid> = loka_shared::rooms::scoped_room(event).into_iter().collect();
+        let parts: Vec<Uuid> = loka_shared::rooms::scoped_part(event).into_iter().collect();
+        let (Ok(open_rooms), Ok(open_parts)) = (store.open_rooms(&rooms, &current).await, store.open_tasks(&parts, &current).await) else {
             return Live::Skip;
-        }
+        };
+        let Some(visible) = visible_event(
+            event.clone(),
+            viewer,
+            &hidden,
+            &owned,
+            current.role == Role::Admin,
+            &channels,
+            &open_rooms,
+            &open_parts,
+        ) else {
+            return Live::Skip;
+        };
+        send = visible;
     }
-    serde_json::to_string(event).map(Live::Send).unwrap_or(Live::Skip)
+    serde_json::to_string(&send).map(Live::Send).unwrap_or(Live::Skip)
 }
 
 pub async fn list_rules(
@@ -1725,7 +2357,12 @@ pub struct UpdateRule {
     body: Option<String>,
     scope: Option<String>,
     enabled: Option<bool>,
+    github_repos: Option<Vec<String>>,
+    #[serde(default)]
+    model: Option<Value>,
 }
+
+pub const RULE_REPOS_ONLY_ON_APPROVED: &str = "Only approved actions can name repositories for pull request actions.";
 
 pub async fn update_rule(
     State(state): State<AppState>,
@@ -1734,19 +2371,45 @@ pub async fn update_rule(
     Extension(viewer): Extension<Viewer>,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateRule>,
-) -> Result<Json<WorldRule>, StatusCode> {
-    if body.scope.as_deref().is_some_and(|s| !valid_scope(s))
-        || body.body.as_deref().is_some_and(|b| b.trim().is_empty())
-    {
-        return Err(StatusCode::BAD_REQUEST);
+) -> Result<Json<WorldRule>, (StatusCode, Json<Value>)> {
+    let refuse = |status: StatusCode, error: &str| (status, Json(json!({ "error": error })));
+    let failed = |error: anyhow::Error| (internal(error), Json(json!({})));
+    if body.scope.as_deref().is_some_and(|s| !valid_scope(s)) || body.body.as_deref().is_some_and(|b| b.trim().is_empty()) {
+        return Err(refuse(StatusCode::BAD_REQUEST, "A rule needs some text and a known scope."));
     }
+    if let Some(Err(error)) = body.github_repos.as_deref().map(loka_shared::pr_actions::clean_repos) {
+        return Err(refuse(StatusCode::BAD_REQUEST, &error.to_string()));
+    }
+    let pin = match body.model.as_ref().map(loka_shared::variety::rule_model).transpose() {
+        Ok(pin) => pin,
+        Err(error) => return Err(refuse(StatusCode::BAD_REQUEST, &error)),
+    };
+    let global_org = viewer.org.filter(|_| role == Role::Admin);
+    let rule = state
+        .world
+        .update_rule(id, user.0, global_org, body.scope.as_deref(), body.body.as_deref().map(str::trim), body.enabled)
+        .await
+        .map_err(failed)?
+        .ok_or_else(|| refuse(StatusCode::NOT_FOUND, "That rule is gone."))?;
+    let rule = match pin {
+        Some(pin) => state
+            .world
+            .set_rule_model(rule.id, user.0, global_org, pin.as_ref())
+            .await
+            .map_err(failed)?
+            .ok_or_else(|| refuse(StatusCode::BAD_REQUEST, "Approved actions cannot pin a model."))?,
+        None => rule,
+    };
+    let Some(repos) = body.github_repos.as_deref() else {
+        return Ok(Json(rule));
+    };
     state
         .world
-        .update_rule(id, user.0, viewer.org.filter(|_| role == Role::Admin), body.scope.as_deref(), body.body.as_deref().map(str::trim), body.enabled)
+        .set_rule_repos(rule.id, user.0, global_org, repos)
         .await
-        .map_err(internal)?
+        .map_err(failed)?
         .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or_else(|| refuse(StatusCode::BAD_REQUEST, RULE_REPOS_ONLY_ON_APPROVED))
 }
 
 pub async fn delete_rule(
@@ -2194,6 +2857,7 @@ pub async fn agent_kit(State(state): State<AppState>, Path(id): Path<Uuid>) -> R
 
 #[derive(Deserialize)]
 pub struct SessionsQuery {
+    id: Option<Uuid>,
     agent_id: Option<Uuid>,
     limit: Option<i64>,
 }
@@ -2210,7 +2874,7 @@ pub async fn list_session_briefs(
     let agents = state.world.list_agents_in(viewer.org).await.map_err(internal)?;
     let usable: Vec<Uuid> = agents.iter().filter(|a| access::can_use(&viewer, a)).map(|a| a.id).collect();
     let managed: Vec<Uuid> = agents.iter().filter(|a| access::can_manage(&viewer, a)).map(|a| a.id).collect();
-    let rows = state.world.session_briefs(q.agent_id, limit).await.map_err(internal)?;
+    let rows = state.world.session_briefs(q.agent_id, q.id, limit).await.map_err(internal)?;
     Ok(Json(
         rows.into_iter()
             .filter(|s| usable.contains(&s.agent_id) && (managed.contains(&s.agent_id) || !loka_shared::guests::CHAT_SESSIONS.contains(&s.role.as_str())))
@@ -2372,11 +3036,23 @@ pub async fn stop_run(
     Json(body): Json<StopRun>,
 ) -> Result<(StatusCode, Json<Value>), StatusCode> {
     let run = state.world.get_run(id).await.map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
-    if run.status != "running" || run.kind == "turn" {
+    let stepping = body.mode.as_deref() == Some("step");
+    let withdrawing = body.mode.as_deref() == Some("withdraw") || run.status == "queued" && !stepping;
+    if run.kind == "turn" || (withdrawing && run.status != "queued") || (!withdrawing && run.status != "running") {
         return Err(StatusCode::CONFLICT);
     }
     let name = state.world.user_display_name(user.0).await.map_err(internal)?.unwrap_or_else(|| "someone".into());
-    if body.mode.as_deref() == Some("step") {
+    if withdrawing {
+        let withdrawn = loka_agent::runner_server::RunnerCoordinator::new(state.db.clone(), state.world.clone())
+            .withdraw_queued_run(id, &name)
+            .await
+            .map_err(internal)?;
+        if !withdrawn {
+            return Err(StatusCode::CONFLICT);
+        }
+        return Ok((StatusCode::ACCEPTED, Json(json!({ "mode": "withdraw", "withdrawn": true }))));
+    }
+    if stepping {
         let session = state.world.get_session(run.session_id).await.map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
         let text = "I pressed Stop on the step you were running. Do not run it again the same way; carry on with the rest of the task, and tell me if you are blocked.";
         let followup = state.world.start_followup(&session, text, &name, true).await.map_err(|e| {
@@ -2392,7 +3068,7 @@ pub async fn stop_run(
     if !stopped {
         return Err(StatusCode::CONFLICT);
     }
-    Ok((StatusCode::ACCEPTED, Json(json!({ "mode": "run" }))))
+    Ok((StatusCode::ACCEPTED, Json(json!({ "mode": "run", "withdrawn": false }))))
 }
 
 pub async fn retry_run(
@@ -2983,10 +3659,12 @@ pub async fn list_quests(
         .for_tasks(&ids)
         .await
         .map_err(internal)?;
+    let mut decisions = state.world.decision_summaries_for(&ids, &viewer).await.map_err(internal)?;
     for task in &mut tasks {
         let (mine, rest): (Vec<_>, Vec<_>) = milestones.into_iter().partition(|m| m.task_id == task.id);
         task.milestones = mine;
         milestones = rest;
+        task.decisions = decisions.remove(&task.id);
     }
     Ok(Json(tasks))
 }
@@ -3021,6 +3699,7 @@ pub(crate) async fn quest_task(state: &AppState, viewer: &Viewer, task_id: Uuid)
 pub struct RoomQuery {
     after: Option<i64>,
     since: Option<DateTime<Utc>>,
+    focus: Option<Uuid>,
 }
 
 #[derive(Deserialize, Default)]
@@ -3056,14 +3735,7 @@ pub async fn quest_resume(
     };
     let note = body.and_then(|Json(body)| body.text);
     match state.world.request_resume(task.id, user.0, &name, note.as_deref()).await {
-        Ok(outcome) => {
-            if matches!(outcome, loka_shared::quests::ResumeOutcome::Resumed { .. }) {
-                if let Err(error) = state.db.update_status(task.id, "in_progress").await {
-                    warn!(task = %task.id, error = %error, "could not refresh the cached quest status after a resume");
-                }
-            }
-            (StatusCode::ACCEPTED, Json(outcome)).into_response()
-        }
+        Ok(outcome) => (StatusCode::ACCEPTED, Json(outcome)).into_response(),
         Err(loka_shared::quests::ResumeRefusal::Refused(reason)) => {
             warn!(task = %task.id, reason = %reason, "resume refused");
             (StatusCode::CONFLICT, Json(json!({ "error": reason }))).into_response()
@@ -3079,27 +3751,72 @@ pub async fn quest_room(
     Path(task_id): Path<Uuid>,
     Query(q): Query<RoomQuery>,
 ) -> Result<Json<Value>, StatusCode> {
-    let task = quest_task(&state, &viewer, task_id).await?;
+    let (task, requested_member_only) = crate::routes::rooms::room_access(&state, &viewer, task_id).await?;
+    let canonical = state.world.room_of(task_id).await.map_err(internal)?;
+    let (room_task, member_only) = if canonical == task_id {
+        (task.clone(), requested_member_only)
+    } else {
+        let (room_task, canonical_member_only) = crate::routes::rooms::room_access(&state, &viewer, canonical).await?;
+        (room_task, requested_member_only || canonical_member_only)
+    };
     let agents = state.world.list_agents_in(viewer.org).await.map_err(internal)?;
     let usable: Vec<Uuid> = agents.iter().filter(|a| access::can_use(&viewer, a)).map(|a| a.id).collect();
-    let since = task.created_at.unwrap_or_else(Utc::now) - chrono::Duration::minutes(5);
-    let mut room = state.world.quest_room(task_id, since, &usable, user.0, q.after, q.since).await.map_err(internal)?;
+    let since = room_task.created_at.unwrap_or_else(Utc::now) - chrono::Duration::minutes(5);
+    let focus = match q.focus {
+        Some(focus) if state.world.sees_message_as(focus, &viewer).await.map_err(internal)? => Some(focus),
+        _ => None,
+    };
+    let mut room = state.world.quest_room(canonical, since, &usable, user.0, q.after, q.since, focus).await.map_err(internal)?;
+    let mut message_scope = room.messages.clone();
+    message_scope.extend(room.needs_you_messages.iter().cloned());
+    let open_messages = state.world.open_room_messages(&message_scope, &viewer).await.map_err(internal)?;
+    room.messages.retain(|message| open_messages.contains(&message.id));
+    room.needs_you_messages.retain(|message| open_messages.contains(&message.id));
+    room.decisions = state.world.decision_summary_for(canonical, &viewer).await.map_err(internal)?;
+    room.members = state.world.room_members_for(canonical, &usable).await.map_err(internal)?;
+    let mut room_parts = state.world.quest_parts(canonical).await.map_err(internal)?;
+    if viewer.role != Role::Admin && room_task.user_id != viewer.user {
+        room_parts.retain(|part| part.assigned_agent_id.is_some_and(|agent| usable.contains(&agent)));
+    }
+    let visible_parts: std::collections::HashSet<Uuid> = room_parts.iter().map(|part| part.id).collect();
+    if member_only {
+        room.sessions.clear();
+        room.runs.clear();
+        room.events.clear();
+    }
     let owned = state.world.owned_agent_ids(user.0).await.map_err(internal)?;
     room.events.retain(|e| {
+        let scoped = loka_shared::rooms::scoped_event(e);
+        let part = loka_shared::rooms::event_part(e, canonical);
         !loka_shared::slack::hidden_from(e, user.0)
             && !loka_shared::loka::hidden_from(e, user.0)
             && !loka_shared::shell::hidden_from(e, &owned)
-            && !loka_shared::event_scope::private_from(e, user.0, &owned)
+            && part.is_none_or(|part| visible_parts.contains(&part))
+            && (scoped || !loka_shared::event_scope::private_from_admin(e, user.0, &owned, viewer.role == Role::Admin))
     });
-    let milestones = MilestoneStore::new(state.world.pool().clone()).for_task(task_id).await.map_err(internal)?;
-    let options = state.world.quest_options(task_id).await.map_err(internal)?;
-    let parts = state.world.quest_parts(task_id).await.map_err(internal)?;
-    let parent = state.world.quest_parent(task_id).await.map_err(internal)?;
-    let plan_waiting = state.world.plan_waiting(task_id).await.map_err(internal)?;
+    let milestones = MilestoneStore::new(state.world.pool().clone()).for_task(task.id).await.map_err(internal)?;
+    let options = state.world.quest_options(task.id).await.map_err(internal)?;
+    let parent = state.world.quest_parent(task.id).await.map_err(internal)?;
+    let plan_waiting = state.world.plan_waiting(task.id).await.map_err(internal)?;
+    let mut parts = if task.id == canonical { room_parts } else { state.world.quest_parts(task.id).await.map_err(internal)? };
+    if task.id != canonical && viewer.role != Role::Admin && task.user_id != viewer.user {
+        parts.retain(|part| part.assigned_agent_id.is_some_and(|agent| usable.contains(&agent)));
+    }
     let manages = |agent_id: Uuid| viewer.role == Role::Admin || agents.iter().any(|agent| agent.id == agent_id && access::can_manage(&viewer, agent));
     let resume = match task.assigned_agent_id {
-        Some(agent_id) if parts.is_empty() && manages(agent_id) => state.world.resume_preview(agent_id, task_id).await.ok().map(|plan| plan.view()),
+        Some(agent_id) if parts.is_empty() && manages(agent_id) => state.world.resume_preview(agent_id, task.id).await.ok().map(|plan| plan.view()),
         _ => None,
+    };
+    let clarification = match task.assigned_agent_id {
+        Some(agent_id) => match state.world.quest_clarification(task_id, agent_id, user.0).await.map_err(internal)? {
+            Some(clarification) => Some(clarification),
+            None => state
+                .world
+                .contextual_quest_clarification(task_id, agent_id, user.0)
+                .await
+                .map_err(internal)?,
+        },
+        None => None,
     };
     Ok(Json(json!({
         "task": {
@@ -3112,6 +3829,9 @@ pub async fn quest_room(
             "attempt_variants": options.attempt_variants,
             "ci_feedback": options.ci_feedback,
             "pace": options.pace,
+            "asking": options.asking,
+            "crew_size": options.crew_size,
+            "crew_variants": options.crew_variants,
             "id": task.id,
             "title": task.title,
             "description": task.description,
@@ -3119,6 +3839,7 @@ pub async fn quest_room(
             "repo": task.repo,
             "branch": task.branch,
             "pr_url": task.pr_url,
+            "past_prs": task.past_prs.unwrap_or_else(|| json!([])),
             "assigned_agent_id": task.assigned_agent_id,
             "user_id": task.user_id,
             "result_content": task.result_content,
@@ -3127,6 +3848,7 @@ pub async fn quest_room(
             "updated_at": task.updated_at,
             "milestones": milestones,
         },
+        "clarification": clarification,
         "room": room,
     })))
 }
@@ -3157,9 +3879,9 @@ pub async fn add_milestones(
     let store = MilestoneStore::new(state.world.pool().clone());
     let added = store.add(task_id, &body.items).await.map_err(|_| StatusCode::BAD_REQUEST)?;
     let task = state.db.get_task(task_id).await.map_err(internal)?;
-    if let Some(task) = task.filter(|t| t.status == "review" && t.pr_url.is_some()) {
+    if let Some(task) = task.filter(|t| t.pr_url.is_some()) {
         if added.iter().any(|m| m.kind == "merge") {
-            store.arm_merge(task.id, true).await.map_err(internal)?;
+            store.arm_merge(task.id).await.map_err(internal)?;
             store.check_now(task.id).await.map_err(internal)?;
         }
     }
@@ -3190,8 +3912,8 @@ pub async fn update_milestone(
         .ok_or(StatusCode::NOT_FOUND)?;
     if body.status.as_deref() == Some("pending") && updated.kind == "merge" {
         if let Some(task) = state.db.get_task(updated.task_id).await.map_err(internal)? {
-            if task.pr_url.is_some() && task.status == "review" {
-                store.arm_merge(task.id, true).await.map_err(internal)?;
+            if task.pr_url.is_some() {
+                store.arm_merge(task.id).await.map_err(internal)?;
                 store.check_now(task.id).await.map_err(internal)?;
             }
         }
@@ -3221,7 +3943,7 @@ pub async fn check_milestones(
     Path(task_id): Path<Uuid>,
 ) -> Result<Json<Value>, StatusCode> {
     milestone_task(&state, role, user.0, task_id).await?;
-    let queued = MilestoneStore::new(state.world.pool().clone()).check_now(task_id).await.map_err(internal)?;
+    let queued = MilestoneStore::new(state.world.pool().clone()).retry_check_now(task_id).await.map_err(internal)?;
     Ok(Json(json!({ "queued": queued })))
 }
 
@@ -3438,6 +4160,65 @@ mod disk_full_tests {
 mod stream_resume_tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
+    use futures_util::{Stream, StreamExt};
+
+    async fn state(url: &str) -> anyhow::Result<AppState> {
+        let db = loka_shared::db::Database::connect(url).await?;
+        let pool = db.pool().clone();
+        Ok(AppState {
+            db,
+            config: crate::config::ApiConfig { repos: vec![], backends: indexmap::IndexMap::new(), skills: vec![], mcp_servers: vec![] },
+            world: loka_shared::world::WorldStore::new(pool.clone()),
+            runners: loka_shared::runners::RunnerStore::new(pool),
+            world_tx: tokio::sync::broadcast::channel(8).0,
+            signal_tx: tokio::sync::broadcast::channel(8).0,
+            runner_tx: crate::runner_wakes::RunnerWakes::default(),
+            term: crate::terminal::TermHub::new(),
+        })
+    }
+
+    async fn next_task_event<S, E>(body: &mut S, task: Uuid) -> anyhow::Result<Value>
+    where
+        S: Stream<Item = Result<axum::body::Bytes, E>> + Unpin,
+        E: std::fmt::Display,
+    {
+        while let Some(chunk) = body.next().await {
+            let text = String::from_utf8(chunk.map_err(|error| anyhow::anyhow!(error.to_string()))?.to_vec())?;
+            for block in text.split("\n\n") {
+                let Some(data) = block.lines().find_map(|line| line.strip_prefix("data: ")) else {
+                    continue;
+                };
+                let event: Value = serde_json::from_str(data)?;
+                if event["type"].as_str().is_some_and(|kind| kind.starts_with("task.")) && event["payload"]["task_id"] == json!(task) {
+                    return Ok(event);
+                }
+            }
+        }
+        anyhow::bail!("world stream closed before the quest event")
+    }
+
+    async fn quest_visible(state: &AppState, viewer: &Viewer, task: Uuid) -> bool {
+        list_quests(
+            State(state.clone()),
+            Extension(UserId(viewer.user)),
+            Extension(viewer.role),
+            Extension(viewer.clone()),
+        )
+        .await
+        .is_ok_and(|Json(tasks)| tasks.iter().any(|candidate| candidate.id == task))
+    }
+
+    async fn room_status(state: &AppState, viewer: &Viewer, task: Uuid) -> Result<(), StatusCode> {
+        quest_room(
+            State(state.clone()),
+            Extension(UserId(viewer.user)),
+            Extension(viewer.clone()),
+            Path(task),
+            Query(RoomQuery { after: None, since: None, focus: None }),
+        )
+        .await
+        .map(|_| ())
+    }
 
     #[test]
     fn events_replayed_after_a_reconnect_say_so_and_live_ones_do_not() {
@@ -3452,6 +4233,7 @@ mod stream_resume_tests {
             payload: json!({ "report_id": "r" }),
             created_at: chrono::Utc::now(),
             org_id: None,
+            quest_scope: None,
         };
         let read = |seq: i64, head: Option<i64>| serde_json::from_str::<Value>(&wire_event(&event(seq), head).unwrap()).unwrap();
         assert_eq!(read(5, Some(9))["replayed"], json!(true));
@@ -3459,6 +4241,120 @@ mod stream_resume_tests {
         assert!(read(10, Some(9)).get("replayed").is_none());
         assert!(read(5, None).get("replayed").is_none());
         assert_eq!(read(5, None)["type"], json!("report.updated"));
+    }
+
+    #[test]
+    fn scoped_card_changes_route_without_exposing_the_hidden_subject() {
+        let viewer = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let agent = Uuid::new_v4();
+        let task = Uuid::new_v4();
+        let event = loka_shared::world::WorldEvent {
+            seq: 1,
+            event_type: "task.changed".into(),
+            agent_id: Some(agent),
+            session_id: None,
+            run_id: None,
+            task_id: Some(task),
+            actor_user_id: Some(other),
+            payload: json!({ "task_id": task, "quiet": true }),
+            created_at: chrono::Utc::now(),
+            org_id: None,
+            quest_scope: Some(json!({ "delivery": { "audience": [viewer] } })),
+        };
+        let routed = visible_event(
+            event.clone(),
+            viewer,
+            &[agent],
+            &HashSet::new(),
+            false,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .expect("routed card change");
+        assert_eq!((routed.agent_id, routed.actor_user_id, routed.task_id), (None, None, Some(task)));
+        assert_eq!(routed.payload, event.payload);
+        assert!(visible_event(
+            event.clone(),
+            other,
+            &[agent],
+            &HashSet::new(),
+            false,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .is_none());
+        let mut ordinary = event;
+        ordinary.quest_scope = None;
+        assert!(visible_event(
+            ordinary,
+            viewer,
+            &[agent],
+            &HashSet::new(),
+            false,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn room_events_require_room_and_part_access() {
+        let viewer = Uuid::new_v4();
+        let agent = Uuid::new_v4();
+        let room = Uuid::new_v4();
+        let part = Uuid::new_v4();
+        let event = loka_shared::world::WorldEvent {
+            seq: 1,
+            event_type: "question.asked".into(),
+            agent_id: Some(agent),
+            session_id: None,
+            run_id: None,
+            task_id: Some(room),
+            actor_user_id: None,
+            payload: json!({ "room": { "task_id": room }, "part_task_id": part }),
+            created_at: chrono::Utc::now(),
+            org_id: None,
+            quest_scope: None,
+        };
+        let rooms = HashSet::from([room]);
+        let parts = HashSet::from([part]);
+        assert!(visible_event(
+            event.clone(),
+            viewer,
+            &[agent],
+            &HashSet::new(),
+            false,
+            &HashSet::new(),
+            &rooms,
+            &parts,
+        )
+        .is_some());
+        assert!(visible_event(
+            event.clone(),
+            viewer,
+            &[agent],
+            &HashSet::new(),
+            false,
+            &HashSet::new(),
+            &HashSet::new(),
+            &parts,
+        )
+        .is_none());
+        assert!(visible_event(
+            event,
+            viewer,
+            &[agent],
+            &HashSet::new(),
+            false,
+            &HashSet::new(),
+            &rooms,
+            &HashSet::new(),
+        )
+        .is_none());
     }
 
     #[test]
@@ -3477,5 +4373,1331 @@ mod stream_resume_tests {
         assert_eq!(last_seen(None, &headers), None);
         headers.insert("last-event-id", HeaderValue::from_static("abc"));
         assert_eq!(last_seen(None, &headers), None);
+    }
+
+    #[tokio::test]
+    async fn visibility_changes_refresh_an_open_quest_stream_and_its_reads() -> anyhow::Result<()> {
+        let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let state = state(&url).await?;
+        let tag = Uuid::new_v4().simple().to_string();
+        let org: Uuid = sqlx::query_scalar("INSERT INTO orgs (slug, name) VALUES ($1, 'Visibility stream') RETURNING id")
+            .bind(format!("visibility-stream-{}", &tag[..16]))
+            .fetch_one(state.db.pool())
+            .await?;
+        let creator: Uuid = sqlx::query_scalar("INSERT INTO users (email, name, active_org_id) VALUES ($1, 'Creator', $2) RETURNING id")
+            .bind(format!("creator-{tag}@test.dev"))
+            .bind(org)
+            .fetch_one(state.db.pool())
+            .await?;
+        let viewer_user: Uuid = sqlx::query_scalar("INSERT INTO users (email, name, active_org_id) VALUES ($1, 'Viewer', $2) RETURNING id")
+            .bind(format!("viewer-{tag}@test.dev"))
+            .bind(org)
+            .fetch_one(state.db.pool())
+            .await?;
+        for user in [creator, viewer_user] {
+            sqlx::query("INSERT INTO org_members (org_id, user_id, role) VALUES ($1, $2, 'member')")
+                .bind(org)
+                .bind(user)
+                .execute(state.db.pool())
+                .await?;
+        }
+        let agent: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id, visibility, org_id)
+             VALUES ($1, 'Visibility agent', 'claude', 'haiku', $2, 'public', $3) RETURNING id",
+        )
+        .bind(format!("visibility-agent-{tag}"))
+        .bind(creator)
+        .bind(org)
+        .fetch_one(state.db.pool())
+        .await?;
+        let task: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_tasks (user_id, title, status, assigned_agent_id, org_id)
+             VALUES ($1, 'Visibility quest', 'in_progress', $2, $3) RETURNING id",
+        )
+        .bind(creator)
+        .bind(agent)
+        .bind(org)
+        .fetch_one(state.db.pool())
+        .await?;
+        let viewer = Viewer {
+            user: viewer_user,
+            org: Some(org),
+            role: Role::Write,
+            org_role: Some(loka_shared::orgs::OrgRole::Member),
+            instance_admin: false,
+        };
+        assert!(quest_visible(&state, &viewer, task).await);
+        assert_eq!(room_status(&state, &viewer, task).await, Ok(()));
+
+        let mut listener = sqlx::postgres::PgListener::connect(&url).await?;
+        listener.listen(loka_shared::world::CHANNEL_EVENTS).await?;
+        let world_tx = state.world_tx.clone();
+        let relay = tokio::spawn(async move {
+            while let Ok(notification) = listener.recv().await {
+                let _ = world_tx.send(loka_shared::world::EventWake::from_payload(notification.payload()));
+            }
+        });
+        let response = stream(
+            State(state.clone()),
+            Extension(UserId(viewer_user)),
+            Extension(viewer.clone()),
+            Query(EventsQuery { after: None, agent_id: None, limit: None }),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("world stream")
+        .into_response();
+        let mut body = response.into_body().into_data_stream();
+        assert!(tokio::time::timeout(Duration::from_secs(1), body.next()).await.is_err());
+
+        state
+            .world
+            .update_agent(agent, &AgentUpdate { visibility: Some("private".into()), ..Default::default() })
+            .await?
+            .expect("agent");
+        let hidden = tokio::time::timeout(Duration::from_secs(5), next_task_event(&mut body, task)).await??;
+        assert_eq!(hidden["agent_id"], Value::Null);
+        assert_eq!(hidden["actor_user_id"], Value::Null);
+        assert_eq!(hidden["payload"], json!({ "task_id": task, "quiet": true }));
+        assert!(!quest_visible(&state, &viewer, task).await);
+        assert_eq!(room_status(&state, &viewer, task).await, Err(StatusCode::FORBIDDEN));
+
+        state
+            .world
+            .update_agent(agent, &AgentUpdate { visibility: Some("public".into()), ..Default::default() })
+            .await?
+            .expect("agent");
+        let restored = tokio::time::timeout(Duration::from_secs(5), next_task_event(&mut body, task)).await??;
+        assert_eq!(restored["agent_id"], Value::Null);
+        assert_eq!(restored["actor_user_id"], Value::Null);
+        assert_eq!(restored["payload"], json!({ "task_id": task, "quiet": true }));
+        assert!(quest_visible(&state, &viewer, task).await);
+        assert_eq!(room_status(&state, &viewer, task).await, Ok(()));
+
+        let delete_after: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM world_events")
+            .fetch_one(state.db.pool())
+            .await?;
+        let mut delete = state.db.pool().begin().await?;
+        sqlx::query("SELECT world_emit_task_deleted(t, $2) FROM agent_tasks t WHERE t.id = $1")
+            .bind(task)
+            .bind(json!({ "reason": "Removed after handoff" }))
+            .execute(&mut *delete)
+            .await?;
+        sqlx::query("DELETE FROM agent_tasks WHERE id = $1").bind(task).execute(&mut *delete).await?;
+        delete.commit().await?;
+        state
+            .world
+            .update_agent(agent, &AgentUpdate { visibility: Some("private".into()), ..Default::default() })
+            .await?
+            .expect("agent");
+        let deleted = tokio::time::timeout(Duration::from_secs(5), next_task_event(&mut body, task)).await??;
+        assert_eq!(deleted["type"], json!("task.deleted"));
+        assert_eq!(deleted["agent_id"], Value::Null);
+        assert_eq!(deleted["actor_user_id"], Value::Null);
+        assert_eq!(deleted["payload"], json!({ "task_id": task, "quiet": true }));
+        assert!(!quest_visible(&state, &viewer, task).await);
+        assert_eq!(room_status(&state, &viewer, task).await, Err(StatusCode::NOT_FOUND));
+
+        let Json(viewer_events) = list_events(
+            State(state.clone()),
+            Extension(UserId(viewer_user)),
+            Extension(viewer.clone()),
+            Query(EventsQuery { after: Some(delete_after), agent_id: None, limit: None }),
+        )
+        .await
+        .expect("viewer events");
+        let viewer_deleted = viewer_events.into_iter().find(|event| event.event_type == "task.deleted" && event.payload["task_id"] == json!(task)).expect("viewer deletion");
+        assert_eq!((viewer_deleted.seq, viewer_deleted.agent_id, viewer_deleted.payload), (deleted["seq"].as_i64().expect("seq"), None, json!({ "task_id": task, "quiet": true })));
+
+        let owner = Viewer {
+            user: creator,
+            org: Some(org),
+            role: Role::Write,
+            org_role: Some(loka_shared::orgs::OrgRole::Member),
+            instance_admin: false,
+        };
+        let Json(owner_events) = list_events(
+            State(state.clone()),
+            Extension(UserId(creator)),
+            Extension(owner),
+            Query(EventsQuery { after: Some(delete_after), agent_id: None, limit: None }),
+        )
+        .await
+        .expect("owner events");
+        let owner_deleted = owner_events.into_iter().find(|event| event.event_type == "task.deleted" && event.payload["task_id"] == json!(task)).expect("owner deletion");
+        assert_eq!((owner_deleted.seq, owner_deleted.agent_id, owner_deleted.payload), (deleted["seq"].as_i64().expect("seq"), Some(agent), json!({ "reason": "Removed after handoff", "task_id": task })));
+        relay.abort();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod milestone_route_tests {
+    use super::*;
+
+    async fn state(url: &str) -> anyhow::Result<AppState> {
+        let db = loka_shared::db::Database::connect(url).await?;
+        let pool = db.pool().clone();
+        Ok(AppState {
+            db,
+            config: crate::config::ApiConfig { repos: vec![], backends: indexmap::IndexMap::new(), skills: vec![], mcp_servers: vec![] },
+            world: loka_shared::world::WorldStore::new(pool.clone()),
+            runners: loka_shared::runners::RunnerStore::new(pool),
+            world_tx: tokio::sync::broadcast::channel(8).0,
+            signal_tx: tokio::sync::broadcast::channel(8).0,
+            runner_tx: crate::runner_wakes::RunnerWakes::default(),
+            term: crate::terminal::TermHub::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn explicit_check_retries_the_same_pr_after_it_closed() -> anyhow::Result<()> {
+        let Ok(url) = std::env::var("MILESTONES_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let state = state(&url).await?;
+        let tag = Uuid::new_v4().simple().to_string();
+        let user: Uuid = sqlx::query_scalar("INSERT INTO users (email) VALUES ($1) RETURNING id")
+            .bind(format!("route-{tag}@milestones.test"))
+            .fetch_one(state.db.pool())
+            .await?;
+        sqlx::query("INSERT INTO org_members (org_id, user_id, role) VALUES ($1, $2, 'member')")
+            .bind(loka_shared::orgs::DEFAULT_ORG)
+            .bind(user)
+            .execute(state.db.pool())
+            .await?;
+        sqlx::query("UPDATE users SET active_org_id = $2 WHERE id = $1")
+            .bind(user)
+            .bind(loka_shared::orgs::DEFAULT_ORG)
+            .execute(state.db.pool())
+            .await?;
+        let task: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_tasks (user_id, title, status, pr_url) VALUES ($1, 'Retry close', 'failed', 'https://github.com/o/r/pull/9') RETURNING id",
+        )
+        .bind(user)
+        .fetch_one(state.db.pool())
+        .await?;
+        let store = MilestoneStore::new(state.world.pool().clone());
+        let milestone = store
+            .add(task, &[NewMilestone { title: "Merge it".into(), kind: "merge".into() }])
+            .await?
+            .pop()
+            .expect("merge milestone");
+        sqlx::query(
+            "UPDATE task_milestones SET status = 'failed', detail = 'Closed without merging', data = jsonb_build_object('closed_pr_url', 'https://github.com/o/r/pull/9') WHERE id = $1",
+        )
+        .bind(milestone.id)
+        .execute(state.db.pool())
+        .await?;
+
+        let Json(result) = check_milestones(State(state.clone()), Extension(UserId(user)), Extension(Role::Write), Path(task))
+            .await
+            .map_err(|status| anyhow::anyhow!("check failed with {status}"))?;
+
+        assert_eq!(result["queued"], json!(true));
+        let rearmed = store.get(milestone.id).await?.expect("rearmed milestone");
+        assert_eq!(rearmed.status, "active");
+        assert_eq!(rearmed.detail.as_deref(), Some("Waiting for review"));
+        assert!(rearmed.next_check_at.is_some());
+
+        sqlx::query(
+            "UPDATE task_milestones SET status = 'skipped', detail = 'No pull request was opened', next_check_at = NULL WHERE id = $1",
+        )
+        .bind(milestone.id)
+        .execute(state.db.pool())
+        .await?;
+        let Json(result) = check_milestones(State(state.clone()), Extension(UserId(user)), Extension(Role::Write), Path(task))
+            .await
+            .map_err(|status| anyhow::anyhow!("check failed with {status}"))?;
+        assert_eq!(result["queued"], json!(true));
+        let rearmed = store.get(milestone.id).await?.expect("late PR skip rearmed");
+        assert_eq!((rearmed.status.as_str(), rearmed.detail.as_deref()), ("active", Some("Waiting for review")));
+        assert!(rearmed.next_check_at.is_some());
+
+        sqlx::query("DELETE FROM agent_tasks WHERE id = $1").bind(task).execute(state.db.pool()).await?;
+        sqlx::query("DELETE FROM org_members WHERE user_id = $1").bind(user).execute(state.db.pool()).await?;
+        sqlx::query("DELETE FROM users WHERE id = $1").bind(user).execute(state.db.pool()).await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod message_task_tests {
+    use super::*;
+
+    async fn state(url: &str) -> anyhow::Result<AppState> {
+        let db = loka_shared::db::Database::connect(url).await?;
+        let pool = db.pool().clone();
+        Ok(AppState {
+            db,
+            config: crate::config::ApiConfig { repos: vec![], backends: indexmap::IndexMap::new(), skills: vec![], mcp_servers: vec![] },
+            world: loka_shared::world::WorldStore::new(pool.clone()),
+            runners: loka_shared::runners::RunnerStore::new(pool),
+            world_tx: tokio::sync::broadcast::channel(8).0,
+            signal_tx: tokio::sync::broadcast::channel(8).0,
+            runner_tx: crate::runner_wakes::RunnerWakes::default(),
+            term: crate::terminal::TermHub::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_clarification_answer_keeps_the_original_quest_resources() -> anyhow::Result<()> {
+        let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let state = state(&url).await?;
+        let tag = Uuid::new_v4().simple().to_string();
+        let user: Uuid = sqlx::query_scalar(
+            "INSERT INTO users (email, name, world_role, active_org_id) VALUES ($1, 'Ana', 'write', $2) RETURNING id",
+        )
+        .bind(format!("task-message-{tag}@example.test"))
+        .bind(loka_shared::orgs::DEFAULT_ORG)
+        .fetch_one(state.db.pool())
+        .await?;
+        sqlx::query("INSERT INTO org_members (org_id, user_id, role) VALUES ($1, $2, 'member') ON CONFLICT DO NOTHING")
+            .bind(loka_shared::orgs::DEFAULT_ORG)
+            .bind(user)
+            .execute(state.db.pool())
+            .await?;
+        let agent: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id, org_id)
+             VALUES ($1, 'Pri', 'claude', 'sonnet', $2, $3) RETURNING id",
+        )
+        .bind(format!("task-message-{tag}"))
+        .bind(user)
+        .bind(loka_shared::orgs::DEFAULT_ORG)
+        .fetch_one(state.db.pool())
+        .await?;
+        let task: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_tasks (user_id, title, status, assigned_agent_id, org_id)
+             VALUES ($1, 'Keep task context', 'in_progress', $2, $3) RETURNING id",
+        )
+        .bind(user)
+        .bind(agent)
+        .bind(loka_shared::orgs::DEFAULT_ORG)
+        .fetch_one(state.db.pool())
+        .await?;
+        let viewer = Viewer {
+            user,
+            org: Some(loka_shared::orgs::DEFAULT_ORG),
+            role: Role::Write,
+            org_role: Some(loka_shared::orgs::OrgRole::Member),
+            instance_admin: false,
+        };
+        let original_tail = "ORIGINAL_ROOM_TEXT_TAIL";
+        let answer_tail = "ACCEPTED_ANSWER_TEXT_TAIL";
+        let original_body = format!("{} {original_tail}", "original request context ".repeat(300));
+        let answer_body = format!("{} {answer_tail}", "accepted answer context ".repeat(300));
+        assert!(original_body.len() > 6000);
+        assert!(answer_body.len() > 6000);
+        let upload = state.world.insert_upload("text/plain", "request.txt", b"original attachment", Some(user)).await?;
+        let result = post_message(
+            State(state.clone()),
+            Extension(UserId(user)),
+            Extension(Role::Write),
+            Extension(viewer.clone()),
+            Path(agent),
+            Json(PostMessage {
+                body: original_body,
+                attachments: vec![upload.id],
+                options: None,
+                answers: None,
+                spoken: false,
+                task_id: Some(task),
+                reply_to: None,
+                share_output: false,
+                run_on: None,
+                quote: Some(json!({ "text": "original quoted context" })),
+                changes: None,
+            }),
+        )
+        .await
+        .map_err(|status| anyhow::anyhow!("post_message returned {status}"))?;
+        assert_eq!(result.0, StatusCode::CREATED);
+        let (source_inbox_id, mut payload): (i64, Value) = sqlx::query_as(
+            "SELECT id, payload FROM agent_inbox
+             WHERE agent_id = $1 AND kind = 'message' AND status = 'pending'
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(agent)
+        .fetch_one(state.db.pool())
+        .await?;
+        assert_eq!(payload["task_id"], json!(task));
+        let stranger: Uuid = sqlx::query_scalar(
+            "INSERT INTO users (email, name, world_role, active_org_id) VALUES ($1, 'Eve', 'write', $2) RETURNING id",
+        )
+        .bind(format!("foreign-task-message-{tag}@example.test"))
+        .bind(loka_shared::orgs::DEFAULT_ORG)
+        .fetch_one(state.db.pool())
+        .await?;
+        sqlx::query("INSERT INTO org_members (org_id, user_id, role) VALUES ($1, $2, 'member') ON CONFLICT DO NOTHING")
+            .bind(loka_shared::orgs::DEFAULT_ORG)
+            .bind(stranger)
+            .execute(state.db.pool())
+            .await?;
+        let foreign = state.world.insert_upload("text/plain", "foreign.txt", b"foreign attachment", Some(stranger)).await?;
+        payload["attachments"].as_array_mut().unwrap().push(json!({
+            "id": foreign.id,
+            "mime": "text/plain",
+            "name": "foreign.txt",
+            "url": format!("/api/world/uploads/{}", foreign.id),
+        }));
+        payload["files"].as_array_mut().unwrap().push(json!({
+            "id": foreign.id,
+            "mime": "text/plain",
+            "name": "foreign.txt",
+            "text": "foreign attachment",
+        }));
+        sqlx::query("UPDATE agent_inbox SET payload = $2 WHERE id = $1")
+            .bind(source_inbox_id)
+            .bind(&payload)
+            .execute(state.db.pool())
+            .await?;
+        let card = state
+            .world
+            .insert_reply(
+                NewMessage {
+                    agent_id: agent,
+                    author_kind: "agent",
+                    author_user_id: None,
+                    author_agent_id: Some(agent),
+                    body: "Which database should this use?",
+                    session_id: None,
+                    run_id: None,
+                    meta: json!({
+                        "kind": "ask",
+                        "choices": [],
+                        "clarify_request": {
+                            "request": "Stored origin request is intentionally shorter",
+                            "task_id": task,
+                            "title": "Keep task context",
+                            "source_inbox_id": source_inbox_id,
+                            "message_id": result.1.id,
+                        },
+                    }),
+                },
+                None,
+            )
+            .await?;
+        let answer = post_message(
+            State(state.clone()),
+            Extension(UserId(user)),
+            Extension(Role::Write),
+            Extension(viewer.clone()),
+            Path(agent),
+            Json(PostMessage {
+                body: answer_body,
+                attachments: vec![],
+                options: None,
+                answers: Some(card.id),
+                spoken: false,
+                task_id: Some(task),
+                reply_to: None,
+                share_output: false,
+                run_on: None,
+                quote: None,
+                changes: None,
+            }),
+        )
+        .await
+        .map_err(|status| anyhow::anyhow!("answer post_message returned {status}"))?;
+        assert_eq!(answer.0, StatusCode::CREATED);
+        assert_eq!(answer.1.meta["attachments"], json!([]));
+        assert!(answer.1.meta.get("quote").is_none());
+        let continuations: Vec<Value> = sqlx::query_scalar(
+            "SELECT payload FROM agent_inbox
+             WHERE agent_id = $1 AND kind = 'task.assigned'
+               AND payload->>'clarification_continuation' = $2",
+        )
+        .bind(agent)
+        .bind(card.id.to_string())
+        .fetch_all(state.db.pool())
+        .await?;
+        assert_eq!(continuations.len(), 1);
+        let continuation = &continuations[0];
+        assert_eq!(continuation["attachments"].as_array().unwrap().len(), 1);
+        assert_eq!(continuation["files"].as_array().unwrap().len(), 1);
+        assert_eq!(continuation["attachments"][0]["id"], json!(upload.id));
+        assert_eq!(continuation["files"][0]["id"], json!(upload.id));
+        assert_eq!(continuation["files"][0]["text"], "original attachment");
+        assert!(continuation["brief"].as_str().unwrap().contains("original quoted context"));
+        assert!(continuation["brief"].as_str().unwrap().contains(original_tail));
+        assert!(continuation["brief"].as_str().unwrap().contains(answer_tail));
+        assert!(continuation["clarification_handoff"]["request"].as_str().unwrap().contains(original_tail));
+        assert!(continuation["clarification_handoff"]["request"].as_str().unwrap().contains("original quoted context"));
+        assert_eq!(continuation["clarification_handoff"]["question"], "Which database should this use?");
+        assert!(continuation["clarification_handoff"]["answer"].as_str().unwrap().contains(answer_tail));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unbound_clarification_queues_one_canonical_private_handoff() -> anyhow::Result<()> {
+        let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let state = state(&url).await?;
+        let tag = Uuid::new_v4().simple().to_string();
+        let user: Uuid = sqlx::query_scalar(
+            "INSERT INTO users (email, name, world_role, active_org_id) VALUES ($1, 'Mira', 'write', $2) RETURNING id",
+        )
+        .bind(format!("unbound-clarification-{tag}@example.test"))
+        .bind(loka_shared::orgs::DEFAULT_ORG)
+        .fetch_one(state.db.pool())
+        .await?;
+        sqlx::query("INSERT INTO org_members (org_id, user_id, role) VALUES ($1, $2, 'member') ON CONFLICT DO NOTHING")
+            .bind(loka_shared::orgs::DEFAULT_ORG)
+            .bind(user)
+            .execute(state.db.pool())
+            .await?;
+        let agent: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id, org_id)
+             VALUES ($1, 'Rio', 'claude', 'sonnet', $2, $3) RETURNING id",
+        )
+        .bind(format!("unbound-clarification-{tag}"))
+        .bind(user)
+        .bind(loka_shared::orgs::DEFAULT_ORG)
+        .fetch_one(state.db.pool())
+        .await?;
+        let caller_task: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_tasks (user_id, title, status, assigned_agent_id, org_id)
+             VALUES ($1, 'Unrelated room', 'in_progress', $2, $3) RETURNING id",
+        )
+        .bind(user)
+        .bind(agent)
+        .bind(loka_shared::orgs::DEFAULT_ORG)
+        .fetch_one(state.db.pool())
+        .await?;
+        let viewer = Viewer {
+            user,
+            org: Some(loka_shared::orgs::DEFAULT_ORG),
+            role: Role::Write,
+            org_role: Some(loka_shared::orgs::OrgRole::Member),
+            instance_admin: false,
+        };
+        let linked = state
+            .world
+            .insert_reply(
+                NewMessage {
+                    agent_id: agent,
+                    author_kind: "agent",
+                    author_user_id: None,
+                    author_agent_id: Some(agent),
+                    body: "The linked deployment context",
+                    session_id: None,
+                    run_id: None,
+                    meta: Value::Null,
+                },
+                None,
+            )
+            .await?;
+        let upload_bytes = b"private original attachment";
+        let upload = state.world.insert_upload("text/plain", "private.txt", upload_bytes, Some(user)).await?;
+        let original_tail = "UNBOUND_ORIGINAL_TAIL";
+        let answer_tail = "UNBOUND_ANSWER_TAIL";
+        let original_body = format!(
+            "Use msg:{} as context. {} {original_tail}",
+            linked.id,
+            "unbound original context ".repeat(260),
+        );
+        let answer_body = format!("{} {answer_tail}", "unbound accepted answer ".repeat(260));
+        assert!(original_body.len() > 5500);
+        assert!(answer_body.len() > 5500);
+        let original = post_message(
+            State(state.clone()),
+            Extension(UserId(user)),
+            Extension(Role::Write),
+            Extension(viewer.clone()),
+            Path(agent),
+            Json(PostMessage {
+                body: original_body,
+                attachments: vec![upload.id],
+                options: None,
+                answers: None,
+                spoken: false,
+                task_id: None,
+                reply_to: None,
+                share_output: false,
+                run_on: None,
+                quote: Some(json!({ "text": "unbound original quote" })),
+                changes: None,
+            }),
+        )
+        .await
+        .map_err(|status| anyhow::anyhow!("original post_message returned {status}"))?;
+        let (source_inbox_id, source_payload): (i64, Value) = sqlx::query_as(
+            "SELECT id, payload FROM agent_inbox
+             WHERE agent_id = $1 AND kind = 'message' AND payload->>'message_id' = $2
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(agent)
+        .bind(original.1.id.to_string())
+        .fetch_one(state.db.pool())
+        .await?;
+        assert_eq!(source_payload["links"].as_array().unwrap().len(), 1);
+        let card = state
+            .world
+            .insert_reply(
+                NewMessage {
+                    agent_id: agent,
+                    author_kind: "agent",
+                    author_user_id: None,
+                    author_agent_id: Some(agent),
+                    body: "Which environment should I use?",
+                    session_id: None,
+                    run_id: None,
+                    meta: json!({
+                        "kind": "ask",
+                        "choices": [],
+                        "clarify_request": {
+                            "request": "Stored preview is shorter",
+                            "source_inbox_id": source_inbox_id,
+                            "message_id": original.1.id,
+                        },
+                    }),
+                },
+                None,
+            )
+            .await?;
+        let answer = post_message(
+            State(state.clone()),
+            Extension(UserId(user)),
+            Extension(Role::Write),
+            Extension(viewer.clone()),
+            Path(agent),
+            Json(PostMessage {
+                body: answer_body,
+                attachments: vec![],
+                options: None,
+                answers: Some(card.id),
+                spoken: false,
+                task_id: Some(caller_task),
+                reply_to: None,
+                share_output: false,
+                run_on: None,
+                quote: Some(json!({ "text": "unbound answer quote" })),
+                changes: None,
+            }),
+        )
+        .await
+        .map_err(|status| anyhow::anyhow!("answer post_message returned {status}"))?;
+        let continuations: Vec<(i64, Value)> = sqlx::query_as(
+            "SELECT id, payload FROM agent_inbox
+             WHERE agent_id = $1 AND kind = 'message'
+               AND payload->>'clarification_continuation' = $2",
+        )
+        .bind(agent)
+        .bind(card.id.to_string())
+        .fetch_all(state.db.pool())
+        .await?;
+        assert_eq!(continuations.len(), 1);
+        let continuation_id = continuations[0].0;
+        let continuation = &continuations[0].1;
+        assert_eq!(continuation["message_id"], json!(answer.1.id));
+        assert!(continuation["body"].as_str().unwrap().contains(answer_tail));
+        assert!(continuation["task_id"].is_null());
+        assert!(continuation["clarification_handoff"]["request"].as_str().unwrap().contains(original_tail));
+        assert!(continuation["clarification_handoff"]["request"].as_str().unwrap().contains("unbound original quote"));
+        assert_eq!(continuation["clarification_handoff"]["question"], "Which environment should I use?");
+        assert!(continuation["clarification_handoff"]["answer"].as_str().unwrap().contains(answer_tail));
+        assert_eq!(continuation["attachments"].as_array().unwrap().len(), 1);
+        assert_eq!(continuation["attachments"][0]["id"], json!(upload.id));
+        assert_eq!(continuation["attachments"][0]["url"], json!(format!("/api/world/uploads/{}", upload.id)));
+        assert_eq!(continuation["files"].as_array().unwrap().len(), 1);
+        assert_eq!(continuation["files"][0]["text"], "private original attachment");
+        assert_eq!(continuation["links"].as_array().unwrap().len(), 1);
+        assert_eq!(continuation["links"][0]["ref"], json!(linked.id));
+        assert_eq!(continuation["from_owner"], true);
+        assert!(continuation.get("clarification_channel").is_none());
+        assert_eq!(continuation["quote"]["text"], "unbound answer quote");
+        let carried_bytes: Vec<u8> = sqlx::query_scalar("SELECT bytes FROM world_uploads WHERE id = $1")
+            .bind(continuation["attachments"][0]["id"].as_str().unwrap().parse::<Uuid>()?)
+            .fetch_one(state.db.pool())
+            .await?;
+        assert_eq!(carried_bytes.as_slice(), upload_bytes);
+        let visible_event: Value = sqlx::query_scalar(
+            "SELECT payload FROM world_events WHERE type = 'message.created' AND payload->>'message_id' = $1",
+        )
+        .bind(answer.1.id.to_string())
+        .fetch_one(state.db.pool())
+        .await?;
+        assert_eq!(visible_event["attachments"], json!([]));
+        assert_eq!(visible_event["files"], json!([]));
+        assert_eq!(visible_event["links"], json!([]));
+        assert!(visible_event.get("clarification_handoff").is_none());
+        let mut tx = state.db.pool().begin().await?;
+        let legacy_prior = clarification_source_resources(
+            &mut tx,
+            &json!({ "message_id": answer.1.id }),
+            agent,
+            user,
+            viewer.org,
+            None,
+        )
+        .await?;
+        assert_eq!(legacy_prior["clarification_handoff"], continuation["clarification_handoff"]);
+        drop(tx);
+
+        let completed_task: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_tasks (user_id, title, status, assigned_agent_id, org_id)
+             VALUES ($1, 'Completed source', 'todo', $2, $3) RETURNING id",
+        )
+        .bind(user)
+        .bind(agent)
+        .bind(viewer.org)
+        .fetch_one(state.db.pool())
+        .await?;
+        sqlx::query("UPDATE agent_tasks SET status = 'done' WHERE id = $1")
+            .bind(completed_task)
+            .execute(state.db.pool())
+            .await?;
+        let completed_source = post_message(
+            State(state.clone()),
+            Extension(UserId(user)),
+            Extension(Role::Write),
+            Extension(viewer.clone()),
+            Path(agent),
+            Json(PostMessage {
+                body: "Use the completed quest as context".into(),
+                attachments: vec![upload.id],
+                options: None,
+                answers: None,
+                spoken: false,
+                task_id: Some(completed_task),
+                reply_to: None,
+                share_output: false,
+                run_on: None,
+                quote: None,
+                changes: None,
+            }),
+        )
+        .await
+        .map_err(|status| anyhow::anyhow!("completed source post_message returned {status}"))?;
+        let completed_source_inbox: i64 = sqlx::query_scalar(
+            "SELECT id FROM agent_inbox
+             WHERE agent_id = $1 AND kind = 'message' AND payload->>'message_id' = $2
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(agent)
+        .bind(completed_source.1.id.to_string())
+        .fetch_one(state.db.pool())
+        .await?;
+        let completed_card = state
+            .world
+            .insert_reply(
+                NewMessage {
+                    agent_id: agent,
+                    author_kind: "agent",
+                    author_user_id: None,
+                    author_agent_id: Some(agent),
+                    body: "Which matching format?",
+                    session_id: None,
+                    run_id: None,
+                    meta: json!({
+                        "kind": "ask",
+                        "choices": [],
+                        "clarify_request": {
+                            "request": "Use the completed quest as context",
+                            "source_inbox_id": completed_source_inbox,
+                            "message_id": completed_source.1.id,
+                            "context_task_id": completed_task,
+                        },
+                    }),
+                },
+                None,
+            )
+            .await?;
+        let completed_room = quest_room(
+            State(state.clone()),
+            Extension(UserId(user)),
+            Extension(viewer.clone()),
+            Path(completed_task),
+            Query(RoomQuery { after: None, since: None, focus: None }),
+        )
+        .await
+        .map_err(|status| anyhow::anyhow!("completed room returned {status}"))?;
+        assert_eq!(completed_room.0["clarification"]["id"], completed_card.id.to_string());
+        assert!(completed_room.0["room"]["messages"]
+            .as_array()
+            .is_some_and(|messages| messages.iter().any(|message| message["id"] == completed_card.id.to_string())));
+        let completed_answer = post_message(
+            State(state.clone()),
+            Extension(UserId(user)),
+            Extension(Role::Write),
+            Extension(viewer.clone()),
+            Path(agent),
+            Json(PostMessage {
+                body: "Use CSV".into(),
+                attachments: vec![],
+                options: None,
+                answers: Some(completed_card.id),
+                spoken: false,
+                task_id: Some(completed_task),
+                reply_to: None,
+                share_output: false,
+                run_on: None,
+                quote: None,
+                changes: None,
+            }),
+        )
+        .await
+        .map_err(|status| anyhow::anyhow!("completed answer post_message returned {status}"))?;
+        let completed_continuation: Value = sqlx::query_scalar(
+            "SELECT payload FROM agent_inbox
+             WHERE agent_id = $1 AND kind = 'message'
+               AND payload->>'clarification_continuation' = $2",
+        )
+        .bind(agent)
+        .bind(completed_card.id.to_string())
+        .fetch_one(state.db.pool())
+        .await?;
+        assert!(completed_continuation["task_id"].is_null());
+        assert_eq!(completed_continuation["attachments"][0]["id"], json!(upload.id));
+        let completed_event_task: Option<Uuid> = sqlx::query_scalar(
+            "SELECT task_id FROM world_events WHERE type = 'message.created' AND payload->>'message_id' = $1",
+        )
+        .bind(completed_answer.1.id.to_string())
+        .fetch_one(state.db.pool())
+        .await?;
+        assert_eq!(completed_event_task, Some(completed_task));
+        let answered_room = quest_room(
+            State(state.clone()),
+            Extension(UserId(user)),
+            Extension(viewer.clone()),
+            Path(completed_task),
+            Query(RoomQuery { after: None, since: None, focus: None }),
+        )
+        .await
+        .map_err(|status| anyhow::anyhow!("answered completed room returned {status}"))?;
+        assert!(answered_room.0["clarification"].is_null());
+        assert!(answered_room.0["room"]["messages"]
+            .as_array()
+            .is_some_and(|messages| messages.iter().any(|message| {
+                message["id"] == completed_answer.1.id.to_string()
+                    && message["meta"]["context_task_id"] == completed_task.to_string()
+            })));
+
+        let stale_card = state
+            .world
+            .insert_reply(
+                NewMessage {
+                    agent_id: agent,
+                    author_kind: "agent",
+                    author_user_id: None,
+                    author_agent_id: Some(agent),
+                    body: "Which stale format?",
+                    session_id: None,
+                    run_id: None,
+                    meta: json!({
+                        "kind": "ask",
+                        "choices": [],
+                        "clarify_request": {
+                            "request": "Use the completed quest as context",
+                            "source_inbox_id": completed_source_inbox,
+                            "message_id": completed_source.1.id,
+                            "context_task_id": completed_task,
+                        },
+                    }),
+                },
+                None,
+            )
+            .await?;
+        state.world.delete_task(completed_task, "Mira", None).await?;
+        let inbox_before_stale_answers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_inbox WHERE agent_id = $1")
+            .bind(agent)
+            .fetch_one(state.db.pool())
+            .await?;
+        for task_id in [None, Some(completed_task)] {
+            let stale_answer = post_message(
+                State(state.clone()),
+                Extension(UserId(user)),
+                Extension(Role::Write),
+                Extension(viewer.clone()),
+                Path(agent),
+                Json(PostMessage {
+                    body: "Use JSON".into(),
+                    attachments: vec![],
+                    options: None,
+                    answers: Some(stale_card.id),
+                    spoken: false,
+                    task_id,
+                    reply_to: None,
+                    share_output: false,
+                    run_on: None,
+                    quote: None,
+                    changes: None,
+                }),
+            )
+            .await;
+            assert_eq!(stale_answer.expect_err("deleted contextual quest"), StatusCode::CONFLICT);
+        }
+        let stale_answers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_messages WHERE agent_id = $1 AND meta->>'answers' = $2")
+            .bind(agent)
+            .bind(stale_card.id.to_string())
+            .fetch_one(state.db.pool())
+            .await?;
+        assert_eq!(stale_answers, 1);
+        let inbox_after_stale_answers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_inbox WHERE agent_id = $1")
+            .bind(agent)
+            .fetch_one(state.db.pool())
+            .await?;
+        assert_eq!(inbox_after_stale_answers, inbox_before_stale_answers);
+
+        let second_question = "Which deployment window should I use?";
+        let second_answer_tail = "SECOND_ACCEPTED_ANSWER_TAIL";
+        let second_answer = format!("{} {second_answer_tail}", "second accepted answer ".repeat(280));
+        let second_card = state
+            .world
+            .insert_reply(
+                NewMessage {
+                    agent_id: agent,
+                    author_kind: "agent",
+                    author_user_id: None,
+                    author_agent_id: Some(agent),
+                    body: second_question,
+                    session_id: None,
+                    run_id: None,
+                    meta: json!({
+                        "kind": "ask",
+                        "choices": [],
+                        "clarify_request": {
+                            "request": "SECOND_ROUND_VISIBLE_PREVIEW_MUST_NOT_APPEAR",
+                            "source_inbox_id": continuation_id,
+                            "message_id": answer.1.id,
+                        },
+                    }),
+                },
+                None,
+            )
+            .await?;
+        let second_post = || PostMessage {
+            body: second_answer.clone(),
+            attachments: vec![],
+            options: None,
+            answers: Some(second_card.id),
+            spoken: false,
+            task_id: None,
+            reply_to: None,
+            share_output: false,
+            run_on: None,
+            quote: Some(json!({ "text": "second answer quote" })),
+            changes: None,
+        };
+        let second_result = post_message(
+            State(state.clone()),
+            Extension(UserId(user)),
+            Extension(Role::Write),
+            Extension(viewer.clone()),
+            Path(agent),
+            Json(second_post()),
+        )
+        .await
+        .map_err(|status| anyhow::anyhow!("second answer post_message returned {status}"))?;
+        assert_eq!(second_result.0, StatusCode::CREATED);
+        let second_visible_event: Value = sqlx::query_scalar(
+            "SELECT payload FROM world_events WHERE type = 'message.created' AND payload->>'message_id' = $1",
+        )
+        .bind(second_result.1.id.to_string())
+        .fetch_one(state.db.pool())
+        .await?;
+        assert!(second_visible_event.get("clarification_handoff").is_none());
+        let duplicate = post_message(
+            State(state.clone()),
+            Extension(UserId(user)),
+            Extension(Role::Write),
+            Extension(viewer.clone()),
+            Path(agent),
+            Json(second_post()),
+        )
+        .await;
+        assert!(matches!(duplicate, Err(StatusCode::CONFLICT)));
+        let second_continuations: Vec<Value> = sqlx::query_scalar(
+            "SELECT payload FROM agent_inbox
+             WHERE agent_id = $1 AND kind = 'message'
+               AND payload->>'clarification_continuation' = $2",
+        )
+        .bind(agent)
+        .bind(second_card.id.to_string())
+        .fetch_all(state.db.pool())
+        .await?;
+        assert_eq!(second_continuations.len(), 1);
+        let second_continuation = &second_continuations[0];
+        let second_handoff = &second_continuation["clarification_handoff"];
+        let canonical_brief = loka_shared::quests::clarification_exchange(
+            second_handoff.get("request").and_then(Value::as_str),
+            second_handoff["question"].as_str().unwrap(),
+            second_handoff["answer"].as_str().unwrap(),
+            second_continuation,
+        );
+        for marker in [
+            original_tail,
+            "Which environment should I use?",
+            answer_tail,
+            second_question,
+            second_answer_tail,
+            "unbound original quote",
+            "unbound answer quote",
+            "second answer quote",
+        ] {
+            assert_eq!(canonical_brief.matches(marker).count(), 1, "{marker}");
+        }
+        assert!(!canonical_brief.contains("SECOND_ROUND_VISIBLE_PREVIEW_MUST_NOT_APPEAR"));
+        assert_eq!(second_continuation["attachments"].as_array().unwrap().len(), 1);
+        assert_eq!(second_continuation["attachments"][0]["id"], json!(upload.id));
+        assert_eq!(second_continuation["files"][0]["text"], "private original attachment");
+        let second_bytes: Vec<u8> = sqlx::query_scalar("SELECT bytes FROM world_uploads WHERE id = $1")
+            .bind(second_continuation["attachments"][0]["id"].as_str().unwrap().parse::<Uuid>()?)
+            .fetch_one(state.db.pool())
+            .await?;
+        assert_eq!(second_bytes.as_slice(), upload_bytes);
+
+        let legacy_card = state
+            .world
+            .insert_reply(
+                NewMessage {
+                    agent_id: agent,
+                    author_kind: "agent",
+                    author_user_id: None,
+                    author_agent_id: Some(agent),
+                    body: "Can I recover the old message reference?",
+                    session_id: None,
+                    run_id: None,
+                    meta: json!({
+                        "kind": "ask",
+                        "choices": [],
+                        "clarify_request": {
+                            "request": "Legacy preview",
+                            "message_id": original.1.id,
+                        },
+                    }),
+                },
+                None,
+            )
+            .await?;
+        let (status, _) = post_message(
+            State(state.clone()),
+            Extension(UserId(user)),
+            Extension(Role::Write),
+            Extension(viewer.clone()),
+            Path(agent),
+            Json(PostMessage {
+                body: "Recover it".into(),
+                attachments: vec![],
+                options: None,
+                answers: Some(legacy_card.id),
+                spoken: false,
+                task_id: None,
+                reply_to: None,
+                share_output: false,
+                run_on: None,
+                quote: None,
+                changes: None,
+            }),
+        )
+        .await
+        .map_err(|status| anyhow::anyhow!("legacy answer post_message returned {status}"))?;
+        assert_eq!(status, StatusCode::CREATED);
+        let legacy: Value = sqlx::query_scalar(
+            "SELECT payload FROM agent_inbox
+             WHERE agent_id = $1 AND kind = 'message'
+               AND payload->>'clarification_continuation' = $2",
+        )
+        .bind(agent)
+        .bind(legacy_card.id.to_string())
+        .fetch_one(state.db.pool())
+        .await?;
+        assert!(legacy["clarification_handoff"]["request"].as_str().unwrap().contains(original_tail));
+        assert!(legacy["clarification_handoff"]["request"].as_str().unwrap().contains("unbound original quote"));
+        assert_eq!(legacy["attachments"][0]["id"], json!(upload.id));
+        assert_eq!(legacy["attachments"][0]["url"], json!(format!("/api/world/uploads/{}", upload.id)));
+
+        let root = state
+            .world
+            .insert_reply(
+                NewMessage {
+                    agent_id: agent,
+                    author_kind: "user",
+                    author_user_id: Some(user),
+                    author_agent_id: None,
+                    body: "Thread root",
+                    session_id: None,
+                    run_id: None,
+                    meta: Value::Null,
+                },
+                None,
+            )
+            .await?;
+        state
+            .world
+            .insert_reply(
+                NewMessage {
+                    agent_id: agent,
+                    author_kind: "agent",
+                    author_user_id: None,
+                    author_agent_id: Some(agent),
+                    body: "THREAD_FINAL_REQUIREMENT",
+                    session_id: None,
+                    run_id: None,
+                    meta: Value::Null,
+                },
+                Some(root.id),
+            )
+            .await?;
+        let thread_upload = state.world.insert_upload("text/plain", "thread.txt", b"thread attachment", Some(user)).await?;
+        let thread_source = post_message(
+            State(state.clone()),
+            Extension(UserId(user)),
+            Extension(Role::Write),
+            Extension(viewer.clone()),
+            Path(agent),
+            Json(PostMessage {
+                body: String::new(),
+                attachments: vec![thread_upload.id],
+                options: None,
+                answers: None,
+                spoken: false,
+                task_id: None,
+                reply_to: Some(root.id),
+                share_output: false,
+                run_on: None,
+                quote: None,
+                changes: None,
+            }),
+        )
+        .await
+        .map_err(|status| anyhow::anyhow!("thread source post_message returned {status}"))?;
+        let (thread_source_inbox, thread_source_payload): (i64, Value) = sqlx::query_as(
+            "SELECT id, payload FROM agent_inbox
+             WHERE agent_id = $1 AND kind = 'message' AND payload->>'message_id' = $2
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(agent)
+        .bind(thread_source.1.id.to_string())
+        .fetch_one(state.db.pool())
+        .await?;
+        assert_eq!(thread_source_payload["reply_to"], json!(root.id));
+        assert!(thread_source_payload["thread"].as_str().unwrap().contains("THREAD_FINAL_REQUIREMENT"));
+        sqlx::query("DELETE FROM agent_inbox WHERE id = $1")
+            .bind(thread_source_inbox)
+            .execute(state.db.pool())
+            .await?;
+        state
+            .world
+            .insert_reply(
+                NewMessage {
+                    agent_id: agent,
+                    author_kind: "agent",
+                    author_user_id: None,
+                    author_agent_id: Some(agent),
+                    body: "LATER_THREAD_CHANGE_MUST_NOT_APPEAR",
+                    session_id: None,
+                    run_id: None,
+                    meta: Value::Null,
+                },
+                Some(root.id),
+            )
+            .await?;
+        let thread_card = state
+            .world
+            .insert_reply(
+                NewMessage {
+                    agent_id: agent,
+                    author_kind: "agent",
+                    author_user_id: None,
+                    author_agent_id: Some(agent),
+                    body: "Which final requirement should I use?",
+                    session_id: None,
+                    run_id: None,
+                    meta: json!({
+                        "kind": "ask",
+                        "choices": [],
+                        "clarify_request": {
+                            "request": "Attachment-only thread request",
+                            "message_id": thread_source.1.id,
+                        },
+                    }),
+                },
+                None,
+            )
+            .await?;
+        let (status, _) = post_message(
+            State(state.clone()),
+            Extension(UserId(user)),
+            Extension(Role::Write),
+            Extension(viewer.clone()),
+            Path(agent),
+            Json(PostMessage {
+                body: "Use the attached final requirement".into(),
+                attachments: vec![],
+                options: None,
+                answers: Some(thread_card.id),
+                spoken: false,
+                task_id: None,
+                reply_to: None,
+                share_output: false,
+                run_on: None,
+                quote: None,
+                changes: None,
+            }),
+        )
+        .await
+        .map_err(|status| anyhow::anyhow!("thread answer post_message returned {status}"))?;
+        assert_eq!(status, StatusCode::CREATED);
+        let thread_continuation: Value = sqlx::query_scalar(
+            "SELECT payload FROM agent_inbox
+             WHERE agent_id = $1 AND kind = 'message'
+               AND payload->>'clarification_continuation' = $2",
+        )
+        .bind(agent)
+        .bind(thread_card.id.to_string())
+        .fetch_one(state.db.pool())
+        .await?;
+        let thread_request = thread_continuation["clarification_handoff"]["request"].as_str().unwrap();
+        assert!(thread_request.contains("Attachment-only thread request"));
+        assert!(thread_request.contains("THREAD_FINAL_REQUIREMENT"));
+        assert!(thread_request.contains(&root.id.simple().to_string()[..8]));
+        assert!(!thread_request.contains("LATER_THREAD_CHANGE_MUST_NOT_APPEAR"));
+        assert_eq!(thread_continuation["attachments"][0]["id"], json!(thread_upload.id));
+        assert_eq!(thread_continuation["files"][0]["text"], "thread attachment");
+
+        let mut tx = state.db.pool().begin().await?;
+        let mismatched = clarification_source_resources(
+            &mut tx,
+            &json!({ "source_inbox_id": source_inbox_id, "message_id": thread_source.1.id }),
+            agent,
+            user,
+            viewer.org,
+            None,
+        )
+        .await?;
+        assert_eq!(mismatched, json!({}));
+        let wrong_actor = clarification_source_resources(
+            &mut tx,
+            &json!({ "source_inbox_id": source_inbox_id, "message_id": original.1.id }),
+            agent,
+            Uuid::new_v4(),
+            viewer.org,
+            None,
+        )
+        .await?;
+        assert_eq!(wrong_actor, json!({}));
+        let wrong_task = clarification_source_resources(
+            &mut tx,
+            &json!({ "source_inbox_id": source_inbox_id, "message_id": original.1.id }),
+            agent,
+            user,
+            viewer.org,
+            Some(caller_task),
+        )
+        .await?;
+        assert_eq!(wrong_task, json!({}));
+        drop(tx);
+
+        let numeric_seq = state
+            .world
+            .emit(
+                NewEvent::new("message.updated")
+                    .agent(agent)
+                    .actor(Some(user))
+                    .payload(json!({ "message_id": 42, "body": "Edited channel requirement", "task_id": Value::Null })),
+                Some((agent, "message")),
+            )
+            .await?;
+        let numeric_inbox: i64 = sqlx::query_scalar("SELECT id FROM agent_inbox WHERE event_seq = $1")
+            .bind(numeric_seq)
+            .fetch_one(state.db.pool())
+            .await?;
+        let assignment_seq = state
+            .world
+            .emit(
+                NewEvent::new("task.updated")
+                    .agent(agent)
+                    .actor(Some(user))
+                    .task(Some(caller_task))
+                    .payload(json!({ "task_id": caller_task, "brief": "Preserve this assignment snapshot" })),
+                Some((agent, "task.assigned")),
+            )
+            .await?;
+        let assignment_inbox: i64 = sqlx::query_scalar("SELECT id FROM agent_inbox WHERE event_seq = $1")
+            .bind(assignment_seq)
+            .fetch_one(state.db.pool())
+            .await?;
+        let mut tx = state.db.pool().begin().await?;
+        let numeric = clarification_source_resources(
+            &mut tx,
+            &json!({ "source_inbox_id": numeric_inbox, "message_id": 42 }),
+            agent,
+            user,
+            viewer.org,
+            None,
+        )
+        .await?;
+        assert_eq!(numeric["body"], "Edited channel requirement");
+        let assignment = clarification_source_resources(
+            &mut tx,
+            &json!({ "source_inbox_id": assignment_inbox, "task_id": caller_task }),
+            agent,
+            user,
+            viewer.org,
+            Some(caller_task),
+        )
+        .await?;
+        assert!(assignment.get("attachments").is_some());
+        drop(tx);
+
+        state
+            .world
+            .emit(
+                NewEvent::new("message.created")
+                    .agent(agent)
+                    .actor(Some(user))
+                    .payload(source_payload),
+                None,
+            )
+            .await?;
+        let mut tx = state.db.pool().begin().await?;
+        let ambiguous = clarification_source_resources(
+            &mut tx,
+            &json!({ "message_id": original.1.id }),
+            agent,
+            user,
+            viewer.org,
+            None,
+        )
+        .await?;
+        assert_eq!(ambiguous, json!({}));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod message_route_tests {
+    use super::*;
+
+    #[test]
+    fn structured_fields_route_before_the_shell_prefix() {
+        let card = Some(Uuid::new_v4());
+        assert_eq!(message_route(card, None, "!rm -rf ~"), MessageRoute::Structured, "a bang-prefixed answer is an answer, checked as a card answer");
+        assert_eq!(message_route(None, card, "!rm -rf ~"), MessageRoute::Structured, "a bang-prefixed correction is a correction, checked as one");
+        assert_eq!(message_route(card, card, "!ls"), MessageRoute::Structured);
+        assert_eq!(message_route(None, None, "! ls -la "), MessageRoute::Shell("ls -la"), "a plain bang message still runs as a shell command");
+        assert_eq!(message_route(None, None, "!"), MessageRoute::Shell(""), "an empty command is refused by the caller");
+        assert_eq!(message_route(None, None, "hello !there"), MessageRoute::Plain);
+    }
+
+    #[test]
+    fn corrections_reach_only_the_room_lead_or_answer_target() {
+        let lead = Uuid::new_v4();
+        let target = Uuid::new_v4();
+        let question = loka_shared::quest_questions::ChangeableQuestion {
+            question_id: Uuid::new_v4(),
+            agent_id: target,
+            task_id: Some(Uuid::new_v4()),
+            lead_agent_id: Some(lead),
+        };
+        assert!(correction_agent_allowed(lead, &question));
+        assert!(correction_agent_allowed(target, &question));
+        assert!(!correction_agent_allowed(Uuid::new_v4(), &question));
     }
 }

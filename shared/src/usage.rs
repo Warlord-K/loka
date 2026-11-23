@@ -76,7 +76,8 @@ impl WorldStore {
         let days = days.clamp(1, MAX_DAYS);
         let rows = sqlx::query_as::<_, UsageRow>(
             "SELECT a.id AS agent_id, a.name AS agent, a.cli AS agent_cli, a.model AS agent_model,
-                    s.backend AS cli, s.model, r.kind,
+                    s.backend AS cli, s.model,
+                    CASE WHEN r.kind = 'aside' AND s.asked_by->>'kind' = 'question' THEN 'answer' ELSE r.kind END AS kind,
                     COUNT(*) AS runs,
                     COUNT(*) FILTER (WHERE r.status = 'completed') AS completed,
                     COUNT(*) FILTER (WHERE r.status = 'failed') AS failed,
@@ -93,7 +94,7 @@ impl WorldStore {
              WHERE a.owner_user_id = $1
                AND ($2::uuid IS NULL OR a.id = $2)
                AND r.created_at >= NOW() - make_interval(days => $3)
-             GROUP BY a.id, a.name, a.cli, a.model, s.backend, s.model, r.kind
+             GROUP BY a.id, a.name, a.cli, a.model, s.backend, s.model, 7
              ORDER BY cost_usd DESC, runs DESC",
         )
         .bind(owner)

@@ -130,10 +130,86 @@ pub fn compact_unsupported(cli: &str) -> Option<&'static str> {
     (!matches!(cli, "claude" | "codex" | "omp")).then_some(NO_COMPACT)
 }
 
-pub fn used(context_tokens: u64, input_tokens: u64, cached_input_tokens: u64) -> i64 {
+pub fn reports_thread_totals(cli: &str) -> bool {
+    cli == "codex"
+}
+
+pub fn measured(cli: &str, context_tokens: u64, input_tokens: u64, cached_input_tokens: u64) -> i64 {
     match context_tokens {
+        0 if reports_thread_totals(cli) => 0,
         0 => (input_tokens + cached_input_tokens) as i64,
         measured => measured as i64,
+    }
+}
+
+pub const INSTRUCTIONS_BLOCK: &str = "instructions";
+pub const SKILLS_BLOCK: &str = "skills";
+const SENT_BLOCKS: [&str; 2] = [INSTRUCTIONS_BLOCK, SKILLS_BLOCK];
+
+pub fn resumes_same_session(resume: bool, fork: bool, rewinding: bool) -> bool {
+    resume && !fork && !rewinding
+}
+
+pub fn block_hash(text: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, text.as_bytes());
+    digest.as_ref()[..16].iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct SentContext(std::collections::BTreeMap<String, String>);
+
+impl SentContext {
+    pub fn carried(stored: Option<&Value>, resumes: bool) -> Self {
+        match stored {
+            Some(stored) if resumes => Self::from_value(stored),
+            _ => Self::default(),
+        }
+    }
+
+    pub fn from_value(value: &Value) -> Self {
+        let blocks = value
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(block, _)| SENT_BLOCKS.contains(&block.as_str()))
+            .filter_map(|(block, hash)| {
+                let hash = hash.as_str()?;
+                (hash.len() == 32 && hash.bytes().all(|b| b.is_ascii_hexdigit())).then(|| (block.clone(), hash.to_string()))
+            })
+            .collect();
+        Self(blocks)
+    }
+
+    pub fn to_value(&self) -> Value {
+        serde_json::to_value(&self.0).unwrap_or_else(|_| json!({}))
+    }
+
+    pub fn hash(&self, block: &str) -> Option<&str> {
+        self.0.get(block).map(String::as_str)
+    }
+
+    pub fn offer(&mut self, block: &str, text: &str) -> bool {
+        let hash = block_hash(text);
+        let send = self.hash(block) != Some(hash.as_str()) && !text.trim().is_empty();
+        self.0.insert(block.to_string(), hash);
+        send
+    }
+
+    pub fn append(&mut self, prompt: &str, block: &str, text: &str) -> String {
+        if self.offer(block, text) {
+            format!("{prompt}\n\n{text}")
+        } else {
+            prompt.to_string()
+        }
+    }
+
+    pub fn set(&mut self, block: &str, hash: &str) {
+        self.0.insert(block.to_string(), hash.to_string());
+    }
+
+    pub fn only(&self, block: &str) -> Self {
+        Self(self.0.iter().filter(|(name, _)| *name == block).map(|(k, v)| (k.clone(), v.clone())).collect())
     }
 }
 
@@ -292,6 +368,39 @@ pub fn resume_intro(name: &str, backend: &str, used: i64) -> String {
     format!(
         "[fresh session] You are {name}. This quest's session grew past the model's context window{size}, so this is a fresh {backend} session. The work so far is in this worktree: check git status and git log before you change anything, and carry on from there. Your notes and recent quests below are what you remember."
     )
+}
+
+pub fn lost_intro(name: &str, backend: &str, in_worktree: bool) -> String {
+    let work = if in_worktree {
+        " The work so far is in this worktree: check git status and git log before you change anything, and carry on from there."
+    } else {
+        ""
+    };
+    format!(
+        "[fresh session] You are {name}. The {backend} conversation you were in could not be found on this device, so this is a fresh {backend} session.{work} Your notes and recent quests below are what you remember."
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreshWhy {
+    Overflow,
+    Lost,
+}
+
+impl FreshWhy {
+    pub fn intro(self, name: &str, backend: &str) -> String {
+        match self {
+            FreshWhy::Overflow => fresh_intro(name, backend, None),
+            FreshWhy::Lost => lost_intro(name, backend, false),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartOver {
+    Kept,
+    Forgotten,
+    Retried(Uuid),
 }
 
 pub fn quest_brief(prompt: &str) -> &str {
@@ -474,19 +583,30 @@ impl WorldStore {
     }
 
     pub async fn inherited_context_tokens(&self, main: &AgentSession) -> Result<i64> {
-        if main.context_tokens > 0 {
-            return Ok(main.context_tokens);
+        self.session_context_tokens(main, None).await
+    }
+
+    pub async fn session_context_tokens(&self, session: &AgentSession, before_run: Option<Uuid>) -> Result<i64> {
+        if session.context_tokens > 0 {
+            return Ok(session.context_tokens);
         }
         let bytes: i64 = sqlx::query_scalar(
             "SELECT COALESCE(SUM(octet_length(COALESCE(r.prompt, '')) + octet_length(COALESCE(r.output, ''))), 0)::bigint
              FROM session_runs r
              WHERE r.session_id = $1
-               AND r.created_at > COALESCE(
-                 (SELECT MAX(c.created_at) FROM session_runs c WHERE c.session_id = $1 AND c.prompt = $2),
+               AND r.id IS DISTINCT FROM $3
+               AND r.context_note->>'recovered_by' IS NULL
+               AND r.prompt <> $2
+               AND r.created_at >= COALESCE(
+                 (SELECT MAX(c.created_at) FROM session_runs c
+                  WHERE c.session_id = $1 AND c.id IS DISTINCT FROM $3
+                    AND (c.prompt = $2 OR c.context_path IN ('native', 'checkpoint') OR c.retry_cause = ANY($4))),
                  '-infinity'::timestamptz)",
         )
-        .bind(main.id)
+        .bind(session.id)
         .bind(COMPACT_PROMPT)
+        .bind(before_run)
+        .bind(crate::context_budget::RECOVERY_CAUSES.map(String::from).to_vec())
         .fetch_one(self.pool())
         .await?;
         Ok(estimated_tokens(0, bytes))
@@ -558,129 +678,7 @@ impl WorldStore {
         Ok(ForkChoice::Fresh { used, limit, compacting })
     }
 
-    pub async fn fresh_retry(&self, run_id: Uuid, diagnosis: &crate::run_causes::Diagnosis) -> Result<Option<Uuid>> {
-        if !diagnosis.fork_too_long() {
-            return Ok(None);
-        }
-        let run = sqlx::query_as::<_, (Uuid, Uuid, Option<Uuid>, String, String, Option<Uuid>, Option<String>)>(
-            "SELECT session_id, agent_id, task_id, kind, prompt, fork_from, retry_cause
-             FROM session_runs WHERE id = $1",
-        )
-        .bind(run_id)
-        .fetch_optional(self.pool())
-        .await?;
-        let Some((session_id, agent_id, Some(task_id), kind, prompt, fork_from, retry_cause)) = run else {
-            return Ok(None);
-        };
-        if retry_cause.as_deref() == Some(crate::run_causes::FRESH_RETRY_CAUSE) {
-            return Ok(None);
-        }
-        let Some(agent) = self.get_agent(agent_id).await? else {
-            return Ok(None);
-        };
-        let (memory, prompt, backend) = match (kind.as_str(), fork_from) {
-            ("task", Some(fork_from)) => {
-                let main = sqlx::query_as::<_, (String, i64)>("SELECT backend, context_tokens FROM agent_sessions WHERE id = $1")
-                    .bind(fork_from)
-                    .fetch_optional(self.pool())
-                    .await?;
-                let (backend, used) = main.unwrap_or_else(|| (agent.cli.clone(), 0));
-                let memory = self.fresh_start_memory(&agent, &fresh_intro(&agent.name, &backend, Some(used))).await?;
-                (memory, unforked(&prompt), backend)
-            }
-            ("followup", None) => {
-                let Some((backend, used, brief)) = self.quest_session_brief(session_id, task_id).await? else {
-                    return Ok(None);
-                };
-                let memory = self.fresh_start_memory(&agent, &resume_intro(&agent.name, &backend, used)).await?;
-                (memory, format!("{brief}\n\n{LATEST_FOLLOWUP}\n{prompt}"), backend)
-            }
-            _ => return Ok(None),
-        };
-        let mut tx = self.pool().begin().await?;
-        let status = sqlx::query_scalar::<_, String>("SELECT status FROM agent_tasks WHERE id = $1 FOR UPDATE")
-            .bind(task_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-        let closed = if kind == "task" { &["cancelled", "done"][..] } else { &["cancelled"][..] };
-        if status.is_none_or(|status| closed.contains(&status.as_str())) {
-            return Ok(None);
-        }
-        let retried = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(
-               SELECT 1 FROM session_runs
-               WHERE task_id = $1 AND retry_cause = $2
-                 AND created_at >= (SELECT created_at FROM session_runs WHERE id = $3)
-             )",
-        )
-        .bind(task_id)
-        .bind(crate::run_causes::FRESH_RETRY_CAUSE)
-        .bind(run_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if retried {
-            return Ok(None);
-        }
-        let open = sqlx::query_scalar::<_, String>("SELECT status FROM agent_sessions WHERE id = $1 FOR UPDATE")
-            .bind(session_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .is_some_and(|status| status != "archived");
-        if !open {
-            return Ok(None);
-        }
-        sqlx::query(
-            "UPDATE agent_sessions SET cli_session_id = NULL, usage_baseline = '{}'::jsonb, status = 'active', updated_at = NOW()
-             WHERE id = $1",
-        )
-        .bind(session_id)
-        .execute(&mut *tx)
-        .await?;
-        let id = crate::world::clone_run(
-            &mut tx,
-            run_id,
-            crate::world::RunClone {
-                kind: Some("task"),
-                fork_from: None,
-                prompt: &format!("{memory}\n\n{prompt}"),
-                activity: Some("Starting fresh from notes"),
-                retry_cause: Some(crate::run_causes::FRESH_RETRY_CAUSE),
-                not_before: None,
-                retry: true,
-            },
-        )
-        .await?
-        .id;
-        tx.commit().await?;
-        let compacting = kind == "task"
-            && compact_unsupported(&backend).is_none()
-            && matches!(
-                self.request_compact(&agent, json!({ "origin": "fork_failed", "failed_run_id": run_id })).await?,
-                CompactRequest::Queued | CompactRequest::AlreadyPending
-            );
-        if compacting {
-            let _ = self.announce_context(agent.id).await;
-        }
-        let mut payload = json!({
-            "task_id": task_id,
-            "session_id": session_id,
-            "failed_run_id": run_id,
-            "retry_run_id": id,
-            "fresh": true,
-            "compacting": compacting,
-            "quiet": true,
-        });
-        diagnosis.merge_into(&mut payload);
-        self.emit(
-            NewEvent::new("run.retrying").agent(agent_id).session(session_id).run(id).task(Some(task_id)).payload(payload),
-            None,
-        )
-        .await?;
-        tracing::info!(agent = %agent.slug, %run_id, retry = %id, compacting, "Quest fork was too long, retrying fresh from notes");
-        Ok(Some(id))
-    }
-
-    async fn quest_session_brief(&self, session_id: Uuid, task_id: Uuid) -> Result<Option<(String, i64, String)>> {
+    pub(crate) async fn quest_session_brief(&self, session_id: Uuid, task_id: Uuid) -> Result<Option<(String, i64, String)>> {
         let session = sqlx::query_as::<_, (String, String, i64)>("SELECT role, backend, context_tokens FROM agent_sessions WHERE id = $1")
             .bind(session_id)
             .fetch_optional(self.pool())
@@ -690,11 +688,11 @@ impl WorldStore {
         };
         let first = sqlx::query_scalar::<_, String>(
             "SELECT prompt FROM session_runs
-             WHERE session_id = $1 AND kind = 'task' AND retry_cause IS DISTINCT FROM $2
+             WHERE session_id = $1 AND kind = 'task' AND (retry_cause IS NULL OR retry_cause <> ALL($2))
              ORDER BY created_at LIMIT 1",
         )
         .bind(session_id)
-        .bind(crate::run_causes::FRESH_RETRY_CAUSE)
+        .bind(crate::context_budget::RECOVERY_CAUSES.map(String::from).to_vec())
         .fetch_optional(self.pool())
         .await?;
         let brief = match first {
@@ -942,11 +940,47 @@ mod tests {
             ("codex", 40_000, 120_000, 300_000, 40_000),
             ("omp", 117, 50, 60, 117),
             ("cursor", 0, 12_000, 30_000, 42_000),
-            ("cursor acp", 0, 0, 0, 0),
+            ("cursor", 0, 0, 0, 0),
+            ("claude", 0, 40_000, 90_000, 130_000),
+            ("omp", 0, 40_000, 90_000, 130_000),
+            ("codex", 0, 400_000, 900_000, 0),
         ];
         for (cli, context, input, cached, expected) in cases {
-            assert_eq!(used(context, input, cached), expected, "{cli}");
+            assert_eq!(measured(cli, context, input, cached), expected, "{cli} {context} {input} {cached}");
         }
+    }
+
+    #[test]
+    fn a_block_is_sent_once_per_session_and_again_after_a_change_or_a_fresh_start() {
+        let stored = |sent: &SentContext| Some(sent.to_value());
+        let mut first = SentContext::carried(None, true);
+        assert!(first.offer(SKILLS_BLOCK, "skills v1"), "fresh session");
+        let mut resumed = SentContext::carried(stored(&first).as_ref(), true);
+        assert!(!resumed.offer(SKILLS_BLOCK, "skills v1"), "resumed with the same text");
+        assert!(resumed.offer(SKILLS_BLOCK, "skills v2"), "resumed after a real change");
+        let mut forked = SentContext::carried(stored(&resumed).as_ref(), resumes_same_session(true, true, false));
+        assert!(forked.offer(SKILLS_BLOCK, "skills v2"), "fork is a new CLI session");
+        let mut rewound = SentContext::carried(stored(&resumed).as_ref(), resumes_same_session(true, false, true));
+        assert!(rewound.offer(SKILLS_BLOCK, "skills v2"), "rewind may drop what was sent");
+        let mut fresh = SentContext::carried(stored(&resumed).as_ref(), resumes_same_session(false, false, false));
+        assert!(fresh.offer(SKILLS_BLOCK, "skills v2"), "new or reset CLI session");
+        let mut compacted = SentContext::carried(Some(&json!({})), true);
+        assert!(compacted.offer(SKILLS_BLOCK, "skills v2"), "compaction forgets what was sent");
+        let mut other_block = SentContext::carried(stored(&resumed).as_ref(), true);
+        assert!(other_block.offer(INSTRUCTIONS_BLOCK, "skills v2"), "blocks are tracked apart");
+        let mut empty = SentContext::default();
+        assert!(!empty.offer(SKILLS_BLOCK, "  "), "nothing to send");
+    }
+
+    #[test]
+    fn stored_sent_context_keeps_only_known_blocks_with_real_hashes() {
+        let hash = block_hash("x");
+        let sent = SentContext::from_value(&json!({
+            "skills": hash, "instructions": "short", "other": hash, "rules": 3
+        }));
+        assert_eq!(sent.to_value(), json!({ "skills": hash }));
+        assert_eq!(SentContext::from_value(&json!(null)), SentContext::default());
+        assert_eq!(sent.only(INSTRUCTIONS_BLOCK), SentContext::default());
     }
 
     fn inbox(id: i64, kind: &str) -> InboxItem {

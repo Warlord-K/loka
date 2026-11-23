@@ -838,6 +838,14 @@ pub struct WantedKeys {
 impl WorldStore {
     pub async fn transfer_agent(&self, agent_id: Uuid, to_user: Uuid) -> Result<std::result::Result<(Uuid, Vec<String>), TransferRefusal>> {
         let mut tx = self.pool().begin().await?;
+        let Some(org) = sqlx::query_scalar::<_, Uuid>("SELECT org_id FROM agent_profiles WHERE id = $1")
+            .bind(agent_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        else {
+            return Ok(Err(TransferRefusal::NotFound));
+        };
+        crate::orgs::lock_org_parent(&mut tx, org).await?;
         let row: Option<(Option<Uuid>, Option<Uuid>, bool)> = sqlx::query_as(
             "SELECT owner_user_id, runner_id,
                     EXISTS (SELECT 1 FROM users u WHERE u.main_agent_id = a.id) OR EXISTS (SELECT 1 FROM org_members m WHERE m.main_agent_id = a.id)

@@ -25,7 +25,7 @@ pub const TOOLS: &[&str] = &["pen", "pencil", "marker", "eraser"];
 pub const FOLDER: &str = "Practice";
 pub const TAG: &str = "practice";
 pub const NO_COACH: &str = "Pick a coach for this practice first.";
-pub const NOT_PRACTICE: &str = "This canvas is not a practice canvas.";
+pub const NOT_PRACTICE: &str = "This workspace is not a practice workspace.";
 pub const NOT_YOUR_AGENT: &str = "The coach must be one of your own agents.";
 pub const NOT_AN_IMAGE: &str = "Upload the drawing as a PNG, JPEG, GIF or WebP image first, then send its upload id.";
 pub const TOO_BIG: &str = "Stroke data is at most 2 MB once saved; send fewer points.";
@@ -233,7 +233,7 @@ pub fn parse_strokes(value: &Value) -> Result<Strokes> {
         .map_err(|e| anyhow!("Strokes are {{width, height, strokes: [{{tool, color, size, points: [{{x, y, p, t}}]}}]}}: {e}"))?;
     let side = |v: f64| v.is_finite() && v > 0.0 && v <= MAX_SIDE;
     if !side(strokes.width) || !side(strokes.height) {
-        bail!("Canvas width and height are between 1 and {MAX_SIDE}.");
+        bail!("The drawing width and height are between 1 and {MAX_SIDE}.");
     }
     if strokes.strokes.len() > MAX_STROKES {
         bail!("An attempt has at most {MAX_STROKES} strokes.");
@@ -259,7 +259,7 @@ pub fn parse_strokes(value: &Value) -> Result<Strokes> {
         total += stroke.points.len();
         let far = MAX_SIDE * 2.0;
         if stroke.points.iter().any(|p| !(p.x.is_finite() && p.y.is_finite() && p.x.abs() <= far && p.y.abs() <= far)) {
-            bail!("Stroke {n} has a point outside the canvas.");
+            bail!("Stroke {n} has a point outside the drawing area.");
         }
         if stroke.points.iter().any(|p| !(p.p.is_finite() && (0.0..=1.0).contains(&p.p))) {
             bail!("Stroke {n} pressure p is between 0 and 1.");
@@ -323,7 +323,7 @@ pub fn stroke_line(index: usize, stroke: &Stroke, diagonal: f64) -> String {
 
 pub fn stroke_summary(strokes: &Strokes) -> String {
     if strokes.strokes.is_empty() {
-        return format!("No strokes on a {:.0}x{:.0} canvas (only the picture).", strokes.width, strokes.height);
+        return format!("No strokes in a {:.0}x{:.0} drawing area (only the picture).", strokes.width, strokes.height);
     }
     let diagonal = strokes.width.hypot(strokes.height);
     let mut tools: Vec<(String, usize)> = Vec::new();
@@ -336,7 +336,7 @@ pub fn stroke_summary(strokes: &Strokes) -> String {
     let tools: Vec<String> = tools.iter().map(|(t, n)| format!("{t} {n}")).collect();
     let span = strokes.strokes.iter().flat_map(|s| s.points.iter().map(|p| p.t)).fold(0.0_f64, f64::max);
     let mut lines = vec![format!(
-        "{} strokes on a {:.0}x{:.0} canvas ({}), drawn over {:.1} s, in drawing order (y grows downward):",
+        "{} strokes in a {:.0}x{:.0} drawing area ({}), drawn over {:.1} s, in drawing order (y grows downward):",
         strokes.strokes.len(),
         strokes.width,
         strokes.height,
@@ -577,7 +577,7 @@ impl WorldStore {
             report = self
                 .update_report(id, ReportActor::User(owner), &ReportPatch { title: Some(title), ..Default::default() })
                 .await?
-                .ok_or_else(|| anyhow!("That practice canvas is gone."))?;
+                .ok_or_else(|| anyhow!("That practice workspace is gone."))?;
         }
         let next = Practice { subject: clean_subject(skill)?, coach_agent_id: coach.unwrap_or(current.coach_agent_id) };
         if next != current {
@@ -623,7 +623,7 @@ impl WorldStore {
             let current: Option<Uuid> = sqlx::query_scalar("SELECT challenge_id FROM world_reports WHERE id = $1").bind(report.id).fetch_optional(self.pool()).await?.flatten();
             return match current {
                 Some(id) => self.get_item(id).await?.ok_or_else(|| anyhow!("that lesson is gone")),
-                None => bail!("That practice canvas is gone."),
+                None => bail!("That practice workspace is gone."),
             };
         }
         tx.commit().await?;
@@ -799,7 +799,7 @@ impl WorldStore {
             report = self
                 .update_report(report.id, by, &ReportPatch { title: Some(title.to_string()), ..Default::default() })
                 .await?
-                .ok_or_else(|| anyhow!("That practice canvas is gone."))?;
+                .ok_or_else(|| anyhow!("That practice workspace is gone."))?;
         }
         let next = Practice { subject: subject.clone(), coach_agent_id: coach.or(current.coach_agent_id) };
         if next != current {
@@ -953,7 +953,7 @@ impl WorldStore {
         if lesson.status == "archived" {
             bail!(LESSON_REMOVED);
         }
-        let report = &self.get_report(report.id).await?.ok_or_else(|| anyhow!("That practice canvas is gone."))?;
+        let report = &self.get_report(report.id).await?.ok_or_else(|| anyhow!("That practice workspace is gone."))?;
         let coach = self.current_coach(report, &practice).await?;
         let mut tx = self.pool().begin().await?;
         sqlx::query("SELECT id FROM world_items WHERE id = $1 FOR UPDATE").bind(lesson.id).execute(&mut *tx).await?;
@@ -986,7 +986,7 @@ impl WorldStore {
             .bind(id)
             .bind(user)
             .bind(lesson.id)
-            .bind(note.clone().unwrap_or_else(|| format!("Canvas attempt {n}")))
+            .bind(note.clone().unwrap_or_else(|| format!("Workspace attempt {n}")))
             .bind(coach)
             .execute(&mut *tx)
             .await?;
@@ -1187,7 +1187,7 @@ impl WorldStore {
             match found {
                 None => bail!("No practice attempt {attempt}."),
                 Some((status, _, n)) if status == "checked" => bail!("Attempt {n} is already checked; each attempt gets one check. Wait for the next practice.ready."),
-                Some((_, None, _)) => bail!("Attempt {attempt} lost its coach; only the canvas's current coach can check it."),
+                Some((_, None, _)) => bail!("Attempt {attempt} lost its coach; only the workspace's current coach can check it."),
                 Some(_) => bail!("Attempt {attempt} was sent to another coach."),
             }
         };
@@ -1200,7 +1200,7 @@ impl WorldStore {
         };
         sqlx::query(
             "INSERT INTO challenge_attempts (id, user_id, challenge_id, answer, grader_agent_id)
-             SELECT a.id, a.user_id, r.challenge_id, COALESCE(NULLIF(btrim(a.note), ''), 'Canvas attempt ' || a.n), $2
+             SELECT a.id, a.user_id, r.challenge_id, COALESCE(NULLIF(btrim(a.note), ''), 'Workspace attempt ' || a.n), $2
              FROM world_practice_attempts a JOIN world_reports r ON r.id = a.report_id
              WHERE a.id = $1 AND r.challenge_id IS NOT NULL
              ON CONFLICT DO NOTHING",
@@ -1341,7 +1341,7 @@ mod tests {
             line(vec![point(100.0, 100.0, 1500.0), point(200.0, 100.0, 1600.0), point(200.0, 200.0, 1700.0), point(100.0, 200.0, 1800.0), point(100.0, 110.0, 1900.0)]),
         ] });
         let summary = stroke_summary(&parse_strokes(&raw).unwrap());
-        assert!(summary.starts_with("5 strokes on a 400x400 canvas (pen 5), drawn over 1.9 s"), "{summary}");
+        assert!(summary.starts_with("5 strokes in a 400x400 drawing area (pen 5), drawn over 1.9 s"), "{summary}");
         assert!(summary.contains("1. pen left to right, 2 points, (50, 100) to (350, 102), length 300"));
         assert!(summary.contains("2. pen top to bottom"));
         assert!(summary.contains("3. pen down-left"));

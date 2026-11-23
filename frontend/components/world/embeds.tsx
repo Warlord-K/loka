@@ -1,13 +1,14 @@
 "use client";
 
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { ArrowSquareOut, Books, Buildings, CheckSquare, FileText, FlowArrow, Hash, ListChecks, MapTrifold, Square, Student, Timer, UserCircle, UsersThree } from "@phosphor-icons/react";
+import { ArrowSquareOut, Books, Buildings, CalendarDots, CheckSquare, Devices, FileText, FlowArrow, Hash, ListChecks, MapTrifold, Square, Student, Terminal, Timer, UserCircle, UsersThree } from "@phosphor-icons/react";
 import { latestOnly } from "@/lib/latest";
+import { externalFeatureHref, featureLinkFromHref } from "@/lib/feature-links";
 import { cn, safeDecode } from "@/lib/utils";
-import { messageTime, dayLabel, worldApi, type ChannelSummary, type TaskBrief, type Todo, type WorldAgent, type WorldEvent } from "@/lib/world";
+import { messageTime, dayLabel, prActionState, worldApi, type ChannelSummary, type TaskBrief, type Todo, type WorldAgent, type WorldEvent } from "@/lib/world";
 import { AgentFace } from "./channel-ui";
 import { MessageLink, messageRefFromHref, openWorldLink, worldRefFromHref } from "./message-links";
-import { SetupCard } from "./setup-hint";
+import { requestSetup, SetupCard } from "./setup-hint";
 import { SlackMark } from "./panels";
 import { StatusIcon } from "./quest-ui";
 import { countdown, focusTodo, isTimerTodo } from "./todos-ui";
@@ -19,8 +20,12 @@ import { openAcademy, type AdventureCard, type ChallengeDetail, type RegionDetai
 import { lokaApi } from "./loka-client";
 import { EMBED_DRAG, embedDragData } from "@/lib/canvas-embeds";
 import { QUEST_STAGE_LABEL, questStage } from "@/lib/quest-status";
+import { summaryText } from "@/lib/quest-board";
 import { useLiveQuests } from "./live-quests";
 import { Shimmer } from "./shimmer";
+import { OPEN_WORKSPACE } from "@/lib/workspace-layout";
+import { OpenWorkshop } from "./workbench/open-workshop";
+import { OPEN_TERMINAL_EVENT } from "./run-command";
 
 const REF_SOURCE = "ch\\d{1,18}|[0-9a-fA-F][0-9a-fA-F-]{5,35}";
 const ID_SOURCE = "[0-9a-fA-F][0-9a-fA-F-]{5,35}";
@@ -38,9 +43,13 @@ export type Embed =
   | { kind: "todo"; ref: string }
   | { kind: "quest"; ref: string }
   | { kind: "report"; ref: string; item?: string }
+  | { kind: "workspace"; ref: string; item?: string }
+  | { kind: "workbench"; sessionId: string }
+  | { kind: "open"; target: "terminal" | "devices" }
   | { kind: "practice"; ref: string }
   | { kind: "team" | "list" | "place" | "region"; ref: string }
   | { kind: "challenge" | "course"; ref: string }
+  | { kind: "schedule"; ref: string }
   | { kind: "agent"; ref: string }
   | { kind: "setup"; key: string }
   | { kind: "channel"; id: string }
@@ -61,20 +70,28 @@ function titleFromSlug(slug?: string): string {
 
 export function embedFromHref(href?: string | null): Embed | null {
   if (!href) return null;
+  if (typeof window !== "undefined") {
+    const feature = featureLinkFromHref(href, window.location.origin);
+    if (feature?.kind === "workbench") return feature;
+    if (feature?.kind === "workspace") return { kind: "workspace", ref: feature.reportId, item: feature.item };
+    if (externalFeatureHref(href)) return null;
+  }
   const msg = messageRefFromHref(href);
   if (msg) return { kind: "msg", ref: msg };
   const linked = worldRefFromHref(href);
   if (linked) return linked;
   const setup = href.match(SETUP);
   if (setup) return { kind: "setup", key: setup[1].toLowerCase().replace(/-/g, "_") };
+  const open = href.match(/^open:(terminal|devices)$/i);
+  if (open) return { kind: "open", target: open[1].toLowerCase() as "terminal" | "devices" };
   const item = href.match(new RegExp(`^report:(${ID_SOURCE})(${ITEM_SOURCE})$`, "i"));
   if (item) return { kind: "report", ref: item[1].toLowerCase(), item: item[2].slice(1) };
   const agent = href.match(/^agent:([A-Za-z0-9][A-Za-z0-9_-]{0,63})$/i);
   if (agent) return { kind: "agent", ref: agent[1].toLowerCase() };
-  const scheme = href.match(/^(todo|quest|report|practice|team|list|place|region|challenge|course):(.+)$/i);
+  const scheme = href.match(/^(todo|quest|report|practice|team|list|place|region|challenge|course|schedule):(.+)$/i);
   if (scheme) {
-    const kind = scheme[1].toLowerCase() as "todo" | "quest" | "report" | "practice" | "team" | "list" | "place" | "region" | "challenge" | "course";
-    const valid = kind === "practice" ? ATTEMPT_ID : ["team", "list", "place", "region", "challenge", "course"].includes(kind) ? EXACT_ID : ID;
+    const kind = scheme[1].toLowerCase() as "todo" | "quest" | "report" | "practice" | "team" | "list" | "place" | "region" | "challenge" | "course" | "schedule";
+    const valid = kind === "practice" ? ATTEMPT_ID : ["team", "list", "place", "region", "challenge", "course", "schedule"].includes(kind) ? EXACT_ID : ID;
     return valid.test(scheme[2]) ? { kind, ref: scheme[2].toLowerCase() } : null;
   }
   if (href.startsWith("#channel-")) return { kind: "channel", id: href.slice(9) };
@@ -88,14 +105,15 @@ export function embedFromHref(href?: string | null): Embed | null {
 }
 
 export function allowedEmbedUrl(url: string): boolean {
-  return /^(msg|todo|quest|report|practice|team|list|place|region|challenge|course):/i.test(url) || SETUP.test(url) || url.startsWith("#channel-");
+  return /^(msg|todo|quest|report|practice|team|list|place|region|challenge|course|schedule):/i.test(url) || /^open:(terminal|devices)$/i.test(url) || SETUP.test(url) || url.startsWith("#channel-");
 }
 
 const SETUP = /^setup:([a-z][a-z_-]{1,31})$/i;
-const CARD_LINE = new RegExp(`^([ \\t]*)((?:msg|todo|quest|report):(?:${REF_SOURCE})(?:${ITEM_SOURCE})?|(?:team|list|place|region|challenge|course):(?:${EXACT_ID_SOURCE})|practice:(?:${ATTEMPT_ID_SOURCE})|setup:[A-Za-z][A-Za-z_-]{1,31}|https?:\\/\\/\\S+)[ \\t]*$`, "gm");
+const CARD_LINE = new RegExp(`^([ \\t]*)((?:msg|todo|quest|report):(?:${REF_SOURCE})(?:${ITEM_SOURCE})?|(?:team|list|place|region|challenge|course|schedule):(?:${EXACT_ID_SOURCE})|practice:(?:${ATTEMPT_ID_SOURCE})|setup:[A-Za-z][A-Za-z_-]{1,31}|open:(?:terminal|devices)|https?:\\/\\/\\S+)[ \\t]*$`, "gim");
 const BARE = new RegExp(`(^|[\\s(])(msg|todo|quest|report):(${REF_SOURCE})(${ITEM_SOURCE})?`, "gi");
-const WORLD_BARE = new RegExp(`(^|[\\s(])(team|list|place|region|challenge|course):(${EXACT_ID_SOURCE})(?![0-9a-fA-F-])`, "gi");
+const WORLD_BARE = new RegExp(`(^|[\\s(])(team|list|place|region|challenge|course|schedule):(${EXACT_ID_SOURCE})(?![0-9a-fA-F-])`, "gi");
 const PRACTICE_BARE = new RegExp(`(^|[\\s(])practice:(${ATTEMPT_ID_SOURCE})(?![0-9a-fA-F-])`, "gi");
+const OPEN_BARE = /(^|[\s(])open:(terminal|devices)(?![A-Za-z0-9_-])/gi;
 const CHANNEL = /(^|[\s(])#([A-Za-z][\w-]{0,79})/g;
 
 export function linkEmbeds(text: string, channels: Map<string, string>): string {
@@ -113,6 +131,7 @@ export function linkEmbeds(text: string, channels: Map<string, string>): string 
       lead === "(" && all[offset - 1] === "]" ? whole : `${lead}[${scheme}:${ref}](${scheme.toLowerCase()}:${ref})`,
     )
     .replace(PRACTICE_BARE, (whole, lead: string, ref: string, offset: number, all: string) => (lead === "(" && all[offset - 1] === "]" ? whole : `${lead}[practice:${ref}](practice:${ref})`))
+    .replace(OPEN_BARE, (whole, lead: string, target: string, offset: number, all: string) => (lead === "(" && all[offset - 1] === "]" ? whole : `${lead}[open:${target}](open:${target.toLowerCase()})`))
     .replace(CHANNEL, (whole, lead: string, name: string) => {
       const id = channels.get(name.toLowerCase());
       return id ? `${lead}[#${name}](#channel-${id})` : whole;
@@ -324,16 +343,28 @@ function QuestBadge({ quest }: { quest: TaskBrief }) {
 
 function QuestEmbed({ refId, label, card }: { refId: string; label?: string; card: boolean }) {
   const quests = useLiveQuests();
+  const agents = useLoaded(agentsOnce, "agents");
   if (!quests) return <Shell card={card} icon={<StatusIcon status="todo" size={12} />} label={label || "quest"} />;
   const quest = quests.find((q) => matchesId(q.id, refId));
   if (!quest) return <Missing label={label || "a quest you cannot open"} />;
+  const lead = agents?.find((a) => a.id === quest.assigned_agent_id)?.name;
+  const summary = summaryText(quest.decisions, lead);
   return (
     <Shell
       card={card}
       icon={<StatusIcon status={quest.status} size={12} />}
       label={label || quest.title}
       byline={<QuestBadge quest={quest} />}
-      body={quest.title}
+      body={
+        summary ? (
+          <>
+            <span className="block">{quest.title}</span>
+            <span className={cn("mt-0.5 block text-w-xs", quest.decisions?.passed_up ? "font-semibold text-w-alert" : "text-w-muted")}>{summary}</span>
+          </>
+        ) : (
+          quest.title
+        )
+      }
       drag={embedDragData({ kind: "quest", target: quest.id }, quest.title)}
       onClick={() =>
         window.dispatchEvent(new CustomEvent("world:open-quest", { detail: { taskId: quest.id, agentId: quest.assigned_agent_id } }))
@@ -407,11 +438,54 @@ function WorldTargetEmbed({ kind, refId, label, card }: { kind: "team" | "list" 
   return <Shell card={card} icon={icon} label={label || name} byline={`${kind[0].toUpperCase()}${kind.slice(1)} · ${detail}`} body={name} onClick={() => openWorldLink(kind, refId)} />;
 }
 
+function ScheduleEmbed({ refId, label, card }: { refId: string; label?: string; card: boolean }) {
+  const [state, setState] = useState<{ key: string; found: Awaited<ReturnType<typeof worldApi.schedule>> | null } | null>(null);
+  useEffect(() => {
+    const reads = latestOnly();
+    const load = () => {
+      const isLatest = reads.begin();
+      void worldApi
+        .schedule(refId)
+        .then((found) => isLatest() && setState({ key: refId, found }))
+        .catch(() => isLatest() && setState({ key: refId, found: null }));
+    };
+    const onEvent = (event: Event) => {
+      const ev = (event as CustomEvent<WorldEvent>).detail;
+      if ((ev.type.startsWith("action.") || ev.type === "schedule.updated") && ev.payload.schedule_id === refId.toLowerCase()) load();
+    };
+    load();
+    window.addEventListener("world-event", onEvent);
+    window.addEventListener("world-reconnected", load);
+    return () => {
+      reads.begin();
+      window.removeEventListener("world-event", onEvent);
+      window.removeEventListener("world-reconnected", load);
+    };
+  }, [refId]);
+  const found = state?.key === refId ? state.found : undefined;
+  const icon = <CalendarDots size={12} weight="bold" />;
+  if (found === undefined) return <Shell card={card} icon={icon} label={label || "schedule"} />;
+  if (!found) return <Missing label={label || "a schedule you cannot open"} />;
+  const { schedule, agent } = found;
+  const action = schedule.kind === "action";
+  const detail = action ? prActionState(schedule).text : schedule.enabled ? "On" : "Paused";
+  return (
+    <Shell
+      card={card}
+      icon={icon}
+      label={label || schedule.name}
+      byline={`${action ? "Pull request action" : "Routine"} · ${agent.name}`}
+      body={detail}
+      onClick={() => window.dispatchEvent(new CustomEvent("world:open-schedule", { detail: { agentId: agent.id, id: schedule.id } }))}
+    />
+  );
+}
+
 type AcademyRef = { title: string; byline: string; body: string };
 
 function lessonRef(d: ChallengeDetail): AcademyRef {
   const c = d.card;
-  const kind = c.type === "canvas" ? "Canvas lesson" : c.type === "reading" ? "Reading lesson" : "Lesson";
+  const kind = c.type === "canvas" ? "Practice workspace lesson" : c.type === "reading" ? "Reading lesson" : "Lesson";
   const state = c.state === "passed" ? "passed" : c.attempts > 0 ? `${c.attempts} ${c.attempts === 1 ? "attempt" : "attempts"}` : `${c.xp} xp`;
   return { title: c.title, byline: `${kind} · ${subjectLabel(c.skill)} · ${state}`, body: c.title };
 }
@@ -557,26 +631,26 @@ function CanvasItemEmbed({ report, itemId, label, card }: { report: ReportBrief;
           className="inline-flex items-center gap-1 self-start rounded-md px-1 text-w-xs font-semibold text-w-link hover:bg-w-sand"
         >
           <FlowArrow size={11} weight="bold" />
-          On canvas {report.title}
+          In workspace {report.title}
         </button>
       </span>
     );
   const what = item ? canvasItemKind(item) : "Item";
-  const text = item ? canvasItemLabel(item) || what : item === null ? "This item is no longer on the canvas" : "";
+  const text = item ? canvasItemLabel(item) || what : item === null ? "This item is no longer in the workspace" : "";
   return (
     <Shell
       card={card}
       icon={<FlowArrow size={12} weight="bold" />}
       label={label || `${what} on ${report.title}`}
       muted={item === null}
-      byline={[`${what} on canvas`, report.title].join(" · ")}
+      byline={[`${what} in workspace`, report.title].join(" · ")}
       body={text || undefined}
       onClick={() => openReport(report.id, itemId)}
     />
   );
 }
 
-function ReportEmbed({ refId, item, label, card }: { refId: string; item?: string; label?: string; card: boolean }) {
+function ReportEmbed({ refId, item, workspace = false, label, card }: { refId: string; item?: string; workspace?: boolean; label?: string; card: boolean }) {
   const [state, setState] = useState<{ ref: string; report: ReportBrief | null } | null>(() => (reportSeen.has(refId) ? { ref: refId, report: reportSeen.get(refId) ?? null } : null));
   useEffect(() => {
     let live = true;
@@ -591,9 +665,21 @@ function ReportEmbed({ refId, item, label, card }: { refId: string; item?: strin
   if (!report) return <Missing label={label || "a report you cannot open"} />;
   const canvas = report.kind === "canvas";
   if (report.practice) return <PracticeReportEmbed report={report} label={label} card={card} />;
+  if (canvas && workspace) {
+    return (
+      <Shell
+        card={card}
+        icon={<FlowArrow size={12} weight="bold" />}
+        label={label || "Open workspace"}
+        byline={`Workspace · ${report.item_count} ${report.item_count === 1 ? "item" : "items"}`}
+        body={report.title}
+        onClick={() => window.dispatchEvent(new CustomEvent(OPEN_WORKSPACE, { detail: { id: report.id, item } }))}
+      />
+    );
+  }
   if (canvas && item) return <CanvasItemEmbed report={report} itemId={item} label={label} card={card} />;
   const what = canvas
-    ? [`Canvas · ${report.item_count} ${report.item_count === 1 ? "item" : "items"}`, report.open_marks ? `${report.open_marks} open ${report.open_marks === 1 ? "mark" : "marks"}` : null]
+    ? [`Workspace · ${report.item_count} ${report.item_count === 1 ? "item" : "items"}`, report.open_marks ? `${report.open_marks} open ${report.open_marks === 1 ? "mark" : "marks"}` : null]
     : ["Report"];
   return (
     <Shell
@@ -608,6 +694,24 @@ function ReportEmbed({ refId, item, label, card }: { refId: string; item?: strin
         </>
       }
       onClick={() => openReport(report.id)}
+    />
+  );
+}
+
+function WorkbenchEmbed({ sessionId, label }: { sessionId: string; label?: string }) {
+  return <OpenWorkshop detail={{ sessionId, diff: true }} label={label || "View changes"} />;
+}
+
+function OpenEmbed({ target, label, card }: { target: "terminal" | "devices"; label?: string; card: boolean }) {
+  const terminal = target === "terminal";
+  return (
+    <Shell
+      card={card}
+      icon={terminal ? <Terminal size={12} weight="bold" /> : <Devices size={12} weight="bold" />}
+      label={label || (terminal ? "Open terminal" : "Open devices")}
+      byline={terminal ? "Terminal" : "Devices"}
+      body={terminal ? "Open a terminal on your Mac" : "Open your connected devices"}
+      onClick={() => terminal ? window.dispatchEvent(new CustomEvent(OPEN_TERMINAL_EVENT)) : requestSetup("devices")}
     />
   );
 }
@@ -868,6 +972,12 @@ export function EmbedView({ embed, label, card }: { embed: Embed; label?: string
       return <AgentEmbed refId={embed.ref} label={label} card={card} />;
     case "report":
       return <ReportEmbed refId={embed.ref} item={embed.item} label={label} card={card} />;
+    case "workspace":
+      return <ReportEmbed refId={embed.ref} item={embed.item} workspace label={label} card={card} />;
+    case "workbench":
+      return <WorkbenchEmbed sessionId={embed.sessionId} label={label} />;
+    case "open":
+      return <OpenEmbed target={embed.target} label={label} card={card} />;
     case "practice":
       return <PracticeEmbed refId={embed.ref} label={label} card={card} />;
     case "team":
@@ -878,6 +988,8 @@ export function EmbedView({ embed, label, card }: { embed: Embed; label?: string
     case "challenge":
     case "course":
       return <AcademyEmbed kind={embed.kind} refId={embed.ref} label={label} card={card} />;
+    case "schedule":
+      return <ScheduleEmbed refId={embed.ref} label={label} card={card} />;
     case "setup":
       return <SetupCard featureKey={embed.key} />;
     case "channel":

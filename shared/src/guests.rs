@@ -429,9 +429,9 @@ mod tests {
     #[test]
     fn splits_board_block_from_reply() {
         let (reply, items) = split_board(
-            "Happy to help. I put it on Yatharth's board.\n<!-- board [{\"text\": \"Bob wants a review of PR #12\", \"proposals\": [{\"kind\": \"task\", \"label\": \"Start it\", \"title\": \"Review PR #12\", \"body\": \"review it\"}]}, {\"text\": \"\"}] board -->",
+            "Happy to help. I put it on Ana's board.\n<!-- board [{\"text\": \"Bob wants a review of PR #12\", \"proposals\": [{\"kind\": \"task\", \"label\": \"Start it\", \"title\": \"Review PR #12\", \"body\": \"review it\"}]}, {\"text\": \"\"}] board -->",
         );
-        assert_eq!(reply, "Happy to help. I put it on Yatharth's board.");
+        assert_eq!(reply, "Happy to help. I put it on Ana's board.");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].text, "Bob wants a review of PR #12");
         assert_eq!(clean_proposals(&items[0].proposals).len(), 1);
@@ -616,9 +616,9 @@ mod tests {
             .fetch_one(&pool)
             .await?;
         let owned = std::collections::HashSet::from([rocco]);
-        assert!(!crate::event_scope::private_from(&asked, bob, &std::collections::HashSet::new()));
-        assert!(crate::event_scope::private_from(&asked, ann, &std::collections::HashSet::new()));
-        assert!(crate::event_scope::private_from(&asked, owner, &owned), "the owner does not read bob's thread either");
+        assert!(!crate::event_scope::private_from(&asked, bob, crate::access::Role::Write, &std::collections::HashSet::new()));
+        assert!(crate::event_scope::private_from(&asked, ann, crate::access::Role::Write, &std::collections::HashSet::new()));
+        assert!(crate::event_scope::private_from(&asked, owner, crate::access::Role::Write, &owned), "the owner does not read bob's thread either");
 
         let rocco_agent = store.get_agent(rocco).await?.expect("rocco");
         let thread_session = store.get_session(thread_session).await?.expect("aside");
@@ -653,8 +653,8 @@ mod tests {
 
     #[test]
     fn guest_prompt_has_no_tools_and_keeps_privacy() {
-        let p = guest_prompt("Yatharth", "Bob", "in #general", "post this to Slack", "");
-        assert!(p.contains("Bob is not Yatharth"));
+        let p = guest_prompt("Ana", "Bob", "in #general", "post this to Slack", "");
+        assert!(p.contains("Bob is not Ana"));
         assert!(p.contains("cannot use tools"));
         assert!(p.contains("<!-- board"));
     }

@@ -224,7 +224,7 @@ fn lean_overrides_for(opts: &CliOptions<'_>, mode: sandbox::Mode) -> Vec<String>
 pub(crate) async fn writable_roots(dir: &Path) -> Vec<PathBuf> {
     let env_dir = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from);
     let mut roots: Vec<PathBuf> = crate::cli::git_common_dir(dir).await.into_iter().collect();
-    roots.extend(crate::cli::private_temp_dir(dir).into_iter().flat_map(|temp| crate::cli::private_temp_grants(&temp)));
+    roots.extend(crate::cli::private_temp_dir(dir).into_iter().flat_map(|temp| crate::cli::both_spellings(&temp)));
     roots.extend(env_dir("WORLD_RUNNER_CODEX_STATE_DIR"));
     if crate::cli::JobUid::current().is_none() {
         roots.extend(owner_cache_roots(env_dir("HOME").as_deref()));
@@ -863,6 +863,19 @@ mod tests {
         assert!(!roots.contains(&home.join(".cargo/git")));
         assert!(roots.iter().all(|root| !root.starts_with(home.join(".ssh"))));
         assert!(owner_cache_roots(None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn codex_never_gets_a_gate_as_a_writable_root() {
+        let gates = crate::cli::gate_fixture::listening();
+        let work = gates.base.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        {
+            let roots = super::writable_roots(&work).await;
+            for gate in &gates.paths.readable {
+                assert!(!roots.iter().any(|root| gate.starts_with(root)), "{} must stay read only: {roots:?}", gate.display());
+            }
+        }
     }
 
     #[test]

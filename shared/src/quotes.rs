@@ -53,6 +53,13 @@ impl WorldStore {
         let Some(mut quote) = clean(raw) else { return Ok(None) };
         let reference = quote.get("source").and_then(Value::as_str).and_then(|source| source.split_once(':'));
         let visible = match reference {
+            Some(("msg", id)) => match self.resolve_message(id, None).await? {
+                Some(message) if message.task_id.is_some() => match message.reference.parse() {
+                    Ok(message_id) => self.sees_message_as(message_id, viewer).await?,
+                    Err(_) => false,
+                },
+                _ => true,
+            },
             Some(("team", id)) => self.team_visible_to(viewer.user, id.parse()?).await?.is_some(),
             Some(("list", id)) => self
                 .item_for_viewer(id.parse()?, viewer.user, viewer.org(), viewer.role == Role::Admin)

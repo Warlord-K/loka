@@ -1,5 +1,6 @@
 import type { Accessory, Trade, LokaLook, Resident, LokaShopStyle } from "@/components/world/types";
 import { gearAccessories, hash, lookFor, pick, text } from "./looks";
+import type { Asking, DecisionStatus, DecisionSummary, MixSlot, Party, QuestionMeta, RoomAsking, RoomMember, RoomMessageKind } from "./quest-board";
 
 export { lookFor };
 
@@ -73,6 +74,8 @@ export interface WorldAgent {
   revoked_powers: string[];
   approval_mode?: ApprovalMode;
   quest_context?: QuestContext;
+  asking?: Asking;
+  crew_variants?: MixSlot[] | null;
   reviewer?: ReviewerChoice | null;
   paused_reason?: string | null;
   archived_at?: string | null;
@@ -206,6 +209,11 @@ export interface AgentMessage {
   edited_at?: string | null;
   session_role: string | null;
   meta: MessageMeta | null;
+  kind?: RoomMessageKind | null;
+  decision_status?: DecisionStatus | null;
+  answered_by?: Party | null;
+  routes_to?: Party | null;
+  asked_by_session?: string | null;
   reply_to?: string | null;
   reply_count?: number;
   last_reply_at?: string | null;
@@ -289,6 +297,13 @@ export interface MessageMeta {
   watching?: boolean;
   merged?: boolean;
   answers?: string;
+  answers_question?: string;
+  refs?: string[];
+  question?: QuestionMeta;
+  suggestion?: string | null;
+  why?: string | null;
+  room_only?: boolean;
+  early_answer?: { text: string; by: Party | null } | null;
   shell_run_id?: string;
   command?: string;
   device?: string;
@@ -413,7 +428,7 @@ export interface WorldEvent {
 export interface SessionBrief {
   id: string;
   agent_id: string;
-  role: "main" | "task" | "aside" | "review" | "designer" | "direct";
+  role: "main" | "task" | "aside" | "review" | "designer" | "direct" | "action";
   backend: string;
   model: string;
   status: string;
@@ -608,6 +623,7 @@ export interface WorldRule {
   body: string;
   enabled: boolean;
   position: number;
+  github_repos?: string[];
 }
 
 export interface EnvironmentEntry {
@@ -760,7 +776,31 @@ export interface AgentSchedule {
   run_at: string | null;
   next_run_at: string | null;
   enabled: boolean;
-  kind?: "routine" | "heartbeat";
+  kind?: "routine" | "heartbeat" | "action";
+  task_id?: string | null;
+  action?: { kind: "merge" | "delete_branch" | "close" | "rerun_checks"; repo: string; number: number; sha: string; check?: string };
+  on_event?: "task.finished" | "task.merged" | "task.pr_closed";
+  fired?: { type: string; at?: string };
+  outcome?: { status: "ran" | "skipped" | "failed"; reason: string; merge_sha?: string | null; at?: string };
+  run_id?: string | null;
+}
+
+const ACTION_EVENT_WORDS: Record<string, string> = {
+  "task.finished": "the quest finishes its review",
+  "task.merged": "the pull request merges",
+  "task.pr_closed": "the pull request closes unmerged",
+};
+
+export function prActionState(s: AgentSchedule): { tone: "ok" | "warn" | "danger" | "muted"; text: string } {
+  const o = s.outcome;
+  if (o?.status === "ran") return { tone: "ok", text: `Ran${o.merge_sha ? `, merge commit ${o.merge_sha.slice(0, 8)}` : ""}${o.reason ? `: ${o.reason}` : ""}` };
+  if (o?.status === "skipped") return { tone: "warn", text: `Skipped: ${o.reason}` };
+  if (o?.status === "failed") return { tone: "danger", text: `Failed: ${o.reason}` };
+  if (s.run_id || s.fired) return { tone: "muted", text: "Running now" };
+  if (!s.enabled) return { tone: "muted", text: "Paused" };
+  if (s.on_event) return { tone: "muted", text: `Waits until ${ACTION_EVENT_WORDS[s.on_event] ?? "the quest moves on"}` };
+  const at = s.next_run_at ?? s.run_at;
+  return { tone: "muted", text: at && new Date(at).getTime() > Date.now() ? `Runs ${new Date(at).toLocaleString()}` : "Runs now" };
 }
 
 export interface McpServer {
@@ -797,6 +837,8 @@ export interface TaskBrief {
   attempts?: number | null;
   plan_waiting?: boolean;
   pace?: QuestPace | null;
+  decisions?: DecisionSummary | null;
+  asking?: Asking | null;
 }
 
 export type QuestPace = "normal" | "quick" | "urgent";
@@ -815,6 +857,9 @@ export interface QuestOptions {
   ci_feedback?: boolean;
   pace?: QuestPace;
   context?: QuestContext;
+  asking?: Asking;
+  crew_size?: number;
+  crew_variants?: MixSlot[];
 }
 
 export interface QuestPart {
@@ -833,6 +878,12 @@ export interface QuestResume {
 
 export type QuestResumeResult = { result: "resumed"; session_id: string; run_id: string } | { result: "asked" };
 
+export interface PastPr {
+  url: string;
+  number: number | null;
+  state: "merged" | "closed" | null;
+}
+
 export interface QuestRoomTask {
   resume?: QuestResume | null;
   parts?: QuestPart[];
@@ -844,6 +895,7 @@ export interface QuestRoomTask {
   repo: string | null;
   branch: string | null;
   pr_url: string | null;
+  past_prs?: PastPr[];
   assigned_agent_id: string | null;
   user_id: string | null;
   result_content: string | null;
@@ -860,12 +912,18 @@ export interface QuestRoomTask {
 
 export interface QuestRoomPage {
   task: QuestRoomTask;
+  clarification: AgentMessage | null;
   room: {
+    task_id?: string;
     sessions: SessionBrief[];
     runs: (SessionRun & { session_id: string; agent_id: string })[];
     events: WorldEvent[];
     messages: AgentMessage[];
+    needs_you_messages?: AgentMessage[];
     cursor: number;
+    members?: RoomMember[];
+    asking?: RoomAsking;
+    decisions?: DecisionSummary;
   };
 }
 
@@ -1092,6 +1150,8 @@ export interface SearchMessageHit {
   author_emoji: string | null;
   excerpt: string;
   created_at: string;
+  task_id?: string | null;
+  room_kind?: RoomMessageKind | null;
 }
 
 export interface SearchResults {
@@ -1109,7 +1169,7 @@ export interface SearchResults {
     items?: { id: string; kind: string; label: string }[];
     practice?: { subject: string; coach_agent_id?: string | null } | null;
   }[];
-  quests: { id: string; title: string; status: string; assigned_agent_id: string | null; updated_at: string | null; plan_waiting?: boolean }[];
+  quests: { id: string; title: string; status: string; assigned_agent_id: string | null; updated_at: string | null; plan_waiting?: boolean; decisions?: DecisionSummary | null }[];
   todos: { id: string; text: string; status: string; priority: number; added_at: string }[];
   lists: { id: string; kind?: "list" | "timer"; name: string; status: string; updated_at: string }[];
   channels: { id: string; name: string; topic: string | null }[];
@@ -1170,6 +1230,13 @@ export const worldApi = {
     }
     return res.json() as Promise<TerminalOpened>;
   },
+  closeTerminal: async (id: string) => {
+    const res = await fetch(`/api/world/terminal/sessions/${id}`, { method: "DELETE" });
+    if (!res.ok) {
+      const body = (await res.json().catch(() => null)) as { error?: string; message?: string } | null;
+      throw new WorldApiError(res.status, body?.message ?? res.statusText, body?.error);
+    }
+  },
   openBrowserView: async (agentId: string, questId?: string | null) => {
     const res = await fetch("/api/world/terminal/sessions", {
       method: "POST",
@@ -1224,11 +1291,11 @@ export const worldApi = {
     fetch(`/api/world/agents/${id}/messages?limit=200`, { cache: "no-store" }).then((r) => json<AgentMessage[]>(r)),
   messagesBefore: (id: string, before: string) =>
     fetch(`/api/world/agents/${id}/messages?limit=200&before=${encodeURIComponent(before)}`, { cache: "no-store" }).then((r) => json<AgentMessage[]>(r)),
-  send: (id: string, body: string, attachments: string[] = [], options?: TurnOptions, answers?: string, spoken?: boolean, taskId?: string, replyTo?: string, quote?: { text: string; label?: string; source?: string; context?: string } | null) =>
+  send: (id: string, body: string, attachments: string[] = [], options?: TurnOptions, answers?: string, spoken?: boolean, taskId?: string, replyTo?: string, quote?: { text: string; label?: string; source?: string; context?: string } | null, changes?: string) =>
     fetch(`/api/world/agents/${id}/messages`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ body, attachments, options, answers, spoken, task_id: taskId, reply_to: replyTo, quote: quote ?? undefined }),
+      body: JSON.stringify({ body, attachments, options, answers, spoken, task_id: taskId, reply_to: replyTo, quote: quote ?? undefined, changes }),
     }).then((r) => sendJson<AgentMessage>(r)),
   quickStart: (agentId: string, body: { text: string; attachments?: string[]; spoken?: boolean; cli?: string; model?: string; quote?: { text: string; label?: string; source?: string; context?: string } | null }) =>
     fetch(`/api/world/agents/${agentId}/quick`, {
@@ -1255,12 +1322,13 @@ export const worldApi = {
     }),
   messageReplies: (id: string, messageId: string) =>
     fetch(`/api/world/agents/${id}/messages/${messageId}/replies`, { cache: "no-store" }).then((r) => json<AgentMessage[]>(r)),
-  questRoom: (taskId: string, after?: number, since?: string) => {
+  questRoom: (taskId: string, after?: number, since?: string, focus?: string) => {
     const q = new URLSearchParams();
     if (after !== undefined) q.set("after", String(after));
     if (since) q.set("since", since);
+    if (focus) q.set("focus", focus);
     const qs = q.toString();
-    return fetch(`/api/world/tasks/${taskId}/room${qs ? `?${qs}` : ""}`, { cache: "no-store" }).then((r) => json<QuestRoomPage>(r));
+    return fetch(`/api/world/tasks/${taskId}/room${qs ? `?${qs}` : ""}`, { cache: "no-store" }).then((r) => sendJson<QuestRoomPage>(r));
   },
   editMessage: (id: string, messageId: string, body: string) =>
     fetch(`/api/world/agents/${id}/messages/${messageId}`, {
@@ -1322,7 +1390,7 @@ export const worldApi = {
     fetch("/api/world/assistant", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }).then((r) =>
       json<WorldAgent>(r),
     ),
-  update: (id: string, patch: Partial<Pick<WorldAgent, "name" | "persona" | "cli" | "model" | "avatar_emoji" | "look" | "gear" | "tags" | "expertise" | "revoked_powers" | "visibility" | "approval_mode" | "quest_context" | "reviewer" | "daily_budget_usd" | "daily_token_budget">> & { handle?: string; paused?: boolean; archived?: boolean; delete_after_days?: number | null }) =>
+  update: (id: string, patch: Partial<Pick<WorldAgent, "name" | "persona" | "cli" | "model" | "avatar_emoji" | "look" | "gear" | "tags" | "expertise" | "revoked_powers" | "visibility" | "approval_mode" | "quest_context" | "asking" | "crew_variants" | "reviewer" | "daily_budget_usd" | "daily_token_budget">> & { handle?: string; paused?: boolean; archived?: boolean; delete_after_days?: number | null }) =>
     fetch(`/api/world/agents/${id}`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
@@ -1353,6 +1421,8 @@ export const worldApi = {
       body: JSON.stringify({ event_types: eventTypes }),
     }).then((r) => json<string[]>(r)),
   schedules: (id: string) => fetch(`/api/world/agents/${id}/schedules`, { cache: "no-store" }).then((r) => json<AgentSchedule[]>(r)),
+  schedule: (id: string) =>
+    fetch(`/api/world/schedules/${encodeURIComponent(id)}`, { cache: "no-store" }).then((r) => json<{ schedule: AgentSchedule; agent: { id: string; name: string } }>(r)),
   addSchedule: (id: string, input: { name: string; prompt: string; cron_expression?: string; run_at?: string; kind?: "routine" | "heartbeat" }) =>
     fetch(`/api/world/agents/${id}/schedules`, {
       method: "POST",
@@ -1451,8 +1521,13 @@ export const worldApi = {
     fetch("/api/config", { cache: "no-store" })
       .then((r) => json<{ backends?: Record<string, BackendModels> }>(r))
       .then((c) => c.backends ?? {}),
-  sessions: (agentId?: string) =>
-    fetch(`/api/world/sessions${agentId ? `?agent_id=${agentId}` : ""}`, { cache: "no-store" }).then((r) => json<SessionBrief[]>(r)),
+  sessions: (agentId?: string, sessionId?: string) => {
+    const params = new URLSearchParams();
+    if (agentId) params.set("agent_id", agentId);
+    if (sessionId) params.set("id", sessionId);
+    const query = params.size ? `?${params}` : "";
+    return fetch(`/api/world/sessions${query}`, { cache: "no-store" }).then((r) => json<SessionBrief[]>(r));
+  },
   sessionRuns: (id: string, before?: string, light = false) =>
     fetch(`/api/world/sessions/${id}/runs?limit=${RUN_PAGE}${before ? `&before=${encodeURIComponent(before)}` : ""}${light ? "&light=true" : ""}`, { cache: "no-store" }).then((r) => json<SessionRun[]>(r)),
   runText: (id: string) => fetch(`/api/world/runs/${id}/text`, { cache: "no-store" }).then((r) => json<{ prompt: string; output: string | null }>(r)),
@@ -1468,6 +1543,14 @@ export const worldApi = {
       body: JSON.stringify({ mode }),
     });
     if (!res.ok) throw new Error(res.status === 409 ? "That run already finished." : "Could not stop it. Try again.");
+  },
+  withdrawRun: async (id: string) => {
+    const res = await fetch(`/api/world/runs/${id}/stop`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode: "withdraw" }),
+    });
+    if (!res.ok) throw new Error(res.status === 409 ? "That run already started or finished." : "Could not withdraw it. Try again.");
   },
   followUp: (id: string, text: string, interrupt = false) =>
     fetch(`/api/world/sessions/${id}/messages`, {
@@ -1585,12 +1668,12 @@ export const worldApi = {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ body, scope, global }),
     }).then((r) => json<WorldRule>(r)),
-  updateRule: (id: string, patch: { body?: string; scope?: string; enabled?: boolean }) =>
+  updateRule: (id: string, patch: { body?: string; scope?: string; enabled?: boolean; github_repos?: string[] }) =>
     fetch(`/api/world/rules/${id}`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(patch),
-    }).then((r) => json<WorldRule>(r)),
+    }).then((r) => sendJson<WorldRule>(r)),
   deleteRule: (id: string) => fetch(`/api/world/rules/${id}`, { method: "DELETE" }),
   environment: () => fetch("/api/world/environment", { cache: "no-store" }).then((r) => json<EnvironmentResponse>(r)),
   importEnvironment: (items: { name: string; value: string }[]) =>

@@ -13,6 +13,17 @@ export type ExactMapDestination = {
 export type ExactDestination = ExactWorldLink & { map?: ExactMapDestination };
 
 export type NavigationKind = "agent" | "quest" | "report" | "canvas" | "team" | "list" | "todo" | "person" | "channel" | "message" | "reply" | "region" | "place" | "practice" | "lesson" | "academy";
+export type ReportCollection = "reports" | "workspaces";
+
+export function reportCollection(report: { kind: "doc" | "canvas" }): ReportCollection {
+  return report.kind === "canvas" ? "workspaces" : "reports";
+}
+
+export function mergeReportCandidates<T extends { id: string }>(...groups: (readonly T[] | null | undefined)[]): T[] {
+  const reports = new Map<string, T>();
+  for (const group of groups) for (const report of group ?? []) reports.set(report.id, report);
+  return [...reports.values()];
+}
 
 export type NavigationForeground = {
   panel: "agent" | "history" | "reports" | "board" | "lists" | "people" | "chat" | "map" | "academy";
@@ -27,7 +38,7 @@ const foreground = (policy: NavigationForeground): NavigationForeground => polic
 
 const FOREGROUND: Record<NavigationKind, NavigationForeground> = {
   agent: foreground({ panel: "agent" }),
-  quest: foreground({ panel: "history" }),
+  quest: foreground({ panel: "history", keepSideChat: true }),
   report: foreground({ panel: "reports", keepSideChat: true, overlay: true }),
   canvas: foreground({ panel: "reports", keepSideChat: true, overlay: true }),
   team: foreground({ panel: "board", board: "teams", closeTerminal: true }),
@@ -260,13 +271,13 @@ export async function runNavigation<T>(
   resolve: () => T | null | Promise<T | null>,
   allow: () => boolean | void | Promise<boolean | void>,
   apply: (destination: T) => void,
-  unavailable: () => void,
+  unavailable: (error: unknown) => void,
 ) {
   let destination;
   try {
     destination = await resolve();
-  } catch {
-    if (current()) unavailable();
+  } catch (error) {
+    if (current()) unavailable(error);
     return;
   }
   if (destination === null || !current() || (await allow()) === false || !current()) return;

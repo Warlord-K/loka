@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::FromRow;
+use sqlx::{FromRow, PgConnection};
 use uuid::Uuid;
 
 use crate::world::{emit_in, NewEvent, WorldStore};
@@ -151,6 +151,28 @@ pub fn broadcast_token(tokens: &[String]) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+pub(crate) async fn agent_reaches_channel_with(
+    conn: &mut PgConnection,
+    channel_id: Uuid,
+    agent: Uuid,
+    public_too: bool,
+) -> std::result::Result<bool, sqlx::Error> {
+    Ok(sqlx::query_scalar::<_, bool>(
+        "SELECT ($3 AND c.kind = 'channel')
+             OR EXISTS (SELECT 1 FROM channel_members m WHERE m.channel_id = c.id AND m.member_kind = 'agent' AND m.member_id = $2)
+             OR EXISTS (SELECT 1 FROM agent_teams t WHERE t.channel_id = c.id AND (
+                    EXISTS (SELECT 1 FROM agent_team_members tm WHERE tm.team_id = t.id AND tm.member_kind = 'agent' AND tm.member_id = $2)
+                 OR EXISTS (SELECT 1 FROM org_members om WHERE om.user_id = t.owner_user_id AND om.org_id = c.org_id AND om.main_agent_id = $2)))
+         FROM channels c WHERE c.id = $1",
+    )
+    .bind(channel_id)
+    .bind(agent)
+    .bind(public_too)
+    .fetch_optional(&mut *conn)
+    .await?
+    .unwrap_or(false))
 }
 
 impl WorldStore {
@@ -310,20 +332,8 @@ impl WorldStore {
     }
 
     pub async fn agent_reaches_channel(&self, channel_id: Uuid, agent: Uuid, public_too: bool) -> Result<bool> {
-        Ok(sqlx::query_scalar::<_, bool>(
-            "SELECT ($3 AND c.kind = 'channel')
-                 OR EXISTS (SELECT 1 FROM channel_members m WHERE m.channel_id = c.id AND m.member_kind = 'agent' AND m.member_id = $2)
-                 OR EXISTS (SELECT 1 FROM agent_teams t WHERE t.channel_id = c.id AND (
-                        EXISTS (SELECT 1 FROM agent_team_members tm WHERE tm.team_id = t.id AND tm.member_kind = 'agent' AND tm.member_id = $2)
-                     OR EXISTS (SELECT 1 FROM org_members om WHERE om.user_id = t.owner_user_id AND om.org_id = c.org_id AND om.main_agent_id = $2)))
-             FROM channels c WHERE c.id = $1",
-        )
-        .bind(channel_id)
-        .bind(agent)
-        .bind(public_too)
-        .fetch_optional(self.pool())
-        .await?
-        .unwrap_or(false))
+        let mut conn = self.pool().acquire().await?;
+        Ok(agent_reaches_channel_with(&mut conn, channel_id, agent, public_too).await?)
     }
 
     pub async fn channel_messages(&self, channel_id: Uuid, after: Option<i64>, limit: i64) -> Result<Vec<ChannelMessage>> {
@@ -497,9 +507,17 @@ impl WorldStore {
 
     pub async fn open_channel_thread(&self, agent_id: Uuid, channel_id: Uuid) -> Result<Option<i64>> {
         Ok(sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT (payload->>'reply_to')::bigint FROM agent_inbox
-             WHERE agent_id = $1 AND status = 'processing' AND kind = 'channel.mention'
-               AND payload->>'channel_id' = $2::text AND payload ? 'reply_to'
+            "SELECT CASE
+                 WHEN kind = 'channel.mention' THEN (payload->>'reply_to')::bigint
+                 ELSE (payload->'clarification_channel'->>'root_id')::bigint
+               END
+             FROM agent_inbox
+             WHERE agent_id = $1 AND status = 'processing' AND (
+               (kind = 'channel.mention' AND payload->>'channel_id' = $2::text AND payload ? 'reply_to')
+               OR (kind = 'message' AND payload->>'from_owner' = 'true'
+                 AND payload ? 'clarification_continuation'
+                 AND payload->'clarification_channel'->>'channel_id' = $2::text)
+             )
              ORDER BY id DESC LIMIT 1",
         )
         .bind(agent_id)

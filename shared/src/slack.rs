@@ -541,6 +541,7 @@ mod tests {
             actor_user_id: Some(owner),
             payload: sample().payload(owner),
             created_at: chrono::Utc::now(),
+            quest_scope: None,
         };
         assert!(!hidden_from(&event, owner));
         assert!(hidden_from(&event, Uuid::new_v4()));
@@ -689,6 +690,7 @@ mod tests {
             actor_user_id: Some(owner),
             payload: note.payload(owner),
             created_at: chrono::Utc::now(),
+            quest_scope: None,
         };
         assert!(!hidden_from(&event, owner));
         assert!(hidden_from(&event, Uuid::new_v4()));

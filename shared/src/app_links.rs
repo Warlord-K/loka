@@ -28,6 +28,10 @@ pub fn quest_url(id: Uuid) -> String {
     format!("{}/world?quest={id}", app_url())
 }
 
+pub fn workshop_diff_url(session: Uuid) -> String {
+    format!("{}/world?workbench={session}&diff={session}", app_url())
+}
+
 pub fn report_url(id: Uuid) -> String {
     format!("{}/world?report={id}", app_url())
 }
@@ -70,6 +74,7 @@ mod tests {
         assert!(report_url(id).ends_with(&format!("/world?report={id}")));
         assert!(agent_url("ada lovelace").ends_with("/world?agent=ada%20lovelace"));
         assert!(message_url("ch12").ends_with("/world?msg=ch12"));
+        assert!(workshop_diff_url(id).ends_with(&format!("/world?workbench={id}&diff={id}")));
         assert!(canvas_item_url(id, "i1a2").ends_with(&format!("/world?report={id}&item=i1a2")));
         assert!(list_url(id).ends_with(&format!("/world?list={id}")));
         assert!(team_url(id).ends_with(&format!("/world?team={id}")));

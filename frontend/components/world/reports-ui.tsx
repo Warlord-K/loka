@@ -4,7 +4,7 @@ import { quoteProps } from "./quote";
 import { SOLO } from "@/lib/edition";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import { applyLatest, latestOnly } from "@/lib/latest";
-import { guardedDetailLoader, type NavigationRequest } from "@/lib/exact-world-navigation";
+import { guardedDetailLoader, mergeReportCandidates, type NavigationRequest } from "@/lib/exact-world-navigation";
 import { navigationDetails } from "@/lib/navigation-details";
 import { ArrowCounterClockwise, SquaresFour, Student, GraduationCap, ArrowLeft, CaretDown, CaretRight, Check, ClockCounterClockwise, FileText, Folder, FolderOpen, Globe, Link as LinkIcon, ListBullets, Lock, Code, Copy, DownloadSimple, PencilSimple, Plus, Trash, Clock, Files, FolderSimple, Hash, Notebook, PushPinSimple, UserCircle, type Icon as PhosphorIcon, SidebarSimple } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
@@ -12,18 +12,23 @@ import { WindowHeader, EmptyState, GHOST_ICON_BTN } from "./settings-shell";
 import { AgentFace } from "./channel-ui";
 import { Keycap } from "./keycap";
 import { worldUrl } from "./message-links";
+import { workspaceHref } from "@/lib/feature-links";
 import { worldApi, type WorldAgent } from "@/lib/world";
 import {
   folderParts,
   headingsOf,
   REPORTS_STALE,
   reportsApi,
+  reportCollection,
+  secureRequestId,
   wikify,
   ReportError,
   StaleReport,
   type Report,
   type ReportBrief,
+  type ReportCollection,
   type ReportDetail,
+  type ReportListFilter,
   type Revision,
   type RevisionBrief,
 } from "@/lib/reports";
@@ -52,7 +57,7 @@ const ReportCanvas = dynamic(() => import("./report-canvas"), {
   ssr: false,
   loading: () => (
     <div className="grid h-full place-items-center text-w-base text-w-muted">
-      <Shimmer>Opening the canvas</Shimmer>
+      <Shimmer>Opening the workspace</Shimmer>
     </div>
   ),
 });
@@ -82,6 +87,7 @@ type Draft = { title: string; folder: string; tags: string; body: string };
 type SaveState = "idle" | "saving" | "saved" | "failed";
 type DraftField = keyof Draft;
 type Conflict = { latest: Report; fields: DraftField[] };
+type PanelFailure = { kind: "detail"; id: string; message: string } | { kind: "link"; title: string; message: string } | { kind: "workspace"; message: string };
 
 const DRAFT_FIELDS: DraftField[] = ["title", "body", "folder", "tags"];
 const FIELD_NAMES: Record<DraftField, string> = { title: "title", body: "text", folder: "folder", tags: "tags" };
@@ -138,7 +144,7 @@ interface FolderNode {
 }
 
 const MAX_BYTES = 512 * 1024;
-const reportCache: { list: ReportBrief[] | null } = { list: null };
+const reportCache: Record<ReportCollection, ReportBrief[] | null> = { reports: null, workspaces: null };
 const PROSE = "text-w-md leading-[1.75] text-w-text [&_li]:my-1 [&_p]:my-3 [&_blockquote]:my-4 [&_ul]:my-3 [&_ol]:my-3";
 const TOOL_BTN = cn("inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-w-sm text-w-text2 transition-colors hover:bg-w-sand hover:text-w-strong", EASE, FOCUS, "focus-visible:ring-offset-0");
 const TOOL_ICON = cn("grid h-8 w-8 place-items-center rounded-lg text-w-muted transition-colors hover:bg-w-sand hover:text-w-strong", EASE, FOCUS, "focus-visible:ring-offset-0");
@@ -264,7 +270,7 @@ function Property({ icon: PropIcon, label, children }: { icon: PhosphorIcon; lab
   );
 }
 
-function LinkList({ title, items, onOpen }: { title: string; items: ReportBrief[]; onOpen: (id: string) => void }) {
+function LinkList({ title, items, onOpen }: { title: string; items: ReportBrief[]; onOpen: (report: ReportBrief) => void }) {
   if (!items.length) return null;
   return (
     <div className="mt-6 first:mt-0">
@@ -272,8 +278,8 @@ function LinkList({ title, items, onOpen }: { title: string; items: ReportBrief[
       <ul className="space-y-0.5">
         {items.map((r) => (
           <li key={r.id}>
-            <button type="button" onClick={() => onOpen(r.id)} className="group flex w-full items-start gap-2 rounded-lg px-2 py-1.5 text-left transition-colors hover:bg-w-sand/70">
-              <FileText size={15} className="mt-0.5 shrink-0 text-w-muted group-hover:text-w-link" />
+            <button type="button" onClick={() => onOpen(r)} className="group flex w-full items-start gap-2 rounded-lg px-2 py-1.5 text-left transition-colors hover:bg-w-sand/70">
+              {r.kind === "canvas" ? <SquaresFour size={15} className="mt-0.5 shrink-0 text-w-muted group-hover:text-w-link" /> : <FileText size={15} className="mt-0.5 shrink-0 text-w-muted group-hover:text-w-link" />}
               <span className="min-w-0 flex-1">
                 <span className="block truncate text-w-sm font-medium text-w-text">{r.title}</span>
                 <span className="line-clamp-1 text-w-xs leading-snug text-w-muted">{excerptText(r.excerpt)}</span>
@@ -339,7 +345,30 @@ function ReportCard({
   );
 }
 
-type ReportSelection = { id: string | null; item?: string | null; title?: string; missing?: () => void; loaded?: boolean; detail?: ReportDetail; request?: number; workspace?: boolean };
+type ReportSelection = { id: string | null; item?: string | null; title?: string; missing?: () => void; loaded?: boolean; detail?: ReportDetail; request?: number; workspace?: boolean; collection?: ReportCollection; draft?: { title: string; folder: string } };
+
+const REPORT_PAGE = 100;
+
+async function readReportCollection(filter: ReportListFilter, current: () => boolean): Promise<ReportBrief[] | null> {
+  if (filter.kind !== "canvas") {
+    const reports = await reportsApi.list(filter);
+    return current() ? reports : null;
+  }
+  const reports: ReportBrief[] = [];
+  const seen = new Set<string>();
+  for (let offset = 0; ; offset += REPORT_PAGE) {
+    const page = await reportsApi.list({ ...filter, limit: REPORT_PAGE, offset });
+    if (!current()) return null;
+    let added = 0;
+    for (const report of page) {
+      if (seen.has(report.id)) continue;
+      seen.add(report.id);
+      reports.push(report);
+      added += 1;
+    }
+    if (page.length < REPORT_PAGE || added === 0) return reports;
+  }
+}
 
 export interface WorkspaceKit {
   channelsOpen: boolean;
@@ -357,6 +386,7 @@ function reportVersion(report: Report): string {
 export function ReportsPanel({
   agents,
   meId,
+  canWrite,
   selection,
   sideToggle,
   onClose,
@@ -368,6 +398,7 @@ export function ReportsPanel({
 }: {
   agents: WorldAgent[];
   meId: string | null;
+  canWrite: boolean;
   selection: ReportSelection;
   workspace?: WorkspaceKit;
   sideToggle?: ReactNode;
@@ -379,13 +410,32 @@ export function ReportsPanel({
 }) {
   const handles = useAgentHandles(agents);
   const everyone = useEveryone();
-  const [all, setAll] = useState<ReportBrief[] | null>(() => reportCache.list);
-  useEffect(() => {
-    if (all) reportCache.list = all;
-  }, [all]);
+  const collection = selection.collection ?? (selection.detail ? reportCollection(selection.detail.report) : "reports");
+  const [lists, setLists] = useState<Record<ReportCollection, ReportBrief[] | null>>(() => ({ ...reportCache }));
+  const all = lists[collection];
+  const setCollection = useCallback((target: ReportCollection, reports: ReportBrief[]) => {
+    reportCache[target] = reports;
+    setLists((current) => ({ ...current, [target]: reports }));
+  }, []);
+  const setAll = useCallback((reports: ReportBrief[]) => {
+    setCollection(collection, reports);
+  }, [collection, setCollection]);
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<ReportBrief[] | null>(null);
+  const [hitQuery, setHitQuery] = useState("");
+  const [hitScope, setHitScope] = useState("");
+  const [listError, setListError] = useState(false);
+  const [searchError, setSearchError] = useState(false);
+  const [searching, setSearching] = useState(false);
+  const [searchRetry, setSearchRetry] = useState(0);
   const [scope, setScope] = useState<Scope>({ kind: "all" });
+  const scopeKey = scope.kind === "all" || scope.kind === "pinned" ? scope.kind : `${scope.kind}:${scope.kind === "folder" ? scope.path : scope.tag}`;
+  const queryRef = useRef(query);
+  queryRef.current = query;
+  const scopeRef = useRef(scope);
+  scopeRef.current = scope;
+  const scopeKeyRef = useRef(scopeKey);
+  scopeKeyRef.current = scopeKey;
   const [openFolders, setOpenFolders] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<string | null>(null);
   const selectedRef = useRef(selected);
@@ -393,6 +443,9 @@ export function ReportsPanel({
   const [focus, setFocus] = useState<ReportSelection | null>(null);
   const selectionRequests = useRef(latestOnly()).current;
   const actionRequests = useRef(latestOnly()).current;
+  const listRequests = useRef(latestOnly()).current;
+  const linkRequests = useRef(latestOnly()).current;
+  const searchRequests = useRef(latestOnly()).current;
   const readerCurrentRef = useRef<() => boolean>(() => false);
   const detailLoader = useRef(guardedDetailLoader()).current;
   const revisionListLoader = useRef(guardedDetailLoader()).current;
@@ -404,7 +457,10 @@ export function ReportsPanel({
     revisionLoader.invalidate();
   }, [detailLoader, revisionListLoader, revisionLoader]);
   const [detail, setDetail] = useState<ReportDetail | null>(null);
+  const detailRef = useRef(detail);
+  detailRef.current = detail;
   const [missing, setMissing] = useState(false);
+  const [panelFailure, setPanelFailure] = useState<PanelFailure | null>(null);
   const [mode, setMode] = useState<Mode>("read");
   const modeRef = useRef(mode);
   modeRef.current = mode;
@@ -450,17 +506,22 @@ export function ReportsPanel({
   const [libraryHidden, setLibraryHidden] = useState(false);
   useEffect(() => {
     try {
-      setLibraryHidden(window.localStorage.getItem("world.reports.library") === "hidden");
-    } catch {}
-  }, []);
+      setLibraryHidden(window.localStorage.getItem(`world.${collection}.library`) === "hidden");
+    } catch {
+      setLibraryHidden(false);
+    }
+  }, [collection]);
   const toggleLibrary = () =>
     setLibraryHidden((v) => {
       try {
-        window.localStorage.setItem("world.reports.library", v ? "shown" : "hidden");
+        window.localStorage.setItem(`world.${collection}.library`, v ? "shown" : "hidden");
       } catch {}
       return !v;
     });
   const [focusPoint, setFocusPoint] = useState<FocusPoint | null>(null);
+  const creatingWorkspaceRef = useRef(false);
+  const workspaceCreationRef = useRef<Parameters<typeof reportsApi.create>[0] | null>(null);
+  const [creatingWorkspace, setCreatingWorkspace] = useState(false);
   const editing = mode === "edit";
   const dirty = useMemo(() => {
     if (!draft) return false;
@@ -469,15 +530,70 @@ export function ReportsPanel({
     return draft.title !== r.title || draft.body !== r.body || draft.folder !== r.folder || draft.tags !== r.tags.join(", ");
   }, [draft, detail, selected]);
 
+  const loadSearch = useCallback((delay: number) => {
+    const q = queryRef.current.trim();
+    const targetScope = scopeRef.current;
+    const targetScopeKey = scopeKeyRef.current;
+    const current = searchRequests.begin();
+    if (!q) {
+      setHits(null);
+      setHitQuery("");
+      setHitScope("");
+      setSearchError(false);
+      setSearching(false);
+      return () => {
+        searchRequests.begin();
+      };
+    }
+    setSearchError(false);
+    setSearching(true);
+    const timeout = window.setTimeout(() => {
+      readReportCollection({
+          query: q,
+          kind: collection === "workspaces" ? "canvas" : "doc",
+          folder: targetScope.kind === "folder" ? targetScope.path : undefined,
+          tag: targetScope.kind === "tag" ? targetScope.tag : undefined,
+        }, current)
+        .then((reports) => {
+          if (!reports || !current() || queryRef.current.trim() !== q || scopeKeyRef.current !== targetScopeKey) return;
+          setHits(reports.filter((report) => reportCollection(report) === collection));
+          setHitQuery(q);
+          setHitScope(targetScopeKey);
+          setSearching(false);
+        })
+        .catch(() => {
+          if (!current() || queryRef.current.trim() !== q || scopeKeyRef.current !== targetScopeKey) return;
+          setSearchError(true);
+          setSearching(false);
+        });
+    }, delay);
+    return () => {
+      window.clearTimeout(timeout);
+      if (current()) searchRequests.begin();
+    };
+  }, [collection, searchRequests]);
+
   const loadAll = useCallback(() => {
-    reportsApi
-      .list()
-      .then(setAll)
-      .catch(() => setAll((cur) => cur ?? []));
-  }, []);
+    const current = listRequests.begin();
+    setListError(false);
+    loadSearch(0);
+    readReportCollection({ kind: collection === "workspaces" ? "canvas" : "doc" }, current)
+      .then((reports) => reports && current() && setAll(reports.filter((report) => reportCollection(report) === collection)))
+      .catch(() => current() && setListError(true));
+  }, [collection, listRequests, loadSearch, setAll]);
+
+  const loadLinkCandidates = useCallback(() => {
+    const target: ReportCollection = collection === "workspaces" ? "reports" : "workspaces";
+    const kind = target === "workspaces" ? "canvas" : "doc";
+    const current = linkRequests.begin();
+    readReportCollection({ kind }, current)
+      .then((reports) => reports && current() && setCollection(target, reports.filter((report) => reportCollection(report) === target)))
+      .catch(() => undefined);
+  }, [collection, linkRequests, setCollection]);
 
   const loadDetail = useCallback((id: string, current: () => boolean = () => true) => {
     if (selectedRef.current !== id || !current()) return;
+    setPanelFailure((failure) => failure?.kind === "detail" && failure.id === id ? null : failure);
     const intent = detailLoader.begin(() => selectedRef.current === id && readerCurrentRef.current() && current());
     navigationDetails
       .report(intent, id)
@@ -485,36 +601,39 @@ export function ReportsPanel({
         if (!d || !intent.current()) return;
         setDetail(d);
         setMissing(false);
+        setPanelFailure((failure) => failure?.kind === "detail" && failure.id === id ? null : failure);
       })
       .catch((e) => {
         if (!intent.current()) return;
         if (e instanceof ReportError && e.status === 404) {
           setDetail(null);
           setMissing(true);
+          setPanelFailure((failure) => failure?.kind === "detail" && failure.id === id ? null : failure);
+        } else if (detailRef.current?.report.id !== id) {
+          setPanelFailure({ kind: "detail", id, message: `Could not open this ${collection === "workspaces" ? "workspace" : "report"}.` });
         }
       });
-  }, [detailLoader]);
+  }, [collection, detailLoader]);
 
   useEffect(() => loadAll(), [loadAll]);
+  useEffect(() => {
+    loadLinkCandidates();
+    return () => void linkRequests.begin();
+  }, [linkRequests, loadLinkCandidates]);
 
   useEffect(() => {
-    const q = query.trim();
-    if (!q) {
-      setHits(null);
-      return;
-    }
-    let live = true;
-    const t = window.setTimeout(() => {
-      reportsApi
-        .list({ query: q })
-        .then((r) => live && setHits(r))
-        .catch(() => live && setHits([]));
-    }, 220);
-    return () => {
-      live = false;
-      window.clearTimeout(t);
-    };
-  }, [query, all]);
+    return loadSearch(220);
+  }, [collection, loadSearch, query, scopeKey, searchRetry]);
+
+  useEffect(() => {
+    setQuery("");
+    setHits(null);
+    setHitQuery("");
+    setHitScope("");
+    setSearchError(false);
+    setSearching(false);
+    setScope({ kind: "all" });
+  }, [collection]);
 
   useEffect(() => {
     setRevision(null);
@@ -523,13 +642,12 @@ export function ReportsPanel({
     readerRef.current?.scrollTo({ top: 0 });
   }, [selected]);
 
-  const detailRef = useRef(detail);
-  detailRef.current = detail;
   const editingRef = useRef(editing);
   editingRef.current = editing;
   useEffect(() => {
     const onStale = (e: Event) => {
       loadAll();
+      loadLinkCandidates();
       const event = (e as CustomEvent<{ report_id?: string; collection_only?: boolean } | undefined>).detail;
       if (event?.collection_only) return;
       const id = event?.report_id;
@@ -538,7 +656,7 @@ export function ReportsPanel({
     };
     window.addEventListener(REPORTS_STALE, onStale);
     return () => window.removeEventListener(REPORTS_STALE, onStale);
-  }, [loadAll, loadDetail]);
+  }, [loadAll, loadDetail, loadLinkCandidates]);
 
   useEffect(() => {
     if (mode !== "history" || !selected) return;
@@ -738,8 +856,9 @@ export function ReportsPanel({
     };
   }, [mode, dirty, leaveEdit, onClose, setHistoryOpen]);
 
-  const visible = useMemo(() => (all ?? []).filter((r) => everyone || r.owner_user_id === meId), [all, everyone, meId]);
-  const othersCount = (all ?? []).length - visible.length;
+  const collectionItems = useMemo(() => (all ?? []).filter((r) => reportCollection(r) === collection), [all, collection]);
+  const visible = useMemo(() => collectionItems.filter((r) => everyone || r.owner_user_id === meId), [collectionItems, everyone, meId]);
+  const othersCount = collectionItems.length - visible.length;
   const tree = useMemo(() => folderTree(visible), [visible]);
   const tags = useMemo(() => {
     const counts = new Map<string, number>();
@@ -748,14 +867,18 @@ export function ReportsPanel({
   }, [visible]);
   const folders = useMemo(() => [...new Set(visible.map((r) => r.folder).filter(Boolean))].sort(), [visible]);
   const shown = useMemo(() => {
-    const ids = new Set(visible.map((r) => r.id));
-    return (hits ?? visible).filter((r) => ids.has(r.id) && inScope(r, scope));
-  }, [hits, visible, scope]);
+    if (!query.trim()) return visible.filter((r) => inScope(r, scope));
+    if (hitQuery !== query.trim() || hitScope !== scopeKey) return [];
+    return (hits ?? []).filter((r) => (everyone || r.owner_user_id === meId) && inScope(r, scope));
+  }, [everyone, hitQuery, hitScope, hits, meId, query, scope, scopeKey, visible]);
   const headings = useMemo(() => (detail ? headingsOf(withoutTitle(revision?.body ?? detail.report.body, revision?.title ?? detail.report.title)) : []), [detail, revision]);
+  const linkedReports = useMemo(() => {
+    return mergeReportCandidates(lists.reports, lists.workspaces, detail?.backlinks, detail?.outlinks);
+  }, [detail, lists]);
   const known = useMemo(() => {
-    const titles = new Set((all ?? []).flatMap((r) => [r.title.toLowerCase(), r.slug]));
+    const titles = new Set(linkedReports.flatMap((r) => [r.title.toLowerCase(), r.slug]));
     return (title: string) => titles.has(title.toLowerCase());
-  }, [all]);
+  }, [linkedReports]);
 
   const author = (agentId: string | null, userId: string | null) => {
     const agent = agentId ? agents.find((a) => a.id === agentId) : undefined;
@@ -776,6 +899,22 @@ export function ReportsPanel({
       if (!allowed) return;
       ownReader(current);
       setError(null);
+      setPanelFailure(null);
+      if (requested?.draft) {
+        editorRef.current += 1;
+        creatingRef.current = null;
+        selectedRef.current = null;
+        setDetail(null);
+        setMissing(false);
+        setSelected(null);
+        const nextDraft = { title: requested.draft.title, folder: requested.draft.folder, tags: "", body: "" };
+        draftRef.current = nextDraft;
+        setDraft(nextDraft);
+        setMode("edit");
+        setSource(false);
+        setSaveState("idle");
+        return;
+      }
       setMode("read");
       selectedRef.current = id;
       if (requested?.detail?.report.id === id) {
@@ -795,9 +934,11 @@ export function ReportsPanel({
   };
   const selectRef = useRef(select);
   selectRef.current = select;
-  const requestSelection = (selection: ReportSelection, request?: NavigationRequest) => onNavigate
-    ? onNavigate({ ...selection, loaded: Boolean(selection.id) }, request)
-    : void select(selection.id, selection);
+  const requestSelection = (selection: ReportSelection, request?: NavigationRequest) => {
+    const next = { collection, ...selection, loaded: Boolean(selection.id) };
+    return onNavigate ? onNavigate(next, request) : void select(next.id, next);
+  };
+  const openLibrary = () => requestSelection({ id: null, workspace: false });
   useEffect(() => {
     if (!onNavigate) {
       if (selection.id) void selectRef.current(selection.id, selection);
@@ -806,6 +947,24 @@ export function ReportsPanel({
     const current = selectionRequests.begin();
     ownReader(current);
     finishEdit();
+    setPanelFailure(null);
+    if (selection.draft) {
+      editorRef.current += 1;
+      creatingRef.current = null;
+      selectedRef.current = null;
+      setDetail(null);
+      setMissing(false);
+      setSelected(null);
+      const nextDraft = { title: selection.draft.title, folder: selection.draft.folder, tags: "", body: "" };
+      draftRef.current = nextDraft;
+      setDraft(nextDraft);
+      setMode("edit");
+      setSource(false);
+      setSaveState("idle");
+      setError(null);
+      setFocus(selection);
+      return;
+    }
     if (selection.detail) {
       const incoming = selection.detail;
       detailLoader.invalidate();
@@ -830,14 +989,10 @@ export function ReportsPanel({
   }, [detailLoader, revisionListLoader, revisionLoader, selectionRequests]);
 
   const openWiki = (title: string) => {
-    const key = title.toLowerCase();
-    const local = (all ?? []).find((r) => r.title.toLowerCase() === key || r.slug === key);
-    if (local) {
-      requestSelection({ id: local.id });
-      return;
-    }
     const missing = () => {
-      if (detail?.can_edit !== false && window.confirm(`There is no report called "${title}" yet. Start it now?`)) startNew(title, detail?.report.folder ?? "");
+      if (canWrite && detail?.can_edit !== false && window.confirm(`There is no report called "${title}" yet. Start it now?`)) {
+        requestSelection({ id: null, collection: "reports", draft: { title, folder: detail?.report.folder ?? "" } });
+      }
     };
     if (onNavigate) onNavigate({ id: null, title, missing });
     else {
@@ -846,8 +1001,10 @@ export function ReportsPanel({
       const intent = detailLoader.begin(current);
       void navigationDetails.reportFind(intent, title).then((r) => {
         if (r && intent.current()) requestSelection({ id: r.id });
-      }).catch(() => {
-        if (intent.current()) missing();
+      }).catch((error) => {
+        if (!intent.current()) return;
+        if (error instanceof ReportError && error.status === 404) missing();
+        else setPanelFailure({ kind: "link", title, message: `Could not open “${title}”.` });
       });
     }
   };
@@ -872,22 +1029,37 @@ export function ReportsPanel({
     setSource(false);
     setSaveState("idle");
     setError(null);
+    setPanelFailure(null);
   };
 
-  const newCanvas = async () => {
+  const newWorkspace = async (retry = false) => {
+    if (creatingWorkspaceRef.current) return;
+    creatingWorkspaceRef.current = true;
+    setCreatingWorkspace(true);
+    setPanelFailure(null);
     const navigation = onBeginNavigation?.();
-    if (editing && !(await canLeaveEdit())) return;
-    if (navigation && !navigation.current()) return;
-    if (editing) finishEdit();
-    setError(null);
     try {
-      const day = new Date().toLocaleDateString(undefined, { month: "short", day: "numeric" });
-      const saved = await reportsApi.create({ title: `Canvas ${day}`, body: "", folder: scope.kind === "folder" ? scope.path : "", canvas: { items: [], edges: [] } });
+      if (editing && !(await canLeaveEdit())) return;
+      if (navigation && !navigation.current()) return;
+      if (editing) finishEdit();
+      setError(null);
+      if (!retry || !workspaceCreationRef.current) {
+        const day = new Date().toLocaleDateString(undefined, { month: "short", day: "numeric" });
+        workspaceCreationRef.current = {
+          request_id: secureRequestId(),
+          title: `Workspace ${day}`,
+          body: "",
+          folder: scope.kind === "folder" ? scope.path : "",
+          canvas: { items: [], edges: [] },
+        };
+      }
+      const saved = await reportsApi.create(workspaceCreationRef.current);
+      workspaceCreationRef.current = null;
       const savedDetail = { report: saved, backlinks: [], outlinks: [], can_edit: true, marks: [] };
       loadAll();
       window.dispatchEvent(new CustomEvent(REPORTS_STALE, { detail: { report_id: saved.id } }));
       if (navigation && !navigation.current()) return;
-      if (onNavigate) requestSelection({ id: saved.id, detail: savedDetail }, navigation);
+      if (onNavigate) requestSelection({ id: saved.id, detail: savedDetail, workspace: true, collection: "workspaces" }, navigation);
       else {
         const current = selectionRequests.begin();
         ownReader(current);
@@ -898,10 +1070,28 @@ export function ReportsPanel({
         setSelected(saved.id);
         setDetail(savedDetail);
       }
-    } catch (e) {
+    } catch {
       if (navigation && !navigation.current()) return;
-      setError(e instanceof Error && e.message ? e.message : "Could not start a canvas. Try again.");
+      setPanelFailure({ kind: "workspace", message: "Could not start a workspace." });
+    } finally {
+      creatingWorkspaceRef.current = false;
+      setCreatingWorkspace(false);
     }
+  };
+
+  const retryPanelFailure = () => {
+    const failure = panelFailure;
+    if (!failure) return;
+    setPanelFailure(null);
+    if (failure.kind === "workspace") {
+      void newWorkspace(true);
+      return;
+    }
+    if (failure.kind === "link") {
+      openWiki(failure.title);
+      return;
+    }
+    if (selectedRef.current === failure.id) loadDetail(failure.id);
   };
 
   const startEdit = (point: FocusPoint | null = null) => {
@@ -1036,7 +1226,7 @@ export function ReportsPanel({
   };
 
   const copyLink = async () => {
-    if (detail) await copy(worldUrl("report", detail.report.id));
+    if (detail) await copy(detail.report.kind === "canvas" ? workspaceHref(window.location.origin, detail.report.id) : worldUrl("report", detail.report.id));
   };
 
   const shownMarkdown = () => (detail ? asMarkdown(revision?.title ?? detail.report.title, revision?.body ?? detail.report.body) : "");
@@ -1103,11 +1293,12 @@ export function ReportsPanel({
   };
 
   const readerOpen = Boolean(selected) || mode === "edit";
+  const libraryCollapsed = readerOpen && libraryHidden;
 
   const sidebar = (
-    <nav aria-label="Report folders">
+    <nav aria-label={collection === "workspaces" ? "Workspace folders" : "Report folders"}>
       <div className="space-y-0.5">
-        <ScopeButton active={scope.kind === "all"} onClick={() => setScope({ kind: "all" })} icon={Files} label="All reports" count={visible.length} />
+        <ScopeButton active={scope.kind === "all"} onClick={() => setScope({ kind: "all" })} icon={Files} label={collection === "workspaces" ? "All workspaces" : "All reports"} count={visible.length} />
         {visible.some((r) => r.pinned) && (
           <ScopeButton active={scope.kind === "pinned"} onClick={() => setScope({ kind: "pinned" })} icon={PushPinSimple} label="Pinned" count={visible.filter((r) => r.pinned).length} />
         )}
@@ -1152,13 +1343,15 @@ export function ReportsPanel({
     </nav>
   );
 
-  const scopeLabel = scope.kind === "all" ? "All reports" : scope.kind === "pinned" ? "Pinned" : scope.kind === "folder" ? folderParts(scope.path).slice(-1)[0] : `#${scope.tag}`;
+  const scopeLabel = scope.kind === "all" ? collection === "workspaces" ? "All workspaces" : "All reports" : scope.kind === "pinned" ? "Pinned" : scope.kind === "folder" ? folderParts(scope.path).slice(-1)[0] : `#${scope.tag}`;
+  const searchPending = Boolean(query.trim() && !searchError && (searching || hitQuery !== query.trim() || hitScope !== scopeKey));
+  const searchSettled = Boolean(query.trim() && !searchPending && !searchError);
 
   const list = (
     <div className={cn(query.trim() ? "" : "mt-5 border-t-2 border-dashed border-w-line pt-4")}>
       <h3 className="mb-2 flex items-center justify-between px-2.5 text-w-sm font-semibold text-w-strong">
         <span className="truncate">{query.trim() ? "Results" : scopeLabel}</span>
-        {all !== null && <span className={COUNT}>{shown.length}</span>}
+        {(query.trim() ? searchSettled : all !== null && !listError) && <span className={COUNT}>{shown.length}</span>}
       </h3>
       <ul
         ref={listRef}
@@ -1176,15 +1369,34 @@ export function ReportsPanel({
           }
         }}
       >
-        {all === null && (
-          <li className="px-2.5 py-2 text-w-sm text-w-muted">
-            <Shimmer>Opening the library</Shimmer>
+        {!query.trim() && all === null && !listError ? (
+          <li className="px-2.5 py-2 text-w-sm text-w-muted"><Shimmer>Opening the library</Shimmer></li>
+        ) : !query.trim() && listError ? (
+          <li role="alert" className="space-y-2 px-2.5 py-2 text-w-sm text-w-muted">
+            <p>{all === null ? "Could not open the library." : "Could not refresh the library."}</p>
+            <button type="button" onClick={loadAll} className={BTN_SECONDARY_SM}>Try again</button>
           </li>
-        )}
-        {all !== null && shown.length === 0 && (
-          <li className="px-2.5 py-2 text-w-sm text-w-muted">{query.trim() ? "No reports match." : visible.length ? "Nothing here yet." : "No reports yet."}</li>
-        )}
-        {shown.map((r) => {
+        ) : query.trim() && searchError ? (
+          <li role="alert" className="space-y-2 px-2.5 py-2 text-w-sm text-w-muted">
+            <p>Could not search. Try again.</p>
+            <button
+              type="button"
+              onClick={() => {
+                setSearchError(false);
+                setSearching(true);
+                setSearchRetry((value) => value + 1);
+              }}
+              className={BTN_SECONDARY_SM}
+            >
+              Try again
+            </button>
+          </li>
+        ) : query.trim() && searchPending ? (
+          <li className="px-2.5 py-2 text-w-sm text-w-muted"><Shimmer>Searching the library</Shimmer></li>
+        ) : (query.trim() ? searchSettled : all !== null) && shown.length === 0 ? (
+          <li className="px-2.5 py-2 text-w-sm text-w-muted">{query.trim() ? `No ${collection} match.` : visible.length ? "Nothing here yet." : `No ${collection} yet.`}</li>
+        ) : null}
+        {(!query.trim() || searchSettled) && shown.map((r) => {
           const agent = r.author_agent_id ? agents.find((a) => a.id === r.author_agent_id) : undefined;
           const on = selected === r.id;
           return (
@@ -1199,14 +1411,14 @@ export function ReportsPanel({
                 <span className="flex items-start gap-2">
                   <span className="min-w-0 flex-1 text-w-sm font-semibold leading-snug text-w-strong">{r.title}</span>
                   {r.practice ? (
-                    <span className={cn(PILL_INFO, "mt-0.5 shrink-0 gap-1")} title={`Practice canvas for ${subjectLabel(r.practice.subject)}`}>
+                    <span className={cn(PILL_INFO, "mt-0.5 shrink-0 gap-1")} title={`Practice workspace for ${subjectLabel(r.practice.subject)}`}>
                       <Student size={11} weight="bold" aria-hidden />
                       {subjectLabel(r.practice.subject)}
                     </span>
-                  ) : r.kind === "canvas" && (
-                    <span className={cn(PILL_INFO, "mt-0.5 shrink-0 gap-1")} title={r.open_marks ? `Canvas with ${r.open_marks} open marks` : "Canvas"}>
+                  ) : r.kind === "canvas" && (r.item_count > 0 || r.open_marks > 0) && (
+                    <span className={cn(PILL_INFO, "mt-0.5 shrink-0 gap-1")} title={`Workspace with ${r.item_count} ${r.item_count === 1 ? "item" : "items"}${r.open_marks ? ` and ${r.open_marks} open ${r.open_marks === 1 ? "mark" : "marks"}` : ""}`}>
                       <SquaresFour size={11} weight="bold" aria-hidden />
-                      Canvas{r.open_marks ? ` · ${r.open_marks}` : ""}
+                      {r.item_count > 0 ? `${r.item_count} ${r.item_count === 1 ? "item" : "items"}` : `${r.open_marks} open`}
                     </span>
                   )}
                   {r.pinned && <PushPinSimple size={12} weight="fill" className="mt-1 shrink-0 text-w-faint" aria-label="Pinned" />}
@@ -1248,7 +1460,11 @@ export function ReportsPanel({
     where: reportAuthor ? (reportAuthor.runner_name ? `on ${reportAuthor.runner_name}, output goes to ${reportAuthor.name}'s chat` : `on ${reportAuthor.name}'s device, output goes to its chat`) : undefined,
   });
 
-  const titles = useMemo(() => (all ?? []).map((r) => r.title), [all]);
+  const titles = useMemo(() => {
+    const unique = new Map<string, string>();
+    for (const report of linkedReports) if (!unique.has(report.title.toLowerCase())) unique.set(report.title.toLowerCase(), report.title);
+    return [...unique.values()];
+  }, [linkedReports]);
   const focusBody = () => {
     const box = readerRef.current;
     const target = box?.querySelector<HTMLElement>(".ProseMirror") ?? box?.querySelector<HTMLTextAreaElement>("textarea[data-source]");
@@ -1651,33 +1867,34 @@ export function ReportsPanel({
         </div>
         {(detail.backlinks.length > 0 || detail.outlinks.length > 0) && (
           <footer className="mt-12 grid gap-4 border-t-2 border-w-line pt-5 @xl/reader:grid-cols-2 @4xl/reader:hidden">
-            <LinkList title={`Linked from (${detail.backlinks.length})`} items={detail.backlinks} onOpen={(id) => requestSelection({ id })} />
-            <LinkList title={`Links to (${detail.outlinks.length})`} items={detail.outlinks} onOpen={(id) => requestSelection({ id })} />
+            <LinkList title={`Linked from (${detail.backlinks.length})`} items={detail.backlinks} onOpen={(linked) => requestSelection({ id: linked.id, collection: reportCollection(linked) })} />
+            <LinkList title={`Links to (${detail.outlinks.length})`} items={detail.outlinks} onOpen={(linked) => requestSelection({ id: linked.id, collection: reportCollection(linked) })} />
           </footer>
         )}
       </article>
       <aside className="sticky top-6 hidden max-h-[calc(100vh-12rem)] w-56 shrink-0 self-start overflow-y-auto pt-12 @4xl/reader:block">
         {toc}
-        <LinkList title={`Linked from (${detail.backlinks.length})`} items={detail.backlinks} onOpen={(id) => requestSelection({ id })} />
+        <LinkList title={`Linked from (${detail.backlinks.length})`} items={detail.backlinks} onOpen={(linked) => requestSelection({ id: linked.id, collection: reportCollection(linked) })} />
         {detail.backlinks.length === 0 && (
           <>
             <h3 className="mb-1.5 mt-6 text-w-xs font-medium text-w-muted">Linked from</h3>
             <p className="px-2 text-w-xs text-w-faint">No other report links here yet.</p>
           </>
         )}
-        <LinkList title={`Links to (${detail.outlinks.length})`} items={detail.outlinks} onOpen={(id) => requestSelection({ id })} />
+        <LinkList title={`Links to (${detail.outlinks.length})`} items={detail.outlinks} onOpen={(linked) => requestSelection({ id: linked.id, collection: reportCollection(linked) })} />
       </aside>
     </div>
   );
 
   const workspaceMode = Boolean(workspace && selection.workspace && report?.kind === "canvas" && !report.practice && mode === "read");
-  const openAsWorkspace = report?.kind === "canvas" && !report.practice && workspace ? () => requestSelection({ id: report.id, workspace: !workspaceMode }) : undefined;
+  const openAsWorkspace = report?.kind === "canvas" && !report.practice && workspace ? () => requestSelection({ id: report.id, workspace: true, collection: "workspaces" }) : undefined;
+  const surfaceTitle = collection === "workspaces" ? "Workspaces" : "Reports";
   return (
-    <div role="dialog" aria-modal="true" aria-label={workspaceMode ? "Workspace" : "Reports"} className={cn(PANEL, "pointer-events-auto flex h-full w-full flex-col overflow-hidden @container")}>
+    <div role="dialog" aria-modal="true" aria-label={workspaceMode ? "Workspace" : surfaceTitle} className={cn(PANEL, "pointer-events-auto flex h-full w-full flex-col overflow-hidden @container")}>
       {workspaceMode && workspace && report ? (
         <WindowHeader
           title="Workspace"
-          subtitle={`${report.title}: the canvas, your agents and your channels in one place`}
+          subtitle={`${report.title}: your shared board, agents and channels in one place`}
           leading={
             <button
               type="button"
@@ -1693,9 +1910,9 @@ export function ReportsPanel({
           onClose={onClose}
           actions={
             <>
-              <button type="button" onClick={openAsWorkspace} className={BTN_SECONDARY} title="Show this canvas in Reports with the library">
-                <Notebook size={14} weight="bold" />
-                <span className="hidden @lg:inline">Open in Reports</span>
+              <button type="button" onClick={openLibrary} className={BTN_SECONDARY} title="Back to all workspaces">
+                <SquaresFour size={14} weight="bold" />
+                <span className="hidden @lg:inline">All workspaces</span>
               </button>
               {sideToggle}
             </>
@@ -1703,43 +1920,54 @@ export function ReportsPanel({
         />
       ) : (
       <WindowHeader
-        title="Reports"
-        subtitle="Write-ups from your agents and you, linked like a notebook"
+        title={surfaceTitle}
+        subtitle={collection === "workspaces" ? "Shared boards for notes, media and live work" : "Write-ups from your agents and you, linked like a notebook"}
         leading={
           <>
             {readerOpen && (
-              <button type="button" onClick={() => requestSelection({ id: null })} aria-label="Back to the library" className={cn(ICON_BTN_MD, "@2xl:hidden")}>
+              <button type="button" onClick={openLibrary} aria-label="Back to the library" className={cn(ICON_BTN_MD, "@2xl:hidden")}>
                 <ArrowLeft size={16} weight="bold" />
               </button>
             )}
-            <button
-              type="button"
-              onClick={toggleLibrary}
-              aria-pressed={!libraryHidden}
-              aria-label={libraryHidden ? "Show the library" : "Hide the library"}
-              title={libraryHidden ? "Show the library" : "Hide the library"}
-              className={cn(GHOST_ICON_BTN, "hidden @2xl:grid")}
-            >
-              <SidebarSimple size={18} weight={libraryHidden ? "regular" : "duotone"} />
-            </button>
+            {readerOpen && (
+              <button
+                type="button"
+                onClick={toggleLibrary}
+                aria-pressed={!libraryCollapsed}
+                aria-label={libraryCollapsed ? "Show the library" : "Hide the library"}
+                title={libraryCollapsed ? "Show the library" : "Hide the library"}
+                className={cn(GHOST_ICON_BTN, "hidden @2xl:grid")}
+              >
+                <SidebarSimple size={18} weight={libraryCollapsed ? "regular" : "duotone"} />
+              </button>
+            )}
           </>
         }
         onClose={onClose}
         actions={
           <>
             <ScopeToggle others={othersCount} className="hidden @3xl:inline-flex" />
-            <button type="button" onClick={() => void newCanvas()} className={BTN_SECONDARY} title="Start a canvas: a board for images, notes and live cards">
-              <SquaresFour size={14} weight="bold" />
-              <span className="hidden @lg:inline">New canvas</span>
-            </button>
-            <button type="button" onClick={() => startNew()} className={BTN_PRIMARY}>
-              <Plus size={14} weight="bold" />
-              <span className="hidden @lg:inline">New report</span>
-            </button>
+            {canWrite && collection === "workspaces" ? (
+              <button type="button" disabled={creatingWorkspace} onClick={() => void newWorkspace()} className={BTN_PRIMARY} title="Start a workspace for images, notes and live cards">
+                <SquaresFour size={14} weight="bold" />
+                <span>{creatingWorkspace ? "Creating" : "New workspace"}</span>
+              </button>
+            ) : canWrite && collection === "reports" ? (
+              <button type="button" onClick={() => startNew()} className={BTN_PRIMARY}>
+                <Plus size={14} weight="bold" />
+                <span className="hidden @lg:inline">New report</span>
+              </button>
+            ) : null}
             {sideToggle}
           </>
         }
       />
+      )}
+      {panelFailure && (
+        <div role="alert" className="flex shrink-0 items-center justify-between gap-3 border-b-2 border-w-danger/30 bg-w-rose px-3 py-2 text-w-sm text-w-danger">
+          <span>{panelFailure.message}</span>
+          <button type="button" onClick={retryPanelFailure} className={BTN_SECONDARY_SM}>Try again</button>
+        </div>
       )}
       <div className="flex min-h-0 flex-1">
         {workspaceMode && workspace?.channelsOpen && (
@@ -1754,19 +1982,21 @@ export function ReportsPanel({
           style={libraryPane.style}
           className={cn(
             "flex min-h-0 w-full flex-col overflow-hidden border-w-line2 transition-[width,opacity] duration-300 [transition-timing-function:cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none @2xl:shrink-0 @2xl:border-dashed",
-            libraryHidden ? "@2xl:!w-0 @2xl:border-r-0 @2xl:opacity-0" : cn("@2xl:border-r-2", libraryPane.custom ? "@2xl:w-[var(--pane-w)]" : "@2xl:w-72 @5xl:w-80"),
+            libraryCollapsed ? "@2xl:invisible @2xl:!w-0 @2xl:border-r-0 @2xl:opacity-0" : cn("@2xl:border-r-2", libraryPane.custom ? "@2xl:w-[var(--pane-w)]" : "@2xl:w-72 @5xl:w-80"),
             SIDEBAR,
             readerOpen && "hidden @2xl:flex",
             workspaceMode && "!hidden",
           )}
-          aria-hidden={libraryHidden || undefined}
-          inert={libraryHidden || undefined}
         >
           <div className="shrink-0 p-3 @2xl:min-w-[16rem]">
             <FilterField
               value={query}
-              onChange={setQuery}
-              placeholder="Search reports"
+              onChange={(value) => {
+                setQuery(value);
+                setSearchError(false);
+                setSearching(Boolean(value.trim()));
+              }}
+              placeholder={collection === "workspaces" ? "Search workspaces" : "Search reports"}
               className="w-full"
               findTarget={!readerOpen}
               onEnter={() => shown[0] && requestSelection({ id: shown[0].id })}
@@ -1779,7 +2009,7 @@ export function ReportsPanel({
             {list}
           </div>
         </div>
-        {!libraryHidden && !workspaceMode && <PaneResizer pane={libraryPane} edge="right" label="Resize the library" className="hidden @2xl:block" />}
+        {!libraryCollapsed && !workspaceMode && <PaneResizer pane={libraryPane} edge="right" label="Resize the library" className="hidden @2xl:block" />}
         <div ref={readerRef} className={cn("min-h-0 flex-1 @container/reader", report?.kind === "canvas" && mode === "read" ? "overflow-hidden" : "overflow-y-auto", !readerOpen && "hidden @2xl:block")}>
           {mode === "edit" ? (
             editor
@@ -1821,6 +2051,12 @@ export function ReportsPanel({
                 loadDetail(report.id);
                 loadAll();
               }}
+              folders={folders}
+              onMoveFolder={async (folder) => {
+                await reportsApi.update(report.id, { folder });
+                loadDetail(report.id);
+                loadAll();
+              }}
               onHistory={() => {
                 setHistoryOpen(true);
               }}
@@ -1831,25 +2067,49 @@ export function ReportsPanel({
             />
           ) : reader ? (
             reader
-          ) : missing ? (
-            <div className="grid h-full place-items-center p-6 text-center text-w-base text-w-muted">This report was deleted or is not shared with you.</div>
-          ) : selected ? (
+          ) : !selected && query.trim() ? (
             <div className="grid h-full place-items-center p-6 text-w-base text-w-muted">
-              <Shimmer>Opening the report</Shimmer>
+              {searchError ? "Could not search. Try again from the library." : searchPending ? <Shimmer>Searching the library</Shimmer> : shown.length ? `Pick a ${collection === "workspaces" ? "workspace" : "report"} to open` : `No ${collection} match.`}
             </div>
+          ) : !selected && all === null && !listError ? (
+            <div className="grid h-full place-items-center p-6 text-w-base text-w-muted"><Shimmer>Opening the library</Shimmer></div>
+          ) : !selected && all === null && listError ? (
+            <div className="grid h-full place-items-center p-6 text-w-base text-w-muted">Could not open the library. Try again from the library.</div>
+          ) : missing ? (
+            <div className="grid h-full place-items-center p-6 text-center text-w-base text-w-muted">This {collection === "workspaces" ? "workspace" : "report"} was deleted or is not shared with you.</div>
+          ) : selected && panelFailure?.kind !== "detail" ? (
+            <div className="grid h-full place-items-center p-6 text-w-base text-w-muted">
+              <Shimmer>Opening the {collection === "workspaces" ? "workspace" : "report"}</Shimmer>
+            </div>
+          ) : selected ? (
+            <div className="h-full" />
           ) : (
             <div className="grid h-full place-items-center p-6">
-              <EmptyState
-                size="lg"
-                icon={Notebook}
-                title={visible.length ? "Pick a report to read" : "No reports yet"}
-                description="Agents write a report when their findings are too long for chat, then share it as a card. You can start one yourself too."
-                action={
-                  <button type="button" onClick={() => startNew()} className={BTN_PRIMARY}>
-                    <Plus size={14} weight="bold" /> New report
-                  </button>
-                }
-              />
+              {collection === "workspaces" ? (
+                <EmptyState
+                  size="lg"
+                  icon={SquaresFour}
+                  title={visible.length ? "Pick a workspace to open" : "No workspaces yet"}
+                  description="Keep notes, media and live work together on a shared board. Agents can make and update workspaces with you."
+                  action={canWrite ? (
+                    <button type="button" disabled={creatingWorkspace} onClick={() => void newWorkspace()} className={BTN_PRIMARY}>
+                      <Plus size={14} weight="bold" /> {creatingWorkspace ? "Creating" : "New workspace"}
+                    </button>
+                  ) : undefined}
+                />
+              ) : (
+                <EmptyState
+                  size="lg"
+                  icon={Notebook}
+                  title={visible.length ? "Pick a report to read" : "No reports yet"}
+                  description="Agents write a report when their findings are too long for chat, then share it as a card. You can start one yourself too."
+                  action={canWrite ? (
+                    <button type="button" onClick={() => startNew()} className={BTN_PRIMARY}>
+                      <Plus size={14} weight="bold" /> New report
+                    </button>
+                  ) : undefined}
+                />
+              )}
             </div>
           )}
         </div>

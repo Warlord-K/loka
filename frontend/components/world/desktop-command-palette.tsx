@@ -4,7 +4,7 @@ import { SOLO } from "@/lib/edition";
 import { AgentFace } from "./channel-ui";
 
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
-import { terminalSummaries, watchTerminals, type Dock, type TerminalDevice, type TerminalSummary } from "@/lib/terminal-layout";
+import { runningTerminals, terminalSummaries, watchTerminals, type Dock, type TerminalDevice, type TerminalSummary } from "@/lib/terminal-layout";
 import { keyProfile, shortcutKeycaps } from "@/lib/terminal-keys";
 import { Command } from "cmdk";
 import Glide from "./glide";
@@ -29,7 +29,9 @@ import { setMusicOn, skipMusic, toggleMusicPause, useMusic } from "./music";
 import { watchBrowser } from "@/lib/browser-view";
 import { MeaningIcon } from "@/lib/meaning-icons";
 import type { NavigationRequest } from "@/lib/exact-world-navigation";
-import { questNeedsYou } from "@/lib/quest-status";
+import { boardQuests, summaryText } from "@/lib/quest-board";
+import { useLiveQuests } from "./live-quests";
+import { needsYouFirst, questNeedsYou } from "@/lib/quest-status";
 import { OPEN_WORKSPACE } from "@/lib/workspace-layout";
 
 function words(text: string): string[] {
@@ -218,6 +220,14 @@ interface PaletteAction {
   core?: boolean;
 }
 
+const ROOM_HIT: Record<string, string> = {
+  question: "Question in a quest",
+  answer: "Answer in a quest",
+  decision: "Decision in a quest",
+  assumed: "Assumption in a quest",
+  needs_you: "Needs you, in a quest",
+};
+
 export function DesktopCommandPalette({
   open,
   agents,
@@ -280,6 +290,8 @@ export function DesktopCommandPalette({
   onOpenShortcuts: (request?: NavigationRequest) => void;
 }) {
   const terminals = useSyncExternalStore(watchTerminals, terminalSummaries, NO_TERMINALS);
+  const liveQuests = useLiveQuests();
+  const terminalsRunning = runningTerminals(terminals);
   const previousFocus = useRef<HTMLElement | null>(null);
   const [questControls, setQuestControls] = useState(0);
   const [search, setSearch] = useState("");
@@ -375,18 +387,28 @@ export function DesktopCommandPalette({
       keywords: `shell tab switch go ${t.label}`,
     })),
   ];
+  const boards = boardQuests(liveQuests ?? []);
   const actions: PaletteAction[] = [
+    ...boards.map((q) => ({
+      id: `quest-board-${q.id}`,
+      label: `Open quest board: ${q.title}`,
+      hint: "",
+      icon: UsersThree,
+      available: canRead,
+      run: () => window.dispatchEvent(new CustomEvent("world:open-quest", { detail: { taskId: q.id, agentId: q.assigned_agent_id } })),
+      keywords: `quest room board crew questions decisions needs you members ${q.decisions?.passed_up ? "waiting answer" : ""}`,
+    })),
     { id: "quest-status", label: "Change quest status", hint: "S", icon: CircleHalf, available: canWrite && questControls > 0, run: questCommand("status"), core: true },
     { id: "quest-assign", label: "Assign quest to", hint: "A", icon: UserSwitch, available: canWrite && questControls > 0, run: questCommand("assignee"), core: true },
     { id: "quests", label: "Open quests", hint: "Q", icon: Scroll, available: canRead, run: onOpenQuests, keywords: "board tasks work", core: true },
     { id: "lists", label: "Open your lists (to-dos, lists, timers)", hint: "L", icon: CheckSquare, available: canWrite, run: onOpenLists, keywords: "todos reminders checklist", core: true },
     { id: "reports", label: "Open reports", hint: "R", icon: FileText, available: canRead, run: () => openReport(), keywords: "library wiki notes docs", core: true },
-    { id: "workspace", label: "Open workspace (a canvas with your chat and channels)", hint: "B", icon: SquaresFour, available: canRead, run: () => window.dispatchEvent(new CustomEvent(OPEN_WORKSPACE)), keywords: "canvas board live cursors agents team channels call", core: true },
+    { id: "workspace", label: "Open workspaces", hint: "B", icon: SquaresFour, available: canRead, run: () => window.dispatchEvent(new CustomEvent(OPEN_WORKSPACE)), keywords: "workspace canvas board live cursors agents team channels call", core: true },
     { id: "chat", label: "Open chat", hint: "C", icon: ChatCircleDots, available: canRead, run: onOpenChat, keywords: "channels messages dm post office", core: true },
     { id: "quick", label: "Quick chat with an agent", hint: "K", icon: Lightning, available: canWrite, run: () => openQuickChat(), keywords: "aside side question ask memory throwaway research", core: true },
     { id: "history", label: "Open session history", hint: "H", icon: ClockCounterClockwise, available: canWrite, run: onOpenHistory, keywords: "sessions runs rewind library", core: true },
     { id: "folder-workshop", label: "Work in a folder with an agent", hint: "O", icon: Hammer, available: canWrite, run: onOpenFolderWorkshop, keywords: "workshop mac directory", core: true },
-    { id: "terminal", label: "Open terminal", hint: "T", icon: TerminalWindow, available: canTerminal, run: onOpenTerminal, keywords: "shell forge console", core: true },
+    { id: "terminal", label: terminalsRunning ? `Terminals, ${terminalsRunning} running` : "Open terminal", hint: "T", icon: TerminalWindow, available: canTerminal, run: onOpenTerminal, keywords: "terminals shell forge console minimized hidden running show back restore", core: true },
     { id: "terminal-chat", label: "Ask an agent about the terminal", hint: "", icon: ChatCircleDots, available: canTerminal && canWrite, run: onTerminalChat, keywords: "terminal shell output error side chat quote explain" },
     { id: "workshop", label: "Open workshop", hint: "", icon: Hammer, available: canWorkshop, run: onOpenWorkshop, keywords: "workbench files editor code", core: true },
     { id: "assistant", label: "Open your main agent", hint: "P", icon: Star, available: canWrite, run: onOpenAssistant, keywords: "assistant main", core: true },
@@ -586,14 +608,14 @@ export function DesktopCommandPalette({
           {results && (
             <>
               {(results.reports?.length ?? 0) > 0 && (
-                <HitGroup heading="Reports">
+                <HitGroup heading="Reports and workspaces">
                   {results.reports?.map((report) => [
                     <Command.Item key={report.id} value={`hit:report:${report.id}`} onSelect={() => selectRecord(() => (report.practice ? openPractice(report.id) : openReport(report.id)))} className={cn(ITEM, "items-start")}>
                       {report.practice ? <Student size={16} weight="duotone" className="mt-0.5 shrink-0 text-w-link" /> : report.kind === "canvas" ? <FlowArrow size={16} weight="duotone" className="mt-0.5 shrink-0 text-w-link" /> : <FileText size={16} weight="duotone" className="mt-0.5 shrink-0 text-w-link" />}
                       <span className="min-w-0 flex-1">
                         <span className="flex items-baseline gap-1.5 text-w-xs text-w-muted">
                           <span className="truncate font-medium text-w-text">{report.title}</span>
-                          {report.practice ? <span className="shrink-0">Practice · {subjectLabel(report.practice.subject)}</span> : report.kind === "canvas" && <span className="shrink-0">Canvas</span>}
+                          {report.practice ? <span className="shrink-0">Practice · {subjectLabel(report.practice.subject)}</span> : report.kind === "canvas" && <span className="shrink-0">Workspace</span>}
                           {report.folder && <span className="truncate">{report.folder}</span>}
                         </span>
                         {report.excerpt && !report.items?.length && <span className="line-clamp-2 text-w-sm leading-snug">{report.excerpt}</span>}
@@ -617,7 +639,12 @@ export function DesktopCommandPalette({
               {results.messages.length > 0 && (
                 <HitGroup heading="Messages">
                   {results.messages.map((hit) => (
-                    <Command.Item key={hit.ref} value={`hit:message:${hit.ref}`} onSelect={() => selectRecord(() => openMessage(hit))} className={cn(ITEM, "items-start")}>
+                    <Command.Item
+                      key={hit.ref}
+                      value={`hit:message:${hit.ref}`}
+                      onSelect={() => selectRecord(() => openMessage(hit))}
+                      className={cn(ITEM, "items-start")}
+                    >
                       <span aria-hidden="true" className="shrink-0 pt-0.5">{(() => {
                         const agent = hit.kind === "agent" ? agents.find((a) => a.id === hit.agent_id) : null;
                         if (agent) return <AgentFace agent={agent} size={16} />;
@@ -625,7 +652,7 @@ export function DesktopCommandPalette({
                       })()}</span>
                       <span className="min-w-0 flex-1">
                         <span className="flex items-baseline gap-1.5 text-w-xs text-w-muted">
-                          <span className="truncate font-medium text-w-text">{hit.kind === "agent" ? hit.agent_name : hit.channel_kind === "dm" ? "Direct message" : `#${hit.channel_name}`}</span>
+                          <span className="truncate font-medium text-w-text">{hit.room_kind && hit.room_kind !== "chat" ? ROOM_HIT[hit.room_kind] : hit.kind === "agent" ? hit.agent_name : hit.channel_kind === "dm" ? "Direct message" : `#${hit.channel_name}`}</span>
                           <span className="truncate">{hit.author}</span>
                         </span>
                         <span className="line-clamp-2 text-w-sm leading-snug">{hit.excerpt}</span>
@@ -637,17 +664,21 @@ export function DesktopCommandPalette({
               )}
               {results.quests.length > 0 && (
                 <HitGroup heading="Quests">
-                  {results.quests.map((quest) => {
+                  {needsYouFirst(results.quests).map((quest) => {
                     const agent = agents.find((a) => a.id === quest.assigned_agent_id);
+                    const summary = summaryText(quest.decisions, agent?.name);
                     return (
                       <Command.Item
                         key={quest.id}
                         value={`hit:quest:${quest.id}`}
                         onSelect={() => selectRecord(() => window.dispatchEvent(new CustomEvent("world:open-quest", { detail: { taskId: quest.id, agentId: quest.assigned_agent_id } })))}
-                        className={ITEM}
+                        className={cn(ITEM, "items-start")}
                       >
                         <StatusIcon status={quest.status} />
-                        <span className="min-w-0 flex-1 truncate">{quest.title}</span>
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate">{quest.title}</span>
+                          {summary && <span className="mt-0.5 block truncate text-w-xs text-w-muted">{summary}</span>}
+                        </span>
                         {questNeedsYou(quest) && <span className="shrink-0 text-w-xs font-semibold text-w-warn">Needs you</span>}
                         {agent && <span className="flex shrink-0 items-center gap-1.5 text-w-xs text-w-muted"><AgentFace agent={agent} size={16} />{agent.name}</span>}
                       </Command.Item>
@@ -700,7 +731,7 @@ export function DesktopCommandPalette({
                       value={`hit:schedule:${s.id}`}
                       icon={<CalendarDots size={16} weight="duotone" className={cn("shrink-0", s.enabled ? "text-w-link" : "text-w-muted")} />}
                       title={s.name}
-                      detail={[agentName(s.agent_id), s.kind === "heartbeat" ? "heartbeat" : "routine", s.enabled ? null : "off"].filter(Boolean).join(" · ")}
+                      detail={[agentName(s.agent_id), s.kind === "heartbeat" ? "heartbeat" : s.kind === "action" ? "pull request action" : "routine", s.enabled ? null : "off"].filter(Boolean).join(" · ")}
                       aside={s.enabled ? cronLabel(s.cron_expression, s.next_run_at) : null}
                       onSelect={jump({ kind: "schedules", agentId: s.agent_id, id: s.id })}
                     />
@@ -731,7 +762,7 @@ export function DesktopCommandPalette({
                         value={`hit:academy:${p.id}`}
                         icon={p.kind === "adventure" ? <Compass size={16} weight="duotone" className="shrink-0 text-w-warn" /> : <GraduationCap size={16} weight="duotone" className="shrink-0 text-w-ok" />}
                         title={p.name}
-                        detail={p.kind === "adventure" ? `Course${typeof p.data.skill === "string" ? ` in ${p.data.skill}` : ""}` : `${report ? "Canvas lesson" : "Lesson"}${typeof p.data.skill === "string" ? ` in ${p.data.skill}` : ""}`}
+                        detail={p.kind === "adventure" ? `Course${typeof p.data.skill === "string" ? ` in ${p.data.skill}` : ""}` : `${report ? "Practice workspace lesson" : "Lesson"}${typeof p.data.skill === "string" ? ` in ${p.data.skill}` : ""}`}
                         aside="Open"
                         onSelect={report ? () => select(() => openPractice(report)) : jump({ kind: "academy", challengeId: p.kind === "challenge" ? p.id : null, courseId: p.kind === "adventure" ? p.id : null })}
                       />

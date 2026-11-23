@@ -43,7 +43,9 @@ import {
   MAC_TERMINALS_PER_PLACE,
   MAX_PANES,
   publishTerminals,
+  terminalSummaries,
   blankPane,
+  clearClosedShellIds,
   checkUntilAnswered,
   enqueue,
   nextLocalCheck,
@@ -67,6 +69,8 @@ import {
   type Zone,
 } from "@/lib/terminal-layout";
 import { escapeTaken, takeEscape } from "@/lib/escape";
+import { closeHint, closeShortcutClosesArea, paneRunning, requestClose, runningShellKind, savedNativeInventory, type CloseSource, type RunningShell } from "@/lib/terminal-close";
+import { terminalStartsAllowed } from "@/lib/terminal-lifecycle";
 import { worldApi, type RunnerView } from "@/lib/world";
 import { desktopApi, isDesktopApp } from "@/lib/desktop";
 import { ConnectionMark } from "./connection-mark";
@@ -76,11 +80,14 @@ import { Shimmer } from "./work-ui";
 import { BTN_SECONDARY_DANGER, FOCUS, PANEL } from "./styles";
 import { SetupHint, useFeature } from "./setup-hint";
 import { MAIN_TARGET, QuoteButton, sendQuote, type MessageQuote } from "./quote";
-import { closeLabel, homeShell, Shell, workshopShell, type ShellState } from "./terminal-shell";
+import { closeLabel, closeUnownedNative, homeShell, shellHeld, Shell, workshopShell, type ShellCloseResult, type ShellState } from "./terminal-shell";
 import { wb } from "./workbench/bridge";
 import { EMBED_DRAG, embedDragData, orphanKeys, terminalTarget } from "@/lib/canvas-embeds";
+import { TerminalCloseDialog, useCloseChoice, type CloseAsk, type ClosePick } from "./terminal-close";
 
 export type TerminalReader = () => TerminalQuote | null;
+
+export type TerminalCloser = (source: CloseSource) => void;
 
 export type TerminalRequest = { id: number; command: string; runnerId: string | null };
 
@@ -152,8 +159,10 @@ function useDrag() {
 export function TerminalPanel({
   meId,
   onClose,
+  onMinimize,
   sideToggle,
   readerRef,
+  closerRef,
   front = true,
   request = null,
   notice,
@@ -168,8 +177,10 @@ export function TerminalPanel({
 }: {
   meId: string | null;
   onClose: () => void;
+  onMinimize?: () => void;
   sideToggle?: ReactNode;
   readerRef?: MutableRefObject<TerminalReader | null>;
+  closerRef?: MutableRefObject<TerminalCloser | null>;
   front?: boolean;
   request?: TerminalRequest | null;
   notice?: ReactNode;
@@ -185,7 +196,8 @@ export function TerminalPanel({
   const workshop = source.kind === "workshop" ? source.sessionKey : null;
   const embed = source.kind === "embed" ? source : null;
   const storageKey = workshop ? workshopLayoutKey(workshop) : embed ? embedLayoutKey(embed.key) : layoutKey(meId);
-  const docked = !workshop && !embed && place.dock !== "window";
+  const devicesPanel = !workshop && !embed;
+  const docked = devicesPanel && place.dock !== "window";
   const profile = useMemo(() => keyProfile(isDesktopApp()), []);
   const hint = (action: LabelledAction) => shortcutLabel(action, profile);
   const [all, setAll] = useState<RunnerView[] | null>(null);
@@ -244,6 +256,17 @@ export function TerminalPanel({
   onTypedRef.current = onTyped;
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
+  const onMinimizeRef = useRef(onMinimize);
+  onMinimizeRef.current = onMinimize;
+  const asks = !!onMinimize && devicesPanel;
+  const [closeChoice, setCloseChoice] = useCloseChoice(meId);
+  const closeChoiceRef = useRef(closeChoice);
+  closeChoiceRef.current = closeChoice;
+  const [asking, setAsking] = useState<CloseAsk | null>(null);
+  const [closing, setClosing] = useState(false);
+  const closingRef = useRef(false);
+  const askCount = useRef(0);
+  const closeCheck = useRef<object | null>(null);
 
   const devices = useMemo(() => (all === null ? null : all.filter((r) => r.status === "online" && (!meId || r.owner_user_id === meId))), [all, meId]);
   const localRef = useRef(localRunner);
@@ -362,6 +385,7 @@ export function TerminalPanel({
   const openOn = useCallback(
     (paneId: string, device: string | null, reattach: string | null = null) => {
       const shell = ensureShell(paneId);
+      if (shell.closingNow || !terminalStartsAllowed(devicesPanel, front, closingRef.current)) return shell;
       if (reattach === null && shell.phase === "elsewhere") reattach = layoutRef.current.panes[paneId]?.native ?? null;
       autoTried.current.add(paneId);
       restored.current.delete(paneId);
@@ -375,7 +399,7 @@ export function TerminalPanel({
       else void shell.openRemote(device);
       return shell;
     },
-    [ensureShell, setLayout, workshop],
+    [ensureShell, setLayout, workshop, devicesPanel, front],
   );
 
   useEffect(() => {
@@ -405,7 +429,7 @@ export function TerminalPanel({
     for (const id of live) ensureShell(id);
     for (const [id, shell] of shells.current) {
       if (live.has(id)) continue;
-      shell.dispose(true);
+      shell.dispose();
       shells.current.delete(id);
       autoTried.current.delete(id);
       setStates((prev) => {
@@ -418,7 +442,7 @@ export function TerminalPanel({
 
   useEffect(
     () => () => {
-      for (const shell of shells.current.values()) shell.dispose(false);
+      for (const shell of shells.current.values()) shell.dispose();
       shells.current.clear();
       autoTried.current.clear();
     },
@@ -435,7 +459,7 @@ export function TerminalPanel({
   const focus = tab?.focus ?? null;
 
   useEffect(() => {
-    if (!focus || !wantFocus.current) return;
+    if (!focus || !wantFocus.current || asking) return;
     wantFocus.current = false;
     let timer = 0;
     let tries = 0;
@@ -447,7 +471,7 @@ export function TerminalPanel({
     };
     timer = window.setTimeout(attempt, 0);
     return () => window.clearTimeout(timer);
-  }, [focus, layout.active, focusTick]);
+  }, [focus, layout.active, focusTick, asking]);
 
   useEffect(() => {
     if (workshop || embed || !layout.tabs.length) return;
@@ -455,10 +479,19 @@ export function TerminalPanel({
       layout.tabs.map((t) => {
         const pane = layout.panes[t.focus];
         const state = states[t.focus];
-        return { id: t.id, label: t.name ?? (state?.title || deviceName(pane?.device ?? null)), device: pane?.device ?? null, panes: panesIn(t.root).length };
+        const running = panesIn(t.root).filter((id) => {
+          const device = states[id]?.device ?? layout.panes[id]?.device ?? null;
+          return paneRunning({ phase: states[id]?.phase ?? "idle", native: layout.panes[id]?.native ?? null, local: !!device && device === localRunner });
+        }).length;
+        return { id: t.id, label: t.name ?? (state?.title || deviceName(pane?.device ?? null)), device: pane?.device ?? null, panes: panesIn(t.root).length, running };
       }),
     );
-  }, [layout, states, deviceName, workshop]);
+  }, [layout, states, deviceName, workshop, embed, localRunner]);
+
+  useEffect(() => {
+    if (!devicesPanel) return;
+    return () => publishTerminals(terminalSummaries().map((summary) => ({ ...summary, running: 0 })));
+  }, [devicesPanel]);
 
   const choices = useMemo(() => (workshop || (!ready && !slow) ? [] : deviceChoices(devices, localRunner)), [ready, slow, devices, localRunner, workshop]);
 
@@ -486,20 +519,177 @@ export function TerminalPanel({
     [setLayout, setTypedNote, problemFor],
   );
 
-  const closeMany = useCallback(
-    (paneIds: string[]) => {
-      for (const id of paneIds) shells.current.get(id)?.kill();
-      const next = paneIds.reduce((acc, id) => closePane(acc, id), layoutRef.current);
+  const resolveHomeNatives = useCallback(
+    (paneIds: string[], resolved: (inventory: ReadonlyMap<string, boolean>) => void) => {
+      if (closeCheck.current) return;
+      const saved = paneIds.flatMap((id) => {
+        const pane = layoutRef.current.panes[id];
+        const shell = shells.current.get(id);
+        const native = shell?.pendingNative ?? pane?.native;
+        if (!native || (!shell?.pendingNative && shell?.native === native)) return [];
+        return [native];
+      });
+      if (!devicesPanel || !isDesktopApp() || !saved.length) {
+        resolved(new Map());
+        return;
+      }
+      const check = {};
+      closeCheck.current = check;
+      void wb.homeTermList().then(
+        (listed) => {
+          if (check !== closeCheck.current) return;
+          closeCheck.current = null;
+          resolved(savedNativeInventory(saved, listed));
+        },
+        () => {
+          if (check !== closeCheck.current) return;
+          closeCheck.current = null;
+          setTypedNote("Could not check the terminals on this Mac. Try again.");
+        },
+      );
+    },
+    [devicesPanel, setTypedNote],
+  );
+
+  const closePanes = useCallback(async (paneIds: string[], homeInventory: ReadonlyMap<string, boolean> = new Map()) => {
+    const results = await Promise.all(
+      paneIds.map(async (id): Promise<[string, ShellCloseResult]> => {
+        const pane = layoutRef.current.panes[id];
+        const shell = shells.current.get(id);
+        if (!shell) return [id, { status: "closed" }];
+        const native = shell.pendingNative ?? pane?.native ?? null;
+        return [id, await shell.close(native && homeInventory.has(native) ? native : null)];
+      }),
+    );
+    return new Map(results);
+  }, []);
+
+  const dropPanes = useCallback(
+    async (paneIds: string[], homeInventory: ReadonlyMap<string, boolean> = new Map()) => {
+      const results = await closePanes(paneIds, homeInventory);
+      const failed = paneIds.filter((id) => results.get(id)?.status === "failed");
+      const removed = paneIds.filter((id) => !failed.includes(id));
+      const next = removed.reduce((acc, id) => closePane(acc, id), layoutRef.current);
       requestFocus();
       setLayout(() => next);
+      if (failed.length) {
+        setTypedNote(failed.length === 1 ? "Could not close this terminal. Try again." : `Could not close ${failed.length} terminals. Try again.`);
+        return;
+      }
       if (next.tabs.length) return;
       saveLayout(window.localStorage, storageKey, null);
       if (!workshop && !embed) publishTerminals([]);
       onCloseRef.current();
     },
-    [storageKey, setLayout, requestFocus, workshop, embed],
+    [closePanes, storageKey, setLayout, requestFocus, setTypedNote, workshop, embed],
+  );
+
+  const runningShells = useCallback(
+    (homeInventory: ReadonlyMap<string, boolean>): RunningShell[] =>
+      Object.values(layoutRef.current.panes).flatMap((pane) => {
+        const shell = shells.current.get(pane.id);
+        const device = shell?.device ?? pane.device;
+        const pendingNative = shell?.pendingNative;
+        const running = runningShellKind(!!shell?.busy, pendingNative ?? null, pane.native, homeInventory, (native) => shellHeld(native, shell));
+        return running ? [{ device: running === "saved" ? "this Mac" : deviceNameRef.current(device) }] : [];
+      }),
+    [],
+  );
+
+  const closeAll = useCallback(async (homeInventory: ReadonlyMap<string, boolean>) => {
+    if (closingRef.current) return;
+    closingRef.current = true;
+    setClosing(true);
+    const paneIds = Object.keys(layoutRef.current.panes);
+    const results = await closePanes(paneIds, homeInventory);
+    const failed = paneIds.filter((id) => results.get(id)?.status === "failed");
+    let saved = clearClosedShellIds(layoutRef.current, results);
+    saved = { ...saved, dock: place.dock, size: place.size };
+    setLayout(() => saved);
+    saveLayout(window.localStorage, storageKey, saved);
+    closingRef.current = false;
+    setClosing(false);
+    if (failed.length) {
+      setTypedNote(failed.length === 1 ? "Could not close one terminal. Try again." : `Could not close ${failed.length} terminals. Try again.`);
+      return;
+    }
+    publishTerminals(terminalSummaries().map((summary) => ({ ...summary, running: 0 })));
+    onCloseRef.current();
+  }, [closePanes, place.dock, place.size, setLayout, setTypedNote, storageKey]);
+
+  const requestCloseTerminals = useCallback(
+    (source: CloseSource) => {
+      if (closingRef.current) return;
+      if (!asks) {
+        onCloseRef.current();
+        return;
+      }
+      const paneIds = Object.keys(layoutRef.current.panes);
+      resolveHomeNatives(paneIds, (homeInventory) => {
+        requestClose(
+          { source, running: runningShells(homeInventory), choice: closeChoiceRef.current },
+          {
+            quiet: () => onCloseRef.current(),
+            minimize: () => onMinimizeRef.current?.(),
+            closeAll: () => closeAll(homeInventory),
+            ask: (plan) => {
+              askCount.current += 1;
+              setAsking({ id: askCount.current, plan });
+            },
+          },
+        );
+      });
+    },
+    [asks, closeAll, resolveHomeNatives, runningShells],
+  );
+
+  const pickClose = useCallback(
+    (pick: ClosePick) => {
+      setAsking(null);
+      if (pick.remember) setCloseChoice(pick.choice);
+      if (pick.choice === "close_all") resolveHomeNatives(Object.keys(layoutRef.current.panes), (inventory) => void closeAll(inventory));
+      else onMinimizeRef.current?.();
+    },
+    [closeAll, resolveHomeNatives, setCloseChoice],
+  );
+
+  useLayoutEffect(() => {
+    if (front) return;
+    closeCheck.current = null;
+    setAsking(null);
+  }, [front]);
+
+  useLayoutEffect(() => () => {
+    closeCheck.current = null;
+  }, []);
+
+  useEffect(() => {
+    if (!closerRef) return;
+    closerRef.current = requestCloseTerminals;
+    return () => {
+      if (closerRef.current === requestCloseTerminals) closerRef.current = null;
+    };
+  }, [closerRef, requestCloseTerminals]);
+
+  const closeMany = useCallback(
+    (paneIds: string[]) => {
+      const closing = new Set(paneIds);
+      if (asks && Object.keys(layoutRef.current.panes).every((id) => closing.has(id))) requestCloseTerminals("last_terminal");
+      else resolveHomeNatives(paneIds, (homeInventory) => dropPanes(paneIds, homeInventory));
+    },
+    [asks, dropPanes, requestCloseTerminals, resolveHomeNatives],
   );
   const closeOne = useCallback((paneId: string) => closeMany([paneId]), [closeMany]);
+  const endShell = useCallback(
+    (paneId: string) => {
+      const shell = shells.current.get(paneId);
+      if (!shell) return;
+      void shell.close().then((result) => {
+        if (result.status === "failed") setTypedNote("Could not close this terminal. Try again.");
+      });
+    },
+    [setTypedNote],
+  );
 
   const run = useCallback(
     (action: TerminalAction, paneId?: string, device?: string) => {
@@ -520,7 +710,8 @@ export function TerminalPanel({
           if (target) place_(newPane(device ?? deviceForNew()), action === "split_right" ? "row" : "column", target);
           return;
         case "close":
-          if (target) closeOne(target);
+          if (closeShortcutClosesArea(asks, current.tabs.length)) requestCloseTerminals("last_terminal");
+          else if (target) closeOne(target);
           return;
         case "focus_next":
           setLayout((prev) => cycleFocus(prev, 1));
@@ -548,7 +739,7 @@ export function TerminalPanel({
           return;
       }
     },
-    [closeOne, deviceForNew, setLayout, place_, requestFocus, setWaiting, embed],
+    [asks, closeOne, deviceForNew, setLayout, place_, requestCloseTerminals, requestFocus, setWaiting, embed],
   );
   runRef.current = run;
 
@@ -559,6 +750,7 @@ export function TerminalPanel({
       if (next === waiting.current) handledCommands.current.add(command);
       waiting.current = next;
     }
+    if (!terminalStartsAllowed(devicesPanel, front, closingRef.current)) return;
     const pending = waiting.current;
     waiting.current = [];
     const still: QueuedCommand[] = [];
@@ -586,10 +778,10 @@ export function TerminalPanel({
       else openOn(blank.id, device);
     }
     setWaiting([...still, ...waiting.current]);
-  }, [command, ready, run, setLayout, requestFocus, openOn, problemFor, setTypedNote, setWaiting]);
+  }, [command, ready, run, setLayout, requestFocus, openOn, problemFor, setTypedNote, setWaiting, devicesPanel, front, closing]);
 
   useEffect(() => {
-    if (!ready || devices === null || listed === null) return;
+    if (!ready || devices === null || listed === null || !terminalStartsAllowed(devicesPanel, front, closingRef.current)) return;
     const online = new Set(devices.map((d) => d.id));
     const tab = activeTab(layout);
     for (const pane of Object.values(layout.panes)) {
@@ -602,6 +794,11 @@ export function TerminalPanel({
       }
       const opensNew = !embed || embed.startsShell;
       if (restored.current.has(pane.id)) {
+        if (devicesPanel && pane.native && shellHeld(pane.native, shell)) {
+          shell.showElsewhere();
+          autoTried.current.add(pane.id);
+          continue;
+        }
         const plan = planRestored({ ready, pane, focused: pane.id === tab?.focus, online, localRunner });
         if (plan === "reattach") openOn(pane.id, localRunner, pane.native);
         else if (plan === "open" && opensNew) openOn(pane.id, pane.device);
@@ -612,7 +809,7 @@ export function TerminalPanel({
       if (opensNew && device && (online.has(device) || device === localRunner)) openOn(pane.id, device);
       else autoTried.current.add(pane.id);
     }
-  }, [ready, layout, devices, localRunner, fallback, openOn, listed, workshop, embed]);
+  }, [ready, layout, devices, localRunner, fallback, openOn, listed, workshop, embed, devicesPanel, front, closing]);
 
   useEffect(() => {
     for (const shell of shells.current.values()) shell.setScale(fontScale);
@@ -621,7 +818,7 @@ export function TerminalPanel({
   const handled = useRef<number | null>(null);
   useEffect(() => {
     if (!request || handled.current === request.id) return;
-    if (!ready) return;
+    if (!ready || !terminalStartsAllowed(devicesPanel, front, closingRef.current)) return;
     handled.current = request.id;
     setTypedNote(null);
     const current = focusedPane(layoutRef.current);
@@ -654,7 +851,7 @@ export function TerminalPanel({
       return;
     }
     finish(openOn(pane.id, workshop ? null : target));
-  }, [request, ready, fallback, ensureShell, openOn, place_, requestFocus, setTypedNote, workshop]);
+  }, [request, ready, fallback, ensureShell, openOn, place_, requestFocus, setTypedNote, workshop, devicesPanel, front, closing]);
 
   const readFocused = useCallback((selectionOnly: boolean): TerminalQuote | null => {
     const id = activeTab(layoutRef.current)?.focus;
@@ -690,11 +887,11 @@ export function TerminalPanel({
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape" || escapeTaken(e)) return;
       if ((e.target as HTMLElement | null)?.closest?.(".xterm")) return;
-      onCloseRef.current();
+      requestCloseTerminals("escape");
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [docked, front, workshop]);
+  }, [docked, front, workshop, embed, requestCloseTerminals]);
 
   const focusedState = focus ? states[focus] : undefined;
   const focusedDevice = focusedState?.device ?? (focus ? layout.panes[focus]?.device ?? null : null);
@@ -829,7 +1026,7 @@ export function TerminalPanel({
           <SquareSplitVertical size={15} weight="bold" />
         </button>
         {focus && (workshop || docked) && shells.current.get(focus)?.busy && (
-          <button type="button" onClick={() => shells.current.get(focus)?.kill()} aria-label="End the shell" title="End the shell in the focused terminal" className={cn(CHROME_BTN, "hover:text-w-term-red")}>
+          <button type="button" onClick={() => endShell(focus)} aria-label="End the shell" title="End the shell in the focused terminal" className={cn(CHROME_BTN, "hover:text-w-term-red")}>
             <Skull size={15} weight="bold" />
           </button>
         )}
@@ -863,7 +1060,7 @@ export function TerminalPanel({
           </button>
         ) : (
           docked && (
-            <button type="button" onClick={onClose} aria-label="Hide terminal" title="Hide terminal, your shells keep their place" className={cn(CHROME_BTN, "ml-1")}>
+            <button type="button" onClick={() => requestCloseTerminals("dock")} aria-label="Close terminal" title={closeHint(closeChoice)} className={cn(CHROME_BTN, "ml-1")}>
               <X size={15} weight="bold" />
             </button>
           )
@@ -886,13 +1083,14 @@ export function TerminalPanel({
         <WindowHeader
           title="Terminal"
           subtitle={status}
-          onClose={onClose}
+          onClose={() => requestCloseTerminals("window")}
+          closeTitle={closeHint(closeChoice)}
           actions={
             (sideToggle || focusedState?.phase === "live" || focusedState?.phase === "connecting" || focusedState?.phase === "starting") && (
               <>
                 {sideToggle}
                 {focus && shells.current.get(focus)?.busy && (
-                  <button type="button" onClick={() => shells.current.get(focus)?.kill()} title="End the shell in the focused terminal" className={BTN_SECONDARY_DANGER}>
+                  <button type="button" onClick={() => endShell(focus)} title="End the shell in the focused terminal" className={BTN_SECONDARY_DANGER}>
                     <Skull size={14} weight="bold" />
                     <span className="hidden sm:inline">Kill</span>
                   </button>
@@ -978,6 +1176,7 @@ export function TerminalPanel({
           <QuoteButton spot={front && quote && quoting ? quote.spot : null} onQuote={quoteSelection} />
         </div>
       </div>
+      {asks && <TerminalCloseDialog ask={asking} onPick={pickClose} onCancel={() => setAsking(null)} />}
     </div>
   );
 }
@@ -1469,13 +1668,20 @@ function PaneView({ id, panes, shells, states, focus, many, drag, workshop, read
   );
 }
 
-export function releaseEmbedTerminals(reportId: string, present: ReadonlySet<string>) {
+export async function releaseEmbedTerminals(reportId: string, present: ReadonlySet<string>) {
   const storage = window.localStorage;
   const stored = Array.from({ length: storage.length }, (_, n) => storage.key(n)).filter((key): key is string => !!key);
   const gone = orphanKeys(stored, embedLayoutKey(`${reportId}:`), present);
   if (!gone.length) return;
   const natives = (keys: string[]) => keys.flatMap((key) => Object.values(loadLayout(storage, key)?.panes ?? {}).flatMap((pane) => (pane.native ? [pane.native] : [])));
   const kept = new Set(natives(stored.filter((key) => key.startsWith("world.terminals.") && !gone.includes(key))));
-  for (const native of natives(gone)) if (!kept.has(native)) void wb.termClose(native).catch(() => {});
-  for (const key of gone) saveLayout(storage, key, null);
+  const snapshots = new Map(gone.map((key) => [key, storage.getItem(key)]));
+  const failed = new Set<string>();
+  await Promise.all(
+    gone.map(async (key) => {
+      const results = await Promise.all(natives([key]).filter((native) => !kept.has(native)).map(closeUnownedNative));
+      if (results.some((result) => result.status === "failed")) failed.add(key);
+    }),
+  );
+  for (const key of gone) if (!failed.has(key) && storage.getItem(key) === snapshots.get(key)) saveLayout(storage, key, null);
 }

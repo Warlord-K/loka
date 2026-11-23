@@ -1,10 +1,11 @@
 use loka_shared::models::AgentTask;
 pub use loka_shared::context::unforked;
+use loka_shared::context::SentContext;
 use loka_shared::outside::{defused, one_line};
 use loka_shared::powers;
 use loka_shared::quests::QuestChoice;
 use loka_shared::teams::TeamContext;
-use loka_shared::world::{BeforeBigWork, InboxItem, ReviewerChoice, WorldAgent, WorldRule};
+use loka_shared::world::{main_clarification_task, BeforeBigWork, InboxItem, ReviewerChoice, WorldAgent, WorldRule, WorldStore};
 use serde::Deserialize;
 use serde_json::Value;
 use std::borrow::Cow;
@@ -58,6 +59,52 @@ pub fn persona(agent: &WorldAgent, owner: &str) -> String {
         .replace("{default_limit}", &(loka_shared::world::default_task_timeout_secs() / 60).to_string())
 }
 
+pub fn main_feature_launch(items: &[InboxItem], recent: &[String], owner: &str) -> String {
+    let mut seed = 0_u64;
+    let mut owner_facing = false;
+    for item in items {
+        if item.payload.get("from_owner").and_then(Value::as_bool) == Some(true) {
+            owner_facing = true;
+            seed = seed.wrapping_mul(31).wrapping_add(item.id as u64);
+        }
+    }
+    if !owner_facing {
+        return String::new();
+    }
+    loka_shared::features::launch_prompt(
+        chrono::Utc::now().date_naive(),
+        loka_shared::features::LaunchScope::Main,
+        seed,
+        recent,
+    )
+    .replace("{owner}", owner)
+}
+
+pub fn feature_launch_active(scope: loka_shared::features::LaunchScope) -> bool {
+    loka_shared::features::has_active_launch(chrono::Utc::now().date_naive(), scope)
+}
+
+pub async fn recent_feature_exposures(store: &WorldStore, agent: &WorldAgent) -> Vec<String> {
+    let Some(owner) = agent.owner_user_id else {
+        return Vec::new();
+    };
+    loka_shared::features::recent_launch_exposures(store, owner, agent.org_id).await.unwrap_or_default()
+}
+
+pub fn quest_feature_launch(task: &AgentTask, recent: &[String], owner: &str) -> String {
+    loka_shared::features::launch_prompt(
+        chrono::Utc::now().date_naive(),
+        loka_shared::features::LaunchScope::Quest,
+        task.id.as_u128() as u64,
+        recent,
+    )
+    .replace("{owner}", owner)
+}
+
+pub fn quest_feature_map(owner: &str) -> String {
+    loka_shared::features::quest_navigation_prompt(owner)
+}
+
 fn reviewer_block(agent: &WorldAgent) -> String {
     let current = match agent.reviewer.as_ref().and_then(ReviewerChoice::from_value) {
         Some(c) => format!("Your default reviewer is {}.", c.label()),
@@ -92,44 +139,103 @@ pub fn turn(items: &[InboxItem], tasks: &[AgentTask]) -> String {
 pub fn clarification_origin(items: &[InboxItem], tasks: &[AgentTask], source: Option<&str>) -> Option<Value> {
     let mut requests = Vec::new();
     for item in items {
-        if item.kind == "message" && item.payload.get("from_owner").and_then(Value::as_bool) == Some(true) {
-            let Some(body) = item.payload.get("body").and_then(Value::as_str).map(str::trim).filter(|body| !body.is_empty()) else {
+        if item.kind == "onboarding.finished" && item.payload.get("from_owner").and_then(Value::as_bool) == Some(true) {
+            let Some(goal) = item.payload.get("goal").and_then(Value::as_str).map(str::trim).filter(|goal| !goal.is_empty()) else {
                 continue;
             };
+            requests.push((
+                Some("onboarding".to_string()),
+                serde_json::json!({
+                    "request": truncate_chars(goal, 2000),
+                    "onboarding": true,
+                    "source_inbox_id": item.id,
+                }),
+            ));
+        }
+        if item.kind == "message" && item.payload.get("from_owner").and_then(Value::as_bool) == Some(true) {
+            let body = item.payload.get("body").and_then(Value::as_str).map(str::trim).unwrap_or_default();
             let reference = match item.payload.get("message_id") {
                 Some(Value::Number(id)) => Some(format!("msg:ch{id}")),
                 Some(Value::String(id)) if !id.is_empty() => Some(format!("msg:{}", link_ref(id))),
                 _ => None,
             };
-            requests.push((
-                reference,
-                serde_json::json!({
-                    "request": truncate_chars(body, 2000),
+            let has_attachments = item.payload.get("attachments").and_then(Value::as_array).is_some_and(|items| !items.is_empty());
+            if body.is_empty() && !(has_attachments && reference.is_some()) {
+                continue;
+            }
+            let mut request = serde_json::json!({
+                    "request": if body.is_empty() { "(attachment-only message)".to_string() } else { truncate_chars(body, 2000) },
                     "message_id": item.payload.get("message_id"),
                     "task_id": item.payload.get("task_id"),
+                    "source_inbox_id": item.id,
+                });
+            if let Some(task_id) = item
+                .payload
+                .get("task_id")
+                .and_then(Value::as_str)
+                .and_then(|task_id| Uuid::parse_str(task_id).ok())
+                .filter(|task_id| tasks.iter().any(|task| task.id == *task_id && task.status == "done"))
+            {
+                request["task_id"] = Value::Null;
+                request["context_task_id"] = serde_json::json!(task_id);
+            }
+            if loka_shared::world::clarification_continuation_unbound(item) {
+                if let Some(route) = item.payload.get("clarification_channel").filter(|route| route.is_object()) {
+                    request["clarification_channel"] = route.clone();
+                }
+            }
+            requests.push((reference, request));
+        }
+        if item.kind == "channel.mention" && item.payload.get("from_owner").and_then(Value::as_bool) == Some(true) {
+            let body = item.payload.get("body").and_then(Value::as_str).map(str::trim).unwrap_or_default();
+            let Some((channel_id, message_id, root_id)) = clarification_channel_route(&item.payload) else {
+                continue;
+            };
+            let has_attachments = item.payload.get("attachments").and_then(Value::as_array).is_some_and(|items| !items.is_empty());
+            if body.is_empty() && !has_attachments {
+                continue;
+            }
+            requests.push((
+                Some(format!("msg:ch{message_id}")),
+                serde_json::json!({
+                    "request": if body.is_empty() { "(attachment-only message)".to_string() } else { truncate_chars(body, 2000) },
+                    "message_id": message_id,
+                    "source_inbox_id": item.id,
+                    "clarification_channel": {
+                        "channel_id": channel_id,
+                        "message_id": message_id,
+                        "root_id": root_id,
+                    },
                 }),
             ));
         }
-        if item.kind == "task.assigned" {
+        if item.kind == "task.assigned"
+            && item.payload.get("subscribed").and_then(Value::as_bool) != Some(true)
+            && item.payload.get("clarification_continuation").is_none()
+        {
             let Some(task_id) = item.payload.get("task_id").and_then(Value::as_str) else {
                 continue;
             };
             let Some(task) = tasks.iter().find(|task| task.id.to_string() == task_id) else {
                 continue;
             };
-            let description = task
-                .description
-                .as_deref()
-                .or_else(|| item.payload.get("brief").and_then(Value::as_str))
-                .map(str::trim)
-                .filter(|description| !description.is_empty());
-            let request = description.map(|description| format!("{}\n\n{description}", task.title)).unwrap_or_else(|| task.title.clone());
+            let description = task.description.as_deref().map(str::trim).filter(|description| !description.is_empty());
+            let brief = item.payload.get("brief").and_then(Value::as_str).map(str::trim).filter(|brief| !brief.is_empty());
+            let mut request = task.title.clone();
+            if let Some(description) = description {
+                request.push_str(&format!("\n\n{description}"));
+            }
+            if let Some(brief) = brief.filter(|brief| Some(*brief) != description) {
+                request.push_str(&format!("\n\nTheir note: {brief}"));
+            }
             requests.push((
                 Some(format!("quest:{}", task.id)),
                 serde_json::json!({
-                    "request": truncate_chars(&request, 2000),
+                    "request": request,
                     "task_id": task.id,
                     "title": task.title,
+                    "resume": item.payload.get("resume"),
+                    "source_inbox_id": item.id,
                 }),
             ));
         }
@@ -139,6 +245,33 @@ pub fn clarification_origin(items: &[InboxItem], tasks: &[AgentTask], source: Op
         None if requests.len() == 1 => requests.pop().map(|(_, request)| request),
         None => None,
     }
+}
+
+fn clarification_channel_route(payload: &Value) -> Option<(Uuid, i64, i64)> {
+    let channel_id = payload.get("channel_id")?.as_str()?.parse().ok()?;
+    let message_id = payload.get("message_id")?.as_i64().filter(|id| *id > 0)?;
+    let root_id = payload.get("reply_to").and_then(Value::as_i64).unwrap_or(message_id);
+    (root_id > 0).then_some((channel_id, message_id, root_id))
+}
+
+pub fn clarification_targets(actions: &[Action], items: &[InboxItem], tasks: &[AgentTask]) -> Vec<Uuid> {
+    let mut targets = Vec::new();
+    for action in actions {
+        let Action::Ask { text, clarify_request: true, clarify_source, .. } = action else {
+            continue;
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        let Some(task_id) = clarification_origin(items, tasks, clarify_source.as_deref()).as_ref().and_then(main_clarification_task)
+        else {
+            continue;
+        };
+        if !targets.contains(&task_id) {
+            targets.push(task_id);
+        }
+    }
+    targets
 }
 
 fn is_slack(item: &InboxItem) -> bool {
@@ -307,13 +440,28 @@ fn attached(p: &Value) -> String {
             }
             None => {
                 let id = file.get("id").and_then(Value::as_str).map(|id| format!(", upload {id}")).unwrap_or_default();
-                out.push_str(&format!(
-                    "\n(attached file {name}, {mime}{id}: its path on disk is listed below when it was saved, but only a quest session can open it: hand the work to a quest and give it this upload id for get_upload)"
-                ));
+                let instruction = "its path on disk is listed below when it was saved, but only a quest session can open it: hand the work to a quest and give it this upload id for get_upload";
+                out.push_str(&format!("\n(attached file {name}, {mime}{id}: {instruction})"));
             }
         }
     }
     out
+}
+
+pub fn clarification_continuation_brief(item: &InboxItem) -> Option<String> {
+    loka_shared::world::clarification_continuation_brief(item)
+}
+
+pub fn clarification_source(item: &InboxItem) -> Option<String> {
+    match item.payload.get("message_id") {
+        Some(Value::Number(id)) => Some(format!("msg:ch{id}")),
+        Some(Value::String(id)) if !id.is_empty() => Some(format!("msg:{}", link_ref(id))),
+        _ => None,
+    }
+}
+
+fn clarification_continuation_preview(item: &InboxItem) -> Option<String> {
+    clarification_continuation_brief(item).map(|brief| truncate_chars(&brief, 12_000))
 }
 
 fn transcript(p: &Value) -> String {
@@ -487,6 +635,14 @@ fn render_event(item: &InboxItem, tasks: &[AgentTask]) -> String {
             s("body"),
             linked(p)
         ),
+        "message" if loka_shared::world::clarification_continuation_unbound(item) => {
+            let source = clarification_source(item).unwrap_or_else(|| "this answer".into());
+            format!(
+                "[event] clarification answered by {}. Continue from the complete request and answer below. If this turn has another owner request or assignment and you start a quest from this answer, include \"clarification_source\":\"{source}\" in that start_task action.\nsource: {source}\n{}",
+                sender(p),
+                clarification_continuation_brief(item).unwrap_or_else(|| s("body"))
+            )
+        }
         "message" if p.get("edited").and_then(Value::as_bool) == Some(true) => format!(
             "[event] {} edited an earlier message. Treat the new version as what they meant.\nbefore:\n{}\nnow:\n{}",
             sender(p),
@@ -517,7 +673,7 @@ fn render_event(item: &InboxItem, tasks: &[AgentTask]) -> String {
             s("body"),
             attached(p),
             linked(p),
-            reply_note(p)
+            loka_shared::replies::reply_note(p)
         ),
         "onboarding.finished" => onboarding_finished(p),
         "aside.answered" => format!(
@@ -525,6 +681,13 @@ fn render_event(item: &InboxItem, tasks: &[AgentTask]) -> String {
             or(&s("agent"), "someone"),
             p.get("asked_by").and_then(|a| a.get("question")).and_then(Value::as_str).unwrap_or(""),
             s("answer")
+        ),
+        "task.assigned" if p.get("clarification_continuation").is_some() => format!(
+            "[event] task.clarified: your person answered the question about this quest. Continue it now with a start_task action on this task_id in this reply. Do not ask the same question again.\nsource: quest:{}\ntask_id: {}\ntitle: {}\n{}",
+            s("task_id"),
+            s("task_id"),
+            s("title"),
+            clarification_continuation_preview(item).unwrap_or_else(|| s("brief"))
         ),
         "task.assigned" if p.get("resume").and_then(Value::as_bool) == Some(true) => format!(
             "[event] task.resume: your person asked to resume this quest and its earlier session cannot continue, so a fresh session on the same branch and worktree has to take it over.\nsource: quest:{}\ntask_id: {}\ntitle: {}\nResume it now with a start_task action on this task_id in this reply: Loka hands the last report to the new session. Do not do the work in chat.{}",
@@ -625,13 +788,14 @@ fn render_event(item: &InboxItem, tasks: &[AgentTask]) -> String {
             }
         ),
         "task.finished" => format!(
-            "[event] task.finished\ntask_id: {}\nstatus: {}{}\nreviewer verdict: {}\npull request: {}\nreport:\n{}{}{}",
+            "[event] task.finished\ntask_id: {}\nstatus: {}{}\nreviewer verdict: {}\npull request: {}\nreport:\n{}{}{}{}",
             s("task_id"),
             or(&s("status"), "unknown"),
             if s("error").is_empty() { String::new() } else { format!("\nerror: {}", s("error")) },
             or(&s("verdict"), "not reviewed"),
             or(&s("pr_url"), "none"),
             pretty(p.get("report")),
+            decisions_note(p),
             cause_note(p),
             blocked_note(p)
         ),
@@ -704,6 +868,17 @@ fn render_event(item: &InboxItem, tasks: &[AgentTask]) -> String {
             defused(&s("text")),
             or(&s("permalink"), "(none)")
         ),
+        "action.ran" | "action.skipped" | "action.failed" => format!(
+            "[event] {}: {}\nschedule:{} (alone on a line it shows as a card)\n{}",
+            item.kind,
+            one_line(&s("line"), 400),
+            s("schedule_id"),
+            match item.kind.as_str() {
+                "action.ran" => "Loka did it without AI. If someone waits on it (a merge sha, a cleaned up branch), tell them in one line; otherwise end with an empty actions list and say nothing.",
+                "action.skipped" => "Nothing was done because the state changed or a rule did not hold. Look at the pull request now and decide again: ask for a review, wait for the fix, or call pr_action again pinned to the current head. Never work around the rule it names.",
+                _ => "GitHub or the device refused it. Read the reason; retry with pr_action only when the cause is gone, and tell your person when they need to act.",
+            }
+        ),
         "timer.done" => format!(
             "[event] Your timer \"{}\" just went off. When you set it you said you would: {}",
             s("label"),
@@ -716,7 +891,7 @@ fn render_event(item: &InboxItem, tasks: &[AgentTask]) -> String {
             or(&s("age"), "a while")
         ),
         "canvas.mark" => format!(
-            "[event] canvas.mark: {} left a {} on your canvas report:{} \"{}\"{}:\n{}\nmark_id: {}\nIterate on it: change the canvas with canvas_add_items, canvas_update_items, canvas_connect or canvas_layout (or start a quest when it needs real work), then call canvas_marks with resolve set to this mark_id and a one-line reply saying what changed.",
+            "[event] canvas.mark: {} left a {} on your workspace report:{} \"{}\"{}:\n{}\nmark_id: {}\nIterate on it: change the workspace with canvas_add_items, canvas_update_items, canvas_connect or canvas_layout (or start a quest when it needs real work), then call canvas_marks with resolve set to this mark_id and a one-line reply saying what changed.",
             sender(p),
             if s("kind") == "sticky" { "sticky note" } else { "mark" },
             s("report_id"),
@@ -730,7 +905,7 @@ fn render_event(item: &InboxItem, tasks: &[AgentTask]) -> String {
             s("mark_id")
         ),
         "practice.ready" => format!(
-            "[event] practice.ready: {} pressed Ready on attempt {} of their {} canvas lesson report:{} \"{}\" in the Academy and you are their coach.\nattempt: {}\nThe drawing is attached as an image.{}\n\nStrokes, in the order drawn:\n{}\n\nEarlier attempts, newest first:\n{}\n\nLook at the image and the stroke order (count, order and direction matter for kanji), compare with the earlier attempts, then call grade_attempt with attempt set to {} and a specific right, fix and next (score 0 to 100 is optional; 60 or more passes, or set passed). A pass earns them xp the first time. grade_attempt posts your answer in their chat, so end this turn with an empty actions list and no reply. list_challenges with attempt and strokes true has the full stroke data.",
+            "[event] practice.ready: {} pressed Ready on attempt {} of their {} practice workspace lesson report:{} \"{}\" in the Academy and you are their coach.\nattempt: {}\nThe drawing is attached as an image.{}\n\nStrokes, in the order drawn:\n{}\n\nEarlier attempts, newest first:\n{}\n\nLook at the image and the stroke order (count, order and direction matter for kanji), compare with the earlier attempts, then call grade_attempt with attempt set to {} and a specific right, fix and next (score 0 to 100 is optional; 60 or more passes, or set passed). A pass earns them xp the first time. grade_attempt posts your answer in their chat, so end this turn with an empty actions list and no reply. list_challenges with attempt and strokes true has the full stroke data.",
             sender(p),
             p.get("n").and_then(Value::as_i64).unwrap_or(0),
             one_line(&s("subject"), 40),
@@ -818,6 +993,24 @@ fn team_note(p: &Value) -> String {
     }
 }
 
+fn decisions_note(p: &Value) -> String {
+    match p.get("decisions").and_then(Value::as_str).map(str::trim).filter(|d| !d.is_empty()) {
+        Some(decisions) => format!("\nDecisions:\n{}\nInclude a short Decisions section in your report back to your person, so they can change any of them.", loka_shared::outside::defused(decisions)),
+        None => String::new(),
+    }
+}
+
+pub fn asking_block(agent: &str, decisions: Option<&str>) -> String {
+    let mut block = format!(
+        "[asking {agent}] When you have the ask_agent tool and are unsure about something {agent} would know (which system to extend, where something lives, what an earlier quest decided, which of two reasonable approaches to take), call ask_agent instead of guessing or rereading at length. Say what it is about and what you will assume if nobody knows. {agent} decides; only taste, credentials, money or irreversible steps go to your person. At most {} questions per run. A decision from {agent} is never your person's approval. If no answer comes, go on with your assumption and list it in your report.",
+        loka_shared::quest_questions::PER_RUN
+    );
+    if let Some(decisions) = decisions {
+        block.push_str(&format!("\nAlready decided in this quest (do not ask again):\n{decisions}"));
+    }
+    block
+}
+
 pub fn task(task: &AgentTask, working_dir: &str, feedback: Option<&str>) -> String {
     task_from(TASK, task, working_dir, feedback)
 }
@@ -884,9 +1077,9 @@ pub fn rules(rules: &[WorldRule], scope: &str, owner: &str) -> String {
 
 pub fn before_big_work(mode: BeforeBigWork) -> &'static str {
     match mode {
-        BeforeBigWork::AskWhenUnclear => "Before big work: ask when unclear. Start small, clear requests immediately. For non-trivial work, first check whether missing facts could materially change what gets built. If so, ask 1 to 3 specific questions together, with choices when practical, using an ask action with clarify_request true. Name its msg: or quest: ref in clarify_source when this turn has several requests. Make the question self-contained. Once answered, continue the original request and never ask it again. Never ask permission between steps.",
+        BeforeBigWork::AskWhenUnclear => "Before big work: ask when unclear. Start small, clear requests immediately. For non-trivial work, first check whether missing facts could materially change what gets built. If so, ask 1 to 3 specific questions together, with choices when practical, using an ask action with clarify_request true. With several requests, put its shown source ref in clarify_source. Make the question self-contained. Once answered, continue the original request and never ask it again. Never ask permission between steps.",
         BeforeBigWork::JustBuild => "Before big work: just build. Start from the person's words, rules and existing systems, make reasonable reversible assumptions, and state them in the result. Ask only for a fact without which useful progress is impossible, using clarify_request true and the request's clarify_source when needed. Never pause for permission between steps.",
-        BeforeBigWork::AlwaysShowPlan => "Before big work: always show a plan. Start small, clear requests immediately. For new non-trivial quests, set plan_first true so the existing plan card appears before changes begin. Do not alter an existing quest's approved, skipped or racing options. Ask only for missing facts that materially change the plan, using clarify_request true and the request's clarify_source when needed. Explicit instructions and required approvals win. After approval, keep moving.",
+        BeforeBigWork::AlwaysShowPlan => "Before big work: always show a plan. Start small, clear requests immediately. For new non-trivial quests, set plan_first true for the existing plan card. For best-of attempts, leave plan_first unset: Loka applies this once before the parallel attempts. Keep existing quest options. Ask only for missing facts that materially change the plan, with clarify_request true and its clarify_source when needed. Explicit instructions and approvals win. After approval, keep moving.",
     }
 }
 
@@ -982,16 +1175,20 @@ pub fn compacts(backend: &str) -> bool {
     matches!(backend, "claude" | "codex" | "omp")
 }
 
-pub fn compact_threshold() -> Option<i64> {
-    let limit = std::env::var("WORLD_COMPACT_TOKENS").ok().and_then(|v| v.parse().ok()).unwrap_or(120_000);
-    (limit > 0).then_some(limit)
+pub fn compaction_due(backend: &str, model: &str, used: i64) -> Option<i64> {
+    loka_shared::context_budget::main_compact_limit(backend, model).filter(|limit| compacts(backend) && used > *limit)
 }
 
-pub fn rules_hash(text: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut h);
-    format!("{:016x}", h.finish())
+pub fn instructions_update(sent: &mut SentContext, resumes: bool, system: &str, rules_text: &str) -> Option<String> {
+    if !sent.offer(loka_shared::context::INSTRUCTIONS_BLOCK, &format!("{system}\n{rules_text}")) {
+        return None;
+    }
+    let update = if resumes {
+        format!("[instructions updated] These replace your earlier instructions:\n{system}\n\n{rules_text}")
+    } else {
+        rules_text.to_string()
+    };
+    (!update.trim().is_empty()).then(|| format!("[rules updated]\n{update}"))
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
@@ -1006,6 +1203,8 @@ pub enum Action {
         task_id: String,
         brief: Option<String>,
         #[serde(default)]
+        clarification_source: Option<String>,
+        #[serde(default)]
         review: Option<bool>,
         #[serde(default)]
         reviewer: Option<Value>,
@@ -1014,7 +1213,7 @@ pub enum Action {
         #[serde(default)]
         milestones: Vec<String>,
         #[serde(flatten)]
-        quest: QuestChoice,
+        quest: Box<QuestChoice>,
     },
     Status { text: String },
     Escalate { text: String },
@@ -1140,6 +1339,8 @@ pub fn clean_drafts(items: &[Draft]) -> Vec<Draft> {
 pub struct Report {
     #[serde(default)]
     pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub proceed_without_plan: bool,
     #[serde(default)]
     pub summary: Option<String>,
     #[serde(default)]
@@ -1405,7 +1606,14 @@ pub fn plan_text(output: &str) -> String {
 pub fn has_plan(output: &str) -> bool {
     extract_block(output, "plan")
         .and_then(|(_, block)| serde_json::from_str::<Value>(&block).ok())
-        .is_some_and(|value| value.is_object())
+        .and_then(|value| value.as_object().cloned())
+        .is_some_and(|plan| {
+            plan.get("summary").and_then(Value::as_str).is_some_and(|summary| !summary.trim().is_empty())
+                || plan
+                    .get("steps")
+                    .and_then(Value::as_array)
+                    .is_some_and(|steps| steps.iter().any(|step| step.as_str().is_some_and(|step| !step.trim().is_empty())))
+        })
 }
 
 pub struct AttemptBrief {
@@ -1663,15 +1871,14 @@ pub fn failed_nudge_output(error: &str) -> String {
     format!("The reviewer was asked for a verdict again, but that follow-up failed: {error}")
 }
 
-pub fn is_verdict_nudge(prompt: &str) -> bool {
-    prompt.starts_with(loka_shared::world::VERDICT_NUDGE_MARK)
-}
-
-pub fn failed_nudge_settles(prompt: &str, error: &str) -> bool {
-    is_verdict_nudge(prompt) && !loka_shared::cli_errors::describe(error).starts_with("Stopped by")
+pub fn failed_nudge_settles(nudge: Option<loka_shared::run_causes::Required>, error: &str) -> bool {
+    nudge == Some(loka_shared::run_causes::Required::Verdict) && !loka_shared::cli_errors::describe(error).starts_with("Stopped by")
 }
 
 pub fn contract_open(kind: &str, session: &loka_shared::world::AgentSession, output: &str) -> bool {
+    if matches!(kind, "task" | "followup") && loka_shared::quests::single_prework_phase(session.asked_by.as_ref()).is_some() {
+        return true;
+    }
     let reported = || parse_report(output).is_some_and(|report| report.status.is_some());
     match kind {
         "task" => !session.planning() && !reported(),
@@ -1836,18 +2043,6 @@ fn threaded(p: &Value) -> bool {
     p.get("reply_to").is_some_and(|r| !r.is_null())
 }
 
-fn reply_note(p: &Value) -> String {
-    let Some(root) = p.get("reply_to").and_then(Value::as_str).filter(|r| !r.is_empty()) else {
-        return String::new();
-    };
-    let thread = p.get("thread").and_then(Value::as_str).filter(|t| !t.trim().is_empty());
-    format!(
-        "\n\n(This is a reply in the thread under msg:{}. Your reply goes into the same thread.{})",
-        link_ref(root),
-        thread.map(|t| format!(" The thread so far:\n{t}")).unwrap_or_default()
-    )
-}
-
 fn channel_thread_hint(p: &Value) -> String {
     match p.get("reply_to").and_then(Value::as_i64) {
         Some(root) => format!("; it lands in the thread under msg:ch{root} on its own"),
@@ -1938,7 +2133,7 @@ fn onboarding_finished(p: &Value) -> String {
     let goal = s("goal");
     if !goal.is_empty() {
         return format!(
-            "[event] onboarding.finished: {} just finished first-time setup. The app asked which CLI, model, name and persona to use. {picked}{device}\nThen they described what they want:\n> {}\nThey expect a proposed setup they can approve. Follow features onboarding in this reply. If material facts are missing, apply their Before big work setting first; otherwise install the playbooks and create the setup quest with milestones and the right plan_first choice. Reply with one friendly line, the numbered plan and quest card. Do not repeat answered setup questions.",
+            "[event] onboarding.finished: {} just finished first-time setup.\nsource: onboarding\nThe app asked which CLI, model, name and persona to use. {picked}{device}\nThen they described what they want:\n> {}\nThey expect a proposed setup they can approve. Follow features onboarding in this reply. If material facts are missing, apply their Before big work setting first; otherwise install the playbooks and create the setup quest with milestones and the right plan_first choice. Reply with one friendly line, the numbered plan and quest card. Do not repeat answered setup questions.",
             sender(p),
             goal.replace('\n', "\n> "),
         );
@@ -2030,13 +2225,26 @@ fn answered_quote(p: &Value) -> String {
                 .and_then(Value::as_str)
                 .map(|id| format!("Continue the existing quest:{id}; do not create a duplicate.\n"))
                 .unwrap_or_default();
-            let source = origin
-                .map(msg_tag)
-                .filter(|reference| !reference.is_empty())
-                .map(|reference| format!("Original message {}; use read_thread if more context is needed.\n", reference.trim()))
-                .unwrap_or_default();
+            let onboarding = origin
+                .and_then(|origin| origin.get("onboarding"))
+                .and_then(Value::as_bool)
+                == Some(true);
+            let continuation = if onboarding {
+                "Continue first-time setup from this goal with features onboarding; do not treat it as a new request.\n"
+            } else {
+                ""
+            };
+            let source = if onboarding {
+                String::new()
+            } else {
+                origin
+                    .map(msg_tag)
+                    .filter(|reference| !reference.is_empty())
+                    .map(|reference| format!("Original message {}; use read_thread if more context is needed.\n", reference.trim()))
+                    .unwrap_or_default()
+            };
             let quoted: Vec<String> = question.lines().map(|l| format!("> {l}")).collect();
-            format!("(replying to your question)\n{request}{task}{source}Question:\n{}\n", quoted.join("\n"))
+            format!("(replying to your question)\n{request}{task}{continuation}{source}Question:\n{}\n", quoted.join("\n"))
         }
         None => String::new(),
     }
@@ -2046,6 +2254,44 @@ fn answered_quote(p: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn instructions_reach_every_new_session_and_a_resumed_one_only_when_they_change() {
+        use loka_shared::context::SentContext;
+        let system = "You are Rue.";
+        let rules = "Sign every reply.";
+        let mut fresh = SentContext::default();
+        assert_eq!(
+            instructions_update(&mut fresh, false, system, rules).as_deref(),
+            Some("[rules updated]\nSign every reply."),
+            "a new or reset session gets the rules on its first turn"
+        );
+        let stored = fresh.to_value();
+        let mut resumed = SentContext::carried(Some(&stored), true);
+        assert_eq!(instructions_update(&mut resumed, true, system, rules), None, "already in the session");
+        let mut changed = SentContext::carried(Some(&stored), true);
+        let update = instructions_update(&mut changed, true, system, "Sign every reply with a wave.").expect("changed rules");
+        assert!(update.starts_with("[rules updated]\n[instructions updated]") && update.contains(system) && update.contains("wave"), "{update}");
+        let mut compacted = SentContext::carried(Some(&serde_json::json!({})), true);
+        assert!(instructions_update(&mut compacted, true, system, rules).is_some_and(|text| text.contains(rules)), "compaction forgets them");
+        let mut rewound = SentContext::carried(Some(&stored), loka_shared::context::resumes_same_session(true, false, true));
+        assert!(instructions_update(&mut rewound, true, system, rules).is_some(), "a rewind may cut them off");
+        let mut no_rules = SentContext::default();
+        assert_eq!(instructions_update(&mut no_rules, false, system, ""), None, "the persona is already the system prompt");
+        assert!(no_rules.hash(loka_shared::context::INSTRUCTIONS_BLOCK).is_some());
+    }
+
+    #[test]
+    fn compaction_is_due_on_the_same_measurement_for_every_worker() {
+        let limit = loka_shared::context_budget::main_compact_limit("claude", "sonnet").expect("default limit");
+        let claude = loka_shared::context::measured("claude", 0, 40_000, limit as u64);
+        assert_eq!(compaction_due("claude", "sonnet", claude), Some(limit), "a missing last-call size falls back to the run's input");
+        let codex = loka_shared::context_budget::main_compact_limit("codex", "gpt-5").expect("codex limit");
+        assert_eq!(compaction_due("codex", "gpt-5", loka_shared::context::measured("codex", 0, 40_000, codex as u64)), None, "thread totals are not a context size");
+        assert_eq!(compaction_due("codex", "gpt-5", loka_shared::context::measured("codex", codex as u64 + 1, 0, 0)), Some(codex));
+        assert_eq!(compaction_due("cursor", "composer-2.5", limit + 1), None, "cursor cannot compact");
+        assert_eq!(compaction_due("claude", "sonnet", limit), None);
+    }
 
     #[test]
     fn clarification_blocks_are_bounded_and_readable() {
@@ -2085,6 +2331,279 @@ mod tests {
         assert!(rendered.contains("quest:aaaaaaaa-0000-0000-0000-000000000000"));
         assert!(rendered.contains("Original message (msg:22222222); use read_thread"));
         assert!(rendered.contains("Question:\n> Which environment?"));
+    }
+
+    #[test]
+    fn clarification_origin_accepts_only_identified_owner_attachments() {
+        let task_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        let attachment = Uuid::new_v4();
+        let file_only = inbox(
+            7,
+            "message",
+            json!({
+                "body": " ",
+                "from_owner": true,
+                "message_id": message_id,
+                "task_id": task_id,
+                "attachments": [{ "id": attachment, "mime": "application/pdf", "name": "brief.pdf" }],
+            }),
+        );
+        let origin = clarification_origin(std::slice::from_ref(&file_only), &[], None).unwrap();
+        assert_eq!(origin["request"], "(attachment-only message)");
+        assert_eq!(origin["message_id"], json!(message_id));
+        assert_eq!(origin["task_id"], json!(task_id));
+        assert_eq!(origin["source_inbox_id"], 7);
+
+        let ignored = [
+            inbox(8, "message", json!({ "body": "", "from_owner": true, "message_id": Uuid::new_v4() })),
+            inbox(9, "message", json!({ "body": "", "from_owner": true, "attachments": [{ "id": attachment }] })),
+            inbox(10, "message", json!({ "body": "", "from_owner": false, "message_id": Uuid::new_v4(), "attachments": [{ "id": attachment }] })),
+        ];
+        assert!(clarification_origin(&ignored, &[], None).is_none());
+    }
+
+    #[test]
+    fn clarification_origin_preserves_verified_channel_routes() {
+        let channel_id = Uuid::new_v4();
+        let verified = inbox(
+            11,
+            "channel.mention",
+            json!({
+                "body": "Ship this from the release branch",
+                "from_owner": true,
+                "channel_id": channel_id,
+                "message_id": 42,
+                "reply_to": 40,
+            }),
+        );
+        let origin = clarification_origin(std::slice::from_ref(&verified), &[], Some("msg:ch42")).unwrap();
+        assert_eq!(origin["request"], "Ship this from the release branch");
+        assert_eq!(origin["message_id"], 42);
+        assert_eq!(origin["clarification_channel"], json!({
+            "channel_id": channel_id,
+            "message_id": 42,
+            "root_id": 40,
+        }));
+
+        let unverified = inbox(
+            12,
+            "channel.mention",
+            json!({
+                "body": "Do not ask about this",
+                "from_owner": false,
+                "channel_id": channel_id,
+                "message_id": 43,
+            }),
+        );
+        let generic = inbox(
+            13,
+            "channel.message",
+            json!({
+                "body": "A generic channel event",
+                "from_owner": true,
+                "channel_id": channel_id,
+                "message_id": 44,
+            }),
+        );
+        assert!(clarification_origin(&[unverified, generic], &[], None).is_none());
+
+        let continuation = inbox(
+            14,
+            "message",
+            json!({
+                "body": "Use the release branch",
+                "from_owner": true,
+                "message_id": Uuid::new_v4(),
+                "clarification_continuation": Uuid::new_v4(),
+                "clarification_handoff": {
+                    "request": "Ship this",
+                    "question": "Which branch?",
+                    "answer": "Use the release branch",
+                },
+                "clarification_channel": {
+                    "channel_id": channel_id,
+                    "message_id": 42,
+                    "root_id": 40,
+                },
+            }),
+        );
+        let repeated = clarification_origin(std::slice::from_ref(&continuation), &[], None).unwrap();
+        assert_eq!(repeated["clarification_channel"], origin["clarification_channel"]);
+        let brief = clarification_continuation_brief(&continuation).unwrap();
+        assert!(brief.contains(&format!("post_to_channel (channel: {channel_id}, thread: msg:ch40)")));
+        assert!(brief.contains("The accepted answer and files are private."));
+
+        let ordinary = inbox(
+            15,
+            "message",
+            json!({
+                "body": "Use the release branch",
+                "from_owner": true,
+                "message_id": Uuid::new_v4(),
+                "clarification_continuation": Uuid::new_v4(),
+                "clarification_handoff": {
+                    "request": "Ship this",
+                    "question": "Which branch?",
+                    "answer": "Use the release branch",
+                },
+                "clarification_channel": null,
+            }),
+        );
+        let ordinary_origin = clarification_origin(std::slice::from_ref(&ordinary), &[], None).unwrap();
+        assert!(ordinary_origin.get("clarification_channel").is_none());
+    }
+
+    #[test]
+    fn clarification_origin_preserves_the_onboarding_goal() {
+        let onboarding = inbox(
+            1,
+            "onboarding.finished",
+            json!({ "goal": "Set up a Rust team", "from_owner": true }),
+        );
+        let origin = clarification_origin(std::slice::from_ref(&onboarding), &[], None).unwrap();
+        assert_eq!(origin["request"], "Set up a Rust team");
+        assert_eq!(origin["onboarding"], true);
+
+        let mixed = [
+            onboarding,
+            inbox(2, "message", json!({ "body": "Another request", "from_owner": true, "message_id": "11111111-0000-0000-0000-000000000000" })),
+        ];
+        assert!(clarification_origin(&mixed, &[], None).is_none());
+        let selected = clarification_origin(&mixed, &[], Some("onboarding")).unwrap();
+        let rendered = render_item(&inbox(5, "message", json!({
+            "author": "Ada",
+            "from_owner": true,
+            "body": "Use the GitHub repositories",
+            "answers": "Which repositories should we cover?",
+            "clarify_origin": selected,
+            "reply_to": "aaaaaaaa-0000-0000-0000-000000000000",
+        })), &[]);
+        assert!(rendered.contains("Original request:\n> Set up a Rust team"));
+        assert!(rendered.contains("Continue first-time setup from this goal with features onboarding"));
+        assert!(rendered.contains("Question:\n> Which repositories should we cover?"));
+        assert!(rendered.contains("Use the GitHub repositories"));
+        assert!(rendered.contains("reply in the thread under msg:aaaaaaaa"));
+        assert!(!rendered.contains("Original message"));
+
+        let ignored = [
+            inbox(3, "onboarding.finished", json!({ "goal": "Untrusted", "from_owner": false })),
+            inbox(4, "onboarding.finished", json!({ "goal": "  ", "from_owner": true })),
+        ];
+        assert!(clarification_origin(&ignored, &[], Some("onboarding")).is_none());
+    }
+
+    #[test]
+    fn clarification_origin_preserves_a_resume_note_and_ignores_subscriptions() {
+        let task_id = Uuid::new_v4();
+        let task = AgentTask {
+            id: task_id,
+            user_id: Uuid::new_v4(),
+            assignee_user_id: None,
+            title: "Repair the export".into(),
+            description: Some("The CSV is missing rows.".into()),
+            repo: None,
+            kind: "task".into(),
+            output_target: None,
+            output_ref: None,
+            source: None,
+            parent_task_id: None,
+            target_branch: None,
+            status: "todo".into(),
+            priority: "medium".into(),
+            position: 0.0,
+            branch: None,
+            pr_url: None,
+            pr_number: None,
+            plan_content: None,
+            result_content: None,
+            feedback: None,
+            not_before: None,
+            agent_session_id: None,
+            error_message: None,
+            cli: None,
+            model: None,
+            task_number: None,
+            cost_usd: 0.0,
+            external_source: None,
+            external_id: None,
+            external_url: None,
+            slack_channel: None,
+            slack_thread_ts: None,
+            assigned_agent_id: None,
+            planner_agent_id: None,
+            implementer_agent_id: None,
+            reviewer_agent_id: None,
+            orchestrator: None,
+            policy_matches: None,
+            created_at: None,
+            updated_at: None,
+            started_at: None,
+            completed_at: None,
+            time_limit_secs: None,
+            org_id: None,
+            past_prs: None,
+        };
+        let subscribed = inbox(1, "task.assigned", json!({ "task_id": task_id, "subscribed": true }));
+        assert!(clarification_origin(&[subscribed], std::slice::from_ref(&task), None).is_none());
+
+        let resumed = inbox(2, "task.assigned", json!({
+            "task_id": task_id,
+            "resume": true,
+            "brief": "Keep the approved column order."
+        }));
+        let actions = [
+            Action::StartTask {
+                task_id: task_id.to_string(),
+                brief: None,
+                clarification_source: None,
+                review: None,
+                reviewer: None,
+                time_limit_minutes: None,
+                milestones: Vec::new(),
+                quest: Box::default(),
+            },
+            Action::Ask {
+                text: "Which branch?".into(),
+                choices: Vec::new(),
+                clarify_request: true,
+                clarify_source: Some(format!("quest:{task_id}")),
+            },
+        ];
+        let reversed = [actions[1].clone(), actions[0].clone()];
+        for ordered in [&actions[..], &reversed[..]] {
+            assert_eq!(clarification_targets(ordered, std::slice::from_ref(&resumed), std::slice::from_ref(&task)), [task_id]);
+        }
+        let origin = clarification_origin(&[resumed], std::slice::from_ref(&task), None).unwrap();
+        assert_eq!(origin["request"], "Repair the export\n\nThe CSV is missing rows.\n\nTheir note: Keep the approved column order.");
+        assert_eq!(origin["resume"], true);
+        let full_note = format!("{}ASSIGNMENT_SNAPSHOT_TAIL", "assignment context ".repeat(180));
+        let full = inbox(4, "task.assigned", json!({ "task_id": task_id, "brief": full_note }));
+        let full_origin = clarification_origin(&[full], std::slice::from_ref(&task), None).unwrap();
+        assert!(full_origin["request"].as_str().unwrap().contains("ASSIGNMENT_SNAPSHOT_TAIL"));
+        let mut completed = task.clone();
+        completed.status = "done".into();
+        let completed_message = inbox(
+            5,
+            "message",
+            json!({
+                "body": "Please do a related follow-up.",
+                "from_owner": true,
+                "message_id": Uuid::new_v4(),
+                "task_id": task_id,
+            }),
+        );
+        let completed_origin =
+            clarification_origin(&[completed_message], std::slice::from_ref(&completed), None).unwrap();
+        assert!(completed_origin.get("task_id").is_none_or(Value::is_null));
+        assert_eq!(completed_origin["context_task_id"], task_id.to_string());
+        let continuation = inbox(3, "task.assigned", json!({
+            "task_id": task_id,
+            "resume": true,
+            "clarification_continuation": Uuid::new_v4(),
+            "brief": "Their answer: main"
+        }));
+        assert!(clarification_origin(&[continuation], &[task], None).is_none());
     }
 
     #[test]
@@ -2145,6 +2664,103 @@ mod tests {
         assert!(resume.contains("task.resume") && resume.contains("start_task action on this task_id") && resume.contains("check the lock"), "{resume}");
         let plain = render_item(&inbox(2, "task.assigned", serde_json::json!({ "task_id": "t9", "title": "Fix it" })), &[]);
         assert!(plain.starts_with("[event] task.assigned") && !plain.contains("task.resume"));
+        let clarified = render_item(
+            &inbox(3, "task.assigned", serde_json::json!({
+                "task_id": "t9", "title": "Fix it", "resume": true,
+                "clarification_continuation": Uuid::new_v4(), "brief": "Their answer: main"
+            })),
+            &[],
+        );
+        assert!(clarified.contains("task.clarified") && clarified.contains("Their answer: main") && !clarified.contains("task.resume"));
+    }
+
+    #[test]
+    fn a_clarification_work_brief_keeps_both_long_tails() {
+        let first_tail = "ORIGINAL_REQUEST_TAIL";
+        let second_tail = "ACCEPTED_ANSWER_TAIL";
+        let brief = format!(
+            "Original request:\n{} {first_tail}\n\nTheir answer:\n{} {second_tail}",
+            "original context ".repeat(400),
+            "answer context ".repeat(450),
+        );
+        assert!(brief.len() > 12_000);
+        let item = inbox(
+            4,
+            "task.assigned",
+            json!({
+                "task_id": Uuid::new_v4(),
+                "title": "Keep it all",
+                "resume": true,
+                "clarification_continuation": Uuid::new_v4(),
+                "clarification_status": "todo",
+                "clarification_resume": false,
+                "brief": brief,
+            }),
+        );
+        let work = clarification_continuation_brief(&item).unwrap();
+        assert!(work.contains(first_tail));
+        assert!(work.contains(second_tail));
+        let preview = render_item(&item, &[]);
+        assert!(preview.contains(first_tail));
+        assert!(!preview.contains(second_tail));
+    }
+
+    #[test]
+    fn a_regular_clarification_keeps_the_full_exchange_once() {
+        let request_tail = "REQUEST_AFTER_5500";
+        let answer_tail = "ANSWER_AFTER_5500";
+        let request = format!("{}{request_tail}", "request ".repeat(800));
+        let answer = format!("{}{answer_tail}", "answer ".repeat(800));
+        let item = inbox(
+            5,
+            "message",
+            json!({
+                "author": "Ana",
+                "author_kind": "user",
+                "from_owner": true,
+                "message_id": Uuid::new_v4(),
+                "body": answer,
+                "clarification_continuation": Uuid::new_v4(),
+                "clarification_handoff": {
+                    "request": request,
+                    "question": "Which database?",
+                    "answer": answer
+                },
+                "files": [{ "name": "choice.txt", "mime": "text/plain", "text": "Postgres only" }]
+            }),
+        );
+        let work = clarification_continuation_brief(&item).unwrap();
+        assert!(work.contains(request_tail));
+        assert!(work.contains(answer_tail));
+        assert_eq!(work.matches(answer_tail).count(), 1);
+        assert_eq!(work.matches("Postgres only").count(), 1);
+        let rendered = turn(std::slice::from_ref(&item), &[]);
+        assert!(rendered.contains(request_tail));
+        assert!(rendered.contains(answer_tail));
+        assert_eq!(rendered.matches(answer_tail).count(), 1);
+        assert_eq!(rendered.matches("Postgres only").count(), 1);
+        assert!(rendered.contains("\"clarification_source\""));
+    }
+
+    #[test]
+    fn a_report_back_lists_decisions_only_when_something_was_decided() {
+        let decided = render_item(&inbox(1, "task.finished", serde_json::json!({
+            "task_id": "t1", "status": "done", "report": { "status": "done", "summary": "ok" },
+            "decisions": "- Which store? -> canvas_marks (decided by Abhi)"
+        })), &[]);
+        assert!(decided.contains("Decisions:\n- Which store? -> canvas_marks") && decided.contains("Decisions section"));
+        let plain = render_item(&inbox(2, "task.finished", serde_json::json!({
+            "task_id": "t2", "status": "done", "report": { "status": "done", "summary": "ok" }
+        })), &[]);
+        assert!(!plain.contains("Decisions"), "nothing decided, no section");
+    }
+
+    #[test]
+    fn helpers_are_told_to_ask_and_what_was_already_decided() {
+        let block = asking_block("Abhi", Some("- Where? -> here"));
+        assert!(block.contains("ask_agent") && block.contains("never your person's approval"));
+        assert!(block.contains("do not ask again") && block.contains("- Where? -> here"));
+        assert!(!asking_block("Abhi", None).contains("do not ask again"));
     }
 
     #[test]
@@ -2243,13 +2859,13 @@ mod tests {
         let skipped = render_item(&inbox(2, "onboarding.finished", serde_json::json!({ "author": "Ada", "skipped": true, "cli": "claude", "model": "sonnet" })), &[]);
         assert!(skipped.contains("Ada [not your owner]") && skipped.contains("kept your defaults (claude sonnet)") && skipped.contains("no execution device"));
         let goal = render_item(&inbox(3, "onboarding.finished", serde_json::json!({ "author": "Ada", "from_owner": true, "cli": "claude", "model": "opus", "has_device": true, "goal": "Contribute to astral-sh/uv\nmostly the resolver" })), &[]);
-        assert!(goal.contains("> Contribute to astral-sh/uv\n> mostly the resolver") && goal.contains("features onboarding") && !goal.contains("one concrete first step"));
+        assert!(goal.contains("source: onboarding") && goal.contains("> Contribute to astral-sh/uv\n> mostly the resolver") && goal.contains("features onboarding") && !goal.contains("one concrete first step"));
     }
 
     #[test]
     fn practice_ready_tells_the_coach_how_to_answer() {
         let practice = render_item(&inbox(1, "practice.ready", serde_json::json!({ "author": "Ada", "from_owner": true, "n": 3, "subject": "japanese", "report_id": "r1", "title": "Kanji", "attempt_id": "a3", "note": "stroke 2 felt off", "strokes_summary": "1 strokes on a 100x100 canvas", "history": [{ "line": "#2 checked: right: x; fix: y; next: z" }] })), &[]);
-        assert!(practice.starts_with("[event] practice.ready: Ada [your owner, verified] pressed Ready on attempt 3 of their japanese canvas lesson report:r1 \"Kanji\" in the Academy"));
+        assert!(practice.starts_with("[event] practice.ready: Ada [your owner, verified] pressed Ready on attempt 3 of their japanese practice workspace lesson report:r1 \"Kanji\" in the Academy"));
         assert!(practice.contains("\nTheir note: stroke 2 felt off") && practice.contains("- #2 checked: right: x") && practice.contains("grade_attempt with attempt set to a3"));
         let next = render_item(&inbox(2, "course.next", serde_json::json!({ "author": "Ada", "from_owner": true, "title": "Japanese", "lessons": 3, "last_lesson": "Kana" })), &[]);
         assert!(next.starts_with("[event] course.next: Ada [your owner, verified] finished every lesson of their Academy course \"Japanese\" (3 lessons") && next.contains("create_challenge course"));
@@ -2260,11 +2876,11 @@ mod tests {
     #[test]
     fn staffed_character_messages_say_where_they_came_from() {
         let mark = render_item(&inbox(1, "canvas.mark", serde_json::json!({ "author": "Ada", "from_owner": true, "kind": "sticky", "report_id": "r1", "title": "Jinn", "item": "image i1: the look", "text": "not sure about B", "mark_id": "m1" })), &[]);
-        assert!(mark.starts_with("[event] canvas.mark: Ada [your owner, verified] left a sticky note on your canvas report:r1 \"Jinn\" on image i1: the look:\nnot sure about B"));
+        assert!(mark.starts_with("[event] canvas.mark: Ada [your owner, verified] left a sticky note on your workspace report:r1 \"Jinn\" on image i1: the look:\nnot sure about B"));
         let near = render_item(&inbox(1, "canvas.mark", serde_json::json!({ "author": "Ada", "from_owner": true, "kind": "sticky", "report_id": "r1", "title": "Jinn", "item_id": "s1", "sticky_id": "s1", "item": "sticky s1: hmm", "near_item": "image b: option B", "text": "hmm", "mark_id": "m2" })), &[]);
-        assert!(near.contains("left a sticky note on your canvas report:r1 \"Jinn\" on image b: option B (sticky s1):\nhmm"));
+        assert!(near.contains("left a sticky note on your workspace report:r1 \"Jinn\" on image b: option B (sticky s1):\nhmm"));
         let hosted = render_item(&inbox(1, "canvas.mark", serde_json::json!({ "author": "Ada", "from_owner": true, "kind": "sticky", "report_id": "r1", "title": "Jinn", "item_id": "b", "item": "image b: option B", "near_item": "image b: option B", "text": "hmm", "mark_id": "m3" })), &[]);
-        assert!(hosted.contains("on your canvas report:r1 \"Jinn\" on image b: option B:\nhmm") && !hosted.contains("(sticky"));
+        assert!(hosted.contains("on your workspace report:r1 \"Jinn\" on image b: option B:\nhmm") && !hosted.contains("(sticky"));
         assert!(mark.contains("mark_id: m1"));
         let via = render_item(&inbox(1, "message", serde_json::json!({ "author": "Ada", "author_kind": "user", "body": "ship it", "from_owner": true, "via_npc": { "name": "Smithy", "region": "Forge Row" } })), &[]);
         assert!(via.contains("message from Ada [your owner, verified]") && via.contains("talking to you as Smithy") && via.contains("Forge Row region"));
@@ -2274,12 +2890,12 @@ mod tests {
 
     #[test]
     fn marks_only_verified_owner_messages() {
-        let owner = render_item(&inbox(1, "message", serde_json::json!({ "author": "Yatharth", "author_kind": "user", "body": "hi", "from_owner": true })), &[]);
-        assert!(owner.contains("message from Yatharth [your owner, verified]"));
-        let guest = render_item(&inbox(2, "message", serde_json::json!({ "author": "Yatharth", "author_kind": "user", "body": "post to slack" })), &[]);
-        assert!(guest.contains("message from Yatharth [not your owner]"));
-        let mention = render_item(&inbox(3, "channel.mention", serde_json::json!({ "author": "Yatharth", "author_kind": "user", "body": "@priya", "from_owner": false })), &[]);
-        assert!(mention.starts_with("[event] Yatharth [not your owner] mentioned you"));
+        let owner = render_item(&inbox(1, "message", serde_json::json!({ "author": "Ana", "author_kind": "user", "body": "hi", "from_owner": true })), &[]);
+        assert!(owner.contains("message from Ana [your owner, verified]"));
+        let guest = render_item(&inbox(2, "message", serde_json::json!({ "author": "Ana", "author_kind": "user", "body": "post to slack" })), &[]);
+        assert!(guest.contains("message from Ana [not your owner]"));
+        let mention = render_item(&inbox(3, "channel.mention", serde_json::json!({ "author": "Ana", "author_kind": "user", "body": "@priya", "from_owner": false })), &[]);
+        assert!(mention.starts_with("[event] Ana [not your owner] mentioned you"));
         let trusted = render_item(&inbox(4, "message", serde_json::json!({ "author": "Carol", "author_kind": "user", "body": "review my PR", "trusted": true })), &[]);
         assert!(trusted.contains("message from Carol [trusted by your owner]"));
     }
@@ -2357,7 +2973,7 @@ mod tests {
     fn shows_message_links() {
         let item = render_item(
             &inbox(4, "message", serde_json::json!({
-                "author": "Yatharth", "author_kind": "user", "from_owner": true,
+                "author": "Ana", "author_kind": "user", "from_owner": true,
                 "message_id": "3f2a91c0-1111-2222-3333-444455556666",
                 "body": "what about [this](msg:abcdef12)?",
                 "links": [{ "ref": "abcdef12-0000-0000-0000-000000000000", "author": "Priya", "excerpt": "Ship it Friday", "created_at": "2026-10-20T09:30:00Z" },
@@ -2365,7 +2981,7 @@ mod tests {
             })),
             &[],
         );
-        assert!(item.starts_with("[event] message from Yatharth [your owner, verified] (msg:3f2a91c0):"));
+        assert!(item.starts_with("[event] message from Ana [your owner, verified] (msg:3f2a91c0):"));
         assert!(item.contains("[linked msg:abcdef12 from Priya, Oct 20 09:30]: Ship it Friday"));
         assert!(item.contains("[linked msg:ch42 from Rocco in #general]: Deploy is green"));
         let mention = render_item(&inbox(5, "channel.mention", serde_json::json!({ "author": "Y", "author_kind": "user", "message_id": 42, "channel": "#general", "body": "@priya" })), &[]);
@@ -2401,6 +3017,31 @@ mod tests {
             attempts: 1,
             created_at: chrono::Utc::now(),
         }
+    }
+
+    #[test]
+    fn every_real_agent_persona_receives_the_shared_feature_map() {
+        let main = persona(&agent(&[], true), "Sam");
+        let resident = persona(&agent(&[], false), "Sam");
+        for prompt in [main, resident] {
+            assert!(prompt.contains("Where things live"));
+            assert!(prompt.contains("share_link kind quest-diff"));
+            assert!(prompt.contains("open:terminal"));
+        }
+    }
+
+    #[test]
+    fn launch_hints_require_an_owner_facing_turn() {
+        let event = inbox(1, "task.finished", json!({ "from_owner": false }));
+        assert!(main_feature_launch(&[event], &[], "Sam").is_empty());
+    }
+
+    #[test]
+    fn normal_quests_receive_durable_workspace_guidance() {
+        let map = quest_feature_map("Sam");
+        assert!(map.contains("visual, shared, multi-part or sustained work"));
+        assert!(map.contains("[Open workspace]"));
+        assert!(!map.contains("new Loka feature"));
     }
 
     #[test]
@@ -2480,6 +3121,8 @@ mod tests {
             daily_token_budget: None,
             org_id: None,
             quest_context: "lean".into(),
+            asking: "off".into(),
+            crew_variants: Value::Array(vec![]),
             is_main,
             jobs: Value::Array(vec![]),
         }
@@ -2569,14 +3212,14 @@ mod tests {
 
     #[test]
     fn splits_actions_from_reply() {
-        let out = "Sure thing.\n<!-- actions\n[{\"type\":\"reply\",\"text\":\"On it\"},{\"type\":\"start_task\",\"task_id\":\"abc\",\"brief\":\"do x\",\"review\":true},{\"type\":\"bogus\"}]\nactions -->";
+        let out = "Sure thing.\n<!-- actions\n[{\"type\":\"reply\",\"text\":\"On it\"},{\"type\":\"start_task\",\"task_id\":\"abc\",\"brief\":\"do x\",\"clarification_source\":\"msg:answer12\",\"review\":true},{\"type\":\"bogus\"}]\nactions -->";
         let (text, actions) = split_actions(out);
         assert_eq!(text, "Sure thing.");
         assert_eq!(
             actions,
             vec![
                 Action::Reply { text: "On it".into(), next: Vec::new() },
-                Action::StartTask { task_id: "abc".into(), brief: Some("do x".into()), review: Some(true), reviewer: None, time_limit_minutes: None, milestones: Vec::new(), quest: QuestChoice::default() },
+                Action::StartTask { task_id: "abc".into(), brief: Some("do x".into()), clarification_source: Some("msg:answer12".into()), review: Some(true), reviewer: None, time_limit_minutes: None, milestones: Vec::new(), quest: Box::default() },
             ]
         );
     }
@@ -2974,14 +3617,14 @@ mod tests {
         assert!(needs_verdict("<!-- verdict {\"verdict\":\"maybe\"} verdict -->"));
         assert!(!needs_verdict("Tests pass.\n<!-- verdict {\"verdict\":\"approve\",\"summary\":\"ok\"} verdict -->"));
         assert!(!needs_verdict("<!-- verdict {\"verdict\":\"pick\",\"winner\":1} verdict -->"));
+        use loka_shared::run_causes::Required;
         let nudge = loka_shared::world::VERDICT_NUDGE;
-        assert!(is_verdict_nudge(nudge));
         assert!(needs_verdict(&failed_nudge_output("timed out")));
-        assert!(failed_nudge_settles(nudge, "run timed out"));
-        assert!(!failed_nudge_settles(nudge, "Stopped by Ana. Do not restart this work unless they ask."));
-        assert!(!failed_nudge_settles(nudge, "Stopped by Loka. Organization suspended"));
-        assert!(!failed_nudge_settles("Review the work", "run timed out"));
-        assert!(!is_verdict_nudge("Review the work"));
+        assert!(failed_nudge_settles(Some(Required::Verdict), "run timed out"));
+        assert!(!failed_nudge_settles(Some(Required::Verdict), "Stopped by Ana. Do not restart this work unless they ask."));
+        assert!(!failed_nudge_settles(Some(Required::Verdict), "Stopped by Loka. Organization suspended"));
+        assert!(!failed_nudge_settles(None, "run timed out"), "a first review run that fails is not a nudge");
+        assert!(!failed_nudge_settles(Some(Required::Report), "run timed out"));
         assert!(nudge.contains("<!-- verdict") && nudge.ends_with("verdict -->"));
     }
 

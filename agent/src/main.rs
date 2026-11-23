@@ -21,6 +21,7 @@ mod key_proxy;
 mod mcp_hub;
 mod model_catalog;
 mod omp;
+mod pr_actions;
 mod opencode;
 mod preflight;
 mod quest_storage;

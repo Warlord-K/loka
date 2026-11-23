@@ -9,6 +9,16 @@
     }
     throw new Error(description);
   };
+  const useViewport = async (width, height) => {
+    window.__lokaNavigationViewportRequest = { width, height };
+    await until(() => Math.abs(innerWidth - width) <= 1 && Math.abs(innerHeight - height) <= 1, `the browser viewport did not reach ${width}x${height}`);
+    window.__lokaNavigationViewportRequest = null;
+  };
+  const useKey = async (key, complete, description) => {
+    window.__lokaNavigationKeyboardRequest = key;
+    await until(complete, description);
+    window.__lokaNavigationKeyboardRequest = null;
+  };
   const visible = (selector) => [...document.querySelectorAll(selector)].filter((element) => element.getClientRects().length);
   const exactText = (selector, value) => visible(selector).find((element) => element.textContent.trim() === value);
   const modal = (name) => visible('[role="dialog"]').find((element) => element.getAttribute('aria-label') === name);
@@ -60,6 +70,12 @@
   const academyLesson = 'feedca00-0000-0000-0000-000000000002';
   const mainAgent = 'a0000000-0000-0000-0000-000000000001';
   const selectedQuest = 'e0000000-0000-0000-0000-000000000003';
+  const workshopSession = 'e9000000-0000-4000-8000-000000000001';
+  const workshopFile = 'frontend/lib/feature-links.ts';
+  const workspaceCanvas = 'f9000000-0000-4000-8000-000000000002';
+  const workspaceItem = 'Focus_Note-7';
+  const libraryCanvas = 'f9000000-0000-4000-8000-000000000003';
+  const libraryItem = 'Library_Note-8';
   const exactTeam = 'abcdef12-3456-4789-abcd-ef1234567890';
   const fakeMessage = 9189901;
   const todoMessage = 9189902;
@@ -80,6 +96,8 @@
   const originalFetch = window.fetch;
   const originalConfirm = window.confirm;
   const now = new Date().toISOString();
+  const requestIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  const workspaceBatch = batch === 'workspace-link' || batch === 'workspace-completion';
   await until(() => {
     const gate = exactText('button', 'Continue in the browser anyway') ?? exactText('button', 'Start exploring');
     if (gate) {
@@ -92,10 +110,11 @@
   const sourceReport = await originalFetch(`/api/world/reports/${report}`).then((response) => response.json());
   const sourceList = await originalFetch(`/api/world/items/${list}`).then((response) => response.json());
   const sourceAgents = batch === 'foreground' || batch === 'async-starts' || batch === 'detail-races' ? await originalFetch('/api/world/agents').then((response) => response.json()) : null;
-  const sourceAgentMessages = batch === 'agent-panel-races' || batch === 'visibility' ? await originalFetch(`/api/world/agents/${mainAgent}/messages?limit=200`).then((response) => response.json()) : null;
+  const sourceQuestRoom = batch === 'quest-catchup' || batch === 'workspace-completion' ? await originalFetch(`/api/world/tasks/${selectedQuest}/room`).then((response) => response.json()) : null;
+  const messageAgent = batch === 'workspace-completion' ? sourceQuestRoom?.task.assigned_agent_id ?? mainAgent : mainAgent;
+  const sourceAgentMessages = batch === 'agent-panel-races' || batch === 'visibility' || batch === 'feature-links' || batch === 'workspace-link' || batch === 'workspace-completion' ? await originalFetch(`/api/world/agents/${messageAgent}/messages?limit=200`).then((response) => response.json()) : null;
   const sourceTodo = batch === 'review' || batch === 'foreground' ? await originalFetch('/api/world/todos/90000000-0000-0000-0000-000000000004').then((response) => response.json()) : null;
   const sourceChannelMessages = batch === 'review' ? await originalFetch(`/api/world/channels/${launch}/messages`).then((response) => response.json()) : null;
-  const sourceQuestRoom = batch === 'quest-catchup' ? await originalFetch(`/api/world/tasks/${selectedQuest}/room`).then((response) => response.json()) : null;
   if (batch === 'detail-races') {
     openPalette();
     await paletteInput('Juniper');
@@ -159,6 +178,8 @@
   let failedItemResponses = 0;
   let savedReport;
   let createdCanvasReads = 0;
+  let failCanvasResponse = false;
+  const canvasRequestIds = [];
   let createdListReads = 0;
   let createdChannelReads = 0;
   let createdChannelPosts = 0;
@@ -189,6 +210,15 @@
   let agentThreadReads = 0;
   let agentThreadHeld = false;
   let holdAgentThread = false;
+  let workspaceAvailable = true;
+  let workspaceDetailReads = 0;
+  let workspaceLibraryDeleted = false;
+  let workspaceSearchFailure = false;
+  let holdWorkspaceSearch = false;
+  let workspaceSearchHeld = false;
+  let workspaceSearchGate;
+  let workspaceCompletionPhase = 'event-first';
+  let workspaceNotificationsCleared = false;
   const mutationDetailReads = new Map();
   let listCreated = false;
   const createdAgents = new Map();
@@ -207,7 +237,12 @@
   ]);
   const mutationBrief = (item) => ({ ...item, excerpt: item.body, size: item.body.length, open_marks: 0, item_count: 0 });
   const detailRevision = (item, revision) => ({ revision, title: revision === 1 ? `${item.title} old` : item.title, body: revision === 1 ? `Old ${item.title} body.` : item.body, canvas: null, folder: item.folder, tags: item.tags, author_agent_id: item.author_agent_id, author_user_id: item.author_user_id, created_at: revision === 1 ? item.created_at : item.updated_at });
-  const fakeCanvas = { ...sourceReport.report, id: createdCanvas, title: 'Held create canvas', slug: 'held-create-canvas', body: '', canvas: { items: [], edges: [] }, links: [], created_at: now, updated_at: now };
+  const fakeCanvas = { ...sourceReport.report, id: createdCanvas, title: 'Held create workspace', slug: 'held-create-workspace', kind: 'canvas', body: 'Workspace with 0 items and 0 arrows.', practice: null, canvas: { items: [], edges: [] }, links: [], created_at: now, updated_at: now };
+  const workspaceReport = { ...sourceReport.report, id: workspaceCanvas, title: 'Shared workspace fixture', slug: 'shared-workspace-fixture', kind: 'canvas', body: '', canvas: { items: [{ id: workspaceItem, kind: 'sticky', text: 'Focused handoff note', color: 'mint', x: 80, y: 80, w: 220, h: 180, by: 'person' }], edges: [] }, links: [], created_at: now, updated_at: now };
+  const workspaceBrief = { ...workspaceReport, excerpt: '', size: 0, open_marks: 0, item_count: 1 };
+  const libraryReport = { ...workspaceReport, id: libraryCanvas, title: 'Library workspace fixture', slug: 'library-workspace-fixture', canvas: { items: [{ id: libraryItem, kind: 'sticky', text: 'Library board note', color: 'lemon', x: 120, y: 100, w: 220, h: 180, by: 'person' }], edges: [] } };
+  const libraryBrief = { ...libraryReport, excerpt: '', size: 0, open_marks: 0, item_count: 1 };
+  let currentLibraryReport = libraryReport;
   const fakeList = { ...sourceList, id: createdList, name: 'Held create list', data: { items: [] }, created_at: now, updated_at: now };
   const fakeTeam = {
     id: exactTeam,
@@ -312,6 +347,120 @@
     session_role: 'main',
     meta: null,
   } : null;
+  const workshopMessage = sourceAgentMessages ? {
+    ...(sourceAgentMessages.at(-1) ?? {}),
+    id: 'm9000000-0000-0000-0007-000000000001',
+    agent_id: mainAgent,
+    session_id: workshopSession,
+    author_kind: 'agent',
+    author_user_id: null,
+    author_agent_id: mainAgent,
+    body: `The changes are ready.\n\n${location.origin}/world?workbench=${workshopSession}&diff=${workshopSession}`,
+    created_at: '2035-01-02T03:04:08.000Z',
+    session_role: 'task',
+    meta: null,
+  } : null;
+  const workspaceMessage = sourceAgentMessages ? {
+    ...(sourceAgentMessages.at(-1) ?? {}),
+    id: 'm9000000-0000-0000-0008-000000000001',
+    agent_id: mainAgent,
+    session_id: null,
+    author_kind: 'agent',
+    author_user_id: null,
+    author_agent_id: mainAgent,
+    body: `Open the focused workspace.\n\n${location.origin}/world?report=${workspaceCanvas.toUpperCase()}&workspace=1&item=${workspaceItem}`,
+    created_at: '2035-01-02T03:04:09.000Z',
+    session_role: 'main',
+    meta: null,
+  } : null;
+  const workspaceCompletionEvent = batch === 'workspace-completion' && sourceQuestRoom ? {
+    seq: sourceQuestRoom.room.cursor + 1,
+    type: 'task.finished',
+    agent_id: sourceQuestRoom.task.assigned_agent_id,
+    task_id: selectedQuest,
+    run_id: null,
+    session_id: sourceQuestRoom.room.sessions.at(-1)?.id ?? null,
+    payload: {
+      report: {
+        status: 'done',
+        summary: `Completion workspace fixture\n\n[Open workspace](${location.origin}/world?report=${workspaceCanvas.toUpperCase()}&workspace=1&item=${workspaceItem})`,
+        findings: [{ severity: 'note', issue: 'The focused note remains available in the completion details.' }],
+      },
+      review: { verdict: 'approve', summary: 'The completion evidence is clear.' },
+    },
+    created_at: '2035-01-02T03:04:10.000Z',
+  } : null;
+  const workspaceCompletionMessage = workspaceCompletionEvent && sourceQuestRoom ? {
+    ...(sourceAgentMessages?.at(-1) ?? {}),
+    id: 'm9000000-0000-0000-0008-000000000002',
+    agent_id: workspaceCompletionEvent.agent_id,
+    session_id: null,
+    author_kind: 'system',
+    author_user_id: null,
+    author_agent_id: workspaceCompletionEvent.agent_id,
+    body: workspaceCompletionEvent.payload.report.summary,
+    created_at: '2035-01-02T03:04:10.001Z',
+    session_role: 'main',
+    meta: {
+      kind: 'quest',
+      title: sourceQuestRoom.task.title,
+      status: 'done',
+      task_id: selectedQuest,
+      session_id: workspaceCompletionEvent.session_id,
+    },
+  } : null;
+  const workspaceQuestRoom = workspaceCompletionEvent && workspaceCompletionMessage ? {
+    ...sourceQuestRoom,
+    task: { ...sourceQuestRoom.task, status: 'done', updated_at: workspaceCompletionEvent.created_at },
+    room: {
+      ...sourceQuestRoom.room,
+      events: [...sourceQuestRoom.room.events.filter((event) => event.type !== 'task.finished'), workspaceCompletionEvent],
+      messages: [...sourceQuestRoom.room.messages, workspaceCompletionMessage],
+      cursor: workspaceCompletionEvent.seq,
+    },
+  } : null;
+  const workspaceRoomPage = (includeEvent, includeMessage, cursor) => workspaceQuestRoom ? {
+    ...workspaceQuestRoom,
+    room: {
+      ...workspaceQuestRoom.room,
+      events: includeEvent ? [workspaceCompletionEvent] : [],
+      messages: includeMessage ? [workspaceCompletionMessage] : [],
+      cursor,
+    },
+  } : null;
+  const workspaceNotification = workspaceCompletionEvent ? {
+    events: [workspaceCompletionEvent],
+    items: [{ id: 990274, seq: workspaceCompletionEvent.seq, kind: 'quest', agent_id: workspaceCompletionEvent.agent_id, created_at: workspaceCompletionEvent.created_at, cleared_at: null }],
+    unread: 1,
+    unread_seqs: [workspaceCompletionEvent.seq],
+    by_agent: { [workspaceCompletionEvent.agent_id]: 1 },
+  } : null;
+  const workshopBrief = {
+    id: workshopSession,
+    agent_id: mainAgent,
+    role: 'task',
+    backend: 'codex',
+    model: 'fixture',
+    status: 'finished',
+    task_id: selectedQuest,
+    task_title: 'Feature link fixture',
+    title: 'Feature link fixture',
+    summary: null,
+    cost_usd: 0,
+    tokens: 0,
+    runs: 1,
+    running: false,
+    created_at: now,
+    updated_at: now,
+    working_dir: `tasks/${selectedQuest}`,
+    base_branch: 'main',
+  };
+  const originalTauri = window.__TAURI__;
+  const workshopCalls = [];
+  const workshopSessionQueries = [];
+  let workshopChangeReads = 0;
+  let workshopChangeMode = 'initial';
+  let workshopModeReads = 0;
   const savedQuickBrief = { ...savedQuickChat, messages: undefined, created_at: now, updated_at: now };
   const replyTemplate = sourceChannelMessages?.at(-1);
   const fakeReplyRoot = replyTemplate ? { ...replyTemplate, id: replyRoot, channel_id: launch, body: 'Synthetic thread root', created_at: '2025-01-04T03:04:05.000Z', reply_to: null, reply_count: 1 } : null;
@@ -325,6 +474,80 @@
   const agentReplyLink = { ref: agentReplyId, kind: 'agent', agent_id: mainAgent, channel_id: null, channel_name: null, channel_kind: null, author: 'Juniper', author_kind: agentReply.author_kind, author_emoji: null, excerpt: agentReply.body, created_at: agentReply.created_at };
   window.fetch = async (path, init) => {
     const method = init?.method ?? 'GET';
+    if (batch === 'feature-links' && typeof path === 'string' && path.startsWith(`/api/world/agents/${mainAgent}/messages?`) && method === 'GET' && sourceAgentMessages && workshopMessage) {
+      return Response.json([...sourceAgentMessages, workshopMessage]);
+    }
+    if (batch === 'workspace-link' && typeof path === 'string' && path.startsWith(`/api/world/agents/${mainAgent}/messages?`) && method === 'GET' && sourceAgentMessages && workspaceMessage) {
+      return Response.json([...sourceAgentMessages, workspaceMessage]);
+    }
+    if (batch === 'workspace-completion' && typeof path === 'string' && path.startsWith(`/api/world/agents/${messageAgent}/messages?`) && method === 'GET' && sourceAgentMessages && workspaceCompletionMessage) {
+      return Response.json([...sourceAgentMessages, workspaceCompletionMessage]);
+    }
+    if (batch === 'workspace-completion' && typeof path === 'string' && path.startsWith(`/api/world/tasks/${selectedQuest}/room`) && method === 'GET' && workspaceQuestRoom) {
+      if (workspaceCompletionPhase === 'event-first') return Response.json(workspaceRoomPage(true, false, workspaceCompletionEvent.seq));
+      if (workspaceCompletionPhase === 'event-with-card') return Response.json(workspaceRoomPage(false, true, workspaceCompletionEvent.seq));
+      if (workspaceCompletionPhase === 'card-first') return Response.json(workspaceRoomPage(false, true, sourceQuestRoom.room.cursor));
+      if (workspaceCompletionPhase === 'card-with-event') return Response.json(workspaceRoomPage(true, false, workspaceCompletionEvent.seq));
+    }
+    if (batch === 'workspace-completion' && typeof path === 'string' && new URL(path, location.href).pathname === '/api/world/notifications' && method === 'GET' && workspaceNotification) {
+      return Response.json(workspaceNotificationsCleared ? { events: [], items: [], unread: 0, unread_seqs: [], by_agent: {} } : workspaceNotification);
+    }
+    if (batch === 'workspace-completion' && path === '/api/world/notifications/clear' && method === 'POST') {
+      workspaceNotificationsCleared = true;
+      return new Response(null, { status: 204 });
+    }
+    if (workspaceBatch && typeof path === 'string' && new URL(path, location.href).pathname === '/api/world/reports/find' && new URL(path, location.href).searchParams.get('key')?.toLowerCase() === workspaceCanvas) {
+      return Response.json(workspaceBrief);
+    }
+    if (batch === 'workspace-link' && typeof path === 'string' && new URL(path, location.href).pathname === '/api/world/reports' && new URL(path, location.href).searchParams.get('kind') === 'canvas' && method === 'GET') {
+      const url = new URL(path, location.href);
+      const offset = Number(url.searchParams.get('offset') ?? '0');
+      const query = url.searchParams.get('query')?.trim().toLowerCase() ?? '';
+      const currentLibraryBrief = { ...libraryBrief, ...currentLibraryReport, excerpt: currentLibraryReport.body ?? '' };
+      const available = [
+        ...(!workspaceLibraryDeleted ? [currentLibraryBrief] : []),
+        ...(workspaceAvailable ? [workspaceBrief] : []),
+      ].filter((report) => !query || `${report.title} ${report.excerpt}`.toLowerCase().includes(query));
+      const page = offset === 0 ? available : [];
+      if (query && workspaceSearchFailure) {
+        workspaceSearchFailure = false;
+        return new Response('Workspace search failed', { status: 503 });
+      }
+      if (query && holdWorkspaceSearch) {
+        workspaceSearchHeld = true;
+        await workspaceSearchGate;
+      }
+      return Response.json(page);
+    }
+    if (workspaceBatch && path === `/api/world/reports/${workspaceCanvas}` && method === 'GET') {
+      if (batch === 'workspace-link') {
+        workspaceDetailReads += 1;
+        if (!workspaceAvailable) return new Response(null, { status: 404 });
+      }
+      return Response.json({ ...sourceReport, report: workspaceReport, backlinks: [], outlinks: [], marks: [], can_edit: true });
+    }
+    if (batch === 'workspace-link' && path === `/api/world/reports/${libraryCanvas}` && method === 'GET') {
+      return workspaceLibraryDeleted
+        ? new Response(null, { status: 404 })
+        : Response.json({ ...sourceReport, report: currentLibraryReport, backlinks: [], outlinks: [], marks: [], can_edit: true });
+    }
+    if (batch === 'workspace-link' && path === `/api/world/reports/${libraryCanvas}` && method === 'PATCH') {
+      currentLibraryReport = { ...currentLibraryReport, ...JSON.parse(init?.body ?? '{}'), updated_at: new Date().toISOString() };
+      return Response.json(currentLibraryReport);
+    }
+    if (batch === 'workspace-link' && path === `/api/world/reports/${libraryCanvas}` && method === 'DELETE') {
+      workspaceLibraryDeleted = true;
+      return new Response(null, { status: 204 });
+    }
+    if (workspaceBatch && path === `/api/world/reports/${workspaceCanvas}/presence` && method === 'POST') return new Response(null, { status: 204 });
+    if (batch === 'feature-links' && typeof path === 'string' && new URL(path, location.href).pathname === '/api/world/sessions' && method === 'GET') {
+      const query = new URL(path, location.href).searchParams;
+      workshopSessionQueries.push(query.toString());
+      return Response.json(query.get('id') === workshopSession
+        ? [workshopBrief]
+        : Array.from({ length: 100 }, (_, index) => ({ ...workshopBrief, id: `f9000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}` })));
+    }
+    if (batch === 'feature-links' && typeof path === 'string' && new URL(path, location.href).pathname === `/api/world/sessions/${workshopSession}/runs` && method === 'GET') return Response.json([]);
     if (batch === 'agent-panel-races' && typeof path === 'string' && path.startsWith(`/api/world/agents/${mainAgent}/messages?`) && method === 'GET' && sourceAgentMessages && incomingAgentMessage) {
       agentMessageReads += 1;
       return Response.json(includeIncomingAgentMessage ? [...sourceAgentMessages, incomingAgentMessage] : sourceAgentMessages);
@@ -614,9 +837,14 @@
     if (path === '/api/world/reports' && method === 'POST') {
       const body = JSON.parse(init?.body ?? '{}');
       if (body.canvas) {
+        canvasRequestIds.push(body.request_id);
         if (holdCanvas) {
           canvasHeld = true;
           await canvasGate;
+        }
+        if (failCanvasResponse) {
+          failCanvasResponse = false;
+          return new Response('Workspace response lost', { status: 503 });
         }
         return Response.json(fakeCanvas);
       }
@@ -692,6 +920,18 @@
     }
     return originalFetch(path, init);
   };
+  const workshopLayoutKey = `world.workbench.v1:${workshopSession}`;
+  const savedWorkshopLayout = batch === 'feature-links' ? localStorage.getItem(workshopLayoutKey) : null;
+  if (batch === 'feature-links') localStorage.removeItem(workshopLayoutKey);
+  const workspaceLayoutKey = `world.workspace.${sourceReport.report.owner_user_id}`;
+  const savedWorkspaceLayout = workspaceBatch ? localStorage.getItem(workspaceLayoutKey) : null;
+  if (workspaceBatch) localStorage.removeItem(workspaceLayoutKey);
+  const workspaceLibraryKey = 'world.workspaces.library';
+  const savedWorkspaceLibrary = batch === 'workspace-link' ? localStorage.getItem(workspaceLibraryKey) : null;
+  if (batch === 'workspace-link') localStorage.removeItem(workspaceLibraryKey);
+  const sideChatKey = 'world.sidechat';
+  const savedSideChat = batch === 'workspace-link' ? localStorage.getItem(sideChatKey) : null;
+  if (batch === 'workspace-link') localStorage.removeItem(sideChatKey);
   const checks = [];
   try {
     if (batch === 'core') {
@@ -701,6 +941,16 @@
       back.click();
       await until(() => visible('button[data-chat-item]').length, 'mobile chat list did not appear');
     };
+    const openWorkspaceLibrary = async () => {
+      await choose('Open workspaces', 'action:workspace');
+      const surface = await until(() => modal('Workspaces') ?? modal('Workspace'), 'Workspaces did not open');
+      if (surface.getAttribute('aria-label') === 'Workspace') {
+        const back = await until(() => [...surface.querySelectorAll('header button')].find((element) => element.getClientRects().length && (element.title === 'Back to all workspaces' || element.textContent.trim() === 'All workspaces')), 'All workspaces did not appear');
+        back.click();
+      }
+      return until(() => modal('Workspaces'), 'Workspaces library did not open');
+    };
+    const newWorkspaceButton = (surface) => [...surface.querySelectorAll('header button')].find((element) => element.getClientRects().length && element.textContent.trim() === 'New workspace');
     checks.push(await run('a real channel palette hit comes to the front over Reports', async () => {
       await choose('Spring launch plan', `hit:report:${report}`);
       await until(() => modal('Reports'), 'Reports did not open');
@@ -801,27 +1051,60 @@
       if (createdChannelReads !== 0) throw new Error('channel creation performed a duplicate exact read');
       if (!modal('Chat') || !exactText('header p', 'latest-create-channel') || new URL(location.href).searchParams.get('list') === list) throw new Error('older exact list replaced the created channel');
     }));
-    checks.push(await run('a held canvas create cannot replace a newer report', async () => {
-      await choose('Spring launch plan', `hit:report:${report}`);
-      await until(() => modal('Reports'), 'Reports did not open');
-      let release;
-      canvasGate = new Promise((resolve) => { release = resolve; });
-      holdCanvas = true;
-      await clickText('button', 'New canvas');
-      await until(() => canvasHeld, 'canvas create was not held');
-      await choose('Competitor pricing, pro tiers', `hit:report:${otherReport}`);
-      await until(() => document.querySelector(`[data-report="${otherReport}"]`)?.getAttribute('aria-current') === 'true', 'newer report did not select');
-      release();
-      await wait(500);
-      holdCanvas = false;
-      if (document.querySelector(`[data-report="${otherReport}"]`)?.getAttribute('aria-current') !== 'true') throw new Error('completed canvas create replaced the newer report');
+    checks.push(await run('a held workspace create cannot replace a newer report', async () => {
+      let release = () => {};
+      try {
+        const workspaces = await openWorkspaceLibrary();
+        canvasGate = new Promise((resolve) => { release = resolve; });
+        holdCanvas = true;
+        const requestStart = canvasRequestIds.length;
+        const create = await until(() => newWorkspaceButton(workspaces), 'New workspace did not appear');
+        create.click();
+        await until(() => canvasHeld, 'workspace create was not held');
+        await choose('Competitor pricing, pro tiers', `hit:report:${otherReport}`);
+        const newerReport = () => {
+          const reports = modal('Reports');
+          return reports && [...reports.querySelectorAll('h2')].find((element) => element.textContent.trim() === 'Competitor pricing, pro tiers');
+        };
+        await until(newerReport, 'newer report did not select');
+        release();
+        await wait(500);
+        const heldRequestId = canvasRequestIds[requestStart];
+        if (!requestIdPattern.test(heldRequestId)) throw new Error('workspace create did not use a valid request ID');
+        if (!newerReport()) throw new Error('completed workspace create replaced the newer report');
+      } finally {
+        holdCanvas = false;
+        release();
+        await wait(100);
+        canvasHeld = false;
+      }
     }));
-    checks.push(await run('a latest canvas create opens from its response without another exact read', async () => {
-      await choose('Spring launch plan', `hit:report:${report}`);
-      createdCanvasReads = 0;
-      await clickText('button', 'New canvas');
-      await until(() => exactText('h1,h2', 'Held create canvas'), 'latest canvas create did not open');
-      if (createdCanvasReads !== 0) throw new Error('canvas creation performed a duplicate exact read');
+    checks.push(await run('a retried workspace create reuses its request ID and opens without another exact read', async () => {
+      try {
+        const workspaces = await openWorkspaceLibrary();
+        createdCanvasReads = 0;
+        const requestStart = canvasRequestIds.length;
+        failCanvasResponse = true;
+        const create = await until(() => newWorkspaceButton(workspaces), 'New workspace did not appear');
+        create.click();
+        const alert = await until(() => workspaces.querySelector('[role="alert"]'), 'workspace create failure did not appear');
+        const retry = await until(() => [...alert.querySelectorAll('button')].find((element) => element.getClientRects().length && element.textContent.trim() === 'Try again'), 'workspace create retry did not appear');
+        retry.click();
+        const workspace = await until(() => {
+          const opened = modal('Workspace');
+          return opened?.querySelector('header p')?.textContent.includes(fakeCanvas.title) ? opened : null;
+        }, 'retried workspace create did not open');
+        if (!workspace.isConnected) throw new Error('retried workspace was not mounted');
+        const retryIds = canvasRequestIds.slice(requestStart);
+        if (retryIds.length !== 2 || retryIds[0] !== retryIds[1]) throw new Error('workspace retry changed its request ID');
+        if (!requestIdPattern.test(retryIds[0])) throw new Error('workspace retry did not use a valid request ID');
+        if (retryIds[0] === canvasRequestIds[requestStart - 1]) throw new Error('separate workspace creates reused a request ID');
+        if (createdCanvasReads !== 0) throw new Error('workspace creation performed a duplicate exact read');
+      } finally {
+        failCanvasResponse = false;
+        holdCanvas = false;
+        canvasHeld = false;
+      }
     }));
     checks.push(await run('a held list create cannot replace a newer exact list', async () => {
       openPalette();
@@ -2086,12 +2369,419 @@
         if (exactText('p', savedQuickMessage.body)) throw new Error('current Quick Chat left the saved conversation selected');
       }));
     }
-    if (!['core', 'review', 'report', 'mobile', 'selections', 'mobile-chat', 'board', 'foreground', 'async-starts', 'mutation-races', 'detail-races', 'quest-catchup', 'agent-panel-races', 'visibility'].includes(batch)) throw new Error(`Unknown navigation batch: ${batch}`);
+    if (batch === 'feature-links') {
+      checks.push(await run('a chat change link opens the exact Workshop diff without starting a terminal', async () => {
+        class FixtureChannel {
+          onmessage = () => {};
+        }
+        const fixtureTauri = {
+          core: {
+            Channel: FixtureChannel,
+            invoke: async (command, args) => {
+              workshopCalls.push(command);
+              if (command === 'desktop_status') return { available: true, runner_id: null, name: 'Fixture Mac', status: 'idle', server: location.origin, workspace_root: '/fixture', repositories: [], backends: [], last_error: null, features: ['workbench'] };
+              if (command === 'wb_open') return { key: 'tasks/canonical-feature-link-fixture', root: '/fixture', name: 'fixture', is_git: true, branch: 'feature', base: 'main', head: 'fixture' };
+              if (command === 'wb_changes') {
+                workshopChangeReads += 1;
+                workshopModeReads += 1;
+                if (workshopChangeMode === 'initial' && workshopModeReads === 1) throw new Error('fixture change read failed');
+                if (workshopChangeMode === 'normal' && workshopModeReads === 1) return { base: 'main', merge_base: 'base', files: [] };
+                return { base: 'main', merge_base: 'base', files: [{ path: workshopFile, status: 'M', old_path: null }] };
+              }
+              if (command === 'wb_read') return { text: 'export const featureLinkFixture = true;\n', sha: 'fixture-sha', size: 40, binary: false, too_large: false };
+              if (command === 'wb_base') return { exists: true, text: 'export const featureLinkFixture = false;\n', binary: false };
+              if (command === 'wb_list') return [];
+              if (command === 'wb_watch') return undefined;
+              if (command === 'wb_unwatch') return undefined;
+              throw new Error(`Unexpected Workshop command: ${command}`);
+            },
+          },
+        };
+        await choose('Open chat', 'action:chat');
+        const chat = await until(() => modal('Chat'), 'Chat did not open');
+        if (!visible('button[data-chat-item]').some((element) => element.textContent.includes('Juniper'))) {
+          const back = await until(() => visible('button[aria-label="Back to chats"]')[0], 'chat list could not be reached');
+          back.click();
+        }
+        const agentRow = await until(() => visible('button[data-chat-item]').find((element) => element.textContent.includes('Juniper')), 'Juniper did not appear in the chat list');
+        agentRow.click();
+        const embedded = await until(() => chat.querySelector('[role="region"][aria-label="Talk to Juniper"]'), 'Juniper conversation did not open');
+        const changes = await until(() => exactText('button', 'View changes'), 'View changes did not appear in chat');
+        window.__TAURI__ = fixtureTauri;
+        changes.click();
+        const workshop = await until(() => modal('Workshop'), 'Workshop did not open from chat');
+        if (!workshopSessionQueries.some((query) => new URLSearchParams(query).get('id') === workshopSession)) throw new Error('the exact Workshop session was not requested');
+        const tab = await until(() => workshopChangeReads === 2 && visible('[role="tab"]').find((element) => element.getAttribute('title') === workshopFile && element.getAttribute('aria-selected') === 'true' && element.textContent.includes('diff')), 'the first changed file did not open');
+        if (workshopChangeReads !== 2) throw new Error(`the failed change read retried ${workshopChangeReads - 1} times`);
+        if (tab.getAttribute('aria-selected') !== 'true' || !tab.textContent.includes('diff')) throw new Error('the changed file did not open in diff mode');
+        if (!exactText('button', 'Diff')?.matches('[aria-pressed="true"]')) throw new Error('the diff view was not selected');
+        if (workshopCalls.some((command) => command.startsWith('term_'))) throw new Error('opening the diff started a terminal');
+        if (!workshop.isConnected || !embedded.isConnected) throw new Error('Workshop navigation replaced the chat instead of opening over it');
+        const opens = workshopCalls.filter((command) => command === 'wb_open').length;
+        let redispatched = 0;
+        const onRedispatch = () => { redispatched += 1; };
+        window.addEventListener('world:open-workbench', onRedispatch);
+        changes.click();
+        await wait(100);
+        window.removeEventListener('world:open-workbench', onRedispatch);
+        if (redispatched) throw new Error('the same-session diff request reached the close guard');
+        if (modal('Workshop') !== workshop || workshopCalls.filter((command) => command === 'wb_open').length !== opens) throw new Error('the same-session diff request reopened the Workshop');
+        workshopChangeMode = 'normal';
+        workshopModeReads = 0;
+        workshop.querySelector('button[aria-label="Close workshop"]')?.click();
+        await until(() => !modal('Workshop'), 'Workshop did not close before the normal-open check');
+        localStorage.setItem(workshopLayoutKey, JSON.stringify({ terminal: false }));
+        window.dispatchEvent(new CustomEvent('world:open-workbench', { detail: { sessionId: workshopSession } }));
+        const normalWorkshop = await until(() => modal('Workshop'), 'the normal Workshop did not open');
+        await until(() => workshopModeReads === 1, 'the normal Workshop did not load its empty changes');
+        changes.click();
+        const refreshedTab = await until(() => workshopModeReads === 2 && visible('[role="tab"]').find((element) => element.getAttribute('title') === workshopFile && element.getAttribute('aria-selected') === 'true' && element.textContent.includes('diff')), 'the direct link did not refresh the empty Workshop');
+        if (workshopModeReads !== 2 || refreshedTab.getAttribute('aria-selected') !== 'true' || !refreshedTab.textContent.includes('diff')) throw new Error('the direct link did not own the refreshed diff result');
+        if (modal('Workshop') !== normalWorkshop) throw new Error('the direct link remounted the normal Workshop');
+      }));
+    }
+    if (batch === 'workspace-link') {
+      const workspaceSurface = async () => until(() => modal('Workspace'), 'Workspace did not open');
+      const workspaceLibrary = async () => until(() => modal('Workspaces'), 'Workspaces library did not open');
+      const closeSurface = async () => {
+        const surface = modal('Workspace') ?? modal('Workspaces');
+        surface?.querySelector('button[aria-label="Close"]')?.click();
+        await until(() => !modal('Workspace') && !modal('Workspaces'), 'Workspaces did not close');
+      };
+      const openExactWorkspace = async () => {
+        window.dispatchEvent(new CustomEvent('world:open-workspace', { detail: { id: workspaceCanvas, item: workspaceItem } }));
+        const surface = await workspaceSurface();
+        await until(() => visible(`.react-flow__node[data-id="${workspaceItem}"].selected`)[0], 'the explicit workspace item was not focused');
+        return surface;
+      };
+      const hideSideChat = async () => {
+        const hide = visible('button[aria-label="Hide agent chat"]')[0];
+        if (!hide) return;
+        hide.click();
+        await until(() => !visible('aside[aria-label^="Talk to "]').length, 'the workspace side chat did not close');
+      };
+      const backToLibrary = async (surface) => {
+        const back = await until(() => [...surface.querySelectorAll('header button')].find((element) => element.getClientRects().length && (element.title === 'Back to all workspaces' || element.textContent.trim() === 'All workspaces')), 'All workspaces did not appear');
+        back.click();
+        return workspaceLibrary();
+      };
+      const assertLibraryInteractive = async (surface, description) => {
+        const search = await until(() => {
+          const field = surface.querySelector('input[aria-label="Search workspaces"]');
+          if (!(field instanceof HTMLInputElement) || !field.getClientRects().length || getComputedStyle(field).visibility !== 'visible') return null;
+          const library = field.closest('.flex.min-h-0.w-full.flex-col');
+          if (!(library instanceof HTMLElement) || library.inert || library.getAttribute('aria-hidden') === 'true') return null;
+          const bounds = field.getBoundingClientRect();
+          const hit = document.elementFromPoint(bounds.left + bounds.width / 2, bounds.top + bounds.height / 2);
+          if (hit !== field && !field.contains(hit)) return null;
+          return field;
+        }, `${description} did not make workspace search visible and interactive`);
+        search.focus();
+        if (document.activeElement !== search) throw new Error(`${description} could not focus workspace search`);
+        return search;
+      };
+      const assertDockLabels = async (description) => {
+        const nav = await until(() => {
+          const hotbar = document.querySelector('nav[aria-label="Hotbar"]');
+          return hotbar instanceof HTMLElement && hotbar.getClientRects().length && getComputedStyle(hotbar).visibility === 'visible' ? hotbar : null;
+        }, `${description} did not show the dock`);
+        const buttons = [...nav.querySelectorAll('button')].filter((button) => button.getClientRects().length);
+        if (!buttons.length) throw new Error(`${description} had no dock labels`);
+        const navBounds = nav.getBoundingClientRect();
+        for (const button of buttons) {
+          const label = button.querySelector(':scope > span.whitespace-normal');
+          if (!(label instanceof HTMLSpanElement)) throw new Error(`${description} could not find the label for ${button.getAttribute('aria-label')}`);
+          const buttonBounds = button.getBoundingClientRect();
+          const labelBounds = label.getBoundingClientRect();
+          if (label.scrollWidth > label.clientWidth + 1) throw new Error(`${description} clipped ${label.textContent.trim()}`);
+          if (labelBounds.left < buttonBounds.left - 1 || labelBounds.right > buttonBounds.right + 1 || labelBounds.top < buttonBounds.top - 1 || labelBounds.bottom > buttonBounds.bottom + 1) throw new Error(`${description} placed ${label.textContent.trim()} outside its button`);
+          if (buttonBounds.left < navBounds.left - 1 || buttonBounds.right > navBounds.right + 1 || buttonBounds.top < navBounds.top - 1 || buttonBounds.bottom > navBounds.bottom + 1) throw new Error(`${description} placed ${label.textContent.trim()} outside the dock`);
+          const style = getComputedStyle(label);
+          if (style.textOverflow === 'ellipsis' || style.whiteSpace === 'nowrap' || style.overflow === 'hidden') throw new Error(`${description} truncated ${label.textContent.trim()}`);
+        }
+        const expectedMainAgent = 'An unusually long main agent display name that still fits';
+        const main = buttons.find((button) => button.getAttribute('aria-keyshortcuts') === 'P');
+        if (!main || !main.textContent.includes(expectedMainAgent)) throw new Error(`${description} did not render the full long main-agent name`);
+      };
+      checks.push(await run('B returns a board selected in the Workspaces library to the library', async () => {
+        window.dispatchEvent(new CustomEvent('world:open-workspace'));
+        const library = await workspaceLibrary();
+        const row = await until(() => library.querySelector(`button[data-report="${libraryCanvas}"]`), 'the flat workspace fixture did not appear in the library');
+        row.click();
+        await until(() => modal('Workspaces')?.querySelector(`.react-flow__node[data-id="${libraryItem}"]`), 'the library did not open the workspace as a board');
+        if (modal('Workspace')) throw new Error('the library selection unexpectedly entered workspace mode');
+        document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'b', code: 'KeyB', bubbles: true, cancelable: true }));
+        const returned = await workspaceLibrary();
+        await until(() => !returned.querySelector(`.react-flow__node[data-id="${libraryItem}"]`) && returned.querySelector('input[data-find-input="true"]'), 'B did not clear the selected library board');
+        await assertLibraryInteractive(returned, 'B from a selected board');
+      }));
+      checks.push(await run('a shared workspace link opens its exact focused item from chat', async () => {
+        const agentName = document.querySelector('nav[aria-label="Hotbar"] button[aria-keyshortcuts="P"] span:not(:empty)')?.textContent.trim() ?? 'Juniper';
+        await choose('Open chat', 'action:chat');
+        const chat = await until(() => modal('Chat'), 'Chat did not open');
+        if (!visible('button[data-chat-item]').some((element) => element.textContent.includes(agentName))) {
+          const back = await until(() => visible('button[aria-label="Back to chats"]')[0], 'chat list could not be reached');
+          back.click();
+        }
+        const agentRow = await until(() => visible('button[data-chat-item]').find((element) => element.textContent.includes(agentName)), `${agentName} did not appear in the chat list`);
+        agentRow.click();
+        const embedded = await until(() => [...chat.querySelectorAll('[role="region"]')].find((element) => element.getAttribute('aria-label') === `Talk to ${agentName}`), `${agentName} conversation did not open`);
+        const open = await until(() => [...embedded.querySelectorAll('button')].find((element) => element.textContent.includes('Workspace') && element.textContent.includes(workspaceReport.title)), 'the shared workspace card did not appear in chat');
+        if (localStorage.getItem(workspaceLayoutKey) !== null) throw new Error('the workspace already had a saved layout before the shared link opened');
+        open.click();
+        const workspace = await until(() => modal('Workspace'), 'the shared link did not open in workspace mode');
+        await until(() => workspace.querySelector('button[aria-label="Hide channels"]'), 'the workspace channel control did not appear');
+        await until(() => [...workspace.querySelectorAll('header button')].find((element) => element.getClientRects().length && (element.title === 'Back to all workspaces' || element.textContent.trim() === 'All workspaces')), 'the workspace header controls did not appear');
+        await until(() => visible(`.react-flow__node[data-id="${workspaceItem}"].selected`)[0], 'the shared workspace item was not focused');
+      }));
+      checks.push(await run('All workspaces and generic Cmd K and B requests leave an exact board for the library', async () => {
+        const linked = await workspaceSurface();
+        await backToLibrary(linked);
+        let exactReads = workspaceDetailReads;
+        await openExactWorkspace();
+        if (workspaceDetailReads <= exactReads) throw new Error('the explicit workspace request did not read its exact board');
+        exactReads = workspaceDetailReads;
+        await choose('Open workspaces', 'action:workspace');
+        await assertLibraryInteractive(await workspaceLibrary(), 'Cmd K from an exact board');
+        if (workspaceDetailReads !== exactReads) throw new Error('Cmd K reopened the remembered board instead of the library');
+        await openExactWorkspace();
+        exactReads = workspaceDetailReads;
+        document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'b', code: 'KeyB', bubbles: true, cancelable: true }));
+        await assertLibraryInteractive(await workspaceLibrary(), 'B from an exact board');
+        if (workspaceDetailReads !== exactReads) throw new Error('B reopened the remembered board instead of the library');
+      }));
+      checks.push(await run('dock, Cmd K and B ignore valid and deleted remembered boards after they close', async () => {
+        const actions = [
+          ['dock', async (dock) => dock.click()],
+          ['Cmd K', () => choose('Open workspaces', 'action:workspace')],
+          ['B', async () => document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'b', code: 'KeyB', bubbles: true, cancelable: true }))],
+        ];
+        try {
+          for (const deleted of [false, true]) {
+            for (const [label, open] of actions) {
+              const state = deleted ? 'deleted remembered board' : 'valid remembered board';
+              workspaceAvailable = true;
+              await openExactWorkspace();
+              await until(() => {
+                try {
+                  return JSON.parse(localStorage.getItem(workspaceLayoutKey) ?? '{}').last === workspaceCanvas;
+                } catch {
+                  return false;
+                }
+              }, `${label} from a ${state} did not persist the remembered board`);
+              await closeSurface();
+              const chat = modal('Chat');
+              if (chat) {
+                chat.querySelector('button[aria-label="Close"]')?.click();
+                await until(() => !modal('Chat'), `${label} from a ${state} could not close the restored Chat`);
+              }
+              const dock = await until(() => {
+                const button = document.querySelector('nav[aria-label="Hotbar"] button[aria-label="Workspaces"]');
+                if (!(button instanceof HTMLButtonElement) || !button.getClientRects().length || button.closest('[aria-hidden="true"]')) return null;
+                const style = getComputedStyle(button);
+                const navStyle = getComputedStyle(button.closest('nav'));
+                return style.visibility === 'visible' && navStyle.visibility === 'visible' && style.pointerEvents !== 'none' ? button : null;
+              }, `${label} from a ${state} did not return to the visible HUD`);
+              workspaceAvailable = !deleted;
+              const exactReads = workspaceDetailReads;
+              await open(dock);
+              const library = await until(() => modal('Workspaces'), `${label} from a ${state} did not open the Workspaces library`);
+              await assertLibraryInteractive(library, `${label} from a ${state}`);
+              if (workspaceDetailReads !== exactReads) throw new Error(`${label} tried to open the ${state}`);
+            }
+          }
+        } finally {
+          workspaceAvailable = true;
+        }
+      }));
+      checks.push(await run('every dock label fits at wide and constrained desktop sizes', async () => {
+        await closeSurface();
+        const chat = modal('Chat');
+        chat?.querySelector('button[aria-label="Close"]')?.click();
+        if (chat) await until(() => !modal('Chat'), 'Chat did not close before the dock check');
+        await useViewport(1440, 900);
+        try {
+          await assertDockLabels('the wide desktop dock');
+          await useViewport(1024, 820);
+          await assertDockLabels('the constrained desktop dock');
+        } finally {
+          if (innerWidth !== 1440 || innerHeight !== 900) await useViewport(1440, 900);
+        }
+      }));
+      checks.push(await run('the saved reader preference cannot hide the compact workspace library', async () => {
+        window.dispatchEvent(new CustomEvent('world:open-workspace'));
+        let librarySurface = await workspaceLibrary();
+        await hideSideChat();
+        const row = await until(() => librarySurface.querySelector(`button[data-report="${libraryCanvas}"]`), 'the workspace row did not appear before the compact check');
+        row.click();
+        await until(() => librarySurface.querySelector(`.react-flow__node[data-id="${libraryItem}"]`), 'the workspace reader did not open before saving the library preference');
+        const hideLibrary = await until(() => visible('button[aria-label="Hide the library"]')[0], 'the wide library toggle did not appear');
+        hideLibrary.click();
+        await until(() => visible('button[aria-label="Show the library"]')[0], 'the hidden reader preference did not save');
+        document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'b', code: 'KeyB', bubbles: true, cancelable: true }));
+        librarySurface = await workspaceLibrary();
+        let search = await assertLibraryInteractive(librarySurface, 'B with a saved hidden reader preference');
+        const showChat = await until(() => [...librarySurface.querySelectorAll('button')].find((element) => element.getAttribute('aria-label') === 'Talk to an agent here'), 'the side chat toggle did not appear');
+        showChat.click();
+        await until(() => visible('aside[aria-label^="Talk to "]')[0], 'the side chat did not open');
+        try {
+          await useViewport(1024, 820);
+          const rootRem = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+          await until(() => librarySurface.getBoundingClientRect().width < 42 * rootRem, 'the real desktop resize did not make Workspaces compact');
+          search = await assertLibraryInteractive(librarySurface, 'the resized workspace library with side chat');
+          setValue(search, 'library workspace');
+          await until(() => librarySurface.querySelector(`button[data-report="${libraryCanvas}"]`), 'the compact search did not find its workspace');
+          search.focus();
+          await useKey('ArrowDown', () => document.activeElement?.matches(`button[data-report="${libraryCanvas}"]`), 'Arrow Down did not move from search into the compact workspace list');
+          await useKey('Enter', () => Boolean(modal('Workspaces')?.querySelector(`.react-flow__node[data-id="${libraryItem}"]`)), 'Enter did not open the focused compact workspace');
+          await useViewport(1440, 900);
+          await until(() => visible('button[aria-label="Show the library"]')[0], 'widening the reader did not restore its saved library preference');
+          document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'b', code: 'KeyB', bubbles: true, cancelable: true }));
+          librarySurface = await workspaceLibrary();
+          await assertLibraryInteractive(librarySurface, 'B after widening a hidden reader');
+        } finally {
+          if (innerWidth !== 1440 || innerHeight !== 900) await useViewport(1440, 900);
+          await hideSideChat();
+        }
+      }));
+      checks.push(await run('active workspace searches refresh after edits, events and deletion', async () => {
+        document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'b', code: 'KeyB', bubbles: true, cancelable: true }));
+        const librarySurface = await workspaceLibrary();
+        const search = await assertLibraryInteractive(librarySurface, 'the active-query fixture');
+        setValue(search, 'library workspace');
+        let row = await until(() => librarySurface.querySelector(`button[data-report="${libraryCanvas}"]`), 'the rename fixture did not match its starting query');
+        row.click();
+        await until(() => librarySurface.querySelector(`.react-flow__node[data-id="${libraryItem}"]`), 'the rename fixture reader did not open');
+        const rename = await until(() => [...librarySurface.querySelectorAll('button')].find((button) => button.title === 'Rename' && button.textContent.includes(currentLibraryReport.title)), 'the workspace rename control did not appear');
+        rename.click();
+        const name = await until(() => librarySurface.querySelector('input[aria-label="Workspace name"]'), 'the workspace name field did not appear');
+        setValue(name, 'Renamed workspace fixture');
+        name.blur();
+        await until(() => currentLibraryReport.title === 'Renamed workspace fixture', 'the workspace rename did not reach the fixture API');
+        const showLibrary = await until(() => visible('button[aria-label="Show the library"]')[0], 'the saved hidden preference did not expose its Show library control');
+        showLibrary.click();
+        await until(() => !librarySurface.querySelector(`button[data-report="${libraryCanvas}"]`) && librarySurface.textContent.includes('No workspaces match.'), 'renaming a workspace did not refresh the active query');
+        if (librarySurface.querySelector('[role="alert"]') || librarySurface.textContent.includes('Searching the library')) throw new Error('the empty workspace result showed another feedback state');
+
+        setValue(search, 'edited cobalt');
+        await until(() => librarySurface.textContent.includes('No workspaces match.'), 'the content query did not settle empty');
+        currentLibraryReport = { ...currentLibraryReport, body: 'The edited cobalt note.', updated_at: new Date().toISOString() };
+        window.dispatchEvent(new CustomEvent('world:reports-stale', { detail: { report_id: libraryCanvas } }));
+        await until(() => librarySurface.querySelector(`button[data-report="${libraryCanvas}"]`), 'a live workspace edit did not refresh the active query');
+
+        currentLibraryReport = { ...currentLibraryReport, title: 'Library workspace fixture', updated_at: new Date().toISOString() };
+        setValue(search, 'library workspace');
+        await until(() => librarySurface.querySelector(`button[data-report="${libraryCanvas}"]`), 'the out-of-order fixture did not reach its starting result');
+        holdWorkspaceSearch = true;
+        workspaceSearchHeld = false;
+        let releaseWorkspaceSearch = () => {};
+        workspaceSearchGate = new Promise((resolve) => { releaseWorkspaceSearch = resolve; });
+        window.dispatchEvent(new CustomEvent('world:reports-stale', { detail: { report_id: libraryCanvas } }));
+        await until(() => workspaceSearchHeld, 'the stale workspace query did not pause');
+        currentLibraryReport = { ...currentLibraryReport, title: 'Renamed away workspace', body: '', updated_at: new Date().toISOString() };
+        holdWorkspaceSearch = false;
+        window.dispatchEvent(new CustomEvent('world:reports-stale', { detail: { report_id: libraryCanvas } }));
+        await until(() => !librarySurface.querySelector(`button[data-report="${libraryCanvas}"]`) && librarySurface.textContent.includes('No workspaces match.'), 'the current empty query did not beat the held result');
+        releaseWorkspaceSearch();
+        await wait(150);
+        if (librarySurface.querySelector(`button[data-report="${libraryCanvas}"]`) || !librarySurface.textContent.includes('No workspaces match.')) throw new Error('the held workspace query replaced the current empty result');
+
+        currentLibraryReport = { ...currentLibraryReport, title: 'Library workspace fixture', updated_at: new Date().toISOString() };
+        workspaceSearchFailure = true;
+        window.dispatchEvent(new CustomEvent('world:reports-stale', { detail: { report_id: libraryCanvas } }));
+        const retry = await until(() => [...librarySurface.querySelectorAll('button')].find((button) => button.textContent.trim() === 'Try again' && button.closest('[role="alert"]')?.textContent.includes('Could not search')), 'the active query failure did not show its retry');
+        if (librarySurface.textContent.includes('No workspaces match.') || librarySurface.textContent.includes('Searching the library')) throw new Error('the failed workspace search showed another feedback state');
+        retry.click();
+        row = await until(() => librarySurface.querySelector(`button[data-report="${libraryCanvas}"]`), 'retrying the active query did not recover');
+        if (librarySurface.querySelector('[role="alert"]')) throw new Error('the recovered workspace search kept its failure state');
+        row.click();
+        await until(() => librarySurface.querySelector(`.react-flow__node[data-id="${libraryItem}"]`), 'the delete fixture reader did not open');
+        const deleted = await window.fetch(`/api/world/reports/${libraryCanvas}`, { method: 'DELETE' });
+        if (!deleted.ok) throw new Error('the external workspace delete failed');
+        window.dispatchEvent(new CustomEvent('world:reports-stale', { detail: { report_id: libraryCanvas } }));
+        await until(() => workspaceLibraryDeleted
+          && !librarySurface.querySelector(`.react-flow__node[data-id="${libraryItem}"]`)
+          && !librarySurface.querySelector(`button[data-report="${libraryCanvas}"]`)
+          && librarySurface.textContent.includes('This workspace was deleted or is not shared with you.')
+          && librarySurface.textContent.includes('No workspaces match.'), 'an external workspace deletion did not refresh its open board and active query');
+      }));
+    }
+    if (batch === 'workspace-completion') {
+      const workspaceActions = (root) => [...root.querySelectorAll('button')].filter((button) => button.textContent.trim() === 'Open workspace');
+      checks.push(await run('an event-first completion keeps one workspace action when its quest card arrives', async () => {
+        workspaceCompletionPhase = 'event-first';
+        await choose('Redesign checkout drawer', `hit:quest:${selectedQuest}`);
+        const room = await until(() => modal('Quest room'), 'Quest room did not open for the completion workspace link');
+        await until(() => room.textContent.includes('Completion workspace fixture') && workspaceActions(room).length === 1, 'the event-only completion fallback did not render one workspace action');
+        if (localStorage.getItem(workspaceLayoutKey) !== null) throw new Error('the workspace already had a saved layout before the event fallback opened');
+        workspaceActions(room)[0].click();
+        const fallbackWorkspace = await until(() => modal('Workspace'), 'the event-only completion fallback did not open the workspace');
+        await until(() => visible(`.react-flow__node[data-id="${workspaceItem}"].selected`)[0], 'the event-only completion fallback did not focus its workspace item');
+        fallbackWorkspace.querySelector('button[aria-label="Close"]')?.click();
+        await until(() => modal('Quest room') === room, 'the quest room did not return after the event fallback closed');
+        workspaceCompletionPhase = 'event-with-card';
+        window.dispatchEvent(new CustomEvent('world-event', { detail: { seq: workspaceCompletionEvent.seq + 1, type: 'message.created', agent_id: workspaceCompletionEvent.agent_id, task_id: selectedQuest, run_id: null, session_id: workspaceCompletionEvent.session_id, payload: { message_id: workspaceCompletionMessage.id }, created_at: workspaceCompletionMessage.created_at } }));
+        await until(() => room.textContent.includes('Quest complete') && workspaceActions(room).length === 1, 'the delivered quest card did not replace the duplicate event workspace action');
+        if (!room.textContent.includes('The focused note remains available in the completion details.')) throw new Error('the event report lost its unique finding');
+        if (!room.textContent.includes('The completion evidence is clear.')) throw new Error('the completion event lost its review detail');
+        room.querySelector('button[aria-label="Close"]')?.click();
+        await until(() => !modal('Quest room'), 'the event-first quest room did not close');
+      }));
+      checks.push(await run('a card-first completion keeps one workspace action when its event arrives', async () => {
+        workspaceCompletionPhase = 'card-first';
+        await choose('Redesign checkout drawer', `hit:quest:${selectedQuest}`);
+        const room = await until(() => modal('Quest room'), 'Quest room did not reopen for the card-first completion');
+        await until(() => room.textContent.includes('Quest complete') && workspaceActions(room).length === 1, 'the card-first completion did not render one workspace action');
+        workspaceCompletionPhase = 'card-with-event';
+        window.dispatchEvent(new CustomEvent('world-event', { detail: workspaceCompletionEvent }));
+        await until(() => room.textContent.includes('The focused note remains available in the completion details.') && workspaceActions(room).length === 1, 'the later completion event duplicated the workspace action');
+        const open = workspaceActions(room)[0];
+        open.click();
+        const workspace = await until(() => modal('Workspace'), 'the completion link did not open in workspace mode');
+        await until(() => workspace.querySelector('button[aria-label="Hide channels"]'), 'the workspace channel control did not appear');
+        await until(() => visible('button[title="Back to all workspaces"]')[0], 'the workspace header controls did not appear');
+        await until(() => visible(`.react-flow__node[data-id="${workspaceItem}"].selected`)[0], 'the completion link did not focus its workspace item');
+        workspace.querySelector('button[aria-label="Close"]')?.click();
+        await until(() => !modal('Workspace'), 'the completion workspace did not close before the notification check');
+      }));
+      checks.push(await run('the web bell reaches the delivered quest card and its exact workspace item', async () => {
+        workspaceNotificationsCleared = false;
+        window.dispatchEvent(new Event('world:notes-stale'));
+        await choose('Open notifications', 'action:notifications');
+        const notifications = await until(() => modal('Notifications'), 'Notifications did not open for the completion');
+        const completion = await until(() => [...notifications.querySelectorAll('button')].find((button) => button.textContent.includes('finished a quest')), 'the completion notification did not appear');
+        completion.click();
+        const agent = await until(() => visible('[role="dialog"]').find((element) => element.getAttribute('aria-label')?.startsWith('Talk to ')), 'the completion notification did not open the agent');
+        const open = await until(() => workspaceActions(agent)[0], 'the delivered quest card workspace action did not appear');
+        open.click();
+        const workspace = await until(() => modal('Workspace'), 'the bell quest card did not open the workspace');
+        await until(() => visible(`.react-flow__node[data-id="${workspaceItem}"].selected`)[0], 'the bell quest card did not focus its workspace item');
+      }));
+    }
+    if (!['core', 'review', 'report', 'mobile', 'selections', 'mobile-chat', 'board', 'foreground', 'async-starts', 'mutation-races', 'detail-races', 'quest-catchup', 'agent-panel-races', 'visibility', 'feature-links', 'workspace-link', 'workspace-completion'].includes(batch)) throw new Error(`Unknown navigation batch: ${batch}`);
     const failed = checks.filter(([, result]) => result !== 'pass');
     if (failed.length) throw new Error(JSON.stringify(failed));
     return { batch, checks, viewport: [innerWidth, innerHeight] };
   } finally {
+    window.__lokaNavigationViewportRequest = null;
+    window.__lokaNavigationKeyboardRequest = null;
     window.fetch = originalFetch;
     window.confirm = originalConfirm;
+    if (batch === 'feature-links') {
+      if (savedWorkshopLayout === null) localStorage.removeItem(workshopLayoutKey);
+      else localStorage.setItem(workshopLayoutKey, savedWorkshopLayout);
+    }
+    if (workspaceBatch) {
+      if (savedWorkspaceLayout === null) localStorage.removeItem(workspaceLayoutKey);
+      else localStorage.setItem(workspaceLayoutKey, savedWorkspaceLayout);
+    }
+    if (batch === 'workspace-link') {
+      if (savedWorkspaceLibrary === null) localStorage.removeItem(workspaceLibraryKey);
+      else localStorage.setItem(workspaceLibraryKey, savedWorkspaceLibrary);
+      if (savedSideChat === null) localStorage.removeItem(sideChatKey);
+      else localStorage.setItem(sideChatKey, savedSideChat);
+    }
+    if (originalTauri) window.__TAURI__ = originalTauri;
+    else delete window.__TAURI__;
   }
 })()

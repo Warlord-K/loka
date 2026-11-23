@@ -71,6 +71,10 @@ fn dedup(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
 }
 
 pub(crate) fn paths(spec: &Spec, granted: &BTreeMap<String, String>, run_temp: Option<&Path>) -> Paths {
+    paths_with_gates(spec, granted, run_temp, crate::cli::gate_paths())
+}
+
+fn paths_with_gates(spec: &Spec, granted: &BTreeMap<String, String>, run_temp: Option<&Path>, gates: crate::cli::GatePaths) -> Paths {
     let home = home();
     let mut hidden: Vec<PathBuf> = sandbox::HIDDEN_PATHS.iter().filter_map(|p| expand(p, home.as_deref())).collect();
     hidden.extend(home.as_ref().map(|home| home.join(sandbox::OWNER_SSH)));
@@ -95,9 +99,9 @@ pub(crate) fn paths(spec: &Spec, granted: &BTreeMap<String, String>, run_temp: O
     let git_roots: Vec<PathBuf> = sandbox::git_write_roots(&spec.working_dir).into_iter().map(PathBuf::from).collect();
     readable.extend(git_roots.iter().cloned());
     readable.extend(crate::mcp_hub::get().map(|hub| hub.socket().to_path_buf()));
-    readable.extend(crate::cli::launcher_alias_dir());
+    readable.extend(gates.readable);
     readable.extend(std::env::var_os("SSH_AUTH_SOCK").filter(|v| !v.is_empty()).map(PathBuf::from));
-    let temp_grants: Vec<PathBuf> = run_temp.map(crate::cli::private_temp_grants).unwrap_or_default();
+    let temp_grants: Vec<PathBuf> = run_temp.map(crate::cli::both_spellings).unwrap_or_default();
     let mut writable: Vec<PathBuf> = spec.state.iter().cloned().chain(temp_grants.iter().cloned()).collect();
     if !spec.read_only {
         writable.push(spec.working_dir.clone());
@@ -108,7 +112,7 @@ pub(crate) fn paths(spec: &Spec, granted: &BTreeMap<String, String>, run_temp: O
     let owner_temp = if spec.read_only { Vec::new() } else { sandbox::user_temp_dirs() };
     let hidden = dedup(hidden.iter().map(|p| resolve(p)).collect());
     let writable = dedup(writable.iter().map(|p| resolve(p)).collect());
-    let sockets = dedup(temp_grants.iter().map(|p| resolve(p)).collect());
+    let sockets = dedup(temp_grants.iter().chain(&gates.sockets).map(|p| resolve(p)).collect());
     Paths { hidden, readable: dedup(readable.iter().map(|p| resolve(p)).collect()), writable, owner_temp: dedup(owner_temp), sockets }
 }
 
@@ -493,6 +497,65 @@ mod tests {
             let dir = resolve(&dir);
             assert!(paths.readable.contains(&dir), "{} must stay readable: {:?}", dir.display(), paths.readable);
             assert!(seatbelt_profile(&paths).contains(dir.to_str().unwrap()));
+        }
+    }
+
+    #[test]
+    fn omp_and_opencode_reach_every_gate_but_never_write_it() {
+        let gates = crate::cli::gate_fixture::listening();
+        let spec = Spec { working_dir: gates.base.join("work"), ..Default::default() };
+        let paths = paths_with_gates(&spec, &BTreeMap::new(), None, gates.paths.clone());
+        let socket = resolve(&gates.socket);
+        let alias = resolve(&gates.alias);
+        assert!(paths.hidden.iter().any(|hidden| socket.starts_with(hidden)), "the socket sits in a hidden folder: {:?}", paths.hidden);
+        assert!(paths.sockets.contains(&socket), "{:?}", paths.sockets);
+        assert!(paths.readable.contains(&socket) && paths.readable.contains(&alias), "{:?}", paths.readable);
+        assert!(!paths.writable.iter().any(|w| socket.starts_with(w) || alias.starts_with(w)), "{:?}", paths.writable);
+        let profile = seatbelt_profile(&paths);
+        assert!(profile.contains(&format!("(allow network-outbound (remote unix-socket {}))", subpaths(&socket))), "{profile}");
+        for path in [&socket, &alias] {
+            assert!(profile.contains(&format!("(allow file-read* {})", subpaths(path))), "{profile}");
+            assert!(!profile.contains(&format!("(allow file-write* {})", subpaths(path))), "{profile}");
+        }
+        let args: Vec<String> = bwrap_args(&paths, on_disk).iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let joined = args.join(" ");
+        assert!(joined.contains(&format!("--ro-bind {0} {0}", socket.display())), "{joined}");
+        assert!(!joined.contains(&format!("--bind {0} {0}", socket.display())), "{joined}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn live_gates_answer_inside_the_omp_and_opencode_wrapper() {
+        use std::io::Write;
+        let gates = crate::cli::gate_fixture::listening();
+        let work = gates.base.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let launcher = gates.alias.join("launcher");
+        std::fs::write(&launcher, "#!/bin/sh\necho launched\n").unwrap();
+        std::fs::set_permissions(&launcher, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let listener = gates.listener.try_clone().unwrap();
+        let answering = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(b"runner").unwrap();
+        });
+        let spec = Spec { working_dir: work.clone(), ..Default::default() };
+        let profile = seatbelt_profile(&paths_with_gates(&spec, &BTreeMap::new(), None, gates.paths.clone()));
+        let sandboxed = |script: &str| {
+            std::process::Command::new(SANDBOX_EXEC).arg("-p").arg(&profile).arg("/bin/sh").arg("-c").arg(script).current_dir(&work).output().unwrap()
+        };
+        let connect = format!(
+            "/usr/bin/python3 -I -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); print(s.recv(16).decode())' {}",
+            gates.socket.display()
+        );
+        let reached = sandboxed(&connect);
+        assert_eq!(String::from_utf8_lossy(&reached.stdout).trim(), "runner", "{}", String::from_utf8_lossy(&reached.stderr));
+        answering.join().unwrap();
+        let ran = sandboxed(&launcher.display().to_string());
+        assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), "launched", "{}", String::from_utf8_lossy(&ran.stderr));
+        for target in [gates.socket.parent().unwrap().join("planted"), gates.alias.join("planted")] {
+            assert!(!sandboxed(&format!("touch '{}'", target.display())).status.success(), "{} must stay read only", target.display());
+            assert!(!target.exists());
         }
     }
 

@@ -12,6 +12,8 @@ pub const RESUME_AFTER_ERROR: &str = "[resumed after an interruption]\nYour last
 
 pub const FRESH_RETRY_CAUSE: &str = "context_fresh";
 
+pub const LOST_SESSION_CAUSE: &str = "session_lost";
+
 pub const UPDATE_PAUSE: &str = "Paused while Loka restarted for an update";
 
 pub const RESUME_AFTER_UPDATE: &str = "[resumed after a Loka update]\nLoka restarted for an update while you were working and resumed this same session for you. Do not start over and do not redo finished steps. Check where you stopped (the last command may not have finished), carry on, and end your final message with the full report block exactly as the task prompt describes.";
@@ -64,6 +66,13 @@ impl Required {
             "task" | "followup" => Some(Required::Report),
             "review" => Some(Required::Verdict),
             _ => None,
+        }
+    }
+
+    pub fn nudge(self) -> &'static str {
+        match self {
+            Required::Report => "report",
+            Required::Verdict => "verdict",
         }
     }
 
@@ -176,7 +185,7 @@ pub fn diagnose(end: &RunEnd) -> Diagnosis {
                 (cause, Some("runner".to_string()), at_run, reason.to_string(), None)
             } else if let Some(failure) = cli_errors::classify(raw) {
                 let resets_at = failure.resets_at;
-                (Cause::CliError, Some(failure.kind.as_str().to_string()), at_run, failure.summary(), resets_at)
+                (Cause::CliError, Some(failure.kind.as_str().to_string()), at_run, failure.summary_for(Some(end.kind)), resets_at)
             } else if !started && WORKSPACE.iter().any(|marker| lower.contains(marker)) {
                 (Cause::NeverStarted, None, "workspace", format!("Its workspace could not be prepared: {first}"), None)
             } else if !started {
@@ -233,8 +242,12 @@ impl Diagnosis {
         }
     }
 
-    pub fn fork_too_long(&self) -> bool {
-        self.cause == Cause::CliError && self.failure.as_deref() == Some("context_too_long") && self.turns <= 1
+    pub fn overflowed(&self) -> bool {
+        self.cause == Cause::CliError && self.failure.as_deref() == Some("context_too_long")
+    }
+
+    pub fn lost_session(&self) -> bool {
+        self.cause == Cause::CliError && self.failure.as_deref() == Some(FailureKind::SessionMissing.as_str())
     }
 
     pub fn for_update(&self) -> bool {
@@ -330,13 +343,14 @@ mod tests {
     }
 
     #[test]
-    fn only_early_context_failures_retry_fresh() {
+    fn context_overflows_are_recognised_at_any_turn() {
         let d = diagnose(&end(Some("Prompt is too long"), "", 0));
         assert_eq!((d.cause, d.failure.as_deref()), (Cause::CliError, Some("context_too_long")));
-        assert!(d.fork_too_long());
-        assert!(diagnose(&end(Some("Prompt is too long"), "", 1)).fork_too_long());
-        assert!(!diagnose(&end(Some("Prompt is too long"), "", 6)).fork_too_long());
-        assert!(!diagnose(&end(Some("API Error: 529 Overloaded"), "", 0)).fork_too_long());
+        assert!(d.overflowed());
+        assert!(diagnose(&end(Some("Prompt is too long"), "", 1)).overflowed());
+        assert!(diagnose(&end(Some("Prompt is too long"), "", 40)).overflowed());
+        assert!(!diagnose(&end(Some("API Error: 529 Overloaded"), "", 0)).overflowed());
+        assert!(!d.transient(), "an overflow is recovered once in a fresh session, never resumed as is");
     }
 
     #[test]
@@ -390,9 +404,9 @@ mod tests {
 
     #[test]
     fn stops_and_timeouts_are_never_retried() {
-        let stopped = diagnose(&end(Some("Stopped by Yatharth. Do not restart this work unless they ask."), "", 5));
+        let stopped = diagnose(&end(Some("Stopped by Ana. Do not restart this work unless they ask."), "", 5));
         assert_eq!(stopped.cause, Cause::Stopped);
-        assert_eq!(stopped.reason, "Yatharth stopped it.");
+        assert_eq!(stopped.reason, "Ana stopped it.");
         assert!(!stopped.transient());
         let timed = diagnose(&end(Some("timed out after 3600s"), "", 40));
         assert_eq!(timed.cause, Cause::TimedOut);

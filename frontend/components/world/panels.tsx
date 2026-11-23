@@ -43,10 +43,11 @@ import { OpenWorkshop } from "./workbench/open-workshop";
 import { AssigneeBadge, assigneeName, QUEST_STATUSES, SelectionBar, StatusIcon, statusLabel, useQuestControls, type QuestViewer } from "./quest-ui";
 import { EmptyState, WindowHeader } from "./settings-shell";
 import { runtimeName } from "@/lib/model-names";
+import { openRoomAsk, roomAsk } from "@/lib/quest-board";
 import { escapeTaken } from "@/lib/escape";
 import { EMBED_DRAG, embedDragData } from "@/lib/canvas-embeds";
 import { questNeedsYou } from "@/lib/quest-status";
-import { useQuestsChanged } from "./live-quests";
+import { useLiveQuests, useSetLiveQuests } from "./live-quests";
 
 export function useEscape(onClose: () => void) {
   useEffect(() => {
@@ -81,6 +82,7 @@ export const ROLE_LABEL: Record<string, string> = {
   aside: "Aside",
   designer: "Designer",
   direct: "Folder session",
+  action: "Pull request action",
 };
 
 export function Header({ title, subtitle, onClose }: { title: string; subtitle?: string; onClose: () => void }) {
@@ -160,7 +162,7 @@ function str(v: unknown): string {
   return typeof v === "string" ? v : "";
 }
 
-export function ReportCard({ card }: { card: BlockCard }) {
+export function ReportCard({ card, handles, onOpenAgent }: { card: BlockCard; handles: Map<string, WorldAgent>; onOpenAgent: (id: string) => void }) {
   const d = card.data ?? {};
   const findings = Array.isArray(d.findings) ? (d.findings as Record<string, unknown>[]) : [];
   const followups = Array.isArray(d.followups) ? (d.followups as unknown[]).map(str).filter(Boolean) : [];
@@ -175,7 +177,7 @@ export function ReportCard({ card }: { card: BlockCard }) {
           </span>
         )}
       </p>
-      {str(d.summary) && <p className="mt-1">{str(d.summary)}</p>}
+      {str(d.summary) && <RichText text={str(d.summary)} handles={handles} onOpenAgent={onOpenAgent} className="mt-1" />}
       {findings.length > 0 && (
         <ul className="mt-1 ml-4 list-disc space-y-0.5">
           {findings.map((f, i) => (
@@ -499,7 +501,7 @@ export function RunTurn({
               </Clamp>
             )}
             {cards.map((card, j) => (
-              <ReportCard key={j} card={card} />
+              <ReportCard key={j} card={card} handles={handles} onOpenAgent={onOpenAgent} />
             ))}
             {lastText && !live && (
               <div className="mt-1 flex items-center justify-end gap-2">
@@ -931,7 +933,7 @@ export function SessionDetail({
   );
 }
 
-export type SessionFocus = { taskId?: string | null; sessionId?: string | null };
+export type SessionFocus = { taskId?: string | null; sessionId?: string | null; item?: string | null };
 
 export function HistoryPanel({
   agents,
@@ -1059,8 +1061,6 @@ export function HistoryPanel({
   );
 }
 
-const questCache: { list: TaskBrief[] } = { list: [] };
-
 const COLUMN_EMPTY: Record<string, string> = {
   todo: "No quests waiting",
   in_progress: "Nobody is on a quest",
@@ -1083,21 +1083,10 @@ export function QuestBoard({
   onOpenAgent: (id: string) => void;
   onOpenQuest: (task: TaskBrief) => void;
 }) {
-  const [tasks, setTaskState] = useState<TaskBrief[]>(() => questCache.list);
-  const setTasks = useCallback((next: TaskBrief[] | ((cur: TaskBrief[]) => TaskBrief[])) => {
-    setTaskState((cur) => {
-      const value = typeof next === "function" ? next(cur) : next;
-      questCache.list = value;
-      return value;
-    });
-  }, []);
+  const tasks = useLiveQuests() ?? [];
+  const setTasks = useSetLiveQuests();
   const [dragging, setDragging] = useState<string[] | null>(null);
   const [over, setOver] = useState<string | null>(null);
-  const refresh = useCallback(() => {
-    worldApi.tasks().then(setTasks).catch(() => {});
-  }, []);
-  useEffect(() => refresh(), [refresh]);
-  useQuestsChanged(refresh);
   const [filter, setFilter] = useState("");
   const everyone = useEveryone();
   const byId = useMemo(() => new Map(agents.map((a) => [a.id, a])), [agents]);
@@ -1223,7 +1212,7 @@ export function QuestBoard({
                         >
                           <span className="block font-semibold leading-snug text-w-strong">{t.title}</span>
                           {questNeedsYou(t) && (
-                            <span className={cn(PILL_WARN, "mt-1")} title="The plan is waiting for your approval in chat">
+                            <span className={cn(PILL_WARN, "mt-1")} title="This quest is waiting for you">
                               Needs you
                             </span>
                           )}
@@ -1345,6 +1334,10 @@ export function describeNotification(e: WorldEvent, names: Map<string, string>):
       return `${who}'s quest is done: the PR for "${str("title")}" was merged`;
     case "task.pr_closed":
       return `The PR for ${who}'s quest "${str("title")}" was closed without merging`;
+    case "action.ran":
+    case "action.skipped":
+    case "action.failed":
+      return `${who}: ${str("line")}`;
     case "run.failed":
     case "run.timed_out":
       return `${who} ran into trouble: ${str("error")}`;
@@ -1355,7 +1348,7 @@ export function describeNotification(e: WorldEvent, names: Map<string, string>):
     case "timer.done":
       return `Timer done: ${str("label")}`;
     case "report.created":
-      return `${who} wrote a report: ${str("title")}`;
+      return p.report_kind === "canvas" ? `${who} made a workspace: ${str("title")}` : `${who} wrote a report: ${str("title")}`;
     case "todo.nudge":
       if (p.timer) return `Time's up: ${str("text")}`;
       return `${p.overdue ? "Overdue" : "Still open"}: ${str("text")}${str("age") ? ` (${str("age")} old${str("added_by") ? `, from ${str("added_by")}` : ""})` : ""}`;
@@ -1487,6 +1480,9 @@ export function NotificationsPanel({
       window.dispatchEvent(new CustomEvent("world:open-channel", { detail: { id: e.payload.channel_id } }));
     else if (e.type === "todo.nudge" || e.type === "timer.done") window.dispatchEvent(new Event("world:open-lists"));
     else if (e.type === "runner.disk_low") requestSetup("storage");
+    else if (roomAsk(e)) openRoomAsk(roomAsk(e)!, e.agent_id);
+    else if (e.type.startsWith("action.") && e.task_id)
+      window.dispatchEvent(new CustomEvent("world:open-quest", { detail: { taskId: e.task_id, agentId: e.agent_id } }));
     else if (e.agent_id) onOpenAgent(e.agent_id);
   };
   const openCount = list.length && view === "open" ? list.reduce((n, g) => n + g.seqs.length, 0) : 0;

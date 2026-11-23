@@ -1,7 +1,7 @@
 "use client";
 
 import type { ReactNode } from "react";
-import { ChatsCircle } from "@phosphor-icons/react";
+import { ChatsCircle, Quotes } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
 import { messageTime } from "@/lib/world";
 import { CopyButton, DeleteButton, EditButton, MessageStamp, RewindButton } from "./chat-kit";
@@ -21,9 +21,24 @@ export function ReplyButton({ onClick }: { onClick: () => void }) {
   );
 }
 
+export function QuoteButton({ onClick, label = "Quote in chat" }: { onClick: () => void; label?: string }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label={label}
+      title={label}
+      className="rounded-md p-0.5 text-w-muted transition-colors hover:bg-w-sand hover:text-w-strong"
+    >
+      <Quotes size={12} weight="bold" />
+    </button>
+  );
+}
+
 export interface MessageActions {
   copy?: string;
   link?: string;
+  onQuote?: () => void;
   onReply?: () => void;
   onEdit?: () => void;
   onRewind?: () => void;
@@ -31,8 +46,8 @@ export interface MessageActions {
 }
 
 export function MessageToolbar({ actions, className }: { actions: MessageActions; className?: string }) {
-  const { copy, link, onReply, onEdit, onRewind, onDelete } = actions;
-  if (!copy?.trim() && !link && !onReply && !onEdit && !onRewind && !onDelete) return null;
+  const { copy, link, onQuote, onReply, onEdit, onRewind, onDelete } = actions;
+  if (!copy?.trim() && !link && !onQuote && !onReply && !onEdit && !onRewind && !onDelete) return null;
   return (
     <div
       className={cn(
@@ -42,6 +57,7 @@ export function MessageToolbar({ actions, className }: { actions: MessageActions
       )}
     >
       {onReply && <ReplyButton onClick={onReply} />}
+      {onQuote && <QuoteButton onClick={onQuote} />}
       {copy !== undefined && <CopyButton text={copy} />}
       {link && <LinkButton reference={link} />}
       {onEdit && <EditButton onClick={onEdit} />}

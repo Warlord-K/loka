@@ -237,7 +237,7 @@ const COMMANDS: Command[] = [
   { id: "code", label: "Code", hint: "A block of code", icon: CodeBlock, keys: ["code", "snippet", "pre"], run: (e) => e.chain().focus().toggleCodeBlock().run() },
   { id: "table", label: "Table", hint: "Rows and columns", icon: TableIcon, keys: ["table", "grid"], run: (e) => e.chain().focus().insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run() },
   { id: "divider", label: "Divider", hint: "A line between sections", icon: Minus, keys: ["divider", "hr", "line", "rule", "separator"], run: (e) => e.chain().focus().setHorizontalRule().run() },
-  { id: "report", label: "Link to report", hint: "Type a report title", icon: FileText, keys: ["link", "report", "wiki", "page"], run: (e) => e.chain().focus().insertContent("[[").run() },
+  { id: "report", label: "Link to report or workspace", hint: "Type a report or workspace title", icon: FileText, keys: ["link", "report", "workspace", "wiki", "page"], run: (e) => e.chain().focus().insertContent("[[").run() },
 ];
 
 type Popup = { kind: "slash" | "wiki"; from: number; query: string; top: number; left: number };
@@ -586,12 +586,12 @@ function PopupMenu({ popup, items, index, onHover, onPick }: { popup: Popup; ite
     <div
       ref={listRef}
       role="listbox"
-      aria-label={popup.kind === "wiki" ? "Reports" : "Blocks"}
+      aria-label={popup.kind === "wiki" ? "Reports and workspaces" : "Blocks"}
       style={style}
       className={cn(MENU, "fixed z-[80] max-h-80 w-72 overflow-y-auto")}
       onMouseDown={(e) => e.preventDefault()}
     >
-      <p className="px-2 pb-1 pt-0.5 text-w-2xs font-medium text-w-muted">{popup.kind === "wiki" ? "Link a report" : "Blocks"}</p>
+      <p className="px-2 pb-1 pt-0.5 text-w-2xs font-medium text-w-muted">{popup.kind === "wiki" ? "Link a report or workspace" : "Blocks"}</p>
       {items.map((item, i) => {
         const ItemIcon = item.icon;
         return (

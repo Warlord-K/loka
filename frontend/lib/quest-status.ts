@@ -3,6 +3,7 @@ export type QuestStage = "needs_you" | "working" | "in_review" | "waiting" | "do
 export interface QuestLike {
   status: string;
   plan_waiting?: boolean | null;
+  decisions?: { passed_up?: number | null } | null;
 }
 
 export interface SessionLike {
@@ -16,8 +17,16 @@ export function questOpen(quest: QuestLike): boolean {
   return !CLOSED_QUEST_STATUSES.includes(quest.status);
 }
 
-export function questNeedsYou(quest: QuestLike): boolean {
+export function questAwaitsPlan(quest: QuestLike): boolean {
   return quest.plan_waiting === true && questOpen(quest);
+}
+
+export function questNeedsYou(quest: QuestLike): boolean {
+  return questAwaitsPlan(quest) || (questOpen(quest) && (quest.decisions?.passed_up ?? 0) > 0);
+}
+
+export function needsYouFirst<T extends QuestLike>(quests: readonly T[]): T[] {
+  return [...quests].sort((a, b) => Number(questNeedsYou(b)) - Number(questNeedsYou(a)));
 }
 
 export function sessionAwaitsPlan(session: SessionLike): boolean {
@@ -36,6 +45,10 @@ export function questStage(quest: QuestLike): QuestStage {
 
 export function questChanged(event: { type: string }): boolean {
   return event.type.startsWith("task.");
+}
+
+export function questEventTaskId(event: { task_id?: string | null; payload?: { task_id?: unknown } }): string | null {
+  return event.task_id ?? (typeof event.payload?.task_id === "string" ? event.payload.task_id : null);
 }
 
 export const QUEST_STAGE_LABEL: Record<QuestStage, string> = {

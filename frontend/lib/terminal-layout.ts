@@ -402,6 +402,12 @@ export function updatePane(layout: TermLayout, paneId: string, change: Partial<O
   return { ...layout, panes: { ...layout.panes, [paneId]: next } };
 }
 
+export function clearClosedShellIds(layout: TermLayout, results: ReadonlyMap<string, { status: string }>): TermLayout {
+  let next = layout;
+  for (const [id, result] of results) if (result.status === "closed") next = updatePane(next, id, { native: null });
+  return next;
+}
+
 export function setDock(layout: TermLayout, dock: Dock): TermLayout {
   return layout.dock === dock ? layout : { ...layout, dock };
 }
@@ -553,7 +559,11 @@ export function saveLayout(storage: Pick<Storage, "setItem" | "removeItem"> | nu
   }
 }
 
-export type TerminalSummary = { id: string; label: string; device: string | null; panes: number };
+export type TerminalSummary = { id: string; label: string; device: string | null; panes: number; running: number };
+
+export function runningTerminals(list: readonly TerminalSummary[]): number {
+  return list.reduce((sum, summary) => sum + summary.running, 0);
+}
 
 let summaries: TerminalSummary[] = [];
 const summaryListeners = new Set<() => void>();
@@ -573,4 +583,18 @@ export function publishTerminals(next: TerminalSummary[]): void {
   if (JSON.stringify(next) === JSON.stringify(summaries)) return;
   summaries = next;
   for (const listener of summaryListeners) listener();
+}
+
+export function savedSummaries(layout: TermLayout | null, live: readonly { id: string; exited: boolean }[], thisMac = "this Mac"): TerminalSummary[] {
+  if (!layout) return [];
+  const alive = new Set(live.filter((term) => !term.exited).map((term) => term.id));
+  const tabs = layout.tabs.map((t) => {
+    const ids = panesIn(t.root);
+    const running = ids.filter((id) => {
+      const native = layout.panes[id]?.native;
+      return !!native && alive.has(native);
+    }).length;
+    return { id: t.id, label: t.name ?? thisMac, device: layout.panes[t.focus]?.device ?? null, panes: ids.length, running };
+  });
+  return tabs.some((t) => t.running > 0) ? tabs : [];
 }

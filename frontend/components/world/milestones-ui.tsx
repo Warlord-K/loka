@@ -27,12 +27,14 @@ export function MilestoneList({
   taskId,
   milestones,
   editable,
+  retryable,
   onChanged,
   className,
 }: {
   taskId: string;
   milestones: Milestone[];
   editable: boolean;
+  retryable?: boolean;
   onChanged: () => void;
   className?: string;
 }) {
@@ -88,14 +90,25 @@ export function MilestoneList({
                 <span className="min-w-0 flex-1">
                   <span className={cn("block leading-snug", done && "text-w-muted line-through")}>{m.title}</span>
                   {merge && <span className="block text-w-2xs text-w-muted">{mergeLine(m)}</span>}
+                  {!merge && m.status === "skipped" && <span className="block text-w-2xs text-w-muted">Skipped</span>}
                 </span>
-                {merge && m.status === "active" && editable && (
+                {merge && retryable && (m.status === "active" || (m.status === "failed" && m.detail === "Closed without merging") || (m.status === "skipped" && m.detail === "No pull request was opened")) && editable && (
                   <button
                     type="button"
                     disabled={checking}
                     onClick={() => {
                       setChecking(true);
-                      void worldApi.checkMilestones(taskId).finally(() => window.setTimeout(() => setChecking(false), 60000));
+                      void worldApi
+                        .checkMilestones(taskId)
+                        .then(({ queued }) => {
+                          onChanged();
+                          if (!queued) {
+                            setChecking(false);
+                            return;
+                          }
+                          window.setTimeout(() => setChecking(false), 60000);
+                        })
+                        .catch(() => setChecking(false));
                     }}
                     title="Check the PR on the next sweep, within a minute"
                     className="inline-flex shrink-0 items-center gap-1 rounded-md px-1 text-w-2xs text-w-link hover:bg-w-sand disabled:text-w-muted"

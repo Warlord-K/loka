@@ -15,6 +15,7 @@ const MAX_FOLDER_DEPTH: usize = 6;
 const KEEP_REVISIONS: i64 = 100;
 const MERGE_SECS: i64 = 300;
 const QUIET_CHARS: usize = 600;
+const WORKSPACE_REQUEST_NAMESPACE: Uuid = Uuid::from_u128(0x84571a4a_41b4_4f35_98c5_7d63f2cc13af);
 pub const STALE_REPORT: &str = "Someone saved a newer version of this report while you were editing.";
 const VISIBLE: &str = "(r.org_id = $9 AND (r.owner_user_id = $1 OR r.visibility = 'public'))";
 pub(crate) const BRIEF_COLUMNS: &str = "r.id, r.owner_user_id, r.author_agent_id, r.author_user_id, r.title, r.slug, r.tags, r.folder, r.pinned,
@@ -157,6 +158,58 @@ pub struct ReportPatch {
 #[derive(Debug)]
 pub struct StaleReport(pub Box<Report>);
 
+pub(crate) fn normalize_workspace_summary(kind: &str, body: &mut String) {
+    if kind != "canvas" {
+        return;
+    }
+    let first = body.split_once('\n').map_or(body.as_str(), |(line, _)| line);
+    let Some(counts) = first.strip_prefix("Canvas with ").and_then(|line| line.strip_suffix('.')) else {
+        return;
+    };
+    let Some((items, arrows)) = counts.split_once(" items and ") else {
+        return;
+    };
+    let Some(arrows) = arrows.strip_suffix(" arrows") else {
+        return;
+    };
+    if !items.is_empty() && !arrows.is_empty() && items.bytes().all(|byte| byte.is_ascii_digit()) && arrows.bytes().all(|byte| byte.is_ascii_digit()) {
+        body.replace_range(.."Canvas".len(), "Workspace");
+    }
+}
+
+fn normalized_report(mut report: Report) -> Report {
+    normalize_workspace_summary(&report.kind, &mut report.body);
+    report
+}
+
+fn normalized_brief(mut report: ReportBrief) -> ReportBrief {
+    normalize_workspace_summary(&report.kind, &mut report.excerpt);
+    report
+}
+
+fn report_event_value(kind: &str, report: &Report, by: ReportActor, quiet: bool, activity: Option<&crate::canvas::Activity>) -> NewEvent {
+    let mut payload = json!({
+        "report_id": report.id,
+        "org_id": report.org_id,
+        "title": report.title,
+        "folder": report.folder,
+        "owner_user_id": report.owner_user_id,
+        "visibility": report.visibility,
+        "revision": report.revision,
+        "report_kind": report.kind,
+        "author_agent_id": by.agent(),
+        "quiet": quiet,
+    });
+    if let Some(activity) = activity {
+        payload["activity"] = json!(activity);
+    }
+    let mut event = NewEvent::new(kind).actor(by.user()).task(report.task_id).payload(payload);
+    if let Some(agent) = by.agent() {
+        event = event.agent(agent);
+    }
+    event
+}
+
 impl std::fmt::Display for StaleReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(STALE_REPORT)
@@ -171,7 +224,9 @@ pub struct ReportFilter {
     pub folder: Option<String>,
     pub tag: Option<String>,
     pub limit: Option<i64>,
+    pub offset: Option<i64>,
     pub practice: Option<bool>,
+    pub kind: Option<String>,
 }
 
 pub fn can_read(report: &Report, viewer: Uuid, role: Role, org: Uuid) -> bool {
@@ -381,6 +436,18 @@ fn changed_chars(a: &str, b: &str) -> usize {
 }
 
 impl WorldStore {
+    async fn report_org_in(&self, db: &mut sqlx::PgConnection, new: &NewReport) -> Result<Option<Uuid>> {
+        Ok(sqlx::query_scalar(
+            "SELECT COALESCE((SELECT org_id FROM agent_profiles WHERE id = $2), (SELECT org_id FROM agent_tasks WHERE id = $3),
+                             world_active_org($1), world_only_org(), world_default_org())",
+        )
+        .bind(new.owner_user_id)
+        .bind(new.by.agent())
+        .bind(new.task_id)
+        .fetch_one(db)
+        .await?)
+    }
+
     async fn unused_report_slug(&self, db: impl sqlx::PgExecutor<'_>, owner: Uuid, title: &str, except: Option<Uuid>) -> Result<String> {
         let base = slug_base(title);
         let taken: Vec<String> = sqlx::query_scalar(
@@ -418,6 +485,11 @@ impl WorldStore {
     }
 
     async fn relink_mentions(&self, owner: Uuid, org: Option<Uuid>, report: Uuid, title: &str) -> Result<()> {
+        let mut db = self.pool().acquire().await?;
+        self.relink_mentions_in(&mut db, owner, org, report, title).await
+    }
+
+    async fn relink_mentions_in(&self, db: &mut sqlx::PgConnection, owner: Uuid, org: Option<Uuid>, report: Uuid, title: &str) -> Result<()> {
         let pending: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
             "SELECT id, owner_user_id, body FROM world_reports
              WHERE id <> $2 AND owner_user_id = $1 AND org_id = $4 AND NOT links @> ARRAY[$2]
@@ -427,11 +499,11 @@ impl WorldStore {
         .bind(report)
         .bind(title)
         .bind(org)
-        .fetch_all(self.pool())
+        .fetch_all(&mut *db)
         .await?;
         for (id, owner, body) in pending {
-            let links = self.resolve_report_links(self.pool(), owner, org, &body, Some(id)).await?;
-            sqlx::query("UPDATE world_reports SET links = $2 WHERE id = $1").bind(id).bind(&links).execute(self.pool()).await?;
+            let links = self.resolve_report_links(&mut *db, owner, org, &body, Some(id)).await?;
+            sqlx::query("UPDATE world_reports SET links = $2 WHERE id = $1").bind(id).bind(&links).execute(&mut *db).await?;
         }
         Ok(())
     }
@@ -440,7 +512,15 @@ impl WorldStore {
         self.insert_report(new, None, None).await
     }
 
-    pub(crate) async fn insert_report(&self, new: NewReport, canvas: Option<&crate::canvas::Canvas>, practice: Option<&serde_json::Value>) -> Result<Report> {
+    async fn insert_report_in(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        new: NewReport,
+        canvas: Option<&crate::canvas::Canvas>,
+        practice: Option<&serde_json::Value>,
+        id: Option<Uuid>,
+        known_org: Option<Uuid>,
+    ) -> Result<Report> {
         let title = clean_title(&new.title)?;
         check_body(&new.body)?;
         let folder = clean_folder(new.folder.as_deref().unwrap_or(""))?;
@@ -450,30 +530,25 @@ impl WorldStore {
             Some(v @ ("private" | "public")) => v.to_string(),
             Some(_) => bail!("visibility is private or public"),
         };
-        let slug = self.unused_report_slug(self.pool(), new.owner_user_id, &title, None).await?;
-        let org: Option<Uuid> = sqlx::query_scalar(
-            "SELECT COALESCE((SELECT org_id FROM agent_profiles WHERE id = $2), (SELECT org_id FROM agent_tasks WHERE id = $3),
-                             world_active_org($1), world_only_org(), world_default_org())",
-        )
-        .bind(new.owner_user_id)
-        .bind(new.by.agent())
-        .bind(new.task_id)
-        .fetch_one(self.pool())
-        .await?;
+        let slug = self.unused_report_slug(&mut **tx, new.owner_user_id, &title, None).await?;
+        let org = match known_org {
+            Some(org) => Some(org),
+            None => self.report_org_in(tx, &new).await?,
+        };
         let mut new = new;
         let mut canvas = canvas.cloned();
         if let Some(c) = canvas.as_mut() {
-            self.check_canvas_uploads(new.owner_user_id, org, c, &crate::canvas::Canvas::default()).await?;
-            Self::check_canvas_embeds(&mut *self.pool().acquire().await?, new.owner_user_id, org, c, &crate::canvas::Canvas::default()).await?;
+            Self::check_canvas_uploads(tx, new.owner_user_id, org, c, &crate::canvas::Canvas::default()).await?;
+            Self::check_canvas_embeds(tx, new.owner_user_id, org, c, &crate::canvas::Canvas::default()).await?;
             new.body = c.summary();
         }
         let canvas = canvas.as_ref().map(crate::canvas::Canvas::to_value);
-        let links = self.resolve_report_links(self.pool(), new.owner_user_id, org, &new.body, None).await?;
-        let mut tx = self.pool().begin().await?;
+        let links = self.resolve_report_links(&mut **tx, new.owner_user_id, org, &new.body, None).await?;
         let report = sqlx::query_as::<_, Report>(
-            "INSERT INTO world_reports (owner_user_id, author_agent_id, author_user_id, title, slug, body, tags, folder, pinned, visibility, links, task_id, org_id, kind, canvas, practice)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CASE WHEN $14::jsonb IS NULL THEN 'doc' ELSE 'canvas' END, $14, $15) RETURNING *",
+            "INSERT INTO world_reports (id, owner_user_id, author_agent_id, author_user_id, title, slug, body, tags, folder, pinned, visibility, links, task_id, org_id, kind, canvas, practice)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, CASE WHEN $15::jsonb IS NULL THEN 'doc' ELSE 'canvas' END, $15, $16) RETURNING *",
         )
+        .bind(id.unwrap_or_else(Uuid::new_v4))
         .bind(new.owner_user_id)
         .bind(new.by.agent())
         .bind(new.by.user())
@@ -489,7 +564,7 @@ impl WorldStore {
         .bind(org)
         .bind(&canvas)
         .bind(practice)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
         sqlx::query(
             "INSERT INTO world_report_revisions (report_id, revision, title, body, folder, tags, author_agent_id, author_user_id, canvas)
@@ -503,12 +578,127 @@ impl WorldStore {
         .bind(new.by.agent())
         .bind(new.by.user())
         .bind(&canvas)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
+        Ok(report)
+    }
+
+    pub(crate) async fn insert_report(&self, new: NewReport, canvas: Option<&crate::canvas::Canvas>, practice: Option<&serde_json::Value>) -> Result<Report> {
+        let by = new.by;
+        let mut tx = self.pool().begin().await?;
+        let report = self.insert_report_in(&mut tx, new, canvas, practice, None, None).await?;
         tx.commit().await?;
         self.relink_mentions(report.owner_user_id, report.org_id, report.id, &report.title).await?;
-        self.report_event("report.created", &report, new.by, false).await?;
+        self.report_event("report.created", &report, by, false).await?;
         Ok(report)
+    }
+
+    pub(crate) async fn insert_canvas_idempotent(&self, mut new: NewReport, canvas: &crate::canvas::Canvas, request_id: Uuid) -> Result<Report> {
+        let by = new.by;
+        let mut tx = self.pool().begin().await?;
+        let org = self.report_org_in(&mut tx, &new).await?.ok_or_else(|| anyhow::anyhow!("a workspace needs an organization"))?;
+        let mut key = [0_u8; 48];
+        key[..16].copy_from_slice(new.owner_user_id.as_bytes());
+        key[16..32].copy_from_slice(org.as_bytes());
+        key[32..].copy_from_slice(request_id.as_bytes());
+        let report_id = Uuid::new_v5(&WORKSPACE_REQUEST_NAMESPACE, &key);
+        let mut lock_bytes = [0_u8; 8];
+        lock_bytes.copy_from_slice(&report_id.as_bytes()[..8]);
+        sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(i64::from_be_bytes(lock_bytes)).execute(&mut *tx).await?;
+        if let Some(report) = sqlx::query_as::<_, Report>(
+            "SELECT * FROM world_reports
+             WHERE id = $1 AND owner_user_id = $2 AND org_id = $3 AND kind = 'canvas' AND practice IS NULL AND task_id IS NULL",
+        )
+        .bind(report_id)
+        .bind(new.owner_user_id)
+        .bind(org)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            tx.rollback().await?;
+            return Ok(normalized_report(report));
+        }
+        new.body = canvas.summary();
+        let report = self.insert_report_in(&mut tx, new, Some(canvas), None, Some(report_id), Some(org)).await?;
+        self.relink_mentions_in(&mut tx, report.owner_user_id, report.org_id, report.id, &report.title).await?;
+        crate::world::emit_in(&mut tx, &report_event_value("report.created", &report, by, false, None), None).await?;
+        tx.commit().await?;
+        Ok(report)
+    }
+
+    pub async fn workspace_task_id(&self, owner: Uuid, org: Uuid, task: Uuid) -> Result<Option<Uuid>> {
+        Ok(sqlx::query_scalar(
+            "SELECT COALESCE(parent_task_id, id) FROM agent_tasks WHERE id = $1 AND user_id = $2 AND org_id = $3",
+        )
+        .bind(task)
+        .bind(owner)
+        .bind(org)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+
+    pub async fn quest_workspace(&self, owner: Uuid, org: Uuid, task: Uuid) -> Result<Option<Report>> {
+        let Some(task) = self.workspace_task_id(owner, org, task).await? else {
+            return Ok(None);
+        };
+        Ok(sqlx::query_as::<_, Report>(
+            "SELECT * FROM world_reports
+             WHERE owner_user_id = $1 AND org_id = $2 AND task_id = $3 AND kind = 'canvas' AND practice IS NULL
+             ORDER BY created_at, id LIMIT 1",
+        )
+        .bind(owner)
+        .bind(org)
+        .bind(task)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+
+    pub async fn create_workspace(&self, mut new: NewReport, canvas: crate::canvas::Canvas, org: Uuid) -> Result<(Report, bool)> {
+        canvas.validate()?;
+        new.body = canvas.summary();
+        let task = new.task_id.ok_or_else(|| anyhow::anyhow!("a workspace needs a quest"))?;
+        let mut tx = self.pool().begin().await?;
+        let task: Option<Uuid> = sqlx::query_scalar(
+            "SELECT COALESCE(parent_task_id, id) FROM agent_tasks WHERE id = $1 AND user_id = $2 AND org_id = $3",
+        )
+        .bind(task)
+        .bind(new.owner_user_id)
+        .bind(org)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let task = task.ok_or_else(|| anyhow::anyhow!("that quest is gone or belongs to someone else"))?;
+        let locked: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM agent_tasks WHERE id = $1 AND user_id = $2 AND org_id = $3 FOR UPDATE",
+        )
+        .bind(task)
+        .bind(new.owner_user_id)
+        .bind(org)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if locked.is_none() {
+            anyhow::bail!("that quest is gone or belongs to someone else");
+        }
+        if let Some(report) = sqlx::query_as::<_, Report>(
+            "SELECT * FROM world_reports
+             WHERE owner_user_id = $1 AND org_id = $2 AND task_id = $3 AND kind = 'canvas' AND practice IS NULL
+             ORDER BY created_at, id LIMIT 1",
+        )
+        .bind(new.owner_user_id)
+        .bind(org)
+        .bind(task)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            tx.rollback().await?;
+            return Ok((report, false));
+        }
+        new.task_id = Some(task);
+        let by = new.by;
+        let report = self.insert_report_in(&mut tx, new, Some(&canvas), None, None, None).await?;
+        tx.commit().await?;
+        self.relink_mentions(report.owner_user_id, report.org_id, report.id, &report.title).await?;
+        self.report_event("report.created", &report, by, true).await?;
+        Ok((report, true))
     }
 
     pub async fn repo_notes(&self, owner: Uuid, org: Option<Uuid>, repo: &str) -> Result<Option<Report>> {
@@ -560,7 +750,7 @@ impl WorldStore {
     }
 
     pub async fn get_report(&self, id: Uuid) -> Result<Option<Report>> {
-        Ok(sqlx::query_as::<_, Report>("SELECT * FROM world_reports WHERE id = $1").bind(id).fetch_optional(self.pool()).await?)
+        Ok(sqlx::query_as::<_, Report>("SELECT * FROM world_reports WHERE id = $1").bind(id).fetch_optional(self.pool()).await?.map(normalized_report))
     }
 
     pub async fn find_report(&self, viewer: Uuid, org: Uuid, key: &str) -> Result<Option<Report>> {
@@ -582,16 +772,26 @@ impl WorldStore {
         .bind(&key)
         .bind(org)
         .fetch_optional(self.pool())
-        .await?)
+        .await?
+        .map(normalized_report))
     }
 
     pub async fn list_reports(&self, viewer: Uuid, org: Uuid, filter: &ReportFilter) -> Result<Vec<ReportBrief>> {
         let query = filter.query.as_deref().map(str::trim).filter(|q| !q.is_empty()).map(|q| format!("%{}%", q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")));
+        let offset = filter.offset.unwrap_or(0);
+        if offset < 0 {
+            bail!("offset must be nonnegative");
+        }
         let folder = match filter.folder.as_deref() {
             Some(f) => Some(clean_folder(f)?),
             None => None,
         };
         let tag = filter.tag.as_deref().and_then(|t| clean_tags(&[t.to_string()]).into_iter().next());
+        let kind = match filter.kind.as_deref() {
+            Some("doc" | "canvas") => filter.kind.as_deref(),
+            Some(_) => bail!("kind must be doc or canvas"),
+            None => None,
+        };
         Ok(sqlx::query_as::<_, ReportBrief>(&format!(
             "SELECT {BRIEF_COLUMNS} FROM world_reports r
              WHERE {visible}
@@ -599,8 +799,9 @@ impl WorldStore {
                AND ($3::text IS NULL OR r.folder = $3 OR r.folder LIKE $3 || '/%' OR $3 = '')
                AND ($4::text IS NULL OR $4 = ANY(r.tags))
                AND ($7::bool IS NULL OR (r.practice IS NOT NULL) = $7)
-             ORDER BY ($2::text IS NOT NULL AND r.title ILIKE $2) DESC, r.pinned DESC, r.updated_at DESC
-             LIMIT $5",
+               AND ($8::text IS NULL OR r.kind = $8)
+             ORDER BY ($2::text IS NOT NULL AND r.title ILIKE $2) DESC, r.pinned DESC, r.updated_at DESC, r.id DESC
+             LIMIT $5 OFFSET $9",
             visible = VISIBLE.replace("$9", "$6"),
         ))
         .bind(viewer)
@@ -610,8 +811,13 @@ impl WorldStore {
         .bind(filter.limit.unwrap_or(300).clamp(1, 1000))
         .bind(org)
         .bind(filter.practice)
+        .bind(kind)
+        .bind(offset)
         .fetch_all(self.pool())
-        .await?)
+        .await?
+        .into_iter()
+        .map(normalized_brief)
+        .collect())
     }
 
     pub async fn find_report_brief(&self, viewer: Uuid, org: Uuid, key: &str) -> Result<Option<ReportBrief>> {
@@ -621,7 +827,8 @@ impl WorldStore {
             .bind(report.id)
             .bind(org)
             .fetch_optional(self.pool())
-            .await?)
+            .await?
+            .map(normalized_brief))
     }
 
     pub async fn report_backlinks(&self, viewer: Uuid, org: Uuid, id: Uuid) -> Result<Vec<ReportBrief>> {
@@ -633,7 +840,10 @@ impl WorldStore {
         .bind(id)
         .bind(org)
         .fetch_all(self.pool())
-        .await?)
+        .await?
+        .into_iter()
+        .map(normalized_brief)
+        .collect())
     }
 
     pub async fn report_outlinks(&self, viewer: Uuid, org: Uuid, report: &Report) -> Result<Vec<ReportBrief>> {
@@ -645,7 +855,10 @@ impl WorldStore {
         .bind(&report.links)
         .bind(org)
         .fetch_all(self.pool())
-        .await?)
+        .await?
+        .into_iter()
+        .map(normalized_brief)
+        .collect())
     }
 
     pub async fn report_revisions(&self, id: Uuid) -> Result<Vec<RevisionBrief>> {
@@ -666,7 +879,13 @@ impl WorldStore {
         .bind(id)
         .bind(revision)
         .fetch_optional(self.pool())
-        .await?)
+        .await?
+        .map(|mut revision| {
+            if revision.canvas.is_some() {
+                normalize_workspace_summary("canvas", &mut revision.body);
+            }
+            revision
+        }))
     }
 
     pub async fn update_report(&self, id: Uuid, by: ReportActor, patch: &ReportPatch) -> Result<Option<Report>> {
@@ -682,12 +901,12 @@ impl WorldStore {
             None => current.title.clone(),
         };
         let canvas = match (current.kind.as_str(), &patch.canvas) {
-            ("canvas", _) if patch.body.is_some() || patch.append.is_some() => bail!("\"{}\" is a canvas; change it with the canvas tools", current.title),
+            ("canvas", _) if patch.body.is_some() || patch.append.is_some() => bail!("\"{}\" is a workspace; change it with the workspace tools", current.title),
             ("canvas", Some(value)) => {
                 let canvas = crate::canvas::Canvas::parse(Some(value))?;
                 canvas.validate()?;
                 let before = crate::canvas::Canvas::parse(current.canvas.as_ref())?;
-                self.check_canvas_uploads(current.owner_user_id, current.org_id, &canvas, &before).await?;
+                Self::check_canvas_uploads(&mut tx, current.owner_user_id, current.org_id, &canvas, &before).await?;
                 Some((canvas.summary(), canvas.to_value()))
             }
             _ => None,
@@ -860,25 +1079,7 @@ impl WorldStore {
     }
 
     pub(crate) async fn report_event_with(&self, kind: &str, report: &Report, by: ReportActor, quiet: bool, activity: Option<&crate::canvas::Activity>) -> Result<()> {
-        let mut payload = json!({
-            "report_id": report.id,
-            "org_id": report.org_id,
-            "title": report.title,
-            "folder": report.folder,
-            "owner_user_id": report.owner_user_id,
-            "visibility": report.visibility,
-            "revision": report.revision,
-            "author_agent_id": by.agent(),
-            "quiet": quiet,
-        });
-        if let Some(activity) = activity {
-            payload["activity"] = json!(activity);
-        }
-        let mut event = NewEvent::new(kind).actor(by.user()).task(report.task_id).payload(payload);
-        if let Some(agent) = by.agent() {
-            event = event.agent(agent);
-        }
-        self.emit(event, None).await?;
+        self.emit(report_event_value(kind, report, by, quiet, activity), None).await?;
         Ok(())
     }
 }
@@ -919,6 +1120,155 @@ mod tests {
         assert_eq!(ref_key("report:abc123"), "abc123");
         assert_eq!(ref_key("[[Cache plan|x]]"), "Cache plan");
         assert_eq!(changed_chars("hello world", "hello brave world"), 6);
+    }
+
+    #[test]
+    fn legacy_workspace_summary_is_normalized_exactly() {
+        let mut body = "Canvas with 12 items and 3 arrows.\n\nA note about Canvas with 4 items and 2 arrows.".to_string();
+        normalize_workspace_summary("canvas", &mut body);
+        assert_eq!(body, "Workspace with 12 items and 3 arrows.\n\nA note about Canvas with 4 items and 2 arrows.");
+
+        for original in [
+            "Canvas with +1 items and 2 arrows.",
+            "Canvas with 1 items and 2 arrows",
+            "Canvas with  items and 2 arrows.",
+            "A Canvas with 1 items and 2 arrows.",
+        ] {
+            let mut body = original.to_string();
+            normalize_workspace_summary("canvas", &mut body);
+            assert_eq!(body, original);
+        }
+        let mut report = "Canvas with 1 items and 2 arrows.".to_string();
+        normalize_workspace_summary("doc", &mut report);
+        assert_eq!(report, "Canvas with 1 items and 2 arrows.");
+    }
+
+    #[tokio::test]
+    async fn workspace_create_is_idempotent_and_normalizes_legacy_summaries() -> Result<()> {
+        let Ok(url) = std::env::var("REPORTS_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new().max_connections(4).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email, name) VALUES ($1, 'Workspace retry tester') RETURNING id")
+            .bind(format!("workspace-retry-{}@example.com", Uuid::new_v4()))
+            .fetch_one(&pool)
+            .await?;
+        let new = || NewReport {
+            owner_user_id: owner,
+            by: ReportActor::User(owner),
+            title: "Retry board".into(),
+            body: String::new(),
+            folder: Some("Research".into()),
+            tags: Vec::new(),
+            visibility: None,
+            pinned: false,
+            task_id: None,
+        };
+        let request = Uuid::new_v4();
+        let (first, concurrent) = tokio::join!(
+            store.create_canvas_idempotent(new(), crate::canvas::Canvas::default(), request),
+            store.create_canvas_idempotent(new(), crate::canvas::Canvas::default(), request),
+        );
+        let first = first?;
+        assert_eq!(concurrent?.id, first.id);
+        assert_eq!(store.create_canvas_idempotent(new(), crate::canvas::Canvas::default(), request).await?.id, first.id);
+        let other = store.create_canvas_idempotent(new(), crate::canvas::Canvas::default(), Uuid::new_v4()).await?;
+        assert_ne!(other.id, first.id);
+
+        let revisions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_report_revisions WHERE report_id = $1").bind(first.id).fetch_one(&pool).await?;
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_events WHERE type = 'report.created' AND payload->>'report_id' = $1")
+            .bind(first.id.to_string())
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!((revisions, events), (1, 1));
+
+        let legacy = "Canvas with 0 items and 0 arrows.\n\nKeep Canvas with 9 items and 9 arrows.";
+        sqlx::query("UPDATE world_reports SET body = $2 WHERE id = $1").bind(first.id).bind(legacy).execute(&pool).await?;
+        sqlx::query("UPDATE world_report_revisions SET body = $2 WHERE report_id = $1 AND revision = 1").bind(first.id).bind(legacy).execute(&pool).await?;
+        let normalized = "Workspace with 0 items and 0 arrows.\n\nKeep Canvas with 9 items and 9 arrows.";
+        assert_eq!(store.get_report(first.id).await?.unwrap().body, normalized);
+        let brief = store.find_report_brief(owner, crate::orgs::DEFAULT_ORG, &first.id.to_string()).await?.unwrap();
+        assert_eq!(brief.excerpt, normalized);
+        assert_eq!(store.report_revision(first.id, 1).await?.unwrap().body, normalized);
+        let stored: String = sqlx::query_scalar("SELECT body FROM world_reports WHERE id = $1").bind(first.id).fetch_one(&pool).await?;
+        assert_eq!(stored, legacy);
+
+        sqlx::query("DELETE FROM world_events WHERE payload->>'owner_user_id' = $1").bind(owner.to_string()).execute(&pool).await?;
+        sqlx::query("DELETE FROM users WHERE id = $1").bind(owner).execute(&pool).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn report_pages_keep_every_workspace_and_folder_in_stable_order() -> Result<()> {
+        let Ok(url) = std::env::var("REPORTS_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new().max_connections(4).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email, name) VALUES ($1, 'Report paging tester') RETURNING id")
+            .bind(format!("report-paging-{}@example.com", Uuid::new_v4()))
+            .fetch_one(&pool)
+            .await?;
+        let other: Uuid = sqlx::query_scalar("INSERT INTO users (email, name) VALUES ($1, 'Report paging stranger') RETURNING id")
+            .bind(format!("report-paging-other-{}@example.com", Uuid::new_v4()))
+            .fetch_one(&pool)
+            .await?;
+        let tag = format!("paging-{}", &Uuid::new_v4().simple().to_string()[..12]);
+        sqlx::query(
+            "INSERT INTO world_reports (owner_user_id, title, slug, body, tags, folder, visibility, org_id, kind, canvas, created_at, updated_at)
+             SELECT $1, format('%s workspace %s', $2::text, n), format('%s-workspace-%s', $2::text, n),
+                    'Workspace with 0 items and 0 arrows.', ARRAY[$2], CASE WHEN n = 305 THEN 'ArchiveOnly' ELSE '' END,
+                    'private', $3, 'canvas', '{\"items\":[],\"edges\":[]}'::jsonb,
+                    now() - CASE WHEN n = 305 THEN interval '1 day' ELSE interval '0 days' END,
+                    now() - CASE WHEN n = 305 THEN interval '1 day' ELSE interval '0 days' END
+             FROM generate_series(1, 305) n",
+        )
+        .bind(owner)
+        .bind(&tag)
+        .bind(crate::orgs::DEFAULT_ORG)
+        .execute(&pool)
+        .await?;
+
+        let filter = ReportFilter { tag: Some(tag.clone()), kind: Some("canvas".into()), limit: Some(100), ..Default::default() };
+        let expected: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM world_reports WHERE owner_user_id = $1 AND $2 = ANY(tags) AND kind = 'canvas'
+             ORDER BY pinned DESC, updated_at DESC, id DESC",
+        )
+        .bind(owner)
+        .bind(&tag)
+        .fetch_all(&pool)
+        .await?;
+        let mut found = Vec::new();
+        loop {
+            let page = store.list_reports(owner, crate::orgs::DEFAULT_ORG, &ReportFilter { offset: Some(found.len() as i64), ..filter.clone() }).await?;
+            let done = page.len() < 100;
+            found.extend(page);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(found.iter().map(|report| report.id).collect::<Vec<_>>(), expected);
+        assert_eq!(found.len(), 305);
+        assert!(!found[..100].iter().any(|report| report.folder == "ArchiveOnly"));
+        assert_eq!(found.iter().filter(|report| report.folder == "ArchiveOnly").count(), 1);
+
+        let searched = store
+            .list_reports(owner, crate::orgs::DEFAULT_ORG, &ReportFilter { query: Some(tag.clone()), tag: Some(tag.clone()), kind: Some("canvas".into()), limit: Some(1000), ..Default::default() })
+            .await?;
+        assert_eq!(searched.len(), 305);
+        assert!(store
+            .list_reports(owner, crate::orgs::DEFAULT_ORG, &ReportFilter { tag: Some(tag.clone()), kind: Some("doc".into()), ..Default::default() })
+            .await?
+            .is_empty());
+        assert!(store.list_reports(other, crate::orgs::DEFAULT_ORG, &filter).await?.is_empty());
+        assert!(store
+            .list_reports(owner, crate::orgs::DEFAULT_ORG, &ReportFilter { offset: Some(-1), ..filter })
+            .await
+            .is_err());
+
+        sqlx::query("DELETE FROM users WHERE id = ANY($1)").bind(vec![owner, other]).execute(&pool).await?;
+        Ok(())
     }
 
     #[tokio::test]

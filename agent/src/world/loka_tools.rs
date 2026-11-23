@@ -20,13 +20,13 @@ pub fn look_tools(tool: fn(&str, &str, Value, &[&str]) -> Value) -> Vec<Value> {
         ),
         tool(
             "list_challenges",
-            "List your person's Academy courses and their lessons (challenges), with how they did on each (new, pending, passed, failed) and their best score. Give course to list one course in order, challenge to read one lesson in full (prompt, reading, coach, attempts), and for a canvas lesson attempt (practice:<id>) with strokes true for the stroke data of that attempt.",
+            "List your person's Academy courses and their lessons (challenges), with how they did on each (new, pending, passed, failed) and their best score. Give course to list one course in order, challenge to read one lesson in full (prompt, reading, coach, attempts), and for a practice workspace lesson attempt (practice:<id>) with strokes true for the stroke data of that attempt.",
             json!({
                 "state": { "type": "string", "description": "Only new, pending, passed or failed, optional" },
                 "course": { "type": "string", "description": "Only the lessons of this course: name or id, optional" },
                 "challenge": { "type": "string", "description": "One lesson to read in full: name or id, optional" },
-                "attempt": { "type": "string", "description": "A canvas attempt to read in full: practice:<id> or its first characters, optional" },
-                "strokes": { "type": "boolean", "description": "With attempt or a canvas challenge: include the full stroke JSON" }
+                "attempt": { "type": "string", "description": "A practice workspace attempt to read in full: practice:<id> or its first characters, optional" },
+                "strokes": { "type": "boolean", "description": "With attempt or a practice workspace challenge: include the full stroke JSON" }
             }),
             &[],
         ),
@@ -107,7 +107,7 @@ pub fn academy_tools(tool: fn(&str, &str, Value, &[&str]) -> Value) -> Vec<Value
     vec![
         tool(
             "create_challenge",
-            "Create an Academy lesson (challenge) for your person: a puzzle, dsa (data structures and algorithms), design (system design), quiz, or canvas (they write or draw on a practice canvas and press Ready; the coach grades the picture and strokes with grade_attempt). Puzzle, dsa, design and quiz are answered in the app: quizzes with choices and correct are graded instantly, the rest by a short examiner conversation using your rubric or tests. Passing earns xp in the skill. Give course to add it to a course in order, reading for the reports or canvases to read first, coach for who grades it. Keep it doable in the minutes you give. When your person is waiting on a quest, relate it to that quest's subject.",
+            "Create an Academy lesson (challenge) for your person: a puzzle, dsa (data structures and algorithms), design (system design), quiz, or canvas (shown as a practice workspace, where they write or draw and press Ready; the coach grades the picture and strokes with grade_attempt). Puzzle, dsa, design and quiz are answered in the app: quizzes with choices and correct are graded instantly, the rest by a short examiner conversation using your rubric or tests. Passing earns xp in the skill. Give course to add it to a course in order, reading for the reports or workspaces to read first, coach for who grades it. Keep it doable in the minutes you give. When your person is waiting on a quest, relate it to that quest's subject.",
             json!({
                 "title": s("Short title"),
                 "type": { "type": "string", "enum": academy::TYPES },
@@ -121,8 +121,8 @@ pub fn academy_tools(tool: fn(&str, &str, Value, &[&str]) -> Value) -> Vec<Value
                 "tests": { "type": "object", "description": "For dsa: {language, harness} with the test cases the examiner traces the answer against", "properties": { "language": { "type": "string" }, "harness": { "type": "string" } } },
                 "choices": { "type": "array", "items": { "type": "string" }, "description": "For a multiple choice quiz" },
                 "correct": { "type": "array", "items": { "type": "integer" }, "description": "1-based positions of the right choices; private" },
-                "course": s("Course name or id to add this lesson to, in order; a canvas lesson without one joins the course of its skill"),
-                "reading": { "type": "array", "items": { "type": "string" }, "description": "Up to 12 of your person's reports or canvases to read first: report:<id>, id, title or slug" },
+                "course": s("Course name or id to add this lesson to, in order; a practice workspace lesson without one joins the course of its skill"),
+                "reading": { "type": "array", "items": { "type": "string" }, "description": "Up to 12 of your person's reports or workspaces to read first: report:<id>, id, title or slug" },
                 "coach": s("Agent name or slug that grades it; default the course coach, then the last coach for the skill, then the main agent"),
                 "region": region.clone(),
                 "task_id": s("The quest this challenge relates to, optional")
@@ -137,7 +137,7 @@ pub fn academy_tools(tool: fn(&str, &str, Value, &[&str]) -> Value) -> Vec<Value
                 "story": s("A few sentences on what the course covers and why"),
                 "challenges": { "type": "array", "items": { "type": "string" }, "description": "Existing lesson names or ids, in order, optional" },
                 "skill": s("Skill it trains, optional"),
-                "folder": s("Reports folder where its canvases and reading live, optional"),
+                "folder": s("Reports folder where its workspaces and reading live, optional"),
                 "coach": s("Agent name or slug that coaches the whole course, optional"),
                 "region": region
             }),

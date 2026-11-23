@@ -17,6 +17,7 @@ import { AgentFace } from "./channel-ui";
 import { Shimmer } from "./work-ui";
 import { CLOSE_BTN } from "./settings-shell";
 import { MeaningIcon } from "@/lib/meaning-icons";
+import { RichText, useAgentHandles } from "./chat-kit";
 
 const PRIORITY = [
   { label: "Urgent", dot: "bg-w-danger", tone: "text-w-danger", bars: 3 },
@@ -391,6 +392,7 @@ function TodoDetail({
   const [copied, setCopied] = useState(false);
   const [timerError, setTimerError] = useState<string | null>(null);
   const box = useRef<HTMLDivElement>(null);
+  const handles = useAgentHandles(agents);
   useEffect(() => setText(todo.text), [todo.id, todo.text]);
   const column = columnOf(todo);
   const dirty = text.trim() !== todo.text && text.trim().length > 0;
@@ -491,6 +493,17 @@ function TodoDetail({
           rows={Math.min(10, Math.max(3, Math.ceil(text.length / 60)))}
           className="w-full shrink-0 resize-y rounded-lg border-2 border-w-line bg-w-field px-2.5 py-2 text-w-base leading-relaxed outline-none focus:border-w-ink"
         />
+        <div>
+          <p className="mb-1 text-w-xs font-semibold text-w-muted">Preview and links</p>
+          <div role="region" aria-label="To-do preview and links" className="rounded-lg border-2 border-w-line bg-w-card px-2.5 py-2">
+            <RichText
+              text={text}
+              handles={handles}
+              onOpenAgent={(id) => window.dispatchEvent(new CustomEvent("world:open-agent", { detail: { id } }))}
+              className="select-text break-words text-w-base leading-relaxed"
+            />
+          </div>
+        </div>
         <ProposalPanel todo={todo} agents={agents} onDecided={onDecided} />
         <div>
           <p className="mb-1 text-w-xs font-semibold text-w-muted">Status</p>

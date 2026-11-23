@@ -1256,8 +1256,8 @@ mod tests {
         .await?;
         assert!(removed_event.payload.get("owner_user_id").is_none());
         assert!(removed_event.payload.get("channel_id").is_none());
-        assert!(!crate::event_scope::private_from(&removed_event, teammate, &std::collections::HashSet::new()));
-        assert!(crate::event_scope::private_from(&removed_event, stranger, &std::collections::HashSet::new()));
+        assert!(!crate::event_scope::private_from(&removed_event, teammate, crate::access::Role::Write, &std::collections::HashSet::new()));
+        assert!(crate::event_scope::private_from(&removed_event, stranger, crate::access::Role::Write, &std::collections::HashSet::new()));
         assert!(!crate::loka::hidden_from(&removed_event, teammate));
         assert!(crate::loka::hidden_from(&removed_event, stranger));
         let added_after: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM world_events").fetch_one(&pool).await?;
@@ -1272,8 +1272,8 @@ mod tests {
         .bind(team.id)
         .fetch_one(&pool)
         .await?;
-        assert!(!crate::event_scope::private_from(&added_event, teammate, &std::collections::HashSet::new()));
-        assert!(crate::event_scope::private_from(&added_event, stranger, &std::collections::HashSet::new()));
+        assert!(!crate::event_scope::private_from(&added_event, teammate, crate::access::Role::Write, &std::collections::HashSet::new()));
+        assert!(crate::event_scope::private_from(&added_event, stranger, crate::access::Role::Write, &std::collections::HashSet::new()));
         assert!(!crate::loka::hidden_from(&added_event, teammate));
         assert!(crate::loka::hidden_from(&added_event, stranger));
         assert!(store.hidden_channels(Some(stranger), None).await?.contains(&channel.id));

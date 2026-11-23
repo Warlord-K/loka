@@ -1,72 +1,52 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { createContext, createElement, useContext, useEffect, useMemo, useSyncExternalStore, type ReactNode } from "react";
 import { questChanged } from "@/lib/quest-status";
+import { createQuestStore, type QuestStore } from "@/lib/live-quests";
 import { worldApi, type TaskBrief, type WorldEvent } from "@/lib/world";
 
-export const QUEST_REFRESH_MS = 700;
+export { QUEST_REFRESH_MS } from "@/lib/live-quests";
 
-const listeners = new Set<() => void>();
-let wired = false;
-let due: number | null = null;
-let quests: Promise<TaskBrief[]> | null = null;
-let last: TaskBrief[] | undefined;
+const emptyStore: QuestStore<TaskBrief> = {
+  load: async () => [],
+  invalidate: () => {},
+  snapshot: () => undefined,
+  subscribe: () => () => {},
+  update: () => {},
+  dispose: () => {},
+};
 
-function wire() {
-  if (wired || typeof window === "undefined") return;
-  wired = true;
-  const stale = () => {
-    if (due !== null) return;
-    due = window.setTimeout(() => {
-      due = null;
-      quests = null;
-      listeners.forEach((listener) => listener());
-    }, QUEST_REFRESH_MS);
-  };
-  window.addEventListener("world-event", (e) => {
-    if (questChanged((e as CustomEvent<WorldEvent>).detail)) stale();
-  });
-  window.addEventListener("world-reconnected", stale);
-}
+const LiveQuestsContext = createContext<QuestStore<TaskBrief>>(emptyStore);
 
-function loadQuests(): Promise<TaskBrief[]> {
-  quests ??= worldApi
-    .tasks()
-    .then((list) => {
-      last = list;
-      return list;
-    })
-    .catch(() => {
-      quests = null;
-      return last ?? [];
-    });
-  return quests;
-}
-
-export function useQuestsChanged(onChange: () => void) {
-  const latest = useRef(onChange);
-  latest.current = onChange;
+export function LiveQuestsProvider({ identity, children }: { identity: string | null; children: ReactNode }) {
+  const store = useMemo(() => (identity ? createQuestStore(() => worldApi.tasks(), setTimeout, clearTimeout, false) : emptyStore), [identity]);
   useEffect(() => {
-    const listener = () => latest.current();
-    wire();
-    listeners.add(listener);
-    return () => {
-      listeners.delete(listener);
+    if (store === emptyStore) return;
+    const onEvent = (event: Event) => {
+      if (questChanged((event as CustomEvent<WorldEvent>).detail)) store.invalidate();
     };
-  }, []);
+    const onReconnect = () => store.invalidate();
+    window.addEventListener("world-event", onEvent);
+    window.addEventListener("world-reconnected", onReconnect);
+    return () => {
+      window.removeEventListener("world-event", onEvent);
+      window.removeEventListener("world-reconnected", onReconnect);
+    };
+  }, [store]);
+  return createElement(LiveQuestsContext.Provider, { value: store }, children);
 }
 
-export function useLiveQuests(): TaskBrief[] | undefined {
-  const [list, setList] = useState(() => last);
-  const read = useRef(() => {});
+export function useLiveQuests(enabled = true): TaskBrief[] | undefined {
+  const available = useContext(LiveQuestsContext);
+  const store = enabled ? available : emptyStore;
+  const list = useSyncExternalStore(store.subscribe, store.snapshot, store.snapshot);
   useEffect(() => {
-    let live = true;
-    read.current = () => void loadQuests().then((value) => live && setList(value));
-    read.current();
-    return () => {
-      live = false;
-    };
-  }, []);
-  useQuestsChanged(() => read.current());
+    void store.load();
+  }, [store]);
   return list;
+}
+
+export function useSetLiveQuests(enabled = true): (change: (current: TaskBrief[]) => TaskBrief[]) => void {
+  const available = useContext(LiveQuestsContext);
+  return (enabled ? available : emptyStore).update;
 }

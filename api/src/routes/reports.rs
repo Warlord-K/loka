@@ -83,6 +83,7 @@ pub struct CreateReport {
     #[serde(default)]
     pinned: bool,
     canvas: Option<serde_json::Value>,
+    request_id: Option<Uuid>,
 }
 
 pub async fn create(
@@ -101,12 +102,17 @@ pub async fn create(
         pinned: body.pinned,
         task_id: None,
     };
-    match body.canvas {
-        Some(value) => {
+    match (body.canvas, body.request_id) {
+        (Some(value), Some(request_id)) => {
+            let canvas = Canvas::from_raw(&value, "person").map_err(invalid)?;
+            state.world.create_canvas_idempotent(new, canvas, request_id).await.map(Json).map_err(invalid)
+        }
+        (Some(value), None) => {
             let canvas = Canvas::from_raw(&value, "person").map_err(invalid)?;
             state.world.create_canvas(new, canvas).await.map(Json).map_err(invalid)
         }
-        None => state.world.create_report(new).await.map(Json).map_err(invalid),
+        (None, None) => state.world.create_report(new).await.map(Json).map_err(invalid),
+        (None, Some(_)) => Err(invalid(anyhow::anyhow!("request_id is only for workspaces"))),
     }
 }
 
@@ -248,7 +254,7 @@ pub async fn presence(
     let body = body.checked().map_err(invalid)?;
     let report = readable(&state, user.0, role, id).await.map_err(status)?;
     if report.kind != "canvas" {
-        return Err((StatusCode::BAD_REQUEST, "only canvases show who is looking".into()));
+        return Err((StatusCode::BAD_REQUEST, "only workspaces show who is looking".into()));
     }
     let allowed = presence_allowed(&mut SEEN.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner()), (user.0, id), std::time::Instant::now(), body.leaving);
     if allowed {

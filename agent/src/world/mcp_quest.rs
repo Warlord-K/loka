@@ -173,8 +173,9 @@ mod tests {
         assert!(pick(&work, "").is_none());
     }
 
-    const TOOL_SOURCES: [&str; 12] = [
+    const TOOL_SOURCES: [&str; 13] = [
         include_str!("mcp.rs"),
+        include_str!("mcp_rooms.rs"),
         include_str!("mcp_control.rs"),
         include_str!("mcp_govern.rs"),
         include_str!("mcp_quest.rs"),
@@ -209,6 +210,7 @@ mod tests {
             .chain(loka_shared::run_causes::Cause::ALL.iter().map(|cause| cause.as_str()))
             .chain(loka_shared::cleanup::CleanupKind::ALL.iter().map(|kind| kind.key()))
             .chain(loka_shared::world::APPROVAL_MODES)
+            .chain(loka_shared::pr_actions::ACTION_NAMES.iter().copied())
             .chain(readiness.features.iter().map(|feature| feature.key))
             .map(str::to_string)
             .collect()

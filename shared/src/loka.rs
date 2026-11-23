@@ -31,7 +31,7 @@ pub fn presets() -> Value {
         "visibility": "private"
     }])
 }
-const PRIVATE_PREFIXES: &[&str] = &["region.", "npc.", "challenge.", "adventure.", "academy.", "music.", "report.", "presence.", "team."];
+pub(crate) const PRIVATE_PREFIXES: &[&str] = &["region.", "npc.", "challenge.", "adventure.", "academy.", "music.", "report.", "presence.", "team."];
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct Region {
@@ -724,6 +724,10 @@ impl WorldStore {
             }
             Some(crate::setup_scan::KIND) => {
                 self.deliver_setup_scan(agent, session, answer, ok).await?;
+                Ok(true)
+            }
+            Some(crate::quest_questions::KIND) => {
+                self.deliver_question_answer(agent, session, answer, ok).await?;
                 Ok(true)
             }
             _ => Ok(false),

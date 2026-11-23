@@ -47,7 +47,7 @@ impl Server {
                 "run": s("Run id or its first 8 characters, from run_history"),
                 "steps": { "type": "integer", "description": "How many of the last executor steps to show, 1 to 40, default 15" }
             }), &["run"]),
-            tool("stop_run", "Stop a running quest, follow-up, review, aside or folder session run. With step true only the step it is running right now is stopped and the work carries on. Your own runs always; other agents' runs of your person need the oversee power. Main turns cannot be stopped.", json!({
+            tool("stop_run", "Stop a running quest, follow-up, review, aside or folder session run, or withdraw one that is still queued so it never starts. With step true only the step it is running right now is stopped and the work carries on. Your own runs always; other agents' runs of your person need the oversee power. Main turns cannot be stopped.", json!({
                 "run": s("Run id or its first 8 characters"),
                 "step": { "type": "boolean", "description": "Stop just the current step instead of the whole run, default false" }
             }), &["run"]),
@@ -144,6 +144,9 @@ impl Server {
     }
 
     pub(super) async fn require_owner_asked(&self) -> Result<()> {
+        if self.question_led().await? {
+            bail!("{}", super::QUESTION_LED_REFUSAL);
+        }
         if !self.trusted_device() {
             bail!("this changes your person's own setup, so it cannot be done from a device someone else shared; ask them to do it in the app");
         }
@@ -238,7 +241,7 @@ impl Server {
         if !added.is_empty() {
             store.add(task_id, &added).await?;
         }
-        if args.get("check_merge").and_then(Value::as_bool) == Some(true) && !store.check_now(task_id).await? {
+        if args.get("check_merge").and_then(Value::as_bool) == Some(true) && !store.retry_check_now(task_id).await? {
             notes.push("no merge milestone is waiting to be checked".into());
         }
         let agent = self.db.get_task(task_id).await?.and_then(|t| t.assigned_agent_id);
@@ -264,8 +267,8 @@ impl Server {
 
     async fn rearm_merge(&self, store: &MilestoneStore, task_id: Uuid) -> Result<()> {
         if let Some(task) = self.db.get_task(task_id).await? {
-            if task.pr_url.is_some() && task.status == "review" {
-                store.arm_merge(task.id, true).await?;
+            if task.pr_url.is_some() {
+                store.arm_merge(task.id).await?;
                 store.check_now(task.id).await?;
             }
         }
@@ -327,6 +330,9 @@ impl Server {
                         if diagnosis.auto_retried { " Loka had already retried it once." } else { "" }
                     ));
                 }
+                if let Some(line) = self.store.run_context(run.id).await? {
+                    out.push(line);
+                }
                 out.push(format!("Prompt starts: {}", short(&run.prompt, 600)));
                 if let Some(output) = run.output.as_deref().filter(|o| !o.trim().is_empty()) {
                     out.push(format!("Output ends: {}", tail(output, 1500)));
@@ -349,13 +355,24 @@ impl Server {
             "stop_run" => {
                 let (run, agent) = self.owner_run(need("run")?).await?;
                 self.require_run_control(&agent)?;
+                let stepping = flag("step");
                 if run.kind == "turn" {
                     bail!("main turns cannot be stopped");
                 }
-                if run.status != "running" {
-                    bail!("that run is {}, not running", run.status);
+                if run.status == "queued" {
+                    if stepping {
+                        bail!("a queued run has no current step to stop");
+                    }
+                    let coordinator = loka_agent::runner_server::RunnerCoordinator::new(self.db.clone(), self.store.clone());
+                    if !coordinator.withdraw_queued_run(run.id, &self.caller.name).await? {
+                        bail!("that run could not be withdrawn; it may have just started");
+                    }
+                    return Ok(format!("Withdrew queued {} run {} of {}. It will not start.", run.kind, &run.id.to_string()[..8], agent.name));
                 }
-                if flag("step") {
+                if run.status != "running" {
+                    bail!("that run is {}, not running or queued", run.status);
+                }
+                if stepping {
                     let session = self.store.get_session(run.session_id).await?.ok_or_else(|| anyhow!("that session is gone"))?;
                     let text = format!("{} stopped the step you were running. Do not run it again the same way; carry on with the rest of the task, and say if you are blocked.", self.caller.name);
                     self.store.start_followup(&session, &text, &self.caller.name, true).await?;

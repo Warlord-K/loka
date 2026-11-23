@@ -2,8 +2,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use loka_shared::milestones::{finished_status, MilestoneStore};
+use loka_shared::context_budget::Prepared;
+use loka_shared::context::SentContext;
+use loka_shared::milestones::MilestoneStore;
 use loka_shared::models::AgentTask;
+use loka_shared::pr_actions;
 use loka_shared::run_causes::Required;
 use loka_shared::runners::RunnerUsage;
 use loka_shared::world::{
@@ -84,8 +87,8 @@ fn with_rules(prompt: String, rules: &str) -> String {
     }
 }
 
-pub fn context_tokens(usage: &Usage) -> i64 {
-    loka_shared::context::used(usage.context_tokens, usage.input_tokens, usage.cached_input_tokens)
+pub fn context_tokens(backend: &str, usage: &Usage) -> i64 {
+    loka_shared::context::measured(backend, usage.context_tokens, usage.input_tokens, usage.cached_input_tokens)
 }
 
 fn session_id_after_run<'a>(
@@ -102,27 +105,40 @@ pub async fn start_task(
     agent: &WorldAgent,
     main: &AgentSession,
     task_id: Uuid,
-    brief: Option<&str>,
+    start_brief: super::quests::StartBrief<'_>,
     review: bool,
     reviewer: Option<&ReviewerChoice>,
-) -> Result<Started> {
+) -> Result<Option<Started>> {
+    let resolved_brief = start_brief.text();
+    let brief = resolved_brief.as_deref();
+    let continuation = start_brief.continuation();
+    let public_brief = if continuation.is_some() { None } else { brief };
     let task = ctx
         .db
         .get_task(task_id)
         .await?
         .ok_or_else(|| anyhow!("task {task_id} not found"))?;
-    let resume = ctx
-        .store
-        .resume_task_session(agent.id, task.id, &agent.name, brief)
-        .await?;
+    let resume = match continuation {
+        Some(item) => ctx
+            .store
+            .resume_clarification_task_session(agent.id, task.id, &agent.name, brief, item)
+            .await?,
+        None => ctx.store.resume_task_session(agent.id, task.id, &agent.name, brief).await?,
+    };
+    if matches!(&resume, TaskResume::Parked) {
+        return Ok(None);
+    }
     if let Some(problem) = resume.problem() {
         return Err(anyhow!(problem));
     }
     if let TaskResume::Resumed { session_id, run_id } = resume {
-        ctx.db.update_status(task.id, "in_progress").await?;
-        ctx.store.announce_resumed(agent.id, task.id, session_id, run_id, brief).await?;
+        if continuation.is_some() {
+        } else {
+            ctx.db.update_status(task.id, "in_progress").await?;
+        }
+        ctx.store.announce_resumed(agent.id, task.id, session_id, run_id, public_brief).await?;
         info!(agent = %agent.slug, task = %task.id, "Task session resumed");
-        return Ok(Started { resumed: true, session_id, run_id });
+        return Ok(Some(Started { resumed: true, session_id, run_id }));
     }
     let layout = Layout::local(&ctx.config.workspaces_dir);
     if let Err(short) = quest_storage::make_room(&layout, &ctx.config.workspaces_dir).await {
@@ -130,18 +146,23 @@ pub async fn start_task(
     }
     let options = ctx.store.quest_options(task.id).await?;
     let mut dirs = Vec::new();
-    for attempt in 1..=options.attempts.max(1) {
+    let opening_attempts = if options.attempts > 1 { 1 } else { options.attempts.max(1) };
+    for attempt in 1..=opening_attempts {
         dirs.push(prepare_workspace(ctx, &task, attempt).await?.to_string_lossy().to_string());
     }
     let rules = work_rules(ctx, agent.id).await;
     let opened = super::quests::open_sessions(
         &ctx.store,
-        super::quests::QuestStart { agent, main, task: &task, brief, review, reviewer, rules: &rules, options: &options },
+        super::quests::QuestStart { agent, main, task: &task, brief, review, reviewer, rules: &rules, options: &options, world_tools: false },
         &dirs,
+        continuation,
     )
     .await?;
     let (session, run) = opened.first().ok_or_else(|| anyhow!("no task session opened"))?;
-    ctx.db.update_status(task.id, "in_progress").await?;
+    if continuation.is_some() {
+    } else {
+        ctx.db.update_status(task.id, "in_progress").await?;
+    }
     ctx.store
         .emit(
             NewEvent::new("task.started")
@@ -149,18 +170,18 @@ pub async fn start_task(
                 .session(session.id)
                 .run(run.id)
                 .task(Some(task.id))
-                .payload(super::quests::started_payload(&task, &options, opened.len(), run.id)),
+                .payload(super::quests::started_payload(&task, &options, options.attempts.max(1) as usize, run.id)),
             None,
         )
         .await?;
-    if opened.len() > 1 {
+    if opened.iter().any(|(session, _)| session.racing()) {
         super::quests::label_attempts(&ctx.store, &task, &opened).await?;
     }
     ctx.store
-        .post_quest_started(agent.id, task.id, session.id, &task.title, brief.filter(|b| !b.trim().is_empty()))
+        .post_quest_started(agent.id, task.id, session.id, &task.title, public_brief.filter(|b| !b.trim().is_empty()))
         .await?;
     info!(agent = %agent.slug, task = %task.id, "Task session queued");
-    Ok(Started { resumed: false, session_id: session.id, run_id: run.id })
+    Ok(Some(Started { resumed: false, session_id: session.id, run_id: run.id }))
 }
 
 async fn prepare_workspace(ctx: &Ctx, task: &AgentTask, attempt: i16) -> Result<PathBuf> {
@@ -200,7 +221,10 @@ fn base_branch(ctx: &Ctx, task: &AgentTask) -> String {
         .unwrap_or_else(|| "main".to_string())
 }
 
-pub async fn execute(ctx: &Ctx, run: SessionRun) -> Result<()> {
+pub async fn execute(ctx: &Ctx, mut run: SessionRun) -> Result<()> {
+    if run.kind == pr_actions::KIND {
+        return pr_action(ctx, run).await;
+    }
     let mut session = ctx
         .store
         .get_session(run.session_id)
@@ -211,12 +235,17 @@ pub async fn execute(ctx: &Ctx, run: SessionRun) -> Result<()> {
         .get_agent(run.agent_id)
         .await?
         .ok_or_else(|| anyhow!("agent {} missing", run.agent_id))?;
-    let working_dir = PathBuf::from(
-        session
-            .working_dir
-            .clone()
-            .unwrap_or_else(|| super::agent_home(ctx, &agent.slug).to_string_lossy().to_string()),
-    );
+    let room_answer = loka_shared::world::room_answer_aside(session.asked_by.as_ref());
+    let working_dir = if room_answer {
+        crate::cli::room_answer_dir(session.id)?
+    } else {
+        PathBuf::from(
+            session
+                .working_dir
+                .clone()
+                .unwrap_or_else(|| super::agent_home(ctx, &agent.slug).to_string_lossy().to_string()),
+        )
+    };
     if !tokio::fs::metadata(&working_dir).await.is_ok_and(|metadata| metadata.is_dir()) {
         let error = format!("the saved quest folder is missing: {}", working_dir.display());
         return fail(ctx, &run, &session, "failed", "run.failed", &error).await;
@@ -231,6 +260,10 @@ pub async fn execute(ctx: &Ctx, run: SessionRun) -> Result<()> {
     let _active = quest_storage::activate(&layout, run.id, layout.quest_of(&working_dir));
     if let Err(error) = ctx.store.release_space_wait(&run).await {
         warn!(run = %run.id, %error, "Could not clear the disk wait of a run that is starting");
+    }
+    let prepared = prepare_request(ctx, &mut run, &mut session).await?;
+    if matches!(run.kind.as_str(), "task" | "followup") {
+        super::quests::append_single_prework_policy(&ctx.store, session.id, run.id, &mut run.prompt).await?;
     }
 
     let (cli_sid, resume, fork) = match run.fork_from {
@@ -307,10 +340,9 @@ pub async fn execute(ctx: &Ctx, run: SessionRun) -> Result<()> {
         Ok(omp) => omp,
         Err(error) => return fail_with(ctx, &run, &session, &error, &redactor).await,
     };
-    let mut prompt = match kit.as_ref().map(|k| k.skills_index.as_str()).filter(|i| !i.is_empty()) {
-        Some(index) => format!("{}\n\n{index}", run.prompt),
-        None => run.prompt.clone(),
-    };
+    let mut sent = SentContext::carried(session.context_sent.as_ref(), loka_shared::context::resumes_same_session(resume, fork, false));
+    let index = kit.as_ref().map(|k| k.skills_index.as_str()).unwrap_or_default();
+    let mut prompt = sent.append(&run.prompt, loka_shared::context::SKILLS_BLOCK, index);
     if !environment.is_empty() {
         prompt.push_str("\n\nEnvironment keys granted to you for this task: ");
         prompt.push_str(&environment.keys().cloned().collect::<Vec<_>>().join(", "));
@@ -351,6 +383,9 @@ pub async fn execute(ctx: &Ctx, run: SessionRun) -> Result<()> {
             Ok(_) => {}
             Err(error) => return fail(ctx, &run, &session, "failed", "run.failed", &loka_shared::cli_errors::chain(&error)).await,
         }
+    }
+    if room_answer {
+        environment.insert(crate::cli::ROOM_ANSWER_ENV.into(), "1".into());
     }
     let max_turns = match run.kind.as_str() {
         "review" => REVIEW_MAX_TURNS,
@@ -408,6 +443,13 @@ pub async fn execute(ctx: &Ctx, run: SessionRun) -> Result<()> {
         .filter(|_| run.kind != "review")
         .and_then(|q| q.effort_for(&session.backend));
     let fast = quest.as_ref().is_some_and(|q| q.fast_for(&session.backend));
+    let answer_payloads = ctx.store.run_answer_payloads(run.id).await?;
+    let upload_home = super::agent_home(ctx, &agent.slug).join(run.id.to_string());
+    let attached = super::prompts::attached_ids(&answer_payloads);
+    let (image_paths, files_note) = super::turn::materialize_attached_uploads(ctx, &upload_home, attached).await;
+    if let Some(note) = files_note {
+        prompt = format!("{prompt}\n\n{note}");
+    }
     let mut opts = CliOptions {
         working_dir: &working_dir,
         prompt: &prompt,
@@ -419,7 +461,7 @@ pub async fn execute(ctx: &Ctx, run: SessionRun) -> Result<()> {
         session_id: cli_sid.as_deref(),
         resume,
         event_tx: Some(event_tx),
-        image_paths: Vec::new(),
+        image_paths,
         fork,
         lean: aside,
         effort: effort.as_deref(),
@@ -428,7 +470,13 @@ pub async fn execute(ctx: &Ctx, run: SessionRun) -> Result<()> {
         mcp_has_secrets,
         sensitive: !granted_environment.is_empty() || !provider_keys.is_empty() || mcp_has_secrets,
         rewind_to: None,
-        approval: if aside { cli::Approval::Full } else { cli::Approval::parse(Some(&agent.approval_mode)) },
+        approval: if loka_shared::quests::is_best_of_prework(session.asked_by.as_ref()) {
+            cli::Approval::ReadOnly
+        } else if aside {
+            cli::Approval::Full
+        } else {
+            cli::Approval::parse(Some(&agent.approval_mode))
+        },
         steer: Default::default(),
         omp_models: omp.map(|omp| omp.models_yml),
         provider_keys: provider_keys.clone(),
@@ -457,7 +505,7 @@ pub async fn execute(ctx: &Ctx, run: SessionRun) -> Result<()> {
     let outcome = tokio::select! {
         outcome = tokio::time::timeout(
             Duration::from_secs(run.timeout_secs.max(60) as u64),
-            cli::record_spawns(wired.pids.clone(), cli::run(&session.backend, opts)),
+            cli::record_spawns(wired.pids.clone(), cli::run_compacting(&session.backend, opts, prepared.compact_first())),
         ) => outcome,
         Ok(by) = stop_rx => {
             stopped_by = Some(by);
@@ -482,10 +530,12 @@ pub async fn execute(ctx: &Ctx, run: SessionRun) -> Result<()> {
     }
     info!(run = %run.id, kind = %run.kind, secs = started.elapsed().as_secs(), "Run finished");
 
-    match outcome {
+    let hold = hold_for_handoff(ctx, &session, &run).await;
+    let ended = match outcome {
         Ok(Ok(result)) => {
             let saved_session_id = session_id_after_run(&session.backend, fork, result.session_id.as_deref(), cli_sid.as_deref()).map(str::to_string);
-            settle_completed(ctx, &agent, session, &run, result, saved_session_id, &redactor).await
+            let kept = Kept { cli_session_id: saved_session_id, sent: Some(sent) };
+            settle_completed(ctx, &agent, session, &run, result, kept, &redactor).await
         }
         Ok(Err(_)) if stopped_by.is_some() => {
             let by = stopped_by.unwrap_or_default();
@@ -504,7 +554,14 @@ pub async fn execute(ctx: &Ctx, run: SessionRun) -> Result<()> {
             let msg = format!("timed out after {}s", run.timeout_secs);
             fail(ctx, &run, &session, "timed_out", "run.timed_out", &msg).await
         }
-    }
+    };
+    release_hold(hold, &run).await;
+    ended
+}
+
+struct Kept {
+    cli_session_id: Option<String>,
+    sent: Option<SentContext>,
 }
 
 async fn settle_completed(
@@ -513,7 +570,7 @@ async fn settle_completed(
     session: AgentSession,
     run: &SessionRun,
     result: CliResult,
-    saved_session_id: Option<String>,
+    kept: Kept,
     redactor: &cli::Redactor,
 ) -> Result<()> {
     let output = redactor.redact(&result.output);
@@ -528,11 +585,14 @@ async fn settle_completed(
         },
     };
     let live = ctx.store
-        .complete_run(run, &output, &reported, saved_session_id.as_deref(), context_tokens(&result.usage))
+        .complete_run(run, &output, &reported, kept.cli_session_id.as_deref(), context_tokens(&session.backend, &result.usage))
         .await?;
     if !live {
         warn!(run = %run.id, "Run finished after it was already closed, keeping the earlier outcome");
         return Ok(());
+    }
+    if let Some(sent) = kept.sent.as_ref() {
+        ctx.store.set_sent_context(session.id, sent).await?;
     }
     if run.kind == "task" {
         let report_value = match report.as_ref() {
@@ -560,8 +620,13 @@ async fn after_completed(
     report: Option<&prompts::Report>,
     output: &str,
 ) -> Result<()> {
-    if super::quests::prework_step(&ctx.store, agent, session, run, output).await? {
-        return Ok(());
+    if run.kind == "followup" {
+        return after_followup(ctx, agent, session, run, output, report).await;
+    }
+    match super::quests::prework_step(&ctx.store, agent, session, run, output).await? {
+        super::quests::PreworkStep::Continue => {}
+        super::quests::PreworkStep::Handled => return Ok(()),
+        super::quests::PreworkStep::FanOut => return start_best_of_attempts(ctx, agent, session, run, output).await,
     }
     match run.kind.as_str() {
         "task" => after_task(ctx, agent, session, run, report, output).await,
@@ -572,9 +637,67 @@ async fn after_completed(
             let text = if text.trim().is_empty() { "Done.".to_string() } else { text };
             ctx.store.record_quick_reply(agent, session, run.id, &text, false).await.map(|_| ())
         }
-        "followup" => after_followup(ctx, agent, session, run, output, report).await,
         _ => Ok(()),
     }
+}
+
+async fn start_best_of_attempts(
+    ctx: &Ctx,
+    agent: &WorldAgent,
+    session: &AgentSession,
+    run: &SessionRun,
+    output: &str,
+) -> Result<()> {
+    let Some(current) = ctx.store.get_session(session.id).await? else {
+        return Ok(());
+    };
+    if current.status != "active" || !loka_shared::quests::is_best_of_prework(current.asked_by.as_ref()) {
+        return Ok(());
+    }
+    let task_id = current.task_id.ok_or_else(|| anyhow!("prework session has no quest"))?;
+    let task = ctx.db.get_task(task_id).await?.ok_or_else(|| anyhow!("task {task_id} not found"))?;
+    if task.status != "in_progress" || task.assigned_agent_id != Some(agent.id) {
+        return Ok(());
+    }
+    let current_options = ctx.store.quest_options(task_id).await?;
+    let options = super::quests::best_of_options(&current, &current_options);
+    let main_id = current.parent_session_id.ok_or_else(|| anyhow!("prework session has no main session"))?;
+    let main = ctx.store.get_session(main_id).await?.ok_or_else(|| anyhow!("main session {main_id} not found"))?;
+    let first = current.working_dir.clone().ok_or_else(|| anyhow!("prework session has no workspace"))?;
+    let brief = current.asked_by.as_ref().and_then(|value| value.get("brief")).and_then(Value::as_str);
+    let mut dirs = vec![first];
+    for attempt in 2..=options.attempts.max(1) {
+        match prepare_workspace(ctx, &task, attempt).await {
+            Ok(dir) => dirs.push(dir.to_string_lossy().to_string()),
+            Err(error) => {
+                ctx.store
+                    .fail_best_of_prework(agent.id, task_id, current.id, run.id, &loka_shared::cli_errors::chain(&error))
+                    .await?;
+                return Ok(());
+            }
+        }
+    }
+    let rules = work_rules(ctx, agent.id).await;
+    let opened = super::quests::fan_out_sessions(
+        &ctx.store,
+        super::quests::QuestStart {
+            agent,
+            main: &main,
+            task: &task,
+            brief,
+            review: false,
+            reviewer: None,
+            rules: &rules,
+            options: &options,
+            world_tools: false,
+        },
+        &dirs,
+        &current,
+        run,
+        output,
+    )
+    .await?;
+    super::quests::label_attempts(&ctx.store, &task, &opened).await
 }
 
 async fn fail_with(ctx: &Ctx, run: &SessionRun, session: &AgentSession, error: &anyhow::Error, redactor: &cli::Redactor) -> Result<()> {
@@ -615,13 +738,97 @@ async fn fail(
     handle_failure(ctx, run, session, event, error).await
 }
 
+async fn pr_action(ctx: &Ctx, run: SessionRun) -> Result<()> {
+    pr_action_with(ctx, run, &crate::pr_actions::Gh).await
+}
+
+async fn pr_action_with<G: crate::pr_actions::GitHub>(ctx: &Ctx, run: SessionRun, github: &G) -> Result<()> {
+    let outcome = match ctx.store.pr_action_of_run(run.id).await? {
+        None => pr_actions::Outcome::failed("the scheduled action was deleted before it ran"),
+        Some(schedule) => match super::quests::pr_action_job(&ctx.store, &schedule).await {
+            Ok(job) => crate::pr_actions::perform(github, &job).await,
+            Err(error) => pr_actions::Outcome::failed(format!("could not check the action: {}", loka_shared::cli_errors::chain(&error))),
+        },
+    };
+    let output = serde_json::to_string(&outcome)?;
+    let finished = ctx
+        .store
+        .finish_run(
+            run.id,
+            RunOutcome { status: "completed", output: Some(&output), error: None, cost_usd: 0.0, input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 },
+        )
+        .await?;
+    if !finished {
+        return Ok(());
+    }
+    ctx.store.announce_completed(run.id).await?;
+    let Some(spec) = ctx.store.settle_pr_action(run.id, &outcome).await? else {
+        return Ok(());
+    };
+    info!(run = %run.id, status = ?outcome.status, reason = %outcome.reason, "Pull request action settled");
+    let Some(task_id) = run.task_id.filter(|_| outcome.status == pr_actions::OutcomeStatus::Ran) else {
+        return Ok(());
+    };
+    let task = ctx.db.get_task(task_id).await?;
+    let merged_url = task
+        .as_ref()
+        .and_then(|task| pr_actions::merged_pr_url(&spec, &outcome, task.pr_url.as_deref(), task.pr_number));
+    match (merged_url, ctx.store.newest_task_session(task_id).await?) {
+        (Some(url), Some(session)) => super::watch::settle_merged(&ctx.store, &ctx.db, &session, url).await,
+        _ => {
+            MilestoneStore::new(ctx.store.pool().clone()).check_now(task_id).await?;
+            Ok(())
+        }
+    }
+}
+
 pub async fn fail_stale(ctx: &Ctx, run: &SessionRun, error: &str) -> Result<()> {
     let session = ctx
         .store
         .get_session(run.session_id)
         .await?
         .ok_or_else(|| anyhow!("session {} missing", run.session_id))?;
-    handle_failure(ctx, run, &session, "run.failed", error).await
+    let hold = hold_for_handoff(ctx, &session, run).await;
+    let ended = handle_failure(ctx, run, &session, "run.failed", error).await;
+    release_hold(hold, run).await;
+    ended
+}
+
+async fn hold_for_handoff(ctx: &Ctx, session: &AgentSession, run: &SessionRun) -> Option<loka_shared::world::FolderHold> {
+    if !matches!(run.kind.as_str(), "task" | "followup" | "review") {
+        return None;
+    }
+    match ctx.store.hold_folder(session).await {
+        Ok(hold) => hold,
+        Err(error) => {
+            warn!(run = %run.id, %error, "Could not hold the quest folder while handing the work on");
+            None
+        }
+    }
+}
+
+async fn release_hold(hold: Option<loka_shared::world::FolderHold>, run: &SessionRun) {
+    if let Some(hold) = hold {
+        if let Err(error) = hold.release().await {
+            warn!(run = %run.id, %error, "Could not release the quest folder after handing the work on");
+        }
+    }
+}
+
+pub(super) async fn prepare_request(ctx: &Ctx, run: &mut SessionRun, session: &mut AgentSession) -> Result<Prepared> {
+    let prepared = ctx.store.prepare_request(run.id).await.unwrap_or_else(|error| {
+        warn!(run = %run.id, error = %loka_shared::cli_errors::chain(&error), "Could not check the context budget, sending the request as it is");
+        Prepared::Send
+    });
+    if let Prepared::Checkpoint { prompt } = &prepared {
+        run.prompt = prompt.clone();
+    }
+    if prepared != Prepared::Send {
+        if let Some(fresh) = ctx.store.get_session(session.id).await? {
+            *session = fresh;
+        }
+    }
+    Ok(prepared)
 }
 
 async fn handle_failure(
@@ -631,6 +838,10 @@ async fn handle_failure(
     event: &str,
     error: &str,
 ) -> Result<()> {
+    if run.kind == pr_actions::KIND {
+        ctx.store.settle_pr_action(run.id, &pr_actions::Outcome::failed(loka_shared::cli_errors::describe(error))).await?;
+        return Ok(());
+    }
     let diagnosis = if matches!(run.kind.as_str(), "task" | "followup" | "review") {
         let diagnosis = ctx
             .store
@@ -643,7 +854,10 @@ async fn handle_failure(
     } else {
         None
     };
-    let error = &loka_shared::cli_errors::describe(error);
+    if diagnosis.is_none() && matches!(ctx.store.start_over(run.id, error).await?, loka_shared::context::StartOver::Retried(_)) {
+        return Ok(());
+    }
+    let error = &loka_shared::cli_errors::describe_run(error, &run.kind);
     let payload = || {
         let mut payload = loka_shared::cli_errors::failure_payload(run.task_id, error, session.id, &run.kind);
         if let Some(diagnosis) = &diagnosis {
@@ -651,9 +865,13 @@ async fn handle_failure(
         }
         payload
     };
-    ctx.store
-        .fail_queued_followups(session.id, &format!("Parent run failed: {error}"))
-        .await?;
+    let task_failed = matches!(run.kind.as_str(), "task" | "publish")
+        || run.kind == "followup" && session.role == "task" && session.status == "active";
+    if !task_failed || session.racing() {
+        ctx.store
+            .fail_queued_followups(session.id, &format!("Parent run failed: {error}"))
+            .await?;
+    }
     if run.kind == "aside" {
         let agent = ctx.store.get_agent(run.agent_id).await?.ok_or_else(|| anyhow!("agent missing"))?;
         return after_aside(ctx, &agent, session, Err(error)).await;
@@ -663,7 +881,10 @@ async fn handle_failure(
         ctx.store.record_quick_reply(&agent, session, run.id, &format!("I could not answer that: {error}"), true).await?;
         return Ok(());
     }
-    if run.kind == "review" && prompts::failed_nudge_settles(&run.prompt, error) && loka_shared::quests::compare_candidates(session).is_none() {
+    if run.kind == "review"
+        && loka_shared::quests::compare_candidates(session).is_none()
+        && prompts::failed_nudge_settles(ctx.store.run_nudge(run.id).await?, error)
+    {
         let agent = ctx.store.get_agent(run.agent_id).await?.ok_or_else(|| anyhow!("agent missing"))?;
         let manual = session
             .asked_by
@@ -694,8 +915,13 @@ async fn handle_failure(
                         .get_agent(run.agent_id)
                         .await?
                         .ok_or_else(|| anyhow!("agent missing"))?;
-                    if let Some(url) = merged_pr_url(ctx, &task_session).await? {
-                        return super::watch::settle_merged(&ctx.store, &ctx.db, &task_session, &url).await;
+                    match merged_pr(ctx, &task_session).await? {
+                        Some((url, false)) => return super::watch::settle_merged(&ctx.store, &ctx.db, &task_session, &url).await,
+                        Some((_, true)) => {
+                            let verdict = json!({ "verdict": prompts::NO_VERDICT, "summary": error });
+                            return finalize(ctx, &agent, &task_session, Some(verdict)).await;
+                        }
+                        None => {}
                     }
                     let stopped = diagnosis.as_ref().is_some_and(|d| d.cause == loka_shared::run_causes::Cause::Stopped);
                     let published = match task_session.task_id {
@@ -712,8 +938,6 @@ async fn handle_failure(
             }
         }
     }
-    let task_failed = run.kind == "task"
-        || run.kind == "followup" && session.role == "task" && session.status == "active";
     if task_failed && session.racing() {
         ctx.store.set_session_status(session.id, "failed", Some(error)).await?;
         let agent = ctx.store.get_agent(run.agent_id).await?.ok_or_else(|| anyhow!("agent missing"))?;
@@ -743,17 +967,29 @@ async fn handle_failure(
             _ => Ok(()),
         };
     }
+    let mut stale_task_failure = false;
     if let (Some(task_id), true) = (run.task_id, task_failed) {
+        let failed = ctx.store.fail_task_session(task_id, session.id, error).await?;
+        if failed {
+        } else {
+            stale_task_failure = ctx.store.task_failure_is_stale(task_id, run.id).await?;
+        }
+    } else if task_failed {
         ctx.store.set_session_status(session.id, "failed", Some(error)).await?;
-        ctx.db.set_error(task_id, error).await?;
+    }
+    let mut failure = payload();
+    if let (true, Some(fields)) = (stale_task_failure, failure.as_object_mut()) {
+        fields.insert("quiet".into(), Value::Bool(true));
     }
     let ev = NewEvent::new(event)
         .agent(run.agent_id)
         .session(session.id)
         .run(run.id)
         .task(run.task_id)
-        .payload(payload());
-    ctx.store.emit(ev, Some((run.agent_id, event))).await?;
+        .payload(failure);
+    ctx.store
+        .emit(ev, (!stale_task_failure).then_some((run.agent_id, event)))
+        .await?;
     Ok(())
 }
 
@@ -772,7 +1008,7 @@ async fn after_task(
     if !ctx.store.complete_task_run(session.id, run.created_at).await? {
         return Ok(());
     }
-    advance_task(ctx, agent, session, run.task_id).await
+    advance_task(ctx, agent, session, run.task_id, run.id).await
 }
 
 async fn missing_report(ctx: &Ctx, session: &AgentSession, run: &SessionRun, output: &str) -> Result<bool> {
@@ -800,7 +1036,7 @@ async fn missing_report(ctx: &Ctx, session: &AgentSession, run: &SessionRun, out
     Ok(false)
 }
 
-async fn advance_task(ctx: &Ctx, agent: &WorldAgent, session: &AgentSession, task_id: Option<Uuid>) -> Result<()> {
+async fn advance_task(ctx: &Ctx, agent: &WorldAgent, session: &AgentSession, task_id: Option<Uuid>, source_run_id: Uuid) -> Result<()> {
     let session = &ctx.store.get_session(session.id).await?.unwrap_or_else(|| session.clone());
     let report = prompts::stored_report(session.summary.as_deref()).unwrap_or_default();
     let task = match task_id {
@@ -812,7 +1048,7 @@ async fn advance_task(ctx: &Ctx, agent: &WorldAgent, session: &AgentSession, tas
         return attempt_done(ctx, agent, session, !matches!(step, Finish::Fail(_))).await;
     }
     match (step, task) {
-        (Finish::Review, Some(task)) => queue_review(ctx, agent, session, &task).await,
+        (Finish::Review, Some(task)) => queue_review(ctx, agent, session, &task, source_run_id).await,
         _ => finalize(ctx, agent, session, None).await,
     }
 }
@@ -852,11 +1088,23 @@ async fn after_compare(ctx: &Ctx, agent: &WorldAgent, review: &AgentSession, ids
     finalize(ctx, agent, &winner, Some(verdict)).await
 }
 
-async fn queue_review(ctx: &Ctx, agent: &WorldAgent, session: &AgentSession, task: &AgentTask) -> Result<()> {
-    if let Some(url) = ctx.store.quest_merged_pr(task.id).await? {
-        return super::watch::settle_merged(&ctx.store, &ctx.db, session, &url).await;
+async fn queue_review(ctx: &Ctx, agent: &WorldAgent, session: &AgentSession, task: &AgentTask, source_run_id: Uuid) -> Result<()> {
+    let pending = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+           SELECT 1 FROM agent_sessions s
+           JOIN session_runs r ON r.session_id = s.id
+           JOIN session_runs source ON source.id = $2
+           WHERE s.parent_session_id = $1 AND s.role = 'review'
+             AND r.created_at > source.created_at)",
+    )
+    .bind(session.id)
+    .bind(source_run_id)
+    .fetch_one(ctx.store.pool())
+    .await?;
+    if pending {
+        return Ok(());
     }
-    let (backend, model) = session.review_target(agent.reviewer.as_ref());
+    let (backend, model) = ctx.store.reviewer_for(agent, session).await?;
     let review = ctx
         .store
         .create_session(NewSession {
@@ -964,9 +1212,26 @@ async fn after_followup(
     output: &str,
     report: Option<&prompts::Report>,
 ) -> Result<()> {
+    let task = match run.task_id {
+        Some(id) => ctx.db.get_task(id).await?,
+        None => None,
+    };
+    let merged_pr_url = match verified_followup_merge(session, run, task.as_ref()).await? {
+        Some(url) if ctx.store.settle_merged_followup(task.as_ref().expect("verified quest").id, session.id, &url).await? => {
+            Some(url)
+        }
+        _ => None,
+    };
+    if merged_pr_url.is_none() {
+        match super::quests::prework_step(&ctx.store, agent, session, run, output).await? {
+            super::quests::PreworkStep::Continue => {}
+            super::quests::PreworkStep::Handled => return Ok(()),
+            super::quests::PreworkStep::FanOut => return start_best_of_attempts(ctx, agent, session, run, output).await,
+        }
+    }
     if let Some(report) = report {
         ctx.store
-            .set_session_status(session.id, &session.status, Some(&serde_json::to_string(report)?))
+            .set_session_summary(session.id, &serde_json::to_string(report)?)
             .await?;
     }
     let unreported = report.and_then(|r| r.status.as_deref()).is_none()
@@ -983,13 +1248,77 @@ async fn after_followup(
             Some((agent.id, "session.replied")),
         )
         .await?;
+    if merged_pr_url.is_some() {
+        return Ok(());
+    }
     if session.role != "task" {
         return Ok(());
     }
+    advance_followup(ctx, agent, session, run, output, unreported).await
+}
+
+pub async fn carry_on_withdrawn(ctx: &Ctx) -> Result<()> {
+    for withdrawn in ctx.store.carry_on_candidates(None, false).await? {
+        let Some(carry) = ctx.store.claim_carry_on(withdrawn, false).await? else {
+            continue;
+        };
+        let prior = carry.prior();
+        let Some(run) = ctx.store.get_run(prior).await? else {
+            carry.complete().await?;
+            continue;
+        };
+        let (Some(session), Some(agent)) = (ctx.store.get_session(run.session_id).await?, ctx.store.get_agent(run.agent_id).await?) else {
+            carry.complete().await?;
+            continue;
+        };
+        let output = run.output.clone().unwrap_or_default();
+        let hold = hold_for_handoff(ctx, &session, &run).await;
+        let carried = match ctx.store.get_session(run.session_id).await {
+            Ok(Some(session)) => {
+                let unreported = prompts::stored_report(session.summary.as_deref()).and_then(|r| r.status).is_none();
+                match super::quests::prework_step(&ctx.store, &agent, &session, &run, &output).await {
+                    Ok(super::quests::PreworkStep::Continue) => {
+                        advance_followup(ctx, &agent, &session, &run, &output, unreported).await
+                    }
+                    Ok(super::quests::PreworkStep::Handled) => Ok(()),
+                    Ok(super::quests::PreworkStep::FanOut) => {
+                        start_best_of_attempts(ctx, &agent, &session, &run, &output).await
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Ok(None) => Ok(()),
+            Err(error) => Err(error),
+        };
+        release_hold(hold, &run).await;
+        match carried {
+            Ok(()) => carry.complete().await?,
+            Err(error) => {
+                carry.release().await?;
+                warn!(run = %run.id, %error, "Could not carry on the work a withdrawn follow-up was holding back");
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn advance_followup(
+    ctx: &Ctx,
+    agent: &WorldAgent,
+    session: &AgentSession,
+    run: &SessionRun,
+    output: &str,
+    unreported: bool,
+) -> Result<()> {
     let FollowupAdvance::Advance { was_completed } = ctx.store.complete_followup(session.id).await? else {
         return Ok(());
     };
     let mut session = ctx.store.get_session(session.id).await?.unwrap_or_else(|| session.clone());
+    let task = match run.task_id {
+        Some(id) => ctx.db.get_task(id).await?,
+        None => None,
+    };
+    let sync = followup_work_sync(&session, run, task.as_ref()).await;
     let nudge_available = if !was_completed && unreported {
         ctx.store.set_session_status(session.id, "active", None).await?;
         let handled = missing_report(ctx, &session, run, output).await?;
@@ -999,12 +1328,7 @@ async fn after_followup(
         false
     };
     let report = prompts::stored_report(session.summary.as_deref()).unwrap_or_default();
-    let task = match run.task_id {
-        Some(id) => ctx.db.get_task(id).await?,
-        None => None,
-    };
     let has_repo = task.as_ref().is_some_and(|task| task.repo.is_some());
-    let sync = followup_pr_sync(ctx, &session, run, report.status.as_deref() == Some("done")).await;
     let verdict = super::quests::review_on_record(&ctx.store, session.id, run.id, sync)
         .await?
         .map(|output| review_verdict_value(&output));
@@ -1014,52 +1338,70 @@ async fn after_followup(
     }
     match (step, task) {
         (FollowupStep::Nudge | FollowupStep::Leave, _) => Ok(()),
-        (FollowupStep::Review, Some(task)) => queue_review(ctx, agent, &session, &task).await,
-        (FollowupStep::Settle, task) => {
-            if sync == loka_shared::runners::PrSync::Merged {
-                if let Some(url) = task.and_then(|task| task.pr_url) {
-                    return super::watch::settle_merged(&ctx.store, &ctx.db, &session, &url).await;
-                }
-            }
-            finalize(ctx, agent, &session, verdict).await
-        }
+        (FollowupStep::Review, Some(task)) => queue_review(ctx, agent, &session, &task, run.id).await,
+        (FollowupStep::Settle, _) => finalize(ctx, agent, &session, verdict).await,
         (FollowupStep::Review | FollowupStep::Salvage | FollowupStep::Fail(_), _) => finalize(ctx, agent, &session, None).await,
     }
 }
 
-async fn followup_pr_sync(ctx: &Ctx, session: &AgentSession, run: &SessionRun, done: bool) -> loka_shared::runners::PrSync {
-    let Some(wd) = session.working_dir.as_deref().filter(|_| done) else {
-        return loka_shared::runners::PrSync::Changed;
-    };
-    let has_repo = match run.task_id {
-        Some(id) => ctx.db.get_task(id).await.ok().flatten().is_some_and(|task| task.repo.is_some()),
-        None => false,
-    };
-    if !has_repo {
-        return loka_shared::runners::PrSync::Changed;
+async fn verified_followup_merge(
+    session: &AgentSession,
+    run: &SessionRun,
+    task: Option<&AgentTask>,
+) -> Result<Option<String>> {
+    if session.role != "task" {
+        return Ok(None);
     }
-    github::pr_sync(Path::new(wd), std::time::SystemTime::from(run.created_at)).await
+    let Some(wd) = session.working_dir.as_deref() else {
+        return Ok(None);
+    };
+    let Some(task) = task.filter(|task| run.task_id == Some(task.id)) else {
+        return Ok(None);
+    };
+    let Some(tracked) = task
+        .pr_url
+        .as_deref()
+        .and_then(loka_shared::git_names::TrackedPr::parse)
+    else {
+        return Ok(None);
+    };
+    if github::tracked_pr_sync(Path::new(wd), std::time::SystemTime::from(run.created_at), tracked).await
+        != loka_shared::runners::PrSync::Merged
+    {
+        return Ok(None);
+    }
+    Ok(Some(tracked.url().to_string()))
 }
 
-async fn merged_pr_url(ctx: &Ctx, task_session: &AgentSession) -> Result<Option<String>> {
+async fn followup_work_sync(session: &AgentSession, run: &SessionRun, task: Option<&AgentTask>) -> loka_shared::runners::PrSync {
+    let (Some(wd), Some(_)) = (session.working_dir.as_deref(), task.filter(|task| run.task_id == Some(task.id))) else {
+        return loka_shared::runners::PrSync::Changed;
+    };
+    match github::pr_sync(Path::new(wd), std::time::SystemTime::from(run.created_at)).await {
+        loka_shared::runners::PrSync::Merged => loka_shared::runners::PrSync::Changed,
+        sync => sync,
+    }
+}
+
+async fn merged_pr(ctx: &Ctx, task_session: &AgentSession) -> Result<Option<(String, bool)>> {
     let Some(task_id) = task_session.task_id else {
         return Ok(None);
     };
-    if let Some(url) = ctx.store.quest_merged_pr(task_id).await? {
-        return Ok(Some(url));
-    }
-    let (Some(wd), Some(url)) = (task_session.working_dir.as_deref(), quest_pr_url(ctx, Some(task_id)).await?) else {
+    let Some(task) = ctx.db.get_task(task_id).await? else {
         return Ok(None);
     };
-    let merged = github::pr_sync(Path::new(wd), std::time::SystemTime::now()).await == loka_shared::runners::PrSync::Merged;
-    Ok(merged.then_some(url))
-}
-
-async fn quest_pr_url(ctx: &Ctx, task_id: Option<Uuid>) -> Result<Option<String>> {
-    match task_id {
-        Some(id) => Ok(ctx.db.get_task(id).await?.and_then(|task| task.pr_url)),
-        None => Ok(None),
-    }
+    let Some(url) = task.pr_url.clone() else {
+        return Ok(None);
+    };
+    let sync = match (
+        task_session.working_dir.as_deref(),
+        loka_shared::git_names::TrackedPr::parse(&url),
+    ) {
+        (Some(wd), Some(tracked)) => Some(github::tracked_pr_sync(Path::new(wd), std::time::SystemTime::now(), tracked).await),
+        _ => None,
+    };
+    let merged = sync == Some(loka_shared::runners::PrSync::Merged) || ctx.store.quest_merged_pr(task_id).await?.is_some();
+    Ok(merged.then_some((url, sync == Some(loka_shared::runners::PrSync::Changed))))
 }
 
 async fn after_review(
@@ -1183,63 +1525,88 @@ async fn finalize(
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_else(|| json!({ "summary": task_session.summary }));
     let parsed: prompts::Report = prompts::stored_report(task_session.summary.as_deref()).unwrap_or_default();
-    let mut pr_url = None;
     let diagnosis = ctx.store.latest_diagnosis(task_session.id).await?;
     let mut error = match (super::quests::finish_error(&parsed, verdict.as_ref()), &diagnosis) {
         (Some(_), Some(diagnosis)) if parsed.status.is_none() => Some(diagnosis.reason.clone()),
         (error, _) => error,
     };
-    let mut task_status = "failed";
-    let mut watching = false;
     let task = match task_session.task_id {
         Some(task_id) => ctx.db.get_task(task_id).await?,
         None => None,
     };
-    if ctx
+    let mut pr_url = task.as_ref().and_then(|task| task.pr_url.clone());
+    let duplicate_report = ctx
         .store
-        .finished_report_unchanged(task_session.id, &report, task.as_ref().and_then(|task| task.pr_url.as_deref()), error.as_deref())
-        .await?
-    {
-        ctx.store
-            .set_session_status(task_session.id, if error.is_some() { "failed" } else { "completed" }, None)
-            .await?;
-        return Ok(());
-    }
+        .finished_report_unchanged(task_session.id, &report, pr_url.as_deref(), error.as_deref())
+        .await?;
     let mut publish_secs = None;
-    let mut changes_requested = false;
-    if let Some(task) = task.as_ref() {
+    let mut open_pr_observation = None;
+    if let Some(task) = task.as_ref().filter(|_| !duplicate_report) {
         if error.is_none() || parsed.synthesized {
             if let (Some(repo), Some(wd)) = (task.repo.as_deref(), task_session.working_dir.as_deref()) {
                 let publishing = Instant::now();
-                match open_pr(ctx, task, repo, Path::new(wd), &parsed).await {
-                    Ok(url) => pr_url = url,
+                match open_pr(ctx, task, repo, task_session, Path::new(wd), &parsed).await {
+                    Ok(PublishOutcome::Open(Some(url), _, checked_at)) => {
+                        let recorded = ctx.db.get_task(task.id).await?.and_then(|task| task.pr_url);
+                        if !recorded.as_deref().is_some_and(|recorded| recorded.eq_ignore_ascii_case(&url)) {
+                            ctx.store.set_session_status(task_session.id, "completed", None).await?;
+                            return Ok(());
+                        }
+                        if let Some(checked_at) = checked_at {
+                            open_pr_observation = Some((url.clone(), checked_at));
+                        }
+                        pr_url = Some(url);
+                    }
+                    Ok(PublishOutcome::Open(None, _, _)) => {}
+                    Ok(PublishOutcome::Merged(url, observed_at)) => {
+                        if !ctx.store.settle_pr_observed(task.id, &url, true, observed_at).await? {
+                            ctx.store.set_session_status(task_session.id, "completed", None).await?;
+                            return Ok(());
+                        }
+                        pr_url = Some(url);
+                    }
+                    Ok(PublishOutcome::Closed(url, observed_at)) => {
+                        if !ctx.store.settle_pr_observed(task.id, &url, false, observed_at).await? {
+                            ctx.store.set_session_status(task_session.id, "completed", None).await?;
+                            return Ok(());
+                        }
+                        pr_url = Some(url);
+                        error = Some(loka_shared::world::PR_CLOSED_ERROR.to_string());
+                    }
+                    Ok(PublishOutcome::Stale) => return Ok(()),
                     Err(e) if error.is_none() => error = Some(loka_shared::cli_errors::chain(&e)),
                     Err(e) => warn!(task = %task.id, error = %e, "Could not publish the work of a run that ended without its report"),
                 }
                 publish_secs = Some(publishing.elapsed().as_secs());
             }
         }
-        if let Some(summary) = parsed.summary.as_deref() {
-            let _ = ctx.db.set_result_content(task.id, summary).await;
-        }
-        let milestones = MilestoneStore::new(ctx.store.pool().clone());
-        milestones.complete_work(task.id, &parsed.milestone_positions(), &parsed.milestone_titles(), error.is_none()).await?;
-        if error.is_none() {
-            watching = milestones.arm_merge(task.id, pr_url.is_some()).await?;
-        }
-        let review_wants_changes = verdict.as_ref().and_then(|v| v.get("verdict")).and_then(Value::as_str) == Some("changes");
-        changes_requested = review_wants_changes;
-        let already_merged = error.is_none() && milestones.merge_done(task.id).await?;
-        task_status = finished_status(error.is_some(), already_merged, pr_url.is_some(), review_wants_changes);
-        if let Some(err) = &error {
-            ctx.db.set_error(task.id, err).await?;
-        } else {
-            ctx.db.update_status(task.id, task_status).await?;
+        if let Some((url, observed_at)) = open_pr_observation.as_ref() {
+            MilestoneStore::new(ctx.store.pool().clone())
+                .rearm_open_pr(task.id, url, observed_at.to_owned())
+                .await?;
         }
     }
-    ctx.store
-        .set_session_status(task_session.id, if error.is_some() { "failed" } else { "completed" }, None)
-        .await?;
+    let changes_requested = verdict.as_ref().and_then(|v| v.get("verdict")).and_then(Value::as_str) == Some("changes");
+    let reconciled = super::quests::reconcile_quest(
+        &ctx.store,
+        &ctx.db,
+        task_session,
+        super::quests::QuestEvidence::Completed {
+            report: &report,
+            parsed: &parsed,
+            error: error.as_deref(),
+            pr_url: pr_url.as_deref(),
+            changes_requested,
+                suppress_announcement: duplicate_report,
+        },
+    )
+    .await?
+    .completed
+    .expect("completed quest evidence returns reconciliation");
+    let super::quests::ReconciledQuest { task, status: task_status, watching, announce } = reconciled;
+    if !announce {
+        return Ok(());
+    }
     let verdict_label = verdict
         .as_ref()
         .and_then(|v| v.get("verdict"))
@@ -1259,6 +1626,7 @@ async fn finalize(
         "pace": wrap.pace,
         "timing": wrap.timing,
     });
+    wrap.add_decisions(&mut payload);
     if let Some(diagnosis) = &diagnosis {
         diagnosis.merge_into(&mut payload);
     }
@@ -1307,84 +1675,156 @@ async fn finalize(
     Ok(())
 }
 
-fn reported_pr_to_keep(found: Option<&github::HeadPr>, report: &prompts::Report, repo: &str) -> Option<(String, i32)> {
-    match found {
-        None => report.reported_pr(repo),
-        Some(_) => None,
-    }
+enum PublishOutcome {
+    Open(Option<String>, bool, Option<chrono::DateTime<chrono::Utc>>),
+    Merged(String, chrono::DateTime<chrono::Utc>),
+    Closed(String, chrono::DateTime<chrono::Utc>),
+    Stale,
 }
 
 async fn open_pr(
     ctx: &Ctx,
     task: &AgentTask,
     repo: &str,
+    task_session: &AgentSession,
     wd: &Path,
     report: &prompts::Report,
-) -> Result<Option<String>> {
+) -> Result<PublishOutcome> {
+    let other = ctx.store.other_folder_writer(task_session).await?;
+    let outcome = publish_pr(ctx, task, repo, wd, report, other.as_deref()).await?;
+    if let PublishOutcome::Open(Some(url), true, _) = &outcome {
+        if let Some(head) = github::head_commit(wd).await {
+            ctx.store.record_published_head(task.id, url, &head).await?;
+        }
+    }
+    Ok(outcome)
+}
+
+async fn publish_pr(
+    ctx: &Ctx,
+    task: &AgentTask,
+    repo: &str,
+    wd: &Path,
+    report: &prompts::Report,
+    other_writer: Option<&str>,
+) -> Result<PublishOutcome> {
     let base = base_branch(ctx, task);
     let task_branch = task.branch.clone().unwrap_or_else(|| task.agent_branch_name());
     let target = workspace::PublishTarget { repo, base: &base, onto: &base, quest_branch: &task_branch };
-    if let Some(url) = task.pr_url.clone() {
-        if let Some(number) = task.pr_number {
-            if let Some(state) = github::pr_state(wd, repo, i64::from(number)).await? {
-                if github::is_final_pr_state(&state) {
-                    return Ok(Some(url));
+    let tracked_pr = task
+        .pr_url
+        .as_deref()
+        .and_then(loka_shared::git_names::TrackedPr::parse);
+    if task.pr_url.is_some() && tracked_pr.is_none() {
+        anyhow::bail!("recorded pull request is invalid")
+    }
+    if let Some(tracked) = tracked_pr {
+        if !tracked.repo().eq_ignore_ascii_case(repo) {
+            anyhow::bail!("recorded pull request is outside this quest's repository")
+        }
+        let url = tracked.url().to_string();
+        let checked_at = chrono::Utc::now();
+        let state = github::pr_state(wd, tracked).await?;
+        let recorded_pr_open_at = (state == "OPEN").then_some(checked_at);
+        let message = report.commit_message.clone().unwrap_or_else(|| format!("fix: address review for {}", task.title));
+        let committed = workspace::commit_for_publish(wd, repo, &message, other_writer).await?;
+        match github::carry_past_recorded_pr(wd, &base, &task_branch, i64::from(tracked.number()), Some(&state), None).await? {
+            github::RecordedPr::Open => {}
+            github::RecordedPr::Final { carried: None, .. } if state == "MERGED" => {
+                return Ok(PublishOutcome::Merged(url, checked_at));
+            }
+            github::RecordedPr::Final { carried: None, .. } => {
+                return Ok(PublishOutcome::Closed(url, checked_at));
+            }
+            github::RecordedPr::Final { state, carried: Some(branch) } => {
+                workspace::publish_commits(wd, &committed.carried(), &target, &branch).await.context("push failed")?;
+                let title = report.pr_title.clone().unwrap_or_else(|| task.title.clone());
+                let body = report.pr_body.clone().or_else(|| report.summary.clone()).unwrap_or_default();
+                let body = github::follow_up_body(&body, i64::from(tracked.number()), &state);
+                let Some(pr) = github::create_pr(wd, repo, &branch, &base, &title, &body).await? else {
+                    return Ok(PublishOutcome::Open(Some(url), false, None));
+                };
+                let replaced = ctx
+                    .db
+                    .replace_current_pr(task.id, tracked.url(), tracked.number(), &pr.url, pr.number)
+                    .await?;
+                if replaced {
+                    return Ok(PublishOutcome::Open(Some(pr.url), true, None));
                 }
+                let current = ctx.db.get_task(task.id).await?.and_then(|task| task.pr_url);
+                let current_is_new = current
+                    .as_deref()
+                    .and_then(loka_shared::git_names::TrackedPr::parse)
+                    .zip(loka_shared::git_names::TrackedPr::parse(&pr.url))
+                    .is_some_and(|(current, created)| current.same_identity(created));
+                return Ok(if current_is_new {
+                    PublishOutcome::Open(Some(pr.url), false, None)
+                } else {
+                    PublishOutcome::Stale
+                });
             }
         }
-        let message = report.commit_message.clone().unwrap_or_else(|| format!("fix: address review for {}", task.title));
-        let committed = workspace::commit_for_publish(wd, repo, &message).await?;
         if !workspace::ahead_of_fresh_base(wd, &base).await? {
-            return Ok(Some(url));
+            return Ok(PublishOutcome::Open(Some(url), false, recorded_pr_open_at));
         }
         let parent_pr = loka_agent::runner_server::parent_quest_pr(&ctx.db, task).await;
         let head = match github::open_pr_containing_head(wd, repo, &base, &task_branch, parent_pr).await? {
             github::HeadPr::Own(_, head) => head,
-            github::HeadPr::Elsewhere(_) => return Ok(Some(url)),
-            github::HeadPr::Extends(pr, head_ref) if github::extends_recorded_pr(task.pr_number.map(i64::from), pr.number) => {
+            github::HeadPr::Elsewhere(_) => return Ok(PublishOutcome::Open(Some(url), false, recorded_pr_open_at)),
+            github::HeadPr::Extends(pr, head_ref)
+                if github::extends_recorded_pr(Some(i64::from(tracked.number())), pr.number) =>
+            {
                 let extending = workspace::PublishTarget { quest_branch: &head_ref, ..target };
                 workspace::publish_commits(wd, &committed, &extending, &head_ref).await.context("push failed")?;
-                return Ok(Some(url));
+                return Ok(PublishOutcome::Open(Some(url), true, recorded_pr_open_at));
             }
             github::HeadPr::Extends(..) | github::HeadPr::Missing => workspace::publish_branch(wd, Some(&task_branch)).await?,
         };
         workspace::publish_commits(wd, &committed, &target, &head).await?;
-        return Ok(Some(url));
+        return Ok(PublishOutcome::Open(Some(url), true, recorded_pr_open_at));
     }
     let message = report
         .commit_message
         .clone()
         .unwrap_or_else(|| format!("feat: {}", task.title));
-    let committed = workspace::commit_for_publish(wd, repo, &message).await?;
+    let committed = workspace::commit_for_publish(wd, repo, &message, other_writer).await?;
     let parent_pr = loka_agent::runner_server::parent_quest_pr(&ctx.db, task).await;
-    let found = if workspace::ahead_of_fresh_base(wd, &base).await? {
-        Some(github::open_pr_containing_head(wd, repo, &base, &task_branch, parent_pr).await?)
-    } else {
-        None
-    };
+    let ahead = workspace::ahead_of_fresh_base(wd, &base).await?;
+    if !ahead {
+        let reported = report.reported_pr(repo).map(|(_, number)| i64::from(number));
+        let checked_at = chrono::Utc::now();
+        let recovered = match task.branch.as_deref() {
+            Some(branch) => github::recover_pr(wd, repo, branch, reported).await?,
+            None => None,
+        };
+        let Some(recovered) = recovered else {
+            return Ok(PublishOutcome::Open(None, false, None));
+        };
+        ctx.db.set_pr(task.id, &recovered.info.url, recovered.info.number).await?;
+        return match recovered.state.as_str() {
+            "MERGED" => Ok(PublishOutcome::Merged(recovered.info.url, checked_at)),
+            "CLOSED" => Ok(PublishOutcome::Closed(recovered.info.url, checked_at)),
+            _ => Ok(PublishOutcome::Open(Some(recovered.info.url), false, Some(checked_at))),
+        };
+    }
+    let found = github::open_pr_containing_head(wd, repo, &base, &task_branch, parent_pr).await?;
     match found {
-        None | Some(github::HeadPr::Elsewhere(_)) => {
-            let Some((url, number)) = reported_pr_to_keep(found.as_ref(), report, repo) else {
-                return Ok(None);
-            };
-            ctx.db.set_pr(task.id, &url, number).await?;
-            return Ok(Some(url));
-        }
-        Some(github::HeadPr::Own(pr, head)) => {
+        github::HeadPr::Elsewhere(_) => return Ok(PublishOutcome::Open(None, false, None)),
+        github::HeadPr::Own(pr, head) => {
             workspace::publish_commits(wd, &committed, &target, &head).await.context("push failed")?;
             ctx.db.set_pr(task.id, &pr.url, pr.number).await?;
-            return Ok(Some(pr.url));
+            return Ok(PublishOutcome::Open(Some(pr.url), true, None));
         }
-        Some(github::HeadPr::Extends(pr, head_ref)) => {
+        github::HeadPr::Extends(pr, head_ref) => {
             let extending = workspace::PublishTarget { quest_branch: &head_ref, ..target };
             workspace::publish_commits(wd, &committed, &extending, &head_ref).await.context("push failed")?;
             ctx.db.set_pr(task.id, &pr.url, pr.number).await?;
-            return Ok(Some(pr.url));
+            return Ok(PublishOutcome::Open(Some(pr.url), true, None));
         }
-        Some(github::HeadPr::Missing) => {}
+        github::HeadPr::Missing => {}
     }
     if !workspace::ahead_of_fresh_base(wd, &base).await? {
-        return Ok(None);
+        return Ok(PublishOutcome::Open(None, false, None));
     }
     let branch = workspace::publish_branch(wd, Some(&task_branch)).await?;
     if branch == base {
@@ -1396,10 +1836,10 @@ async fn open_pr(
     let title = report.pr_title.clone().unwrap_or_else(|| task.title.clone());
     let body = report.pr_body.clone().or_else(|| report.summary.clone()).unwrap_or_default();
     let Some(pr) = github::create_pr(wd, repo, &branch, &into, &title, &body).await? else {
-        return Ok(None);
+        return Ok(PublishOutcome::Open(None, false, None));
     };
     ctx.db.set_pr(task.id, &pr.url, pr.number).await?;
-    Ok(Some(pr.url))
+    Ok(PublishOutcome::Open(Some(pr.url), true, None))
 }
 
 pub(super) fn record_pids(
@@ -1579,8 +2019,7 @@ mod contract;
 
 #[cfg(test)]
 mod tests {
-    use super::{redact_report, reported_pr_to_keep, review_verdict_value, session_id_after_run};
-    use crate::git::github::{HeadPr, PrInfo};
+    use super::{redact_report, review_verdict_value, session_id_after_run};
 
     #[test]
     fn a_review_without_a_readable_verdict_settles_as_no_verdict() {
@@ -1600,15 +2039,6 @@ mod tests {
         assert!(readable.get("note").is_none());
     }
 
-    #[test]
-    fn another_branchs_pr_is_never_attached_from_the_report() {
-        let report = Report { pr_url: Some("https://github.com/o/r/pull/86".into()), ..Report::default() };
-        let elsewhere = HeadPr::Elsewhere(PrInfo { url: "https://github.com/o/r/pull/86".into(), number: 86 });
-        assert_eq!(reported_pr_to_keep(Some(&elsewhere), &report, "o/r"), None);
-        assert_eq!(reported_pr_to_keep(Some(&HeadPr::Missing), &report, "o/r"), None);
-        assert_eq!(reported_pr_to_keep(None, &report, "o/r"), Some(("https://github.com/o/r/pull/86".to_string(), 86)));
-        assert_eq!(reported_pr_to_keep(None, &Report::default(), "o/r"), None);
-    }
     use crate::world::prompts::Report;
     use loka_shared::progress::phrase as activity_phrase;
 
@@ -1642,6 +2072,86 @@ mod tests {
             warm: crate::world::warm::Pool::new(1),
             bus: Default::default(),
         }))
+    }
+
+    #[tokio::test]
+    async fn the_local_worker_runs_a_pull_request_action_once_and_skips_a_moved_head() -> anyhow::Result<()> {
+        use crate::pr_actions::tests::FakeGitHub;
+        use loka_shared::pr_actions::{ActionKind, ActionSpec, NewAction};
+        use uuid::Uuid;
+        let Some(ctx) = test_ctx().await? else {
+            return Ok(());
+        };
+        let pool = ctx.db.pool().clone();
+        let tag = Uuid::new_v4().simple().to_string();
+        let head = "1111111111111111111111111111111111111111";
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email, world_role) VALUES ($1, 'write') RETURNING id")
+            .bind(format!("local-action-{tag}@example.test"))
+            .fetch_one(&pool)
+            .await?;
+        let agent: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id) VALUES ($1, 'Bun', 'claude', 'sonnet', $2) RETURNING id",
+        )
+        .bind(format!("local-action-{tag}"))
+        .bind(owner)
+        .fetch_one(&pool)
+        .await?;
+        let task: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_tasks (user_id, title, status, repo, pr_number, pr_url, branch) VALUES ($1, 'ship it', 'review', 'Acme/Shop', 7, 'https://github.com/Acme/Shop/pull/7', 'quest-branch') RETURNING id",
+        )
+        .bind(owner)
+        .fetch_one(&pool)
+        .await?;
+        let rule = ctx.store.create_rule(Some(owner), None, "allow", "Close and merge reviewed PRs in Acme/Shop").await?;
+        ctx.store.set_rule_repos(rule.id, owner, None, &["Acme/Shop".to_string()]).await?.expect("allow rule");
+        let spec = ActionSpec { kind: ActionKind::Close, repo: "Acme/Shop".into(), number: 7, sha: head.into(), check: None };
+        let queue = |spec: ActionSpec| {
+            let ctx = &ctx;
+            async move {
+                let action = ctx
+                    .store
+                    .create_pr_action(NewAction { user_id: owner, agent_id: agent, task_id: task, spec: &spec, run_at: None, on_event: None, wait_days: None, note: None })
+                    .await?;
+                let run_id = ctx.store.queue_pr_action(&action).await?.expect("queued");
+                sqlx::query("UPDATE session_runs SET status = 'running', started_at = NOW() WHERE id = $1").bind(run_id).execute(ctx.db.pool()).await?;
+                anyhow::Ok((action, ctx.store.get_run(run_id).await?.expect("run")))
+            }
+        };
+        let status = |id: Uuid| {
+            let ctx = &ctx;
+            async move {
+                let row = ctx.store.list_agent_schedules(agent).await?.into_iter().find(|s| s.id == id).expect("listed");
+                anyhow::Ok(row.outcome.and_then(|o| o.get("status").and_then(serde_json::Value::as_str).map(String::from)).unwrap_or_default())
+            }
+        };
+
+        let github = FakeGitHub::new("OPEN");
+        let (closing, run) = queue(spec.clone()).await?;
+        super::pr_action_with(&ctx, run.clone(), &github).await?;
+        assert_eq!(github.acted(), vec!["close Acme/Shop#7".to_string()]);
+        assert_eq!(status(closing.id).await?, "ran");
+        super::pr_action_with(&ctx, run, &github).await?;
+        assert_eq!(github.acted().len(), 1, "a run that already finished never acts twice");
+
+        let moved = FakeGitHub::new("OPEN");
+        moved.live.lock().unwrap().head_sha = "3333333333333333333333333333333333333333".into();
+        let (merging, run) = queue(ActionSpec { kind: ActionKind::Merge, ..spec }).await?;
+        super::pr_action_with(&ctx, run.clone(), &moved).await?;
+        assert!(moved.acted().is_empty());
+        assert_eq!(status(merging.id).await?, "skipped");
+        let (line, wakes): (String, i64) = sqlx::query_as(
+            "SELECT MAX(payload->>'line'), COUNT(*) FROM agent_inbox WHERE agent_id = $1 AND kind = 'action.skipped'",
+        )
+        .bind(agent)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(wakes, 1);
+        assert!(line.contains("head moved from 11111111 to 33333333"), "{line}");
+        let run_status: String = sqlx::query_scalar("SELECT status FROM session_runs WHERE id = $1").bind(run.id).fetch_one(&pool).await?;
+        assert_eq!(run_status, "completed");
+
+        sqlx::query("DELETE FROM agent_profiles WHERE id = $1").bind(agent).execute(&pool).await?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -1789,7 +2299,432 @@ mod tests {
                 sqlx::query_as("SELECT status, error_message FROM agent_tasks WHERE id = $1").bind(task).fetch_one(&pool).await?;
             assert_eq!((status.as_str(), error), ("done", None), "{quest_status}: the quest finishes done");
             assert_eq!(ctx.store.get_session(session).await?.expect("session").status, "completed", "{quest_status}");
+            let retry = ctx
+                .store
+                .start_followup(&ctx.store.get_session(session).await?.expect("session"), "Retry the same report.", "Abhi", false)
+                .await?;
+            sqlx::query("UPDATE session_runs SET status = 'completed', started_at = NOW(), finished_at = NOW() WHERE id = $1")
+                .bind(retry.id)
+                .execute(&pool)
+                .await?;
+            let current = ctx.store.get_session(session).await?.expect("session");
+            super::after_completed(&ctx, &agent, &current, &retry, report.as_ref(), output).await?;
+            let retried: (String, i64) = sqlx::query_as(
+                "SELECT t.status, COUNT(e.seq) FROM agent_tasks t
+                 LEFT JOIN world_events e ON e.task_id = t.id AND e.type = 'task.finished'
+                 WHERE t.id = $1 GROUP BY t.status",
+            )
+            .bind(task)
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(retried, ("done".into(), 1), "{quest_status}: retry reconciles without another announcement");
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_best_of_prework_prepares_extra_workspaces_only_after_release() -> anyhow::Result<()> {
+        use loka_shared::world::NewSession;
+        use serde_json::json;
+        use uuid::Uuid;
+        let Some(ctx) = test_ctx().await? else {
+            return Ok(());
+        };
+        let pool = ctx.db.pool().clone();
+        let tag = Uuid::new_v4().simple().to_string();
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email) VALUES ($1) RETURNING id")
+            .bind(format!("best-of-{tag}@example.test"))
+            .fetch_one(&pool)
+            .await?;
+        let agent_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id, quest_context) VALUES ($1, 'Bun', 'codex', 'gpt', $2, 'lean') RETURNING id",
+        )
+        .bind(format!("best-of-{tag}"))
+        .bind(owner)
+        .fetch_one(&pool)
+        .await?;
+        let main = ctx
+            .store
+            .create_session(NewSession {
+                agent_id,
+                role: "main",
+                backend: "codex",
+                model: "gpt",
+                parent_session_id: None,
+                task_id: None,
+                working_dir: None,
+                usage_baseline: json!({}),
+            })
+            .await?;
+        let task_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_tasks (user_id, title, status, assigned_agent_id, attempts, context) VALUES ($1, 'Compare it', 'todo', $2, 2, 'lean') RETURNING id",
+        )
+        .bind(owner)
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await?;
+        let agent = ctx.store.get_agent(agent_id).await?.expect("agent");
+
+        let started = super::start_task(
+            &ctx,
+            &agent,
+            &main,
+            task_id,
+            super::super::quests::StartBrief::Ordinary(None),
+            false,
+            None,
+        )
+        .await?
+        .expect("task started");
+        let first = std::env::temp_dir().join(task_id.to_string()).join("scratch");
+        let second = std::env::temp_dir().join(task_id.to_string()).join("scratch-2");
+        assert!(first.is_dir());
+        assert!(!second.exists());
+        let session = ctx.store.get_session(started.session_id).await?.expect("session");
+        assert!(loka_shared::quests::is_best_of_prework(session.asked_by.as_ref()));
+        assert_eq!(session.attempt, None);
+        sqlx::query("UPDATE session_runs SET status = 'completed', started_at = NOW(), finished_at = NOW() WHERE id = $1")
+            .bind(started.run_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query("UPDATE agent_sessions SET cli_session_id = $2 WHERE id = $1")
+            .bind(session.id)
+            .bind(format!("best-of-{tag}"))
+            .execute(&pool)
+            .await?;
+        let upload = Uuid::new_v4();
+        let accepted_status: String = sqlx::query_scalar("SELECT status FROM agent_tasks WHERE id = $1")
+            .bind(task_id)
+            .fetch_one(&pool)
+            .await?;
+        let continuation = sqlx::query_as::<_, loka_shared::world::InboxItem>(
+            "INSERT INTO agent_inbox (agent_id, kind, payload, status)
+             VALUES ($1, 'task.assigned', $2, 'processing')
+             RETURNING id, agent_id, kind, event_seq, payload, status, attempts, created_at",
+        )
+        .bind(agent_id)
+        .bind(json!({
+            "task_id": task_id,
+            "title": "Compare it",
+            "brief": "Original request: compare both options. Their answer: use the team account.",
+            "resume": true,
+            "clarification_continuation": Uuid::new_v4(),
+            "clarification_status": accepted_status,
+            "clarification_resume": false,
+            "attachments": [{ "id": upload, "name": "requirements.txt", "mime": "text/plain" }],
+            "files": [{ "name": "notes.txt", "mime": "text/plain", "text": "Keep both checks." }],
+        }))
+        .fetch_one(&pool)
+        .await?;
+        let continued = super::start_task(
+            &ctx,
+            &agent,
+            &main,
+            task_id,
+            super::super::quests::StartBrief::Clarification(&continuation),
+            false,
+            None,
+        )
+        .await?
+        .expect("clarification continued");
+        assert!(continued.resumed);
+        assert_eq!(continued.session_id, session.id);
+        let continued_run = ctx.store.get_run(continued.run_id).await?.expect("continued run");
+        assert!(continued_run.prompt.contains("Their answer: use the team account."));
+        assert!(continued_run.prompt.contains(&format!("upload {upload}")));
+        assert!(continued_run.prompt.contains("Keep both checks."));
+        let replay = super::start_task(
+            &ctx,
+            &agent,
+            &main,
+            task_id,
+            super::super::quests::StartBrief::Clarification(&continuation),
+            false,
+            None,
+        )
+        .await;
+        assert!(replay.is_err());
+        let continuations: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_runs WHERE task_id = $1 AND kind = 'followup'",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(continuations, 1);
+        sqlx::query("UPDATE session_runs SET status = 'completed', started_at = NOW(), finished_at = NOW() WHERE id = $1")
+            .bind(continued.run_id)
+            .execute(&pool)
+            .await?;
+        let run = ctx.store.get_run(continued.run_id).await?.expect("run");
+        let output = "<!-- report {\"status\":\"done\",\"summary\":\"Ready\",\"proceed_without_plan\":true} report -->";
+        let report = super::prompts::parse_report(output);
+
+        super::after_completed(&ctx, &agent, &session, &run, report.as_ref(), output).await?;
+        assert!(second.is_dir());
+        let active: Vec<(i16, String)> = sqlx::query_as(
+            "SELECT attempt, working_dir FROM agent_sessions WHERE task_id = $1 AND status = 'active' AND attempt IS NOT NULL ORDER BY attempt",
+        )
+        .bind(task_id)
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(active, vec![(1, first.display().to_string()), (2, second.display().to_string())]);
+        let queued: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_runs WHERE task_id = $1 AND status = 'queued' AND kind = 'task'",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(queued, 2);
+        let released = ctx.store.get_session(session.id).await?.expect("released session");
+        assert_eq!(released.status, "archived");
+        assert!(!loka_shared::quests::is_best_of_prework(released.asked_by.as_ref()));
+
+        super::after_completed(&ctx, &agent, &session, &run, report.as_ref(), output).await?;
+        let queued_after_retry: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_runs WHERE task_id = $1 AND status = 'queued' AND kind = 'task'",
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(queued_after_retry, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_verified_merge_settles_before_a_queued_local_followup() -> anyhow::Result<()> {
+        use uuid::Uuid;
+        let Some(ctx) = test_ctx().await? else {
+            return Ok(());
+        };
+        let pool = ctx.db.pool().clone();
+        let tag = Uuid::new_v4().simple().to_string();
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email) VALUES ($1) RETURNING id")
+            .bind(format!("merge-queue-{tag}@example.test"))
+            .fetch_one(&pool)
+            .await?;
+        let agent_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id)
+             VALUES ($1, 'Bun', 'claude', 'haiku', $2) RETURNING id",
+        )
+        .bind(format!("merge-queue-{tag}"))
+        .bind(owner)
+        .fetch_one(&pool)
+        .await?;
+        let pr_url = "https://github.com/acme/app/pull/9";
+        let task: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_tasks (user_id, title, status, error_message, assigned_agent_id, repo, pr_url, pr_number, merged_pr_url)
+             VALUES ($1, 'ship it', 'failed', 'earlier failure', $2, 'acme/app', $3, 9, $3) RETURNING id",
+        )
+        .bind(owner)
+        .bind(agent_id)
+        .bind(pr_url)
+        .fetch_one(&pool)
+        .await?;
+        sqlx::query("DELETE FROM task_milestones WHERE task_id = $1 AND kind = 'merge'")
+            .bind(task)
+            .execute(&pool)
+            .await?;
+        sqlx::query("INSERT INTO task_milestones (task_id, title, kind, status) VALUES ($1, 'merge', 'merge', 'active')")
+            .bind(task)
+            .execute(&pool)
+            .await?;
+        let session: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_sessions (agent_id, role, backend, model, cli_session_id, task_id, status, working_dir, review)
+             VALUES ($1, 'task', 'claude', 'haiku', 'cli-1', $2, 'failed', $3, FALSE) RETURNING id",
+        )
+        .bind(agent_id)
+        .bind(task)
+        .bind(format!("tasks/{task}/app"))
+        .fetch_one(&pool)
+        .await?;
+        let first = ctx
+            .store
+            .start_followup(&ctx.store.get_session(session).await?.expect("session"), "Merge it.", "Abhi", false)
+            .await?;
+        let second = ctx
+            .store
+            .start_followup(&ctx.store.get_session(session).await?.expect("session"), "Clean up.", "Abhi", false)
+            .await?;
+        sqlx::query("UPDATE session_runs SET status = 'completed', started_at = NOW(), finished_at = NOW() WHERE id = $1")
+            .bind(first.id)
+            .execute(&pool)
+            .await?;
+        assert!(ctx.store.settle_merged_followup(task, session, pr_url).await?);
+        let state: (String, Option<String>, String, String, String) = sqlx::query_as(
+            "SELECT t.status, t.error_message, m.status, s.status, r.status
+             FROM agent_tasks t JOIN task_milestones m ON m.task_id = t.id AND m.kind = 'merge'
+             JOIN agent_sessions s ON s.id = $2 JOIN session_runs r ON r.id = $3 WHERE t.id = $1",
+        )
+        .bind(task)
+        .bind(session)
+        .bind(second.id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(state, ("done".into(), None, "done".into(), "completed".into(), "cancelled".into()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn withdrawing_the_follow_up_a_finished_one_waited_on_finishes_the_quest_on_the_local_worker() -> anyhow::Result<()> {
+        use uuid::Uuid;
+        let Some(ctx) = test_ctx().await? else {
+            return Ok(());
+        };
+        let pool = ctx.db.pool().clone();
+        let tag = Uuid::new_v4().simple().to_string();
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email) VALUES ($1) RETURNING id")
+            .bind(format!("withdraw-{tag}@example.test"))
+            .fetch_one(&pool)
+            .await?;
+        let agent_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id) VALUES ($1, 'Bun', 'claude', 'haiku', $2) RETURNING id",
+        )
+        .bind(format!("withdraw-{tag}"))
+        .bind(owner)
+        .fetch_one(&pool)
+        .await?;
+        let task: Uuid = sqlx::query_scalar("INSERT INTO agent_tasks (user_id, title, status, assigned_agent_id) VALUES ($1, 'ship it', 'done', $2) RETURNING id")
+            .bind(owner)
+            .bind(agent_id)
+            .fetch_one(&pool)
+            .await?;
+        let summary = serde_json::to_string(&Report { status: Some("done".into()), summary: Some("First version".into()), ..Default::default() })?;
+        let session: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_sessions (agent_id, role, backend, model, cli_session_id, task_id, status, summary, review)
+             VALUES ($1, 'task', 'claude', 'haiku', 'cli-1', $2, 'completed', $3, FALSE) RETURNING id",
+        )
+        .bind(agent_id)
+        .bind(task)
+        .bind(&summary)
+        .fetch_one(&pool)
+        .await?;
+        let agent = ctx.store.get_agent(agent_id).await?.expect("agent");
+        let answered = ctx.store.start_followup(&ctx.store.get_session(session).await?.expect("session"), "One more tweak.", "Abhi", false).await?;
+        let stale = ctx.store.start_followup(&ctx.store.get_session(session).await?.expect("session"), "And the docs.", "Abhi", false).await?;
+        let output = "Done.\n<!-- report {\"status\": \"done\", \"summary\": \"Second version\"} report -->";
+        sqlx::query("UPDATE session_runs SET status = 'completed', output = $2, started_at = NOW(), finished_at = NOW() WHERE id = $1")
+            .bind(answered.id)
+            .bind(output)
+            .execute(&pool)
+            .await?;
+        let current = ctx.store.get_session(session).await?.expect("session");
+        super::after_completed(&ctx, &agent, &current, &answered, super::prompts::parse_report(output).as_ref(), output).await?;
+        let finished = || async {
+            sqlx::query_as::<_, (String, Option<String>)>(
+                "SELECT payload->>'status', payload#>>'{report,summary}' FROM world_events WHERE task_id = $1 AND type = 'task.finished' ORDER BY seq",
+            )
+            .bind(task)
+            .fetch_all(&pool)
+            .await
+        };
+        assert!(finished().await?.is_empty(), "the finished follow-up waits for the queued one");
+        let replies = || async {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM world_events WHERE task_id = $1 AND type = 'session.replied'").bind(task).fetch_one(&pool).await
+        };
+        let replied = replies().await?;
+
+        assert!(ctx.store.withdraw_queued(stale.id, "Abhi").await?);
+        super::carry_on_withdrawn(&ctx).await?;
+        assert_eq!(finished().await?, [("done".to_string(), Some("Second version".to_string()))], "withdrawing it finishes the quest with the finished work");
+        assert_eq!(replies().await?, replied, "carrying the work on does not post the reply again");
+        super::carry_on_withdrawn(&ctx).await?;
+        assert_eq!(finished().await?.len(), 1, "the work is carried on once");
+        let status: String = sqlx::query_scalar("SELECT status FROM agent_tasks WHERE id = $1").bind(task).fetch_one(&pool).await?;
+        assert_eq!(status, "done");
+        assert!(ctx.store.settle_cancelled_work().await?.iter().all(|id| *id != task), "the withdrawn run never fails the quest");
+
+        sqlx::query("UPDATE agent_sessions SET review = TRUE WHERE id = $1").bind(session).execute(&pool).await?;
+        sqlx::query("UPDATE agent_tasks SET status = 'in_progress' WHERE id = $1").bind(task).execute(&pool).await?;
+        let reviewed = ctx.store.start_followup(&ctx.store.get_session(session).await?.expect("session"), "Review this too.", "Abhi", false).await?;
+        let withdrawn = ctx.store.start_followup(&ctx.store.get_session(session).await?.expect("session"), "This one is stale.", "Abhi", false).await?;
+        sqlx::query("UPDATE session_runs SET status = 'completed', output = $2, started_at = NOW(), finished_at = NOW() WHERE id = $1")
+            .bind(reviewed.id)
+            .bind(output)
+            .execute(&pool)
+            .await?;
+        assert!(ctx.store.withdraw_queued(withdrawn.id, "Abhi").await?);
+        let current = ctx.store.get_session(session).await?.expect("session");
+        super::after_completed(&ctx, &agent, &current, &reviewed, super::prompts::parse_report(output).as_ref(), output).await?;
+        super::carry_on_withdrawn(&ctx).await?;
+        let reviews: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_runs r JOIN agent_sessions s ON s.id = r.session_id
+             WHERE s.parent_session_id = $1 AND s.role = 'review' AND r.kind = 'review' AND r.created_at > $2",
+        )
+        .bind(session)
+        .bind(reviewed.created_at)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(reviews, 1, "carrying the same completed follow-up on does not queue another review");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn withdrawing_the_follow_up_after_a_plan_posts_the_finished_plan() -> anyhow::Result<()> {
+        use uuid::Uuid;
+        let Some(ctx) = test_ctx().await? else {
+            return Ok(());
+        };
+        let pool = ctx.db.pool().clone();
+        let tag = Uuid::new_v4().simple().to_string();
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email) VALUES ($1) RETURNING id")
+            .bind(format!("withdraw-plan-{tag}@example.test"))
+            .fetch_one(&pool)
+            .await?;
+        let agent_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id) VALUES ($1, 'Bun', 'claude', 'haiku', $2) RETURNING id",
+        )
+        .bind(format!("withdraw-plan-{tag}"))
+        .bind(owner)
+        .fetch_one(&pool)
+        .await?;
+        let task: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_tasks (user_id, title, status, assigned_agent_id, plan_first) VALUES ($1, 'plan it', 'in_progress', $2, TRUE) RETURNING id",
+        )
+        .bind(owner)
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await?;
+        let session: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_sessions (agent_id, role, backend, model, cli_session_id, task_id, status, plan_state)
+             VALUES ($1, 'task', 'claude', 'haiku', 'cli-plan', $2, 'active', 'planning') RETURNING id",
+        )
+        .bind(agent_id)
+        .bind(task)
+        .fetch_one(&pool)
+        .await?;
+        let output = "1. Change the worker\n2. Run its focused tests";
+        let planned: Uuid = sqlx::query_scalar(
+            "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, prompt, output)
+             VALUES ($1, $2, $3, 'followup', 'completed', 'Plan the work', $4) RETURNING id",
+        )
+        .bind(session)
+        .bind(agent_id)
+        .bind(task)
+        .bind(output)
+        .fetch_one(&pool)
+        .await?;
+        let stale: Uuid = sqlx::query_scalar(
+            "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, prompt)
+             VALUES ($1, $2, $3, 'followup', 'queued', 'Replace the plan') RETURNING id",
+        )
+        .bind(session)
+        .bind(agent_id)
+        .bind(task)
+        .fetch_one(&pool)
+        .await?;
+        sqlx::query("UPDATE session_runs SET started_at = NOW(), finished_at = clock_timestamp() WHERE id = $1")
+            .bind(planned)
+            .execute(&pool)
+            .await?;
+        assert!(ctx.store.withdraw_queued(stale, "Abhi").await?);
+        super::carry_on_withdrawn(&ctx).await?;
+        let state: Option<String> = sqlx::query_scalar("SELECT plan_state FROM agent_sessions WHERE id = $1").bind(session).fetch_one(&pool).await?;
+        assert_eq!(state.as_deref(), Some("awaiting"));
+        let ready: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_events WHERE task_id = $1 AND type = 'task.plan_ready'")
+            .bind(task)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(ready, 1, "the completed planning run posts its plan once");
         Ok(())
     }
 

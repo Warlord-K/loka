@@ -31,13 +31,14 @@ import {
   type EmbedRun,
   type EmbedSlots,
 } from "@/lib/canvas-embeds";
-import { QUEST_STAGE_LABEL, questStage } from "@/lib/quest-status";
+import { QUEST_STAGE_LABEL, questEventTaskId, questStage } from "@/lib/quest-status";
 import { runIsLive } from "./panels";
 import { eventLine, QUIET_EVENTS } from "./quest-room";
 import { StatusIcon } from "./quest-ui";
 import { milestoneProgress } from "./milestones-ui";
 import { Shimmer } from "./shimmer";
 import { EASE, FOCUS } from "./styles";
+import { useLiveQuests } from "./live-quests";
 
 const TerminalPanel = dynamic(() => import("./terminal").then((m) => m.TerminalPanel), {
   ssr: false,
@@ -162,8 +163,8 @@ function QuestBody({ embed }: ViewProps) {
     };
     const onEvent = (event: Event) => {
       const e = (event as CustomEvent<WorldEvent>).detail;
-      if (e.task_id === id) {
-        if (!QUIET_EVENTS.test(e.type)) setTail((prev) => pushTail(prev, eventLine(e, "The agent")));
+      if (questEventTaskId(e) === id) {
+        if (e.type !== "task.changed" && e.type !== "task.deleted" && !QUIET_EVENTS.test(e.type)) setTail((prev) => pushTail(prev, eventLine(e, "The agent")));
         soon();
         return;
       }
@@ -221,7 +222,7 @@ function QuestBody({ embed }: ViewProps) {
 }
 
 function BrowserBody() {
-  return <Note>Watching an agent&apos;s browser on a canvas is not available yet.</Note>;
+  return <Note>Watching an agent&apos;s browser in a workspace is not available yet.</Note>;
 }
 
 export const EMBED_VIEWS: Record<EmbedKind, EmbedView> = {
@@ -230,7 +231,7 @@ export const EMBED_VIEWS: Record<EmbedKind, EmbedView> = {
     dark: true,
     openLabel: "Open the terminal panel",
     open: () => window.dispatchEvent(new CustomEvent("world:open-terminal")),
-    ownerOnly: "This terminal runs on a device of the canvas owner, so only they can watch it.",
+    ownerOnly: "This terminal runs on a device of the workspace owner, so only they can watch it.",
     releaseGone: (reportId, present) => void import("./terminal").then((m) => m.releaseEmbedTerminals(reportId, present)),
     Body: TerminalBody,
   },
@@ -366,7 +367,7 @@ function EmbedSlot({ slotKey, live, dark }: { slotKey: string; live: boolean; da
     if (!slots || !here) return;
     return slots.attach(slotKey, here);
   }, [slots, slotKey]);
-  if (!stage) return <Note dark={dark}>Reload the canvas to watch this.</Note>;
+  if (!stage) return <Note dark={dark}>Reload the workspace to watch this.</Note>;
   return <div ref={slot} className={cn("relative h-full w-full overflow-hidden", dark ? "bg-w-term-bg" : "bg-w-card")} />;
 }
 
@@ -398,7 +399,7 @@ export function EmbedItem({ item, host }: { item: CanvasItem; host: EmbedHost })
           </button>
         )}
         {host.canEdit && (
-          <button type="button" onClick={remove} aria-label="Remove from the canvas" title="Remove from the canvas" className={cn("nodrag grid h-6 w-6 place-items-center rounded text-w-muted hover:bg-w-sand hover:text-w-danger", EASE, FOCUS)}>
+          <button type="button" onClick={remove} aria-label="Remove from the workspace" title="Remove from the workspace" className={cn("nodrag grid h-6 w-6 place-items-center rounded text-w-muted hover:bg-w-sand hover:text-w-danger", EASE, FOCUS)}>
             <Trash size={13} weight="bold" />
           </button>
         )}
@@ -457,18 +458,7 @@ export function EmbedPicker({ meId, onPick, onClose }: { meId: string | null; on
   const [kind, setKind] = useState<EmbedKind>("terminal");
   const [query, setQuery] = useState("");
   const devices = useMyDevices(meId);
-  const [quests, setQuests] = useState<TaskBrief[] | null>(null);
-  useEffect(() => {
-    if (kind !== "quest" || quests) return;
-    let gone = false;
-    worldApi
-      .tasks()
-      .then((list) => !gone && setQuests(list))
-      .catch(() => !gone && setQuests([]));
-    return () => {
-      gone = true;
-    };
-  }, [kind, quests]);
+  const quests = useLiveQuests(kind === "quest");
   const words = query.trim().toLowerCase();
   const shownQuests = (quests ?? [])
     .filter((q) => !words || q.title.toLowerCase().includes(words) || q.id.startsWith(words))
@@ -540,7 +530,7 @@ export function EmbedPicker({ meId, onPick, onClose }: { meId: string | null; on
             ))
           ))}
         {kind === "quest" &&
-          (quests === null ? (
+          (quests === undefined ? (
             <li className="px-2 py-3 text-w-sm text-w-muted">
               <Shimmer>Loading quests</Shimmer>
             </li>

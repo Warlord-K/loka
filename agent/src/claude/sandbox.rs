@@ -420,7 +420,7 @@ pub fn open_for_owner(settings: &mut Value) {
 }
 
 pub(crate) fn allow_private_dir(settings: &mut Value, dir: &Path) {
-    let paths: Vec<Value> = crate::cli::private_temp_grants(dir).into_iter().map(|path| Value::String(path.display().to_string())).collect();
+    let paths: Vec<Value> = crate::cli::both_spellings(dir).into_iter().map(|path| Value::String(path.display().to_string())).collect();
     if let Some(write) = settings["sandbox"]["filesystem"]["allowWrite"].as_array_mut() {
         write.extend(paths.iter().cloned());
     }

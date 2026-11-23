@@ -265,23 +265,38 @@ pub async fn update(
         _ => {}
     }
 
-    if let Some(limit) = body.remove("time_limit_minutes") {
+    let time_limit = if let Some(limit) = body.remove("time_limit_minutes") {
         let minutes = match limit {
             Value::Null => None,
             value => Some(value.as_i64().ok_or(StatusCode::BAD_REQUEST)?),
         };
-        state.world.set_task_time_limit(id, minutes).await.map_err(|_| StatusCode::BAD_REQUEST)?;
-    }
+        Some(minutes)
+    } else {
+        None
+    };
     let options = ["plan_first", "attempts", "attempt_variants", "ci_feedback", "pace", "context"];
-    if options.iter().any(|k| body.contains_key(*k)) {
+    let quest = if options.iter().any(|k| body.contains_key(*k)) {
         let args = Value::Object(options.iter().filter_map(|k| body.remove(*k).map(|v| (k.to_string(), v))).collect());
-        let quest = loka_shared::quests::QuestChoice::from_args(&args)
+        Some(loka_shared::quests::QuestChoice::from_args(&args)
             .and_then(|c| c.validate())
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
-        state.world.set_quest_options(id, &quest).await.map_err(|_| StatusCode::BAD_REQUEST)?;
-    }
-    if !body.is_empty() {
-        let rows = state.db.update_task(id, user.0, &body).await.map_err(internal)?;
+            .map_err(|_| StatusCode::BAD_REQUEST)?)
+    } else {
+        None
+    };
+    let quest_settings = quest.as_ref().filter(|choice| !choice.is_empty());
+    if body.is_empty() && (time_limit.is_some() || quest_settings.is_some()) {
+        state.world.set_task_settings(id, time_limit, quest_settings).await.map_err(|_| StatusCode::BAD_REQUEST)?;
+    } else if !body.is_empty() {
+        let rows = match state.db.update_task_with_settings(id, user.0, &body, time_limit, quest_settings).await {
+            Ok(rows) => rows,
+            Err(error) => match error.downcast_ref::<loka_shared::db::UpdateTaskError>() {
+                Some(loka_shared::db::UpdateTaskError::InvalidPullRequest | loka_shared::db::UpdateTaskError::InvalidSettings) => {
+                    return Err(StatusCode::BAD_REQUEST)
+                }
+                Some(loka_shared::db::UpdateTaskError::PullRequestConflict) => return Err(StatusCode::CONFLICT),
+                None => return Err(internal(error)),
+            },
+        };
         if rows == 0 {
             return Err(StatusCode::NOT_FOUND);
         }

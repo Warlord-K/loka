@@ -713,6 +713,7 @@ pub(crate) async fn build_command(opts: &CliOptions<'_>, rpc: bool) -> Result<(C
 #[derive(Default)]
 struct Reader {
     session_id: Option<String>,
+    unsaved: Option<String>,
     output: String,
     outputs: Vec<String>,
     totals: Totals,
@@ -728,16 +729,19 @@ impl Reader {
             }
         };
         match json.get("type").and_then(Value::as_str).unwrap_or("") {
-            "session" if self.session_id.is_none() => {
+            "session" => {
                 if let Some(sid) = json.get("id").and_then(Value::as_str) {
-                    self.session_id = Some(sid.to_string());
-                    send(StreamEvent::SessionStarted { session_id: sid.to_string() });
+                    self.named(sid);
                 }
             }
             "message_end" => {
                 let message = &json["message"];
                 if message.get("role").and_then(Value::as_str) != Some("assistant") {
                     return;
+                }
+                if let Some(sid) = self.unsaved.take() {
+                    self.session_id = Some(sid.clone());
+                    send(StreamEvent::SessionStarted { session_id: sid });
                 }
                 if let Some(usage) = message.get("usage") {
                     self.totals.add(usage);
@@ -781,6 +785,12 @@ impl Reader {
                 });
             }
             _ => {}
+        }
+    }
+
+    fn named(&mut self, sid: &str) {
+        if self.session_id.is_none() {
+            self.unsaved = Some(sid.to_string());
         }
     }
 
@@ -848,6 +858,7 @@ async fn drive<W, R>(
     steer: &mut Option<crate::cli::SteerReceiver>,
     sent: &mut usize,
     started: std::time::Instant,
+    unsaved: Option<String>,
 ) -> Result<Turn>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -857,7 +868,7 @@ where
     let hang_after = crate::cli::tool_hang_after();
     let mut watchdog = tokio::time::interval(std::time::Duration::from_secs(15));
     watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut reader = Reader { tools: Some(crate::cli::OpenTools::new()), ..Default::default() };
+    let mut reader = Reader { tools: Some(crate::cli::OpenTools::new()), unsaved, ..Default::default() };
     let mut failure: Option<String> = None;
     let mut ended = false;
     let mut first_output_ms: Option<u64> = None;
@@ -876,12 +887,7 @@ where
                 match json.get("type").and_then(Value::as_str).unwrap_or("") {
                     "response" if json.get("id").and_then(Value::as_str) == Some("state") => {
                         if let Some(sid) = json.pointer("/data/sessionId").and_then(Value::as_str) {
-                            if reader.session_id.is_none() {
-                                reader.session_id = Some(sid.to_string());
-                                if let Some(tx) = &opts.event_tx {
-                                    let _ = tx.send(StreamEvent::SessionStarted { session_id: sid.to_string() });
-                                }
-                            }
+                            reader.named(sid);
                         }
                     }
                     "response" if json.get("success").and_then(Value::as_bool) == Some(false) => {
@@ -1008,7 +1014,7 @@ async fn run_steerable(opts: &CliOptions<'_>, steer: crate::cli::SteerReceiver) 
     stdin.flush().await?;
     let mut sent = 1usize;
     let mut steer = Some(steer);
-    let turn = drive(&mut stdin, &mut lines, opts, &mut steer, &mut sent, std::time::Instant::now()).await?;
+    let turn = drive(&mut stdin, &mut lines, opts, &mut steer, &mut sent, std::time::Instant::now(), None).await?;
     drop(stdin);
     if tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await.is_err() {
         let _ = child.kill().await;
@@ -1023,6 +1029,7 @@ pub(crate) struct WarmOmp {
     lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
     stderr: std::sync::Arc<std::sync::Mutex<String>>,
     session_id: Option<String>,
+    saved: bool,
     sent: usize,
     _run_dir: RunDir,
 }
@@ -1065,10 +1072,8 @@ impl WarmOmp {
                 anyhow::bail!("omp did not get ready in time");
             }
         };
-        if let (Some(tx), Some(sid)) = (&opts.event_tx, &session_id) {
-            let _ = tx.send(StreamEvent::SessionStarted { session_id: sid.clone() });
-        }
-        Ok(Self { child, stdin, lines, stderr, session_id, sent: 0, _run_dir: run_dir })
+        let saved = opts.resume && !opts.fork && session_id.as_deref().is_some_and(|sid| opts.session_id == Some(sid));
+        Ok(Self { child, stdin, lines, stderr, session_id, saved, sent: 0, _run_dir: run_dir })
     }
 
     pub(crate) fn pid(&self) -> Option<u32> {
@@ -1097,7 +1102,9 @@ impl WarmOmp {
             .context("warm omp session stdin closed")?;
         self.stdin.flush().await?;
         let mut steer = opts.steer.take();
-        let turn = drive(&mut self.stdin, &mut self.lines, opts, &mut steer, &mut self.sent, started).await?;
+        let unsaved = self.session_id.clone().filter(|_| !self.saved);
+        let turn = drive(&mut self.stdin, &mut self.lines, opts, &mut steer, &mut self.sent, started, unsaved).await?;
+        self.saved |= turn.reader.session_id.is_some();
         if turn.ended {
             anyhow::bail!("warm omp session exited mid-turn");
         }
@@ -1191,7 +1198,7 @@ async fn run_print(opts: CliOptions<'_>) -> Result<CliResult> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{message_text, omp_tools, resolve_model, run, run_mcp_json, Totals};
     use crate::cli::CliOptions;
 
@@ -1206,7 +1213,7 @@ mod tests {
         assert!(run_mcp_json(None, &Default::default()).unwrap().is_none());
     }
 
-    fn options<'a>(dir: &'a std::path::Path, prompt: &'a str, model: &'a str, session: Option<&'a str>, fork: bool) -> CliOptions<'a> {
+    pub(crate) fn options<'a>(dir: &'a std::path::Path, prompt: &'a str, model: &'a str, session: Option<&'a str>, fork: bool) -> CliOptions<'a> {
         CliOptions {
             working_dir: dir,
             prompt,
@@ -1421,5 +1428,84 @@ mod redaction_tests {
             drop(tx);
             assert_whole_then_hidden(drain(rx), 3, "omp", pad);
         }
+    }
+}
+
+#[cfg(test)]
+mod unsaved_session_tests {
+    use crate::cli::StreamEvent;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    const ID: &str = "01a21d98-c1f1-7311-ba20-3dde5fef60fa";
+
+    fn fake_omp(lines: &[String]) -> tokio::process::Child {
+        let script = lines.iter().map(|line| format!("printf '%s\\n' '{line}'")).collect::<Vec<_>>().join("\n");
+        tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("{script}\nexit 1"))
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    }
+
+    fn started(rx: &mut tokio::sync::mpsc::UnboundedReceiver<StreamEvent>) -> Vec<String> {
+        let mut ids = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let StreamEvent::SessionStarted { session_id } = event {
+                ids.push(session_id);
+            }
+        }
+        ids
+    }
+
+    fn header() -> String {
+        format!(r#"{{"type":"session","version":3,"id":"{ID}","cwd":"/work"}}"#)
+    }
+
+    fn failed_answer() -> String {
+        r#"{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"401 invalid key"}}"#.to_string()
+    }
+
+    async fn print_mode(lines: &[String]) -> (Option<String>, Vec<String>) {
+        let mut child = fake_omp(lines);
+        let mut out = BufReader::new(child.stdout.take().unwrap()).lines();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut reader = super::Reader::default();
+        while let Some(line) = out.next_line().await.unwrap() {
+            reader.feed(&serde_json::from_str(&line).unwrap(), Some(&tx));
+        }
+        (reader.session_id, started(&mut rx))
+    }
+
+    async fn rpc_mode(lines: &[String]) -> (Option<String>, Vec<String>) {
+        let mut child = fake_omp(lines);
+        let mut out = BufReader::new(child.stdout.take().unwrap()).lines();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let dir = std::env::temp_dir();
+        let opts = crate::cli::CliOptions { event_tx: Some(tx), ..super::tests::options(&dir, "go", "", None, false) };
+        let mut stdin = tokio::io::sink();
+        let turn = super::drive(&mut stdin, &mut out, &opts, &mut None, &mut 1, std::time::Instant::now(), None).await.unwrap();
+        (turn.reader.session_id, started(&mut rx))
+    }
+
+    #[tokio::test]
+    async fn omp_that_dies_before_answering_leaves_no_session_to_resume() {
+        assert_eq!(print_mode(&[header()]).await, (None, vec![]), "omp saves nothing before the first answer");
+        let user = r#"{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#.to_string();
+        assert_eq!(print_mode(&[header(), user]).await, (None, vec![]));
+        let state = format!(r#"{{"type":"response","id":"state","command":"get_state","success":true,"data":{{"sessionId":"{ID}"}}}}"#);
+        let crashed = r#"{"type":"prompt_result","id":"prompt-0","status":"error","error":{"message":"No API key found for openrouter."}}"#.to_string();
+        assert_eq!(rpc_mode(&[state, crashed]).await, (None, vec![]), "a warm start names a session it has not saved yet");
+    }
+
+    #[tokio::test]
+    async fn omp_announces_its_session_once_it_has_saved_an_answer() {
+        let saved = (Some(ID.to_string()), vec![ID.to_string()]);
+        assert_eq!(print_mode(&[header(), failed_answer()]).await, saved, "even a failed answer is saved to the session file");
+        let state = format!(r#"{{"type":"response","id":"state","command":"get_state","success":true,"data":{{"sessionId":"{ID}"}}}}"#);
+        let answer = r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop"}}"#.to_string();
+        let done = r#"{"type":"prompt_result","id":"prompt-0","status":"ok"}"#.to_string();
+        assert_eq!(rpc_mode(&[state, answer, done]).await, saved);
     }
 }

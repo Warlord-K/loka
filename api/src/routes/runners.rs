@@ -14,7 +14,7 @@ use loka_agent::runner_server::RunnerCoordinator;
 use loka_shared::runners::{
     random_token, AssignRunner, AssignRunnerError, BeginCompletion, CreateRunner, HandoffRunner,
     HandoffRunnerError, LeaseBeat, LeaseSteers, RunnerCompletion, RevokeRunner, RunnerEvents, RunnerHeartbeat, RunnerPoll, RunnerPolled,
-    RunnerRegistration, RunnerView, UpdateRunner,
+    RunnerPrCheckResult, RunnerRegistration, RunnerView, UpdateRunner,
 };
 use base64::Engine;
 use ring::digest;
@@ -370,13 +370,20 @@ pub async fn poll(
     if polled.status == "paused" {
         return Ok(Json(polled));
     }
-    let (shell, terminal, job) = tokio::join!(
+    let (shell, terminal, job, pr_check) = tokio::join!(
         async { if request.shell { Some(state.runners.claim_shell(runner_id).await) } else { None } },
         async {
             let room = loka_shared::terminal::TerminalRoom { shells: request.terminal, views: request.views };
             if room.any() { Some(state.runners.claim_terminal(runner_id, room).await) } else { None }
         },
         async { if request.kinds.is_empty() { None } else { Some(claim_job(&state, runner_id, &request.kinds).await) } },
+        async {
+            if request.pr_checks && request.heartbeat.is_some() {
+                Some(state.runners.claim_pr_check(runner_id).await)
+            } else {
+                None
+            }
+        },
     );
     match shell {
         Some(Ok(claimed)) => polled.shell = claimed.map(shell_job),
@@ -404,7 +411,40 @@ pub async fn poll(
         }
         None => {}
     }
+    match pr_check {
+        Some(Ok(pr_check)) => polled.pr_check = pr_check,
+        Some(Err(error)) => {
+            tracing::warn!(%error, %runner_id, "PR check claim failed during runner poll");
+            polled.retry = true;
+        }
+        None => {}
+    }
     Ok(Json(polled))
+}
+
+pub async fn pr_check(
+    State(state): State<AppState>,
+    Path(runner_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(result): Json<RunnerPrCheckResult>,
+) -> Result<StatusCode, ApiError> {
+    authenticate_runner(&state, &headers, Some(runner_id)).await?;
+    if loka_shared::git_names::validate_repo(&result.repo).is_err()
+        || !loka_shared::runners::pr_url_matches(&result.pr_url, &result.repo, result.pr_number)
+    {
+        return Err(problem(StatusCode::BAD_REQUEST, "invalid_pr", "Pull request does not match the quest repository"));
+    }
+    let merged = match result.state.as_str() {
+        "merged" => true,
+        "closed" => false,
+        _ => return Err(problem(StatusCode::BAD_REQUEST, "invalid_state", "Pull request state is not final")),
+    };
+    state
+        .world
+        .settle_pr_from_runner_observed(result.task_id, &result.pr_url, merged, runner_id, result.observed_at)
+        .await
+        .map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(serde::Deserialize)]

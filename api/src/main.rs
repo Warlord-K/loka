@@ -100,6 +100,7 @@ async fn main() -> anyhow::Result<()> {
     let runners = loka_shared::runners::RunnerStore::new(db.pool().clone());
     let (world_tx, _) = tokio::sync::broadcast::channel(256);
     tokio::spawn(relay_world_events(database_url.clone(), world_tx.clone()));
+    loka_shared::quest_questions::share_event_wakes(world_tx.clone());
     let (signal_tx, _) = tokio::sync::broadcast::channel(1024);
     tokio::spawn(relay_signals(database_url.clone(), signal_tx.clone()));
     let runner_tx = runner_wakes::RunnerWakes::default();
@@ -372,15 +373,26 @@ async fn main() -> anyhow::Result<()> {
         .route("/world/quests", get(routes::world::list_quests))
         .route("/world/shell/{id}", get(routes::shell::get_run))
         .route("/world/terminal/sessions", post(routes::terminal::open_session))
+        .route("/world/terminal/sessions/{id}", delete(routes::terminal::close_session))
         .route("/world/shell/{id}/cancel", post(routes::shell::cancel))
         .route("/world/shell/{id}/share", post(routes::shell::share))
         .route("/world/tasks/{id}/room", get(routes::world::quest_room))
+        .route("/world/tasks/{id}/room/messages", post(routes::rooms::post_room_message))
+        .route("/world/tasks/{id}/members", get(routes::rooms::list_members).post(routes::rooms::add_member))
+        .route("/world/tasks/{id}/room/members", get(routes::rooms::list_members).post(routes::rooms::add_member))
+        .route("/world/agents/{id}/crew-preview", get(routes::rooms::crew_preview))
+        .route("/world/tasks/{id}/members/{kind}/{member_id}", delete(routes::rooms::remove_member))
+        .route("/world/tasks/{id}/questions", get(routes::rooms::list_questions))
+        .route("/world/questions/{id}/answer", post(routes::rooms::answer_question))
+        .route("/world/questions/{id}/pass-up", post(routes::rooms::pass_up))
+        .route("/world/questions/{id}/park", post(routes::rooms::park))
         .route("/world/tasks/{id}/resume", post(routes::world::quest_resume))
         .route("/world/tasks/{id}/milestones", get(routes::world::list_milestones).post(routes::world::add_milestones))
         .route("/world/tasks/{id}/milestones/check", post(routes::world::check_milestones))
         .route("/world/milestones/{id}", patch(routes::world::update_milestone).delete(routes::world::delete_milestone))
         .route("/world/items", get(routes::world::list_items).post(routes::world::create_list))
         .route("/world/items/{id}", get(routes::world::get_item).patch(routes::world::update_item))
+        .route("/world/schedules/{id}", get(routes::world::get_schedule))
         .route("/world/regions", get(routes::loka::list_regions))
         .route("/world/regions/{id}", get(routes::loka::get_region))
         .route("/world/loka/presets", get(routes::loka::presets))
@@ -428,6 +440,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/{runner_id}/heartbeat", post(routes::runners::heartbeat))
         .route("/{runner_id}/claim", post(routes::runners::claim))
         .route("/{runner_id}/poll", post(routes::runners::poll))
+        .route("/{runner_id}/pr-checks", post(routes::runners::pr_check))
         .route("/{runner_id}/shell/claim", post(routes::runners::shell_claim))
         .route("/{runner_id}/shell/{run_id}/output", post(routes::runners::shell_output))
         .route("/{runner_id}/shell/{run_id}/finish", post(routes::runners::shell_finish))
@@ -566,6 +579,9 @@ async fn sweep_runner_leases(state: AppState) {
                 }
                 Ok(_) => {}
                 Err(error) => tracing::error!(%error, "settling cancelled reviews failed"),
+            }
+            if let Err(error) = loka_agent::runner_server::RunnerCoordinator::new(state.db.clone(), state.world.clone()).carry_on_withdrawn(None).await {
+                tracing::error!(%error, "carrying on work behind withdrawn follow-ups failed");
             }
             match state.world.settle_cancelled_work().await {
                 Ok(settled) if !settled.is_empty() => {

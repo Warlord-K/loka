@@ -21,6 +21,7 @@ pub mod tokens;
 pub mod todos;
 pub mod users;
 pub mod voice;
+pub mod rooms;
 pub mod webhooks;
 pub mod world;
 pub mod quick;

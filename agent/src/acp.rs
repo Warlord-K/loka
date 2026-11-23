@@ -422,6 +422,28 @@ fn estimated_usage(system: &str, prompt: &str, output: &str, context: u64) -> Us
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn a_warm_session_the_acp_server_cannot_load_is_a_lost_session() {
+        let id = "5d1e0c3a-aaaa-4bbb-8ccc-dddddddddddd";
+        for said in [format!("Session \\\"{id}\\\" not found"), format!("Session {id} not found")] {
+            let script = format!(
+                "read line\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}'\nread line\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{{\"code\":-32602,\"message\":\"{said}\"}}}}'\nsleep 1"
+            );
+            let mut command = Command::new("/bin/sh");
+            command.arg("-c").arg(script);
+            let setup = Setup { command, mode: None, model: None, mcp_servers: json!([]), keep: Vec::new() };
+            let dir = std::env::temp_dir();
+            let opts = crate::omp::tests::options(&dir, "go", "", Some(id), false);
+            let Err(error) = AcpProc::spawn(setup, &opts).await else {
+                panic!("a session the server cannot load never starts");
+            };
+            let text = loka_shared::cli_errors::chain(&error);
+            assert!(text.starts_with("ACP session/load failed: Session "), "{text}");
+            assert!(loka_shared::cli_errors::is_session_missing(&text), "{text}");
+            assert_eq!(loka_shared::cli_errors::lost_session_id(&text).as_deref(), Some(id), "{text}");
+        }
+    }
+
     #[test]
     fn estimates_usage_when_the_server_reports_none() {
         let usage = estimated_usage("abcd", "abcdefgh", "ok", 0);
