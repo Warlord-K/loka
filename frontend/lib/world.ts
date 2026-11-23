@@ -93,6 +93,7 @@ export interface AgentJob {
   status: "queued" | "running";
   title: string | null;
   activity: string | null;
+  waiting?: "disk" | null;
   started_at: string;
 }
 
@@ -269,6 +270,8 @@ export interface MessageMeta {
   partial?: boolean;
   spoken?: boolean;
   choices?: string[];
+  clarify_request?: boolean | { request?: string; message_id?: string | number | null; task_id?: string | null };
+  clarification?: { task_id?: string; session_id?: string; next?: "planning" | "approved" };
   drafts?: Draft[];
   attachments?: Attachment[];
   media?: { collapsed?: boolean };
@@ -302,6 +305,7 @@ export interface MessageMeta {
   memory?: { line: string };
   memory_answered?: "kept" | "skipped";
   failed?: boolean;
+  browser_help?: { task_id: string; session_id: string; site: string; url: string; title?: string };
 }
 
 export interface QuickBrief {
@@ -357,7 +361,7 @@ export function answeredAsks(
   owner?: string | null,
 ): Set<string> {
   const answered = new Set<string>();
-  const open: { id: string; choices: string[] }[] = [];
+  const open: { id: string; choices: string[]; linkedOnly: boolean }[] = [];
   const cards = new Set<string>();
   for (const m of messages) {
     if (m.author_kind === "user" && owner !== undefined && m.author_user_id !== owner) continue;
@@ -370,7 +374,11 @@ export function answeredAsks(
       continue;
     }
     if (m.meta?.kind === "ask" && m.author_kind !== "user") {
-      open.push({ id: m.id, choices: m.meta.choices ?? [] });
+      open.push({
+        id: m.id,
+        choices: m.meta.choices ?? [],
+        linkedOnly: !!m.meta.clarify_request || !!m.meta.clarification,
+      });
       continue;
     }
     if (m.author_kind !== "user" || !open.length) continue;
@@ -379,8 +387,9 @@ export function answeredAsks(
     const at = linked
       ? open.findIndex((a) => a.id === linked)
       : (() => {
-          for (let i = open.length - 1; i >= 0; i--) if (open[i].choices.some((c) => c.trim() === text)) return i;
-          return open.length - 1;
+          for (let i = open.length - 1; i >= 0; i--) if (!open[i].linkedOnly && open[i].choices.some((c) => c.trim() === text)) return i;
+          for (let i = open.length - 1; i >= 0; i--) if (!open[i].linkedOnly) return i;
+          return -1;
         })();
     if (at < 0) continue;
     answered.add(open[at].id);
@@ -398,6 +407,7 @@ export interface WorldEvent {
   session_id?: string | null;
   payload: Record<string, unknown>;
   created_at: string;
+  replayed?: boolean;
 }
 
 export interface SessionBrief {
@@ -419,7 +429,7 @@ export interface SessionBrief {
   updated_at: string;
   working_dir?: string | null;
   base_branch?: string | null;
-  plan_state?: "planning" | "awaiting" | "approved" | null;
+  plan_state?: "planning" | "clarifying" | "awaiting" | "approved" | null;
   attempt?: number | null;
   attempt_state?: "running" | "finished" | "failed" | "won" | "lost" | null;
 }
@@ -458,7 +468,23 @@ export interface SessionRun {
   retry_mode: "resume" | "restart" | null;
   steered_into?: string | null;
   interrupt?: boolean;
+  waiting_for?: "disk" | null;
+  request?: RunAsk | null;
 }
+
+export interface RunAsk {
+  from?: string;
+  text?: string;
+  brief?: string;
+  findings?: string;
+  focus?: string;
+  retry?: number;
+}
+
+export const LIVE_EVENTS: ReadonlySet<string> = new Set(["agent.typing", "presence.canvas"]);
+export const SIGNAL_EVENT = "world-signal";
+
+export const WAITING_FOR_DISK = "Waiting for disk space on its device";
 
 export interface RetryRunResult {
   run: SessionRun | null;
@@ -799,7 +825,16 @@ export interface QuestPart {
   pr_url: string | null;
 }
 
+export interface QuestResume {
+  can: boolean;
+  mode: "resume" | "fresh" | null;
+  reason: string | null;
+}
+
+export type QuestResumeResult = { result: "resumed"; session_id: string; run_id: string } | { result: "asked" };
+
 export interface QuestRoomTask {
+  resume?: QuestResume | null;
   parts?: QuestPart[];
   parent?: QuestPart | null;
   id: string;
@@ -817,6 +852,7 @@ export interface QuestRoomTask {
   updated_at: string | null;
   milestones: Milestone[];
   plan_first?: boolean;
+  plan_waiting?: boolean;
   attempts?: number;
   ci_feedback?: boolean;
   pace?: QuestPace;
@@ -872,8 +908,8 @@ export interface RunnerView {
 }
 
 export type ReadinessState = "ready" | "needs_setup" | "unavailable";
-export type SetupAction = "devices" | "keys" | "github";
-export type FeatureKey = "devices" | "clis" | "signing" | "terminal" | "workshop" | "browser" | "screen" | "apps" | "slack" | "github_feed" | "live_voice" | "keys" | "opencode";
+export type SetupAction = "devices" | "keys" | "github" | "storage";
+export type FeatureKey = "devices" | "clis" | "signing" | "terminal" | "workshop" | "browser" | "screen" | "apps" | "slack" | "github_feed" | "live_voice" | "keys" | "opencode" | "disk";
 
 export interface FeatureReadiness {
   key: FeatureKey;
@@ -1073,7 +1109,7 @@ export interface SearchResults {
     items?: { id: string; kind: string; label: string }[];
     practice?: { subject: string; coach_agent_id?: string | null } | null;
   }[];
-  quests: { id: string; title: string; status: string; assigned_agent_id: string | null; updated_at: string | null }[];
+  quests: { id: string; title: string; status: string; assigned_agent_id: string | null; updated_at: string | null; plan_waiting?: boolean }[];
   todos: { id: string; text: string; status: string; priority: number; added_at: string }[];
   lists: { id: string; kind?: "list" | "timer"; name: string; status: string; updated_at: string }[];
   channels: { id: string; name: string; topic: string | null }[];
@@ -1098,6 +1134,7 @@ export function matchesQuery(query: string, ...fields: (string | null | undefine
 export interface TerminalOpened {
   session_id: string;
   device: string;
+  agent?: string | null;
   socket: string;
   expires_at: number;
 }
@@ -1106,6 +1143,7 @@ export const worldApi = {
   search: (q: string, signal?: AbortSignal) =>
     fetch(`/api/world/search?q=${encodeURIComponent(q)}&limit=8`, { cache: "no-store", signal }).then((r) => json<SearchResults>(r)),
   agents: () => fetch("/api/world/agents", { cache: "no-store" }).then((r) => json<WorldAgent[]>(r)),
+  agent: (id: string) => fetch(`/api/world/agents/${id}`, { cache: "no-store" }).then((r) => json<WorldAgent>(r)),
   readiness: () => fetch("/api/world/readiness", { cache: "no-store" }).then((r) => json<Readiness>(r)),
   runners: (signal?: AbortSignal) => fetch("/api/world/runners", { cache: "no-store", signal }).then((r) => json<RunnerView[]>(r)),
   setDeviceAccess: async (id: string, change: { screen_access?: boolean; app_control?: boolean }) => {
@@ -1125,6 +1163,18 @@ export const worldApi = {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ runner_id: runnerId, cols, rows }),
+    });
+    if (!res.ok) {
+      const body = (await res.json().catch(() => null)) as { error?: string; message?: string } | null;
+      throw new WorldApiError(res.status, body?.message ?? res.statusText, body?.error);
+    }
+    return res.json() as Promise<TerminalOpened>;
+  },
+  openBrowserView: async (agentId: string, questId?: string | null) => {
+    const res = await fetch("/api/world/terminal/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(questId ? { agent_id: agentId, task_id: questId } : { agent_id: agentId }),
     });
     if (!res.ok) {
       const body = (await res.json().catch(() => null)) as { error?: string; message?: string } | null;
@@ -1393,6 +1443,10 @@ export const worldApi = {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ ...source, agent_id: agentId }),
     }).then((r) => json<Skill>(r)),
+  terminalsPerDevice: () =>
+    fetch("/api/config", { cache: "no-store" })
+      .then((r) => json<{ terminalsPerDevice?: number }>(r))
+      .then((c) => c.terminalsPerDevice ?? null),
   backends: () =>
     fetch("/api/config", { cache: "no-store" })
       .then((r) => json<{ backends?: Record<string, BackendModels> }>(r))
@@ -1420,13 +1474,19 @@ export const worldApi = {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ text, interrupt }),
-    }).then((r) => json<SessionRun>(r)),
+    }).then((r) => sendJson<SessionRun>(r)),
+  resumeQuest: (id: string, text?: string) =>
+    fetch(`/api/world/tasks/${id}/resume`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: text?.trim() || null }),
+    }).then((r) => sendJson<QuestResumeResult>(r)),
   review: (id: string, reviewer: { agentId?: string | null; cli?: string | null; model?: string | null }, focus: string | null) =>
     fetch(`/api/world/sessions/${id}/review`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ reviewer_agent_id: reviewer.agentId ?? null, reviewer_cli: reviewer.cli ?? null, reviewer_model: reviewer.model ?? null, focus }),
-    }).then((r) => json<SessionRun>(r)),
+    }).then((r) => sendJson<SessionRun>(r)),
   notifications: (cleared = false) =>
     fetch(`/api/world/notifications${cleared ? "?cleared=true" : ""}`, { cache: "no-store" }).then((r) => json<Notifications>(r)),
   clearNotes: (body: { ids?: number[]; all?: boolean }) =>
@@ -1743,6 +1803,7 @@ const CAUSE_LABELS: Record<string, string> = {
   never_started: "Never got going",
   cli_error: "The CLI hit an error",
   no_report: "Ended without a report",
+  no_verdict: "Ended without a verdict",
   timed_out: "Ran out of time",
   stopped: "Stopped",
 };

@@ -15,7 +15,7 @@ pub struct AppServer {
     stdin: ChildStdin,
     stdout: Lines<BufReader<ChildStdout>>,
     stderr: Arc<Mutex<String>>,
-    secrets: Vec<String>,
+    secrets: crate::cli::Redactor,
     next_id: u64,
     thread_id: Option<String>,
 }
@@ -250,8 +250,8 @@ impl AppServer {
         crate::cli::announce_spawn(opts.event_tx.as_ref(), &child);
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("codex stdin missing"))?;
         let stdout = BufReader::new(child.stdout.take().ok_or_else(|| anyhow!("codex stdout missing"))?).lines();
-        let stderr = stderr_tail(child.stderr.take());
-        let mut server = Self { child, stdin, stdout, stderr, secrets: opts.secret_values(), next_id: 0, thread_id: None };
+        let stderr = stderr_tail(child.stderr.take(), opts.redactor());
+        let mut server = Self { child, stdin, stdout, stderr, secrets: opts.redactor(), next_id: 0, thread_id: None };
         let initialize =
             server.request("initialize", json!({ "clientInfo": { "name": "loka", "version": env!("CARGO_PKG_VERSION") } }));
         tokio::time::timeout(Duration::from_secs(30), initialize).await.context("codex app-server did not initialize")??;
@@ -392,7 +392,7 @@ impl AppServer {
                                     commands.insert(id.to_string(), Instant::now());
                                 }
                             }
-                            emit_item(opts, &item, false);
+                            emit_item(opts.event_tx.as_ref(), &item, false);
                         }
                         "item/completed" => {
                             let item = params.get("item").cloned().unwrap_or(Value::Null);
@@ -416,7 +416,7 @@ impl AppServer {
                                 "commandExecution" | "mcpToolCall" | "fileChange" | "webSearch" => timing.tool_calls += 1,
                                 _ => {}
                             }
-                            emit_item(opts, &item, true);
+                            emit_item(opts.event_tx.as_ref(), &item, true);
                         }
                         "thread/tokenUsage/updated" => {
                             if let Some(total) = thread_usage(&params, &thread_id) {
@@ -434,6 +434,10 @@ impl AppServer {
                                 .or_else(|| Some(params.to_string()));
                         }
                         "turn/completed" => {
+                            let finished_turn = params.pointer("/turn/id").and_then(Value::as_str);
+                            if turn_id.as_deref().zip(finished_turn).is_some_and(|(ours, finished)| ours != finished) {
+                                continue;
+                            }
                             timing.result_ms = Some(elapsed(started));
                             tools.clear();
                             turn_id = None;
@@ -608,7 +612,7 @@ impl AppServer {
                                     final_answer = Some(text.to_string());
                                 }
                                 if let Some(tx) = &opts.event_tx {
-                                    let _ = tx.send(StreamEvent::AssistantText(text.trim().chars().take(300).collect()));
+                                    let _ = tx.send(StreamEvent::AssistantText(text.trim().to_string()));
                                 }
                             }
                         }
@@ -692,7 +696,7 @@ impl AppServer {
                     Ok(Ok(status)) => status.to_string(),
                     _ => "unknown status".to_string(),
                 };
-                let stderr = crate::remote_runner::redact(&self.stderr_tail(), &self.secrets);
+                let stderr = self.secrets.redact(&self.stderr_tail());
                 warn!(%status, %stderr, "Codex app-server exited");
                 bail!("codex app-server exited with {status}");
             };
@@ -723,7 +727,7 @@ impl AppServer {
                 continue;
             }
             if let Some(error) = message.get("error") {
-                bail!("codex {method} failed: {}", crate::remote_runner::redact(&error.to_string(), &self.secrets));
+                bail!("codex {method} failed: {}", self.secrets.redact(&error.to_string()));
             }
             return Ok(message.get("result").cloned().unwrap_or(Value::Null));
         }
@@ -761,8 +765,8 @@ fn stop_commands(server_pid: Option<u32>, commands: &mut std::collections::HashM
     }
 }
 
-fn emit_item(opts: &CliOptions<'_>, item: &Value, completed: bool) {
-    let Some(tx) = &opts.event_tx else {
+fn emit_item(events: Option<&crate::cli::EventSender>, item: &Value, completed: bool) {
+    let Some(tx) = events else {
         return;
     };
     let text = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or("");
@@ -771,7 +775,7 @@ fn emit_item(opts: &CliOptions<'_>, item: &Value, completed: bool) {
         ("commandExecution", false) => {
             let _ = tx.send(StreamEvent::ToolUse {
                 tool: "Bash".to_string(),
-                input_summary: text("command").chars().take(120).collect(),
+                input_summary: text("command").to_string(),
             });
         }
         ("commandExecution", true) => {
@@ -779,7 +783,7 @@ fn emit_item(opts: &CliOptions<'_>, item: &Value, completed: bool) {
             if !output.is_empty() {
                 let _ = tx.send(StreamEvent::ToolResult {
                     tool: "Bash".to_string(),
-                    output: crate::cli::truncate_for_log(output, crate::cli::TOOL_OUTPUT_MAX_CHARS),
+                    output: output.to_string(),
                 });
             }
         }
@@ -791,7 +795,7 @@ fn emit_item(opts: &CliOptions<'_>, item: &Value, completed: bool) {
             if !output.trim().is_empty() {
                 let _ = tx.send(StreamEvent::ToolResult {
                     tool: mcp_tool(),
-                    output: crate::cli::truncate_for_log(output.trim(), crate::cli::TOOL_OUTPUT_MAX_CHARS),
+                    output: output.trim().to_string(),
                 });
             }
         }
@@ -815,7 +819,7 @@ fn emit_item(opts: &CliOptions<'_>, item: &Value, completed: bool) {
         ("agentMessage", true) => {
             let message = text("text").trim();
             if !message.is_empty() {
-                let _ = tx.send(StreamEvent::AssistantText(message.chars().take(300).collect()));
+                let _ = tx.send(StreamEvent::AssistantText(message.to_string()));
             }
         }
         _ => {}
@@ -971,8 +975,8 @@ mod tests {
         let mut child = command.spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
-        let stderr = crate::cli::stderr_tail(child.stderr.take());
-        super::AppServer { child, stdin, stdout, stderr, secrets: Vec::new(), next_id: 0, thread_id: None }
+        let stderr = crate::cli::stderr_tail(child.stderr.take(), crate::cli::Redactor::default());
+        super::AppServer { child, stdin, stdout, stderr, secrets: crate::cli::Redactor::default(), next_id: 0, thread_id: None }
     }
 
     fn message_done(thread: &str, text: &str) -> serde_json::Value {
@@ -1008,6 +1012,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_turn_that_is_not_the_one_we_started_never_ends_the_run() {
+        let notifications = [
+            json!({ "method": "turn/started", "params": { "threadId": "parent", "turn": { "id": "t" } } }),
+            json!({ "method": "turn/completed", "params": { "threadId": "parent", "turn": { "id": "child-turn", "status": "completed" } } }),
+            message_done("parent", PARENT_REPORT),
+            turn_done("parent", "completed"),
+        ];
+        let mut server = fake_server(true, &notifications);
+        let dir = std::env::temp_dir();
+        let opts = options(&dir, "model", "do the quest", None);
+        let (_sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (result, _) = server.work(&opts, std::time::Instant::now(), receiver).await.unwrap();
+        assert_eq!(result.output, PARENT_REPORT);
+    }
+
+    #[tokio::test]
     async fn a_child_agent_turn_never_ends_a_warm_ask() {
         let notifications = [
             message_done("explorer", "Exploration delivered to the parent"),
@@ -1036,5 +1056,24 @@ mod tests {
         let unlabelled = json!({ "tokenUsage": { "total": { "inputTokens": 40, "cachedInputTokens": 10, "outputTokens": 2 } } });
         assert_eq!(thread_usage(&unlabelled, "task").unwrap().input_tokens, 30);
         assert!(thread_usage(&json!({ "threadId": "task" }), "task").is_none());
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use crate::cli::straddle::{around, assert_whole_then_hidden, drain, pads};
+    use serde_json::json;
+
+    #[test]
+    fn the_app_server_parser_sends_whole_text_so_a_secret_across_any_cut_is_hidden() {
+        for pad in pads() {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            super::emit_item(Some(&tx), &json!({"type": "commandExecution", "command": around(pad)}), false);
+            super::emit_item(Some(&tx), &json!({"type": "commandExecution", "aggregatedOutput": around(pad)}), true);
+            super::emit_item(Some(&tx), &json!({"type": "agentMessage", "text": around(pad)}), true);
+            super::emit_item(Some(&tx), &json!({"type": "mcpToolCall", "server": "s", "tool": "t", "result": around(pad)}), true);
+            drop(tx);
+            assert_whole_then_hidden(drain(rx), 4, "codex app-server", pad);
+        }
     }
 }

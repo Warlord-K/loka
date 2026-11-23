@@ -6,12 +6,65 @@ use tracing::{info, warn};
 use crate::cli::{job_command, workspace_command};
 use loka_shared::git_names::{github_repo, validate_git_ref};
 
-pub async fn configure_git_auth(github_token: &str) -> Result<()> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let git_dir = Path::new(&home);
+pub struct GitHost {
+    home: Option<PathBuf>,
+    path: Option<std::ffi::OsString>,
+}
+
+impl GitHost {
+    pub const INHERITED: GitHost = GitHost { home: None, path: None };
+
+    #[cfg(test)]
+    pub(crate) fn isolated(home: &Path, path: Option<std::ffi::OsString>) -> Self {
+        Self { home: Some(home.to_path_buf()), path }
+    }
+
+    fn home(&self) -> PathBuf {
+        self.home.clone().unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".to_string())))
+    }
+
+    fn home_var(&self) -> Option<PathBuf> {
+        self.home.clone().or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+    }
+
+    fn path_var(&self) -> Option<std::ffi::OsString> {
+        self.path.clone().or_else(|| std::env::var_os("PATH"))
+    }
+
+    fn credentials(&self) -> PathBuf {
+        match &self.home {
+            Some(home) => home.join(".git-credentials"),
+            None => PathBuf::from("/tmp/.git-credentials"),
+        }
+    }
+
+    fn author(&self, name: &str) -> Option<String> {
+        self.home.is_none().then(|| std::env::var(name).ok()).flatten().filter(|value| !value.is_empty())
+    }
+
+    fn apply<'a>(&self, command: &'a mut Command) -> &'a mut Command {
+        if let Some(home) = &self.home {
+            command
+                .env("HOME", home)
+                .env("XDG_CONFIG_HOME", home.join(".config"))
+                .env("GIT_CONFIG_GLOBAL", home.join(".gitconfig"))
+                .env("GIT_CONFIG_NOSYSTEM", "1");
+            for name in ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"] {
+                command.env_remove(name);
+            }
+        }
+        if let Some(path) = &self.path {
+            command.env("PATH", path);
+        }
+        command
+    }
+}
+
+pub async fn configure_git_auth(github_token: &str, host: &GitHost) -> Result<()> {
+    let home = host.home();
 
     if !github_token.is_empty() {
-        let cred_path = PathBuf::from("/tmp/.git-credentials");
+        let cred_path = host.credentials();
         tokio::fs::write(
             &cred_path,
             format!("https://x-access-token:{github_token}@github.com\n"),
@@ -24,14 +77,16 @@ pub async fn configure_git_auth(github_token: &str) -> Result<()> {
             tokio::fs::set_permissions(&cred_path, std::fs::Permissions::from_mode(0o600)).await?;
         }
 
-        let _ = job_command("git")
+        let mut git = job_command("git");
+        let _ = host
+            .apply(&mut git)
             .args([
                 "config",
                 "--global",
                 "credential.helper",
                 &format!("store --file={}", cred_path.display()),
             ])
-            .current_dir(git_dir)
+            .current_dir(&home)
             .output()
             .await;
     }
@@ -39,7 +94,7 @@ pub async fn configure_git_auth(github_token: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn configure_git_signing(signing: Option<&crate::config::SigningConfig>) -> Result<()> {
+pub async fn configure_git_signing(signing: Option<&crate::config::SigningConfig>, host: &GitHost) -> Result<()> {
     let signing = match signing {
         Some(signing) => signing,
         None => return Ok(()),
@@ -54,8 +109,7 @@ pub async fn configure_git_signing(signing: Option<&crate::config::SigningConfig
         );
     }
 
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let local_key = PathBuf::from(home).join(".ssh/signing_key_active");
+    let local_key = host.home().join(".ssh/signing_key_active");
     tokio::fs::create_dir_all(local_key.parent().expect("signing key has a parent")).await?;
     if key_path != &local_key {
         tokio::fs::copy(key_path, &local_key)
@@ -77,7 +131,9 @@ pub async fn configure_git_signing(signing: Option<&crate::config::SigningConfig
         ("commit.gpgsign", "true"),
         ("tag.gpgsign", "true"),
     ] {
-        let output = job_command("git")
+        let mut git = job_command("git");
+        let output = host
+            .apply(&mut git)
             .args(["config", "--global", key, value])
             .output()
             .await
@@ -91,7 +147,9 @@ pub async fn configure_git_signing(signing: Option<&crate::config::SigningConfig
 
     if let Some(signers_path) = &signing.allowed_signers_path {
         if signers_path.exists() {
-            let _ = job_command("git")
+            let mut git = job_command("git");
+            let _ = host
+                .apply(&mut git)
                 .args([
                     "config",
                     "--global",
@@ -110,45 +168,45 @@ pub async fn configure_git_signing(signing: Option<&crate::config::SigningConfig
 const FALLBACK_AUTHOR_NAME: &str = "Loka Agent";
 const FALLBACK_AUTHOR_EMAIL: &str = "agent@loka.ygpt.dev";
 
-pub async fn ensure_repo_identity(repo_path: &Path, github_token: &str) -> Result<()> {
-    let have_name = !git_config_get(repo_path, "user.name").await.is_empty();
-    let have_email = !git_config_get(repo_path, "user.email").await.is_empty();
+pub async fn ensure_repo_identity(repo_path: &Path, github_token: &str, host: &GitHost) -> Result<()> {
+    let have_name = !git_config_get(repo_path, "user.name", host).await.is_empty();
+    let have_email = !git_config_get(repo_path, "user.email", host).await.is_empty();
     if have_name && have_email {
         return Ok(());
     }
 
-    let gh = github_identity(github_token).await;
+    let gh = github_identity(github_token, host).await;
 
     if !have_name {
-        let name = std::env::var("GIT_AUTHOR_NAME").ok().filter(|v| !v.is_empty());
+        let name = host.author("GIT_AUTHOR_NAME");
         let name = name
             .or_else(|| gh.as_ref().map(|(name, _)| name.clone()))
             .unwrap_or_else(|| FALLBACK_AUTHOR_NAME.to_string());
-        run_git(repo_path, &["config", "user.name", &name]).await?;
+        run_git_as(host, repo_path, &["config", "user.name", &name]).await?;
         info!(repo = %repo_path.display(), "Set repo-local git user.name");
     }
     if !have_email {
-        let email = std::env::var("GIT_AUTHOR_EMAIL").ok().filter(|v| !v.is_empty());
+        let email = host.author("GIT_AUTHOR_EMAIL");
         let email = email
             .or_else(|| gh.as_ref().map(|(_, email)| email.clone()))
             .unwrap_or_else(|| FALLBACK_AUTHOR_EMAIL.to_string());
-        run_git(repo_path, &["config", "user.email", &email]).await?;
+        run_git_as(host, repo_path, &["config", "user.email", &email]).await?;
         info!(repo = %repo_path.display(), "Set repo-local git user.email");
     }
     Ok(())
 }
 
-async fn git_config_get(repo_path: &Path, key: &str) -> String {
-    run_git_output(repo_path, &["config", key])
+async fn git_config_get(repo_path: &Path, key: &str, host: &GitHost) -> String {
+    run_git_output_as(host, repo_path, &["config", key])
         .await
         .unwrap_or_default()
         .trim()
         .to_string()
 }
 
-async fn github_identity(github_token: &str) -> Option<(String, String)> {
+async fn github_identity(github_token: &str, host: &GitHost) -> Option<(String, String)> {
     let mut cmd = Command::new("gh");
-    cmd.args(["api", "user"]);
+    host.apply(&mut cmd).args(["api", "user"]);
     if !github_token.is_empty() {
         cmd.env("GH_TOKEN", github_token);
     }
@@ -296,7 +354,7 @@ pub async fn ensure_cloned_at(
 
     ensure_agents_md_symlink(&clone_path).await;
 
-    if let Err(e) = ensure_repo_identity(&clone_path, github_token).await {
+    if let Err(e) = ensure_repo_identity(&clone_path, github_token, &GitHost::INHERITED).await {
         warn!(repo = repo_name, error = %e, "Failed to set repo git identity");
     }
     if let Err(e) = ensure_commit_hygiene(&clone_path).await {
@@ -522,23 +580,23 @@ pub async fn pin_signing(worktree_path: &Path) {
     if crate::cli::job_user().is_some() {
         return;
     }
-    if let Err(error) = pin_signing_with_home(worktree_path, std::env::var_os("HOME").map(PathBuf::from).as_deref()).await {
+    if let Err(error) = pin_signing_in(worktree_path, &GitHost::INHERITED).await {
         warn!(worktree = %worktree_path.display(), %error, "could not write the signing settings into the quest worktree");
     }
 }
 
-async fn pin_signing_with_home(worktree_path: &Path, home: Option<&Path>) -> Result<()> {
-    let scoped = run_git_checked_output(worktree_path, &["config", "--list", "-z", "--show-scope"]).await?;
+async fn pin_signing_in(worktree_path: &Path, host: &GitHost) -> Result<()> {
+    let scoped = run_git_checked_output_as(host, worktree_path, &["config", "--list", "-z", "--show-scope"]).await?;
     let (inherited, repo_level) = split_by_scope(&scoped);
-    let pins = signing_pins(&inherited, home, std::env::var_os("PATH").as_deref());
+    let pins = signing_pins(&inherited, host.home_var().as_deref(), host.path_var().as_deref());
     if pins.is_empty() {
         return Ok(());
     }
     if config_values(&repo_level).get("extensions.worktreeconfig").map(|value| value.as_str()) != Some("true") {
-        run_git(worktree_path, &["config", "--local", "extensions.worktreeConfig", "true"]).await?;
+        run_git_as(host, worktree_path, &["config", "--local", "extensions.worktreeConfig", "true"]).await?;
     }
     for (name, value) in &pins {
-        run_git(worktree_path, &["config", "--worktree", name, value]).await?;
+        run_git_as(host, worktree_path, &["config", "--worktree", name, value]).await?;
     }
     Ok(())
 }
@@ -802,6 +860,8 @@ async fn run_signing_git(
         .env("SSH_ASKPASS_REQUIRE", "never")
         .env_remove("GPG_TTY")
         .env_remove("SSH_ASKPASS");
+    #[cfg(unix)]
+    command.process_group(0);
     if let Some(gnupg_home) = gnupg_home {
         command.env("GNUPGHOME", gnupg_home);
     }
@@ -810,7 +870,7 @@ async fn run_signing_git(
     let output = match tokio::time::timeout(limit, child.wait_with_output()).await {
         Ok(output) => output.with_context(|| format!("Failed to run git {}", args.join(" ")))?,
         Err(_) => {
-            crate::cli::kill_process_trees(pid.into_iter().collect()).await;
+            stop_process_group(pid);
             bail!(
                 "git {} did not finish within {} s, so signing was given up (the key probably waits for a passphrase)",
                 args.join(" "),
@@ -822,6 +882,15 @@ async fn run_signing_git(
         bail!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&output.stderr));
     }
     Ok(())
+}
+
+fn stop_process_group(leader: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(group) = leader.and_then(|pid| libc::pid_t::try_from(pid).ok()).filter(|pid| *pid > 0) {
+        unsafe {
+            libc::killpg(group, libc::SIGKILL);
+        }
+    }
 }
 
 async fn gpgsign_enabled(worktree_path: &Path) -> Result<bool> {
@@ -1330,8 +1399,18 @@ pub async fn ensure_agents_md_symlink(repo_path: &Path) {
     }
 }
 
+async fn host_git(host: &GitHost, dir: &Path) -> Command {
+    let mut command = workspace_command("git", dir).await;
+    host.apply(&mut command);
+    command
+}
+
 pub(super) async fn run_git(dir: &Path, args: &[&str]) -> Result<()> {
-    let output = workspace_command("git", dir)
+    run_git_as(&GitHost::INHERITED, dir, args).await
+}
+
+async fn run_git_as(host: &GitHost, dir: &Path, args: &[&str]) -> Result<()> {
+    let output = host_git(host, dir)
         .await
         .args(args)
         .output()
@@ -1350,7 +1429,11 @@ async fn run_git_in(dir: &Path, args: &[&str]) -> Result<()> {
 }
 
 async fn run_git_output(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = workspace_command("git", dir)
+    run_git_output_as(&GitHost::INHERITED, dir, args).await
+}
+
+async fn run_git_output_as(host: &GitHost, dir: &Path, args: &[&str]) -> Result<String> {
+    let output = host_git(host, dir)
         .await
         .args(args)
         .output()
@@ -1359,7 +1442,11 @@ async fn run_git_output(dir: &Path, args: &[&str]) -> Result<String> {
 }
 
 pub(super) async fn run_git_checked_output(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = workspace_command("git", dir)
+    run_git_checked_output_as(&GitHost::INHERITED, dir, args).await
+}
+
+async fn run_git_checked_output_as(host: &GitHost, dir: &Path, args: &[&str]) -> Result<String> {
+    let output = host_git(host, dir)
         .await
         .args(args)
         .output()
@@ -2001,8 +2088,6 @@ mod tests {
 
     #[tokio::test]
     async fn quest_worktrees_sign_without_the_global_git_config() -> Result<()> {
-        let _guard = env_lock().await;
-        let _restore = EnvRestore::stash(&["HOME", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"]);
         let base = temp_path("loka-pin");
         let home = base.join("home");
         tokio::fs::create_dir_all(home.join(".ssh")).await?;
@@ -2011,32 +2096,29 @@ mod tests {
         let public = format!("{}.pub", key.display());
         let signers = base.join("allowed_signers");
         tokio::fs::write(&signers, "").await?;
-        let global = base.join("gitconfig");
         tokio::fs::write(
-            &global,
+            home.join(".gitconfig"),
             format!(
                 "[user]\n\tname = T\n\temail = t@example.com\n[gpg]\n\tformat = ssh\n[gpg \"ssh\"]\n\tallowedSignersFile = {}\n[user]\n\tsigningkey = {public}\n[commit]\n\tgpgsign = true\n",
                 signers.display()
             ),
         )
         .await?;
-        std::env::set_var("HOME", &home);
-        std::env::set_var("GIT_CONFIG_GLOBAL", &global);
-        std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+        let host = GitHost::isolated(&home, None);
 
         let main = base.join("main");
         tokio::fs::create_dir_all(&main).await?;
-        run_git(&main, &["init", "--initial-branch=main"]).await?;
+        run_git_as(&host, &main, &["init", "--initial-branch=main"]).await?;
         tokio::fs::write(main.join("base"), "base").await?;
-        run_git(&main, &["add", "base"]).await?;
-        run_git(&main, &["commit", "-q", "-m", "base"]).await?;
+        run_git_as(&host, &main, &["add", "base"]).await?;
+        run_git_as(&host, &main, &["commit", "-q", "-m", "base"]).await?;
         let quest = base.join("quest");
-        run_git(&main, &["worktree", "add", "-b", "quest", &quest.to_string_lossy()]).await?;
+        run_git_as(&host, &main, &["worktree", "add", "-b", "quest", &quest.to_string_lossy()]).await?;
         let sibling = base.join("sibling");
-        run_git(&main, &["worktree", "add", "-b", "sibling", &sibling.to_string_lossy()]).await?;
+        run_git_as(&host, &main, &["worktree", "add", "-b", "sibling", &sibling.to_string_lossy()]).await?;
 
-        pin_signing_with_home(&quest, Some(&home)).await?;
-        pin_signing_with_home(&quest, Some(&home)).await?;
+        pin_signing_in(&quest, &host).await?;
+        pin_signing_in(&quest, &host).await?;
 
         let without_global = |dir: &Path, args: &[&str]| {
             std::process::Command::new("git")
@@ -2178,8 +2260,13 @@ mod tests {
     async fn a_signing_program_that_waits_for_a_passphrase_is_given_up() -> Result<()> {
         let repo = test_repo().await?;
         let pid_file = repo.0.join(".git/signer.pid");
+        let helper_file = repo.0.join(".git/helper.pid");
         let signer = repo.0.join(".git/waiting-signer");
-        tokio::fs::write(&signer, format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n", pid_file.display())).await?;
+        tokio::fs::write(
+            &signer,
+            format!("#!/bin/sh\nsleep 30 &\necho $! > '{}'\necho $$ > '{}'\nwait\n", helper_file.display(), pid_file.display()),
+        )
+        .await?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -2199,9 +2286,19 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("did not finish within 2 s"), "{error:#}");
         assert!(started.elapsed() < std::time::Duration::from_secs(15));
-        let pid = tokio::fs::read_to_string(&pid_file).await?;
-        let alive = tokio::process::Command::new("kill").args(["-0", pid.trim()]).output().await?;
-        assert!(!alive.status.success(), "the waiting signer {} is still running", pid.trim());
+        for file in [&pid_file, &helper_file] {
+            let pid = tokio::fs::read_to_string(file).await?;
+            let pid: libc::pid_t = pid.trim().parse()?;
+            let mut alive = true;
+            for _ in 0..50 {
+                alive = unsafe { libc::kill(pid, 0) } == 0;
+                if !alive {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            assert!(!alive, "{} still runs after signing was given up", file.display());
+        }
         Ok(())
     }
 
@@ -2414,58 +2511,35 @@ mod tests {
             allowed_signers_path: None,
         };
 
-        let error = configure_git_signing(Some(&signing)).await.unwrap_err();
+        let home = temp_path("loka-home");
+        let error = configure_git_signing(Some(&signing), &GitHost::isolated(&home, None)).await.unwrap_err();
         assert!(error.to_string().contains("does not exist"));
-    }
-
-    async fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
-        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        LOCK.lock().await
-    }
-
-    struct EnvRestore(Vec<(&'static str, Option<String>)>);
-
-    impl EnvRestore {
-        fn stash(keys: &[&'static str]) -> Self {
-            Self(
-                keys.iter()
-                    .map(|key| (*key, std::env::var(key).ok()))
-                    .collect(),
-            )
-        }
-    }
-
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            for (key, value) in &self.0 {
-                match value {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
     }
 
     fn temp_path(prefix: &str) -> PathBuf {
         std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()))
     }
 
-    fn clear_git_env() {
-        std::env::remove_var("GIT_AUTHOR_NAME");
-        std::env::remove_var("GIT_AUTHOR_EMAIL");
-    }
-
-    async fn global_git_config(home: &Path, key: &str) -> Option<String> {
-        let output = Command::new("git")
-            .args(["config", "--global", key])
-            .env("HOME", home)
-            .output()
-            .await
-            .ok()?;
+    async fn global_git_config(host: &GitHost, key: &str) -> Option<String> {
+        let mut git = Command::new("git");
+        let output = host.apply(&mut git).args(["config", "--global", key]).output().await.ok()?;
         output
             .status
             .success()
             .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    async fn fake_gh(script: &str) -> Result<(PathBuf, std::ffi::OsString)> {
+        let bin = temp_path("loka-bin");
+        tokio::fs::create_dir_all(&bin).await?;
+        tokio::fs::write(bin.join("gh"), script).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).await?;
+        }
+        let path = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())))?;
+        Ok((bin, path))
     }
 
     async fn empty_repo(prefix: &str) -> Result<TestRepo> {
@@ -2477,9 +2551,6 @@ mod tests {
 
     #[tokio::test]
     async fn startup_never_rewrites_a_global_git_identity() -> Result<()> {
-        let _guard = env_lock().await;
-        let _restore = EnvRestore::stash(&["HOME", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL"]);
-        clear_git_env();
         let home = temp_path("loka-home");
         tokio::fs::create_dir_all(&home).await?;
         tokio::fs::write(
@@ -2487,87 +2558,113 @@ mod tests {
             "[user]\n\tname = Existing User\n\temail = me@example.com\n",
         )
         .await?;
+        let host = GitHost::isolated(&home, None);
 
-        configure_git_auth("test-token").await?;
+        configure_git_auth("test-token", &host).await?;
 
+        assert_eq!(global_git_config(&host, "user.name").await.as_deref(), Some("Existing User"));
+        assert_eq!(global_git_config(&host, "user.email").await.as_deref(), Some("me@example.com"));
+        let credentials = home.join(".git-credentials");
+        assert_eq!(tokio::fs::read_to_string(&credentials).await?, "https://x-access-token:test-token@github.com\n");
         assert_eq!(
-            global_git_config(&home, "user.name").await.as_deref(),
-            Some("Existing User")
-        );
-        assert_eq!(
-            global_git_config(&home, "user.email").await.as_deref(),
-            Some("me@example.com")
+            global_git_config(&host, "credential.helper").await,
+            Some(format!("store --file={}", credentials.display()))
         );
         let _ = std::fs::remove_dir_all(&home);
         Ok(())
     }
 
+    fn snapshot(dir: &Path) -> Vec<(PathBuf, u64, Option<std::time::SystemTime>)> {
+        let mut found = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(next) = pending.pop() {
+            for entry in std::fs::read_dir(&next).into_iter().flatten().flatten() {
+                let meta = entry.metadata().unwrap();
+                if meta.is_dir() {
+                    pending.push(entry.path());
+                }
+                found.push((entry.path(), meta.len(), meta.modified().ok()));
+            }
+        }
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn workspace_tests_leave_the_home_they_run_under_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = temp_path("loka-sentinel");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(".gitconfig"), "[user]\n\tname = Sentinel\n\temail = sentinel@example.com\n").unwrap();
+        let before = snapshot(&home);
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["git::workspace::tests::", "--skip", "git::workspace::tests::workspace_tests_leave_the_home_they_run_under_untouched"])
+            .env("HOME", &home)
+            .env_remove("GIT_CONFIG_GLOBAL")
+            .env_remove("XDG_CONFIG_HOME")
+            .output()
+            .unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let after = snapshot(&home);
+        std::fs::remove_dir_all(&base).ok();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+        assert!(stdout.contains("test result: ok.") && !stdout.contains(" 0 passed"), "{stdout}");
+        assert_eq!(before, after, "a workspace test wrote into the home it ran under");
+    }
+
+    #[test]
+    fn the_running_process_keeps_its_own_git_home_and_credentials() {
+        let host = GitHost::INHERITED;
+        assert_eq!(host.credentials(), Path::new("/tmp/.git-credentials"));
+        assert_eq!(host.home(), PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".to_string())));
+        let mut command = Command::new("git");
+        host.apply(&mut command);
+        assert_eq!(command.as_std().get_envs().count(), 0, "production commands keep the environment they inherit");
+    }
+
     #[tokio::test]
     async fn repo_identity_is_left_untouched_when_present() -> Result<()> {
-        let _guard = env_lock().await;
-        let _restore = EnvRestore::stash(&["HOME", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL"]);
-        clear_git_env();
         let home = temp_path("loka-home");
         tokio::fs::create_dir_all(&home).await?;
-        std::env::set_var("HOME", &home);
+        let host = GitHost::isolated(&home, None);
 
         let repo = empty_repo("loka-ident").await?;
         run_git(&repo.0, &["config", "user.name", "Repo Owner"]).await?;
         run_git(&repo.0, &["config", "user.email", "owner@repo.example"]).await?;
 
-        ensure_repo_identity(&repo.0, "test-token").await?;
+        ensure_repo_identity(&repo.0, "test-token", &host).await?;
 
-        assert_eq!(
-            git_config_get(&repo.0, "user.name").await,
-            "Repo Owner"
-        );
-        assert_eq!(
-            git_config_get(&repo.0, "user.email").await,
-            "owner@repo.example"
-        );
+        assert_eq!(git_config_get(&repo.0, "user.name", &host).await, "Repo Owner");
+        assert_eq!(git_config_get(&repo.0, "user.email", &host).await, "owner@repo.example");
         let _ = std::fs::remove_dir_all(&home);
         Ok(())
     }
 
     #[tokio::test]
     async fn owner_identity_comes_from_gh_repo_level_only() -> Result<()> {
-        let _guard = env_lock().await;
-        let _restore =
-            EnvRestore::stash(&["HOME", "PATH", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL"]);
-        clear_git_env();
         let home = temp_path("loka-home");
         tokio::fs::create_dir_all(&home).await?;
-        std::env::set_var("HOME", &home);
-
-        let bin = temp_path("loka-bin");
-        tokio::fs::create_dir_all(&bin).await?;
-        tokio::fs::write(
-            bin.join("gh"),
+        let (bin, path) = fake_gh(
             "#!/bin/sh\nif [ \"$1\" = \"api\" ] && [ \"$2\" = \"user\" ]; then\n  printf '%s' '{\"login\":\"mona\",\"name\":\"Mona Lisa\",\"email\":null}'\n  exit 0\nfi\nexit 1\n",
         )
         .await?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755))
-                .await?;
-        }
-        let old_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{old_path}", bin.display()));
+        let host = GitHost::isolated(&home, Some(path));
 
         let repo = empty_repo("loka-ident").await?;
-        ensure_repo_identity(&repo.0, "test-token").await?;
+        ensure_repo_identity(&repo.0, "test-token", &host).await?;
 
-        assert_eq!(git_config_get(&repo.0, "user.name").await, "Mona Lisa");
-        assert_eq!(
-            git_config_get(&repo.0, "user.email").await,
-            "mona@users.noreply.github.com"
-        );
-        assert_eq!(global_git_config(&home, "user.name").await, None);
-        assert_eq!(global_git_config(&home, "user.email").await, None);
+        assert_eq!(git_config_get(&repo.0, "user.name", &host).await, "Mona Lisa");
+        assert_eq!(git_config_get(&repo.0, "user.email", &host).await, "mona@users.noreply.github.com");
+        assert_eq!(global_git_config(&host, "user.name").await, None);
+        assert_eq!(global_git_config(&host, "user.email").await, None);
 
-        commit(&repo.0, "authored").await?;
-        let author = run_git_checked_output(&repo.0, &["log", "-1", "--format=%an <%ae>"]).await?;
+        tokio::fs::write(repo.0.join("authored"), "authored").await?;
+        run_git_as(&host, &repo.0, &["add", "authored"]).await?;
+        run_git_as(&host, &repo.0, &["commit", "-m", "authored"]).await?;
+        let author = run_git_checked_output_as(&host, &repo.0, &["log", "-1", "--format=%an <%ae>"]).await?;
         assert_eq!(author.trim(), "Mona Lisa <mona@users.noreply.github.com>");
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&bin);
@@ -2576,39 +2673,18 @@ mod tests {
 
     #[tokio::test]
     async fn missing_owner_identity_falls_back_without_global_writes() -> Result<()> {
-        let _guard = env_lock().await;
-        let _restore =
-            EnvRestore::stash(&["HOME", "PATH", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL"]);
-        clear_git_env();
         let home = temp_path("loka-home");
         tokio::fs::create_dir_all(&home).await?;
-        std::env::set_var("HOME", &home);
-
-        let bin = temp_path("loka-bin");
-        tokio::fs::create_dir_all(&bin).await?;
-        tokio::fs::write(bin.join("gh"), "#!/bin/sh\nexit 1\n").await?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755))
-                .await?;
-        }
-        let old_path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{old_path}", bin.display()));
+        let (bin, path) = fake_gh("#!/bin/sh\nexit 1\n").await?;
+        let host = GitHost::isolated(&home, Some(path));
 
         let repo = empty_repo("loka-ident").await?;
-        ensure_repo_identity(&repo.0, "test-token").await?;
+        ensure_repo_identity(&repo.0, "test-token", &host).await?;
 
-        assert_eq!(
-            git_config_get(&repo.0, "user.name").await,
-            FALLBACK_AUTHOR_NAME
-        );
-        assert_eq!(
-            git_config_get(&repo.0, "user.email").await,
-            FALLBACK_AUTHOR_EMAIL
-        );
-        assert_eq!(global_git_config(&home, "user.name").await, None);
-        assert_eq!(global_git_config(&home, "user.email").await, None);
+        assert_eq!(git_config_get(&repo.0, "user.name", &host).await, FALLBACK_AUTHOR_NAME);
+        assert_eq!(git_config_get(&repo.0, "user.email", &host).await, FALLBACK_AUTHOR_EMAIL);
+        assert_eq!(global_git_config(&host, "user.name").await, None);
+        assert_eq!(global_git_config(&host, "user.email").await, None);
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&bin);
         Ok(())

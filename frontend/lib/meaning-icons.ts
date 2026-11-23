@@ -1,4 +1,4 @@
-import { ArrowBendUpLeft, ArrowCounterClockwise, Crown, DotsThreeCircle, FlagCheckered, HourglassMedium, Lightbulb, Megaphone, Robot } from "@phosphor-icons/react";
+import { ArrowBendUpLeft, ArrowCounterClockwise, Crown, DotsThreeCircle, FlagCheckered, HourglassMedium, Lightbulb, Megaphone, Monitor, Robot } from "@phosphor-icons/react";
 
 export const MeaningIcon = {
   agent: Robot,
@@ -11,4 +11,5 @@ export const MeaningIcon = {
   pro: Crown,
   result: FlagCheckered,
   tryAgain: ArrowCounterClockwise,
+  watchBrowser: Monitor,
 } as const;

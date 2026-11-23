@@ -41,6 +41,13 @@ impl Database {
         })
     }
 
+    pub fn from_pool(pool: PgPool) -> Self {
+        Self {
+            pool,
+            shared_workspace: false,
+        }
+    }
+
     pub fn with_shared_workspace(mut self, shared: bool) -> Self {
         self.shared_workspace = shared;
         self

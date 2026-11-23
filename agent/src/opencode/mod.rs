@@ -432,7 +432,7 @@ impl Turn {
                     return;
                 }
                 if let Some(tx) = events {
-                    let _ = tx.send(StreamEvent::AssistantText(body.trim().chars().take(300).collect()));
+                    let _ = tx.send(StreamEvent::AssistantText(body.trim().to_string()));
                 }
                 self.texts.push((text(part, "/messageID"), body));
             }
@@ -445,7 +445,7 @@ impl Turn {
                 let input = part.pointer("/state/input").cloned().unwrap_or(serde_json::Value::Null);
                 let _ = tx.send(StreamEvent::ToolUse { tool: tool.clone(), input_summary: crate::cli::summarize_tool_input(&tool, &input) });
                 let output = part.pointer("/state/output").or_else(|| part.pointer("/state/error")).map(crate::cli::summarize_tool_output).unwrap_or_default();
-                let output = crate::cli::truncate_for_log(output.trim(), crate::cli::TOOL_OUTPUT_MAX_CHARS);
+                let output = output.trim().to_string();
                 if !output.is_empty() {
                     let _ = tx.send(StreamEvent::ToolResult { tool, output });
                 }
@@ -685,5 +685,26 @@ mod tests {
         assert_eq!(config["mcp"]["world"]["environment"]["WORLD_RUNNER_URL"], "https://x");
         assert_eq!(config["mcp"]["docs"]["type"], "remote");
         assert_eq!(config["mcp"]["docs"]["headers"]["Authorization"], "Bearer t");
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use crate::cli::straddle::{around, assert_whole_then_hidden, drain, pads};
+    use serde_json::json;
+
+    #[test]
+    fn the_opencode_parser_sends_whole_text_so_a_secret_across_any_cut_is_hidden() {
+        for pad in pads() {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut turn = super::Turn::default();
+            turn.feed(&json!({"type": "text", "part": {"text": around(pad), "messageID": "m1"}}), Some(&tx));
+            turn.feed(
+                &json!({"type": "tool_use", "part": {"tool": "Bash", "state": {"input": {"command": around(pad)}, "output": around(pad)}}}),
+                Some(&tx),
+            );
+            drop(tx);
+            assert_whole_then_hidden(drain(rx), 3, "opencode", pad);
+        }
     }
 }

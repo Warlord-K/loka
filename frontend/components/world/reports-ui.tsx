@@ -2,9 +2,10 @@
 
 import { quoteProps } from "./quote";
 import { SOLO } from "@/lib/edition";
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { latestRequests } from "@/lib/canvas-marks";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import { applyLatest, latestOnly } from "@/lib/latest";
+import { guardedDetailLoader, type NavigationRequest } from "@/lib/exact-world-navigation";
+import { navigationDetails } from "@/lib/navigation-details";
 import { ArrowCounterClockwise, SquaresFour, Student, GraduationCap, ArrowLeft, CaretDown, CaretRight, Check, ClockCounterClockwise, FileText, Folder, FolderOpen, Globe, Link as LinkIcon, ListBullets, Lock, Code, Copy, DownloadSimple, PencilSimple, Plus, Trash, Clock, Files, FolderSimple, Hash, Notebook, PushPinSimple, UserCircle, type Icon as PhosphorIcon, SidebarSimple } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
 import { WindowHeader, EmptyState, GHOST_ICON_BTN } from "./settings-shell";
@@ -338,24 +339,43 @@ function ReportCard({
   );
 }
 
-type ReportSelection = { id: string | null; item?: string | null };
+type ReportSelection = { id: string | null; item?: string | null; title?: string; missing?: () => void; loaded?: boolean; detail?: ReportDetail; request?: number; workspace?: boolean };
+
+export interface WorkspaceKit {
+  channelsOpen: boolean;
+  onToggleChannels: () => void;
+  channels: ReactNode;
+  channel: string | null;
+  onShowChannel: (id: string) => void;
+}
+
+function reportVersion(report: Report): string {
+  const match = /^(.*?)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$/.exec(report.updated_at);
+  return match ? `${match[1]}.${(match[2] ?? "").padEnd(9, "0").slice(0, 9)}${match[3]}` : report.updated_at;
+}
 
 export function ReportsPanel({
   agents,
   meId,
   selection,
-  onSelectionApplied,
   sideToggle,
   onClose,
   onOpenAgent,
+  leaveRequest,
+  onNavigate,
+  onBeginNavigation,
+  workspace,
 }: {
   agents: WorldAgent[];
   meId: string | null;
   selection: ReportSelection;
-  onSelectionApplied: () => void;
+  workspace?: WorkspaceKit;
   sideToggle?: ReactNode;
   onClose: () => void;
   onOpenAgent: (id: string) => void;
+  leaveRequest?: RefObject<((current: () => boolean) => Promise<boolean>) | null>;
+  onNavigate?: (selection: ReportSelection, request?: NavigationRequest) => void;
+  onBeginNavigation?: () => NavigationRequest;
 }) {
   const handles = useAgentHandles(agents);
   const everyone = useEveryone();
@@ -368,11 +388,26 @@ export function ReportsPanel({
   const [scope, setScope] = useState<Scope>({ kind: "all" });
   const [openFolders, setOpenFolders] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<string | null>(null);
+  const selectedRef = useRef(selected);
+  selectedRef.current = selected;
   const [focus, setFocus] = useState<ReportSelection | null>(null);
   const selectionRequests = useRef(latestOnly()).current;
+  const actionRequests = useRef(latestOnly()).current;
+  const readerCurrentRef = useRef<() => boolean>(() => false);
+  const detailLoader = useRef(guardedDetailLoader()).current;
+  const revisionListLoader = useRef(guardedDetailLoader()).current;
+  const revisionLoader = useRef(guardedDetailLoader()).current;
+  const ownReader = useCallback((current: () => boolean) => {
+    readerCurrentRef.current = current;
+    detailLoader.invalidate();
+    revisionListLoader.invalidate();
+    revisionLoader.invalidate();
+  }, [detailLoader, revisionListLoader, revisionLoader]);
   const [detail, setDetail] = useState<ReportDetail | null>(null);
   const [missing, setMissing] = useState(false);
   const [mode, setMode] = useState<Mode>("read");
+  const modeRef = useRef(mode);
+  modeRef.current = mode;
   const [draft, setDraft] = useState<Draft | null>(null);
   const [source, setSource] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -381,12 +416,37 @@ export function ReportsPanel({
   const [conflict, setConflict] = useState<Conflict | null>(null);
   const [revisions, setRevisions] = useState<RevisionBrief[] | null>(null);
   const [revision, setRevision] = useState<Revision | null>(null);
+  const clearRevision = useCallback(() => {
+    revisionLoader.invalidate();
+    setRevision(null);
+  }, [revisionLoader]);
+  const showRevision = useCallback((id: string, number: number) => {
+    const navigation = onBeginNavigation?.();
+    const intent = revisionLoader.begin(() => (!navigation || navigation.current()) && modeRef.current === "history" && selectedRef.current === id && readerCurrentRef.current());
+    void navigationDetails.reportRevision(intent, id, number).then((next) => {
+      if (next && intent.current()) setRevision(next);
+    }).catch(() => {
+      if (intent.current()) setRevision(null);
+    });
+  }, [onBeginNavigation, revisionLoader]);
+  const showCurrentRevision = useCallback(() => {
+    onBeginNavigation?.();
+    clearRevision();
+  }, [clearRevision, onBeginNavigation]);
+  const setHistoryOpen = useCallback((open: boolean) => {
+    onBeginNavigation?.();
+    revisionListLoader.invalidate();
+    clearRevision();
+    modeRef.current = open ? "history" : "read";
+    setMode(modeRef.current);
+  }, [clearRevision, onBeginNavigation, revisionListLoader]);
   const [copied, copy] = useCopy();
   const [copiedText, copyText] = useCopy();
   const [tocOpen, setTocOpen] = useState(false);
   const readerRef = useRef<HTMLDivElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
   const libraryPane = usePaneWidth("reports.library", 18, 13, 34);
+  const channelsPane = usePaneWidth("workspace.channels", 22, 16, 36);
   const [libraryHidden, setLibraryHidden] = useState(false);
   useEffect(() => {
     try {
@@ -416,24 +476,24 @@ export function ReportsPanel({
       .catch(() => setAll((cur) => cur ?? []));
   }, []);
 
-  const detailRequests = useRef(latestRequests()).current;
-  const loadDetail = useCallback((id: string) => {
-    const request = detailRequests.start();
-    reportsApi
-      .get(id)
+  const loadDetail = useCallback((id: string, current: () => boolean = () => true) => {
+    if (selectedRef.current !== id || !current()) return;
+    const intent = detailLoader.begin(() => selectedRef.current === id && readerCurrentRef.current() && current());
+    navigationDetails
+      .report(intent, id)
       .then((d) => {
-        if (!detailRequests.isLatest(request)) return;
+        if (!d || !intent.current()) return;
         setDetail(d);
         setMissing(false);
       })
       .catch((e) => {
-        if (!detailRequests.isLatest(request)) return;
+        if (!intent.current()) return;
         if (e instanceof ReportError && e.status === 404) {
           setDetail(null);
           setMissing(true);
         }
       });
-  }, [detailRequests]);
+  }, [detailLoader]);
 
   useEffect(() => loadAll(), [loadAll]);
 
@@ -460,13 +520,6 @@ export function ReportsPanel({
     setRevision(null);
     setRevisions(null);
     setTocOpen(false);
-    if (!selected) {
-      setDetail(null);
-      setMissing(false);
-      return;
-    }
-    if (detail?.report.id !== selected) setDetail(null);
-    loadDetail(selected);
     readerRef.current?.scrollTo({ top: 0 });
   }, [selected]);
 
@@ -474,12 +527,12 @@ export function ReportsPanel({
   detailRef.current = detail;
   const editingRef = useRef(editing);
   editingRef.current = editing;
-  const selectedRef = useRef(selected);
-  selectedRef.current = selected;
   useEffect(() => {
     const onStale = (e: Event) => {
       loadAll();
-      const id = (e as CustomEvent<{ report_id?: string } | undefined>).detail?.report_id;
+      const event = (e as CustomEvent<{ report_id?: string; collection_only?: boolean } | undefined>).detail;
+      if (event?.collection_only) return;
+      const id = event?.report_id;
       const current = selectedRef.current;
       if (current && (!id || id === current) && !editingRef.current) loadDetail(current);
     };
@@ -489,15 +542,31 @@ export function ReportsPanel({
 
   useEffect(() => {
     if (mode !== "history" || !selected) return;
-    reportsApi
-      .revisions(selected)
-      .then(setRevisions)
-      .catch(() => setRevisions([]));
-  }, [mode, selected, detail?.report.revision]);
+    const id = selected;
+    const intent = revisionListLoader.begin(() => modeRef.current === "history" && selectedRef.current === id && readerCurrentRef.current());
+    navigationDetails
+      .reportRevisions(intent, id)
+      .then((next) => {
+        if (next && intent.current()) setRevisions(next);
+      })
+      .catch(() => {
+        if (intent.current()) setRevisions([]);
+      });
+    return () => revisionListLoader.invalidate();
+  }, [mode, selected, detail?.report.revision, revisionListLoader]);
 
   const draftRef = useRef(draft);
   draftRef.current = draft;
+  const changeDraft = useCallback((change: (current: Draft) => Draft) => {
+    const current = draftRef.current;
+    if (!current) return;
+    const next = change(current);
+    draftRef.current = next;
+    setDraft(next);
+  }, []);
   const savingRef = useRef<Promise<boolean> | null>(null);
+  const editorRef = useRef(0);
+  const creatingRef = useRef<number | null>(null);
   const baseRef = useRef<Report | null>(null);
   const conflictRef = useRef(conflict);
   conflictRef.current = conflict;
@@ -602,19 +671,43 @@ export function ReportsPanel({
     return () => window.clearTimeout(t);
   }, [mode, selected, draft, dirty, conflict, persist]);
 
-  const leaveEdit = useCallback(async (): Promise<boolean> => {
-    if (selectedRef.current) {
-      if (dirty && !(await persist())) return false;
-    } else if (dirty && !window.confirm("Discard this new report?")) return false;
+  const finishEdit = useCallback(() => {
+    editorRef.current += 1;
+    creatingRef.current = null;
+    draftRef.current = null;
     setDraft(null);
     setMode("read");
+    setSaving(false);
     setError(null);
     setSource(false);
     setSaveState("idle");
     showConflict(null);
     baseRef.current = null;
+  }, [showConflict]);
+
+  useEffect(() => () => {
+    editorRef.current += 1;
+    creatingRef.current = null;
+  }, []);
+
+  const canLeaveEdit = useCallback(async () => {
+    if (!dirty) return true;
+    return selectedRef.current ? persist() : window.confirm("Discard this new report?");
+  }, [dirty, persist]);
+
+  const leaveEdit = useCallback(async () => {
+    if (!(await canLeaveEdit())) return false;
+    finishEdit();
     return true;
-  }, [dirty, persist, showConflict]);
+  }, [canLeaveEdit, finishEdit]);
+
+  useEffect(() => {
+    if (!leaveRequest) return;
+    leaveRequest.current = async (current) => current() && (!editing || await canLeaveEdit());
+    return () => {
+      leaveRequest.current = null;
+    };
+  }, [canLeaveEdit, editing, leaveRequest]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -625,8 +718,7 @@ export function ReportsPanel({
         return;
       }
       if (mode === "history") {
-        setMode("read");
-        setRevision(null);
+        setHistoryOpen(false);
         return;
       }
       onClose();
@@ -644,7 +736,7 @@ export function ReportsPanel({
       window.removeEventListener("keydown", onKey);
       window.removeEventListener("keydown", onEditKey);
     };
-  }, [mode, dirty, leaveEdit, onClose]);
+  }, [mode, dirty, leaveEdit, onClose, setHistoryOpen]);
 
   const visible = useMemo(() => (all ?? []).filter((r) => everyone || r.owner_user_id === meId), [all, everyone, meId]);
   const othersCount = (all ?? []).length - visible.length;
@@ -682,40 +774,100 @@ export function ReportsPanel({
     const current = selectionRequests.begin();
     await applyLatest(() => !editing || leaveEdit(), current, (allowed) => {
       if (!allowed) return;
+      ownReader(current);
       setError(null);
       setMode("read");
+      selectedRef.current = id;
+      if (requested?.detail?.report.id === id) {
+        const incoming = requested.detail;
+        setDetail((detail) => detail?.report.id === incoming.report.id && reportVersion(detail.report) > reportVersion(incoming.report)
+          ? { ...incoming, report: { ...incoming.report, ...detail.report } }
+          : incoming);
+        setMissing(false);
+      } else {
+        setDetail((detail) => detail?.report.id === id ? detail : null);
+        setMissing(false);
+      }
       setSelected(id);
       setFocus(requested ?? null);
-      if (requested) onSelectionApplied();
+      if (id && !requested?.detail) loadDetail(id, current);
     });
   };
   const selectRef = useRef(select);
   selectRef.current = select;
+  const requestSelection = (selection: ReportSelection, request?: NavigationRequest) => onNavigate
+    ? onNavigate({ ...selection, loaded: Boolean(selection.id) }, request)
+    : void select(selection.id, selection);
   useEffect(() => {
-    if (selection.id) void selectRef.current(selection.id, selection);
-  }, [selection]);
-  useEffect(() => () => { selectionRequests.begin(); }, [selectionRequests]);
+    if (!onNavigate) {
+      if (selection.id) void selectRef.current(selection.id, selection);
+      return;
+    }
+    const current = selectionRequests.begin();
+    ownReader(current);
+    finishEdit();
+    if (selection.detail) {
+      const incoming = selection.detail;
+      detailLoader.invalidate();
+      setDetail((current) => current?.report.id === incoming.report.id && reportVersion(current.report) > reportVersion(incoming.report)
+        ? { ...incoming, report: { ...incoming.report, ...current.report } }
+        : incoming);
+      setMissing(false);
+    } else {
+      setDetail((detail) => detail?.report.id === selection.id ? detail : null);
+      setMissing(false);
+    }
+    selectedRef.current = selection.id;
+    setSelected(selection.id);
+    setFocus(selection);
+    if (selection.id && !selection.detail) loadDetail(selection.id, current);
+  }, [detailLoader, finishEdit, loadDetail, ownReader, selection, selectionRequests]);
+  useEffect(() => () => {
+    selectionRequests.begin();
+    detailLoader.invalidate();
+    revisionListLoader.invalidate();
+    revisionLoader.invalidate();
+  }, [detailLoader, revisionListLoader, revisionLoader, selectionRequests]);
 
   const openWiki = (title: string) => {
     const key = title.toLowerCase();
     const local = (all ?? []).find((r) => r.title.toLowerCase() === key || r.slug === key);
     if (local) {
-      select(local.id);
+      requestSelection({ id: local.id });
       return;
     }
-    reportsApi
-      .find(title)
-      .then((r) => select(r.id))
-      .catch(() => {
-        if (detail?.can_edit !== false && window.confirm(`There is no report called "${title}" yet. Start it now?`)) startNew(title, detail?.report.folder ?? "");
+    const missing = () => {
+      if (detail?.can_edit !== false && window.confirm(`There is no report called "${title}" yet. Start it now?`)) startNew(title, detail?.report.folder ?? "");
+    };
+    if (onNavigate) onNavigate({ id: null, title, missing });
+    else {
+      const current = selectionRequests.begin();
+      ownReader(current);
+      const intent = detailLoader.begin(current);
+      void navigationDetails.reportFind(intent, title).then((r) => {
+        if (r && intent.current()) requestSelection({ id: r.id });
+      }).catch(() => {
+        if (intent.current()) missing();
       });
+    }
   };
 
   const startNew = async (title = "", folder = scope.kind === "folder" ? scope.path : "") => {
-    if (editing && !(await leaveEdit())) return;
-    setSelected(null);
+    const navigation = onBeginNavigation?.();
+    if (editing && !(await canLeaveEdit())) return;
+    if (navigation && !navigation.current()) return;
+    if (editing) finishEdit();
+    editorRef.current += 1;
+    creatingRef.current = null;
+    const current = selectionRequests.begin();
+    ownReader(current);
+    selectedRef.current = null;
     setDetail(null);
-    setDraft({ title, folder, tags: scope.kind === "tag" ? scope.tag : "", body: "" });
+    setMissing(false);
+    setSelected(null);
+    const nextDraft = { title, folder, tags: scope.kind === "tag" ? scope.tag : "", body: "" };
+    draftRef.current = nextDraft;
+    setDraft(nextDraft);
     setMode("edit");
     setSource(false);
     setSaveState("idle");
@@ -723,25 +875,45 @@ export function ReportsPanel({
   };
 
   const newCanvas = async () => {
-    if (editing && !(await leaveEdit())) return;
+    const navigation = onBeginNavigation?.();
+    if (editing && !(await canLeaveEdit())) return;
+    if (navigation && !navigation.current()) return;
+    if (editing) finishEdit();
     setError(null);
     try {
       const day = new Date().toLocaleDateString(undefined, { month: "short", day: "numeric" });
       const saved = await reportsApi.create({ title: `Canvas ${day}`, body: "", folder: scope.kind === "folder" ? scope.path : "", canvas: { items: [], edges: [] } });
-      setMode("read");
-      setDraft(null);
-      setSelected(saved.id);
+      const savedDetail = { report: saved, backlinks: [], outlinks: [], can_edit: true, marks: [] };
       loadAll();
       window.dispatchEvent(new CustomEvent(REPORTS_STALE, { detail: { report_id: saved.id } }));
+      if (navigation && !navigation.current()) return;
+      if (onNavigate) requestSelection({ id: saved.id, detail: savedDetail }, navigation);
+      else {
+        const current = selectionRequests.begin();
+        ownReader(current);
+        setMode("read");
+        draftRef.current = null;
+        setDraft(null);
+        selectedRef.current = saved.id;
+        setSelected(saved.id);
+        setDetail(savedDetail);
+      }
     } catch (e) {
+      if (navigation && !navigation.current()) return;
       setError(e instanceof Error && e.message ? e.message : "Could not start a canvas. Try again.");
     }
   };
 
   const startEdit = (point: FocusPoint | null = null) => {
     if (!detail || revision || detail.report.kind === "canvas") return;
+    onBeginNavigation?.();
+    detailLoader.invalidate();
+    editorRef.current += 1;
+    creatingRef.current = null;
     setFocusPoint(point);
-    setDraft(draftOf(detail.report));
+    const nextDraft = draftOf(detail.report);
+    draftRef.current = nextDraft;
+    setDraft(nextDraft);
     baseRef.current = detail.report;
     showConflict(null);
     setMode("edit");
@@ -754,74 +926,113 @@ export function ReportsPanel({
   startEditRef.current = startEdit;
 
   const save = async () => {
-    if (selected) {
+    if (selectedRef.current) {
       await persist();
       return;
     }
-    if (!draft || saving) return;
-    if (!draft.title.trim()) {
+    const editor = editorRef.current;
+    const submission = draftRef.current;
+    if (!submission || creatingRef.current === editor) return;
+    if (!submission.title.trim()) {
       setError("Give it a title first.");
       return;
     }
-    if (byteLength(draft.body) > MAX_BYTES) {
+    if (byteLength(submission.body) > MAX_BYTES) {
       setError("Reports are at most 512 KB. Split it into linked reports with [[Title]] links.");
       return;
     }
+    onBeginNavigation?.();
+    creatingRef.current = editor;
     setSaving(true);
     setError(null);
-    const tagList = draft.tags.split(",").map((t) => t.trim()).filter(Boolean);
+    const tagList = submission.tags.split(",").map((t) => t.trim()).filter(Boolean);
     try {
-      const saved = await reportsApi.create({ title: draft.title, body: draft.body, folder: draft.folder, tags: tagList });
-      selectedRef.current = saved.id;
-      setSelected(saved.id);
-      setDetail({ report: saved, backlinks: [], outlinks: [], can_edit: true, marks: [] });
-      setDraft(draftOf(saved));
-      baseRef.current = saved;
-      setSaveState("saved");
+      const saved = await reportsApi.create({ title: submission.title, body: submission.body, folder: submission.folder, tags: tagList });
+      const savedDetail = { report: saved, backlinks: [], outlinks: [], can_edit: true, marks: [] };
       loadAll();
       window.dispatchEvent(new CustomEvent(REPORTS_STALE, { detail: { report_id: saved.id } }));
+      if (editorRef.current !== editor || selectedRef.current !== null || !draftRef.current) return;
+      const savedDraft = draftOf(saved);
+      const nextDraft = rebaseDraft(draftRef.current, submission, savedDraft).draft;
+      selectedRef.current = saved.id;
+      const current = selectionRequests.begin();
+      ownReader(current);
+      setSelected(saved.id);
+      setDetail(savedDetail);
+      draftRef.current = nextDraft;
+      setDraft(nextDraft);
+      baseRef.current = saved;
+      setSaveState(same(nextDraft, savedDraft) ? "saved" : "idle");
     } catch (e) {
+      if (editorRef.current !== editor || selectedRef.current !== null || !draftRef.current) return;
       setError(e instanceof Error && e.message ? e.message : "Could not save. Try again.");
     } finally {
-      setSaving(false);
+      if (creatingRef.current === editor) {
+        creatingRef.current = null;
+        setSaving(false);
+      }
     }
+  };
+
+  const beginReportAction = (id: string) => {
+    const navigation = onBeginNavigation?.();
+    const action = actionRequests.begin();
+    const reader = readerCurrentRef.current;
+    const editor = editorRef.current;
+    return () => (!navigation || navigation.current()) && action() && reader() && selectedRef.current === id && editorRef.current === editor;
   };
 
   const patch = async (change: { pinned?: boolean; visibility?: "private" | "public" }) => {
     if (!detail) return;
+    const id = detail.report.id;
+    const current = beginReportAction(id);
     setError(null);
-    await reportsApi.update(detail.report.id, change).catch(() => setError("That change did not save. Try again."));
-    loadDetail(detail.report.id);
+    await reportsApi.update(id, change).catch(() => {
+      if (current()) setError("That change did not save. Try again.");
+    });
     loadAll();
+    if (current()) loadDetail(id, current);
   };
 
   const remove = async () => {
     if (!detail || !window.confirm(`Delete "${detail.report.title}" and its history for good?`)) return;
+    const id = detail.report.id;
+    const current = beginReportAction(id);
     setError(null);
     try {
-      await reportsApi.remove(detail.report.id);
+      await reportsApi.remove(id);
     } catch {
-      setError("Could not delete this report. Try again.");
+      if (current()) setError("Could not delete this report. Try again.");
       return;
     }
-    setSelected(null);
     loadAll();
-    window.dispatchEvent(new CustomEvent(REPORTS_STALE, { detail: { report_id: detail.report.id } }));
+    window.dispatchEvent(new CustomEvent(REPORTS_STALE, { detail: { report_id: id, collection_only: true } }));
+    if (!current()) return;
+    const selection = selectionRequests.begin();
+    ownReader(selection);
+    selectedRef.current = null;
+    setDetail(null);
+    setMissing(false);
+    setSelected(null);
   };
 
   const restore = async (n: number) => {
     if (!detail || !window.confirm(`Restore revision ${n}? The current text stays in the history.`)) return;
+    const id = detail.report.id;
+    const current = beginReportAction(id);
     setError(null);
     try {
-      await reportsApi.restore(detail.report.id, n);
+      await reportsApi.restore(id, n);
     } catch {
-      setError(`Could not restore revision ${n}. Try again.`);
+      if (current()) setError(`Could not restore revision ${n}. Try again.`);
       return;
     }
-    setRevision(null);
-    setMode("read");
-    loadDetail(detail.report.id);
     loadAll();
+    if (!current()) return;
+    clearRevision();
+    modeRef.current = "read";
+    setMode(modeRef.current);
+    loadDetail(id, current);
   };
 
   const copyLink = async () => {
@@ -961,7 +1172,7 @@ export function ReportsPanel({
           const next = rows[at + (e.key === "ArrowDown" ? 1 : -1)];
           if (next) {
             next.focus();
-            void select(next.dataset.report ?? null);
+            requestSelection({ id: next.dataset.report ?? null });
           }
         }}
       >
@@ -981,7 +1192,7 @@ export function ReportsPanel({
               <button
                 type="button"
                 data-report={r.id}
-                onClick={() => void select(r.id)}
+                onClick={() => requestSelection({ id: r.id })}
                 aria-current={on}
                 className={cn("w-full rounded-lg px-2.5 py-2.5 text-left transition-colors", FOCUS, "focus-visible:ring-offset-0", on ? "bg-w-paper ring-2 ring-inset ring-w-line2" : "hover:bg-w-paper/60")}
               >
@@ -1031,8 +1242,8 @@ export function ReportsPanel({
   const focusAttempt = report && focus?.id && report.id.startsWith(focus.id) ? attemptFromItem(focus.item) : null;
   const lessonRedirect = report && !revision && report.practice && detail?.lesson && ownReport && !keptInReport(report.id) ? report.id : null;
   useEffect(() => {
-    if (lessonRedirect) openAcademy({ reportId: lessonRedirect, attemptId: focusAttempt });
-  }, [lessonRedirect, focusAttempt]);
+    if (lessonRedirect) openAcademy({ reportId: lessonRedirect, attemptId: focusAttempt, request: focus?.request });
+  }, [lessonRedirect, focusAttempt, focus?.request]);
   const reportRunner = useRunCommand(revision ? null : reportAuthor, meId, {
     where: reportAuthor ? (reportAuthor.runner_name ? `on ${reportAuthor.runner_name}, output goes to ${reportAuthor.name}'s chat` : `on ${reportAuthor.name}'s device, output goes to its chat`) : undefined,
   });
@@ -1117,7 +1328,7 @@ export function ReportsPanel({
             value={draft.title}
             onChange={(e) => {
               grow(e.target);
-              setDraft({ ...draft, title: e.target.value.replace(/\n/g, " ") });
+              changeDraft((current) => ({ ...current, title: e.target.value.replace(/\n/g, " ") }));
             }}
             onKeyDown={(e) => {
               if (e.key === "Enter" || (e.key === "ArrowDown" && e.currentTarget.selectionStart === e.currentTarget.value.length)) {
@@ -1139,7 +1350,7 @@ export function ReportsPanel({
               <input
                 list="report-folders"
                 value={draft.folder}
-                onChange={(e) => setDraft({ ...draft, folder: e.target.value })}
+                onChange={(e) => changeDraft((current) => ({ ...current, folder: e.target.value }))}
                 placeholder="Empty, like research/infra"
                 aria-label="Folder"
                 className="-mx-1.5 min-w-0 flex-1 rounded-md bg-transparent px-1.5 py-0.5 text-w-sm text-w-text outline-none transition-colors placeholder:text-w-faint hover:bg-w-sand/70 focus:bg-w-field focus:ring-2 focus:ring-w-teal/40"
@@ -1153,7 +1364,7 @@ export function ReportsPanel({
             <Property icon={Hash} label="Tags">
               <input
                 value={draft.tags}
-                onChange={(e) => setDraft({ ...draft, tags: e.target.value })}
+                onChange={(e) => changeDraft((current) => ({ ...current, tags: e.target.value }))}
                 placeholder="Empty, comma separated"
                 aria-label="Tags"
                 className="-mx-1.5 min-w-0 flex-1 rounded-md bg-transparent px-1.5 py-0.5 text-w-sm text-w-text outline-none transition-colors placeholder:text-w-faint hover:bg-w-sand/70 focus:bg-w-field focus:ring-2 focus:ring-w-teal/40"
@@ -1168,7 +1379,7 @@ export function ReportsPanel({
             value={draft.body}
             onChange={(e) => {
               grow(e.target);
-              setDraft({ ...draft, body: e.target.value });
+              changeDraft((current) => ({ ...current, body: e.target.value }));
             }}
             onKeyDown={(e) => {
               if ((e.metaKey || e.ctrlKey) && e.key === "s") {
@@ -1185,7 +1396,7 @@ export function ReportsPanel({
           <DocEditor
             key={selected ?? "new"}
             value={draft.body}
-            onChange={(body) => setDraft((d) => (d ? { ...d, body } : d))}
+            onChange={(body) => changeDraft((current) => ({ ...current, body }))}
             onLossy={() => {
               setSource(true);
               setError("This report uses formatting the page view cannot keep, so it opened as markdown.");
@@ -1282,10 +1493,7 @@ export function ReportsPanel({
               </button>
               <button
                 type="button"
-                onClick={() => {
-                  setRevision(null);
-                  setMode(mode === "history" ? "read" : "history");
-                }}
+                onClick={() => setHistoryOpen(mode !== "history")}
                 aria-pressed={mode === "history"}
                 title="History"
                 aria-label="History"
@@ -1357,7 +1565,7 @@ export function ReportsPanel({
             <div className="mb-2 flex items-center justify-between gap-2">
               <h3 className="text-w-base font-semibold">History</h3>
               {revision && (
-                <button type="button" onClick={() => setRevision(null)} className="text-w-xs text-w-link hover:underline">
+                <button type="button" onClick={showCurrentRevision} className="text-w-xs text-w-link hover:underline">
                   Back to the current text
                 </button>
               )}
@@ -1377,8 +1585,8 @@ export function ReportsPanel({
                         type="button"
                         onClick={() =>
                           current
-                            ? setRevision(null)
-                            : void reportsApi.revision(report.id, rv.revision).then(setRevision).catch(() => setRevision(null))
+                            ? showCurrentRevision()
+                            : showRevision(report.id, rv.revision)
                         }
                         className="flex min-w-0 flex-1 items-center gap-2 text-left"
                       >
@@ -1443,34 +1651,64 @@ export function ReportsPanel({
         </div>
         {(detail.backlinks.length > 0 || detail.outlinks.length > 0) && (
           <footer className="mt-12 grid gap-4 border-t-2 border-w-line pt-5 @xl/reader:grid-cols-2 @4xl/reader:hidden">
-            <LinkList title={`Linked from (${detail.backlinks.length})`} items={detail.backlinks} onOpen={select} />
-            <LinkList title={`Links to (${detail.outlinks.length})`} items={detail.outlinks} onOpen={select} />
+            <LinkList title={`Linked from (${detail.backlinks.length})`} items={detail.backlinks} onOpen={(id) => requestSelection({ id })} />
+            <LinkList title={`Links to (${detail.outlinks.length})`} items={detail.outlinks} onOpen={(id) => requestSelection({ id })} />
           </footer>
         )}
       </article>
       <aside className="sticky top-6 hidden max-h-[calc(100vh-12rem)] w-56 shrink-0 self-start overflow-y-auto pt-12 @4xl/reader:block">
         {toc}
-        <LinkList title={`Linked from (${detail.backlinks.length})`} items={detail.backlinks} onOpen={select} />
+        <LinkList title={`Linked from (${detail.backlinks.length})`} items={detail.backlinks} onOpen={(id) => requestSelection({ id })} />
         {detail.backlinks.length === 0 && (
           <>
             <h3 className="mb-1.5 mt-6 text-w-xs font-medium text-w-muted">Linked from</h3>
             <p className="px-2 text-w-xs text-w-faint">No other report links here yet.</p>
           </>
         )}
-        <LinkList title={`Links to (${detail.outlinks.length})`} items={detail.outlinks} onOpen={select} />
+        <LinkList title={`Links to (${detail.outlinks.length})`} items={detail.outlinks} onOpen={(id) => requestSelection({ id })} />
       </aside>
     </div>
   );
 
+  const workspaceMode = Boolean(workspace && selection.workspace && report?.kind === "canvas" && !report.practice && mode === "read");
+  const openAsWorkspace = report?.kind === "canvas" && !report.practice && workspace ? () => requestSelection({ id: report.id, workspace: !workspaceMode }) : undefined;
   return (
-    <div role="dialog" aria-modal="true" aria-label="Reports" className={cn(PANEL, "pointer-events-auto flex h-full w-full flex-col overflow-hidden @container")}>
+    <div role="dialog" aria-modal="true" aria-label={workspaceMode ? "Workspace" : "Reports"} className={cn(PANEL, "pointer-events-auto flex h-full w-full flex-col overflow-hidden @container")}>
+      {workspaceMode && workspace && report ? (
+        <WindowHeader
+          title="Workspace"
+          subtitle={`${report.title}: the canvas, your agents and your channels in one place`}
+          leading={
+            <button
+              type="button"
+              onClick={workspace.onToggleChannels}
+              aria-pressed={workspace.channelsOpen}
+              aria-label={workspace.channelsOpen ? "Hide channels" : "Show channels"}
+              title={workspace.channelsOpen ? "Hide channels" : "Show channels"}
+              className={GHOST_ICON_BTN}
+            >
+              <Hash size={18} weight={workspace.channelsOpen ? "duotone" : "regular"} />
+            </button>
+          }
+          onClose={onClose}
+          actions={
+            <>
+              <button type="button" onClick={openAsWorkspace} className={BTN_SECONDARY} title="Show this canvas in Reports with the library">
+                <Notebook size={14} weight="bold" />
+                <span className="hidden @lg:inline">Open in Reports</span>
+              </button>
+              {sideToggle}
+            </>
+          }
+        />
+      ) : (
       <WindowHeader
         title="Reports"
         subtitle="Write-ups from your agents and you, linked like a notebook"
         leading={
           <>
             {readerOpen && (
-              <button type="button" onClick={() => void (editing ? leaveEdit() : select(null))} aria-label="Back to the library" className={cn(ICON_BTN_MD, "@2xl:hidden")}>
+              <button type="button" onClick={() => requestSelection({ id: null })} aria-label="Back to the library" className={cn(ICON_BTN_MD, "@2xl:hidden")}>
                 <ArrowLeft size={16} weight="bold" />
               </button>
             )}
@@ -1502,7 +1740,16 @@ export function ReportsPanel({
           </>
         }
       />
+      )}
       <div className="flex min-h-0 flex-1">
+        {workspaceMode && workspace?.channelsOpen && (
+          <>
+            <aside style={channelsPane.style} aria-label="Channels" className={cn("flex min-h-0 shrink-0 flex-col overflow-hidden border-r-2 border-dashed border-w-line2", channelsPane.custom ? "w-[var(--pane-w)]" : "w-[22rem] 2xl:w-[26rem]")}>
+              {workspace.channels}
+            </aside>
+            <PaneResizer pane={channelsPane} edge="right" label="Resize the channels" />
+          </>
+        )}
         <div
           style={libraryPane.style}
           className={cn(
@@ -1510,6 +1757,7 @@ export function ReportsPanel({
             libraryHidden ? "@2xl:!w-0 @2xl:border-r-0 @2xl:opacity-0" : cn("@2xl:border-r-2", libraryPane.custom ? "@2xl:w-[var(--pane-w)]" : "@2xl:w-72 @5xl:w-80"),
             SIDEBAR,
             readerOpen && "hidden @2xl:flex",
+            workspaceMode && "!hidden",
           )}
           aria-hidden={libraryHidden || undefined}
           inert={libraryHidden || undefined}
@@ -1521,7 +1769,7 @@ export function ReportsPanel({
               placeholder="Search reports"
               className="w-full"
               findTarget={!readerOpen}
-              onEnter={() => shown[0] && void select(shown[0].id)}
+              onEnter={() => shown[0] && requestSelection({ id: shown[0].id })}
               onArrowDown={() => listRef.current?.querySelector<HTMLButtonElement>("button[data-report]")?.focus()}
             />
           </div>
@@ -1531,7 +1779,7 @@ export function ReportsPanel({
             {list}
           </div>
         </div>
-        {!libraryHidden && <PaneResizer pane={libraryPane} edge="right" label="Resize the library" className="hidden @2xl:block" />}
+        {!libraryHidden && !workspaceMode && <PaneResizer pane={libraryPane} edge="right" label="Resize the library" className="hidden @2xl:block" />}
         <div ref={readerRef} className={cn("min-h-0 flex-1 @container/reader", report?.kind === "canvas" && mode === "read" ? "overflow-hidden" : "overflow-y-auto", !readerOpen && "hidden @2xl:block")}>
           {mode === "edit" ? (
             editor
@@ -1546,6 +1794,7 @@ export function ReportsPanel({
               agents={agents}
               meId={meId}
               focusItem={focus && focus.id && report.id.startsWith(focus.id) ? (focus.item ?? null) : null}
+              focusRequest={focus?.request}
               onOpenAgent={onOpenAgent}
               onChanged={() => {
                 loadDetail(report.id);
@@ -1573,9 +1822,12 @@ export function ReportsPanel({
                 loadAll();
               }}
               onHistory={() => {
-                setRevision(null);
-                setMode("history");
+                setHistoryOpen(true);
               }}
+              onWorkspace={openAsWorkspace}
+              inWorkspace={workspaceMode}
+              workspaceChannel={workspaceMode ? (workspace?.channel ?? null) : null}
+              onShowChannel={workspace?.onShowChannel}
             />
           ) : reader ? (
             reader

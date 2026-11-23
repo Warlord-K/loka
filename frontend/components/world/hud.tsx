@@ -1,12 +1,11 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, MotionConfig, motion } from "framer-motion";
-import { Bell, BellRinging, BookOpenText, GearSix, ChatsTeardrop, ClockCounterClockwise, CrownSimple, Hammer, IdentificationBadge, Lightning, Microphone, Notepad, Scroll, TerminalWindow, X, type Icon } from "@phosphor-icons/react";
+import { Bell, BellRinging, BookOpenText, GearSix, ChatsTeardrop, ClockCounterClockwise, CrownSimple, Hammer, Lightning, Microphone, Notepad, Scroll, SquaresFour, TerminalWindow, X, type Icon } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
 import type { Progress } from "@/lib/loka";
-import { portraitUrl } from "./characters";
-import { AgentAvatar } from "./channel-ui";
+import { AgentAvatar, portraitRendering, usePortrait, type Portrait } from "./channel-ui";
 import { PLAYER_LOOK } from "./engine";
 import { BADGE, FOCUS, HUD_ICON, PIXEL } from "./styles";
 import { GlyphTile, eventGlyph } from "./event-glyphs";
@@ -25,9 +24,12 @@ export interface Me {
   status_emoji?: string | null;
   status_text?: string | null;
   mention_wakes_main?: boolean;
+  before_big_work?: BeforeBigWork;
   new_art?: boolean;
   onboarding?: boolean;
 }
+
+export type BeforeBigWork = "ask_when_unclear" | "just_build" | "always_show_plan";
 
 const RANK: Record<Role, number> = { view: 0, read: 1, write: 2, admin: 3 };
 
@@ -36,7 +38,7 @@ export function atLeast(me: Me | null, role: Role): boolean {
 }
 
 export function PlayerCard({ me, progress, onOpen, onProgress }: { me: Me | null; progress: Progress | null; onOpen: () => void; onProgress: () => void }) {
-  const portrait = useMemo(() => portraitUrl(PLAYER_LOOK, 4), []);
+  const portrait = usePortrait(PLAYER_LOOK, 4);
   const name = me?.name || me?.email?.split("@")[0] || "You";
   const status = Boolean(me?.status_emoji || me?.status_text);
   return (
@@ -100,7 +102,7 @@ interface Slot {
   label: string;
   hint?: string;
   icon: Icon;
-  image?: string;
+  image?: Portrait | null;
   group?: number;
   badge?: number;
   tone?: "gold" | "teal" | "plain" | "live";
@@ -150,7 +152,7 @@ export function Hotbar({ slots }: { slots: Slot[] }) {
             )}
           >
             {s.image ? (
-              <img src={s.image} alt="" className="-my-0.5 h-[26px] w-auto transition-transform duration-200 [image-rendering:pixelated] [transition-timing-function:cubic-bezier(0.22,1,0.36,1)] motion-reduce:transform-none" />
+              s.image.url ? <img src={s.image.url} alt="" className={cn("-my-0.5 h-[26px] w-auto transition-transform duration-200 [transition-timing-function:cubic-bezier(0.22,1,0.36,1)] motion-reduce:transform-none", portraitRendering(s.image))} /> : <span className="-my-0.5 inline-block h-[26px] w-[21px]" />
             ) : (
               <s.icon size={22} weight={s.tone === "live" ? "fill" : "duotone"} className="transition-transform duration-200 [transition-timing-function:cubic-bezier(0.22,1,0.36,1)] motion-reduce:transform-none" />
             )}
@@ -188,6 +190,8 @@ export interface Toast {
   kind?: string;
   onClick?: () => void;
   target?: string;
+  card?: string;
+  linkedOnly?: boolean;
   bell?: boolean;
   at?: number;
 }
@@ -274,4 +278,4 @@ export function Toasts({ toasts, dismiss }: { toasts: Toast[]; dismiss: (id: num
   );
 }
 
-export const HOTBAR_ICONS = { Quick: Lightning, Quests: Scroll, Chat: ChatsTeardrop, History: ClockCounterClockwise, Workshop: Hammer, Main: CrownSimple, Talk: Microphone, Lists: Notepad, Reports: BookOpenText, Terminal: TerminalWindow };
+export const HOTBAR_ICONS = { Quick: Lightning, Quests: Scroll, Chat: ChatsTeardrop, History: ClockCounterClockwise, Workshop: Hammer, Main: CrownSimple, Talk: Microphone, Lists: Notepad, Reports: BookOpenText, Terminal: TerminalWindow, Workspace: SquaresFour };

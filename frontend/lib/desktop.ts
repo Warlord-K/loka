@@ -33,6 +33,7 @@ export interface DesktopStatus {
   start_at_login?: boolean;
   slack?: DesktopSlack;
   features?: string[];
+  terminals_per_place?: number;
 }
 
 type DesktopCommand =

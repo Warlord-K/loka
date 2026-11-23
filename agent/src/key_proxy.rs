@@ -151,7 +151,7 @@ impl Shielded {
     }
 }
 
-fn env_of(cmd: &tokio::process::Command) -> HashMap<String, String> {
+pub(crate) fn env_of(cmd: &tokio::process::Command) -> HashMap<String, String> {
     cmd.as_std()
         .get_envs()
         .filter_map(|(name, value)| Some((name.to_str()?.to_string(), value?.to_str()?.to_string())))

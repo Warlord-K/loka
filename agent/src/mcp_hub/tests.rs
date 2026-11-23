@@ -125,7 +125,7 @@ async fn shares_one_process_between_sessions_and_restarts_it() {
         servers.insert("open".into(), json!({ "url": "https://example.test/open", "shared": true }));
         servers
     };
-    let job = |agent| Job { isolation: isolation_for(owner, agent), agent, cwd: &dir, pids: me(), passthrough: &[] };
+    let job = |agent| Job { isolation: isolation_for(owner, agent), agent, cwd: &dir, pids: me(), passthrough: &[], tools: Default::default() };
     let prepared = hub.prepare(job(agent), &servers("first-secret")).await.unwrap();
     let text = Value::Object(prepared.servers.clone()).to_string();
     assert!(!text.contains("first-secret") && !text.contains("remote-secret-123"), "{text}");
@@ -199,7 +199,7 @@ async fn proxy_adds_the_keys_only_for_live_runs() {
     let agent = Uuid::new_v4();
     let mut servers = Map::new();
     servers.insert("remote".into(), json!({ "type": "http", "url": format!("http://{address}/mcp"), "headers": { "Authorization": "Bearer proxied-secret" } }));
-    let job = Job { isolation: isolation_for(Some(Uuid::new_v4()), agent), agent, cwd: &dir, pids: me(), passthrough: &[] };
+    let job = Job { isolation: isolation_for(Some(Uuid::new_v4()), agent), agent, cwd: &dir, pids: me(), passthrough: &[], tools: Default::default() };
     let prepared = hub.prepare(job, &servers).await.unwrap();
     let url = prepared.servers["remote"]["url"].as_str().unwrap().to_string();
     let token = prepared.servers["remote"]["headers"][TOKEN_HEADER].as_str().unwrap().to_string();
@@ -258,7 +258,7 @@ fn processes_matching(needle: &str) -> Vec<(u32, u64)> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn live_claude_and_codex_share_one_server() {
-    let bin = std::env::var("LOKA_AGENT_BIN").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/loka-agent").to_string());
+    let bin = crate::test_env::host_var("LOKA_AGENT_BIN").unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/loka-agent").to_string());
     let codex_model = std::env::var("CODEX_TEST_MODEL").unwrap_or_else(|_| "gpt-6.1-sol".to_string());
     let hub = hub().await;
     let dir = tempfile_dir();
@@ -276,7 +276,7 @@ async fn live_claude_and_codex_share_one_server() {
         let agent = Uuid::new_v4();
         let pids: Pids = Default::default();
         let prepared = hub
-            .prepare(Job { isolation: isolation_for(owner, agent), agent, cwd: &dir, pids: pids.clone(), passthrough: &[] }, &servers)
+            .prepare(Job { isolation: isolation_for(owner, agent), agent, cwd: &dir, pids: pids.clone(), passthrough: &[], tools: Default::default() }, &servers)
             .await
             .unwrap();
         let mut rewritten = prepared.servers.clone();
@@ -362,7 +362,7 @@ async fn handshake(stdin: &mut tokio::process::ChildStdin, stdout: &mut tokio::i
 #[ignore]
 async fn live_hub_memory() {
     let agents: usize = std::env::var("BENCH_AGENTS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
-    let bin = std::env::var("LOKA_AGENT_BIN").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../target/release/loka-agent").to_string());
+    let bin = crate::test_env::host_var("LOKA_AGENT_BIN").unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/../target/release/loka-agent").to_string());
     let catalog = [
         ("github", json!({ "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "bench-token-value" } })),
         ("context7", json!({ "command": "npx", "args": ["-y", "@upstash/context7-mcp"] })),
@@ -406,7 +406,7 @@ async fn live_hub_memory() {
     let mut shims = Vec::new();
     for _ in 0..agents {
         let agent = Uuid::new_v4();
-        keep.push(hub.prepare(Job { isolation: isolation_for(owner, agent), agent, cwd: &dir, pids: me(), passthrough: &[] }, &servers).await.unwrap());
+        keep.push(hub.prepare(Job { isolation: isolation_for(owner, agent), agent, cwd: &dir, pids: me(), passthrough: &[], tools: Default::default() }, &servers).await.unwrap());
         for (name, _) in &catalog {
             let mut child = tokio::process::Command::new(&bin)
                 .args(["mcp-shim", "--hub", &hub.socket.to_string_lossy(), name])
@@ -459,4 +459,15 @@ fn mcp_remote_servers_keep_one_sign_in_folder_per_server() {
     pin_sign_in_dirs(&mut servers, &home);
     assert_eq!(servers, again);
     std::fs::remove_dir_all(&home).unwrap();
+}
+
+#[test]
+fn only_other_servers_get_the_index_gateway_never_the_world_server() {
+    use crate::world::tool_catalog::Delivery;
+    let args = |name: &str, tools| shim_args("/hub.sock", name, tools).iter().map(|arg| arg.as_str().unwrap().to_string()).collect::<Vec<_>>();
+    assert_eq!(args("linear", Delivery::Index), ["mcp-shim", "--hub", "/hub.sock", "linear", "--tools", "index"]);
+    assert_eq!(args("world", Delivery::Index), ["mcp-shim", "--hub", "/hub.sock", "world"]);
+    for tools in [Delivery::Full, Delivery::Native] {
+        assert_eq!(args("linear", tools), ["mcp-shim", "--hub", "/hub.sock", "linear"]);
+    }
 }

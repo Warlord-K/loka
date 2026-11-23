@@ -25,21 +25,26 @@ const HOME_TOOLCHAINS: &[&str] = &[
     "go/bin",
 ];
 
-pub(crate) struct RunTemp(pub PathBuf);
+pub(crate) struct RunTemp(pub PathBuf, bool);
 
 impl Drop for RunTemp {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if !self.1 {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }
 
-pub(crate) fn run_temp() -> std::io::Result<RunTemp> {
+pub(crate) fn run_temp(working_dir: &Path) -> std::io::Result<RunTemp> {
+    if let Some(owned) = crate::cli::owned_temp_dir(working_dir) {
+        return Ok(RunTemp(owned, true));
+    }
     let dir = crate::cli::temp_dir().join(format!("loka-cursor-tmp-{}", uuid::Uuid::new_v4().simple()));
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder.create(&dir)?;
-    let dir = RunTemp(std::fs::canonicalize(&dir)?);
+    let dir = RunTemp(std::fs::canonicalize(&dir)?, false);
     crate::cli::give_to_job_user(&dir.0)?;
     Ok(dir)
 }
@@ -61,7 +66,8 @@ pub(crate) fn policy(mode: Mode, working_dir: &Path, readable: &[PathBuf], temp:
     }
     let home = home();
     let mut read: Vec<PathBuf> = readable.to_vec();
-    let mut write: Vec<PathBuf> = temp.map(Path::to_path_buf).into_iter().collect();
+    read.extend(crate::cli::launcher_alias_dir());
+    let mut write: Vec<PathBuf> = temp.map(crate::cli::private_temp_grants).unwrap_or_default();
     if let Some(home) = &home {
         read.extend(HOME_TOOLCHAINS.iter().map(|rel| home.join(rel)));
         write.extend(crate::claude::sandbox::writable_in(home));
@@ -92,6 +98,40 @@ pub(crate) fn policy(mode: Mode, working_dir: &Path, readable: &[PathBuf], temp:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_runs_keep_the_quest_or_session_folder_and_never_delete_it() {
+        let quest = uuid::Uuid::new_v4();
+        let owned = crate::cli::private_temp_root().join(crate::cli::quest_temp_name(quest));
+        std::fs::create_dir_all(&owned).unwrap();
+        let cwd = PathBuf::from(format!("/r/workspaces/tasks/{quest}/world"));
+        let temp = run_temp(&cwd).unwrap();
+        assert_eq!(temp.0, std::fs::canonicalize(&owned).unwrap());
+        let listed = policy(Mode::Auto, &cwd, &[], Some(&temp.0)).unwrap();
+        let writable: Vec<&str> = listed["additionalReadwritePaths"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        assert!(writable.contains(&temp.0.to_string_lossy().as_ref()), "{writable:?}");
+        drop(temp);
+        assert!(owned.is_dir());
+        let _ = std::fs::remove_dir_all(&owned);
+
+        let session = uuid::Uuid::new_v4();
+        let owned = crate::cli::private_temp_root().join(crate::cli::session_temp_name(session));
+        std::fs::create_dir_all(&owned).unwrap();
+        let temp = crate::cli::SESSION_TEMP.sync_scope(session, || run_temp(Path::new("/Users/a/Projects/app"))).unwrap();
+        assert_eq!(temp.0, std::fs::canonicalize(&owned).unwrap());
+        drop(temp);
+        assert!(owned.is_dir());
+        let _ = std::fs::remove_dir_all(&owned);
+    }
+
+    #[test]
+    fn cursor_runs_with_no_owner_get_a_throwaway_folder() {
+        let temp = run_temp(Path::new("/Users/a/Projects/app")).unwrap();
+        let dir = temp.0.clone();
+        assert!(dir.is_dir() && dir.to_string_lossy().contains("loka-cursor-tmp-"));
+        drop(temp);
+        assert!(!dir.exists());
+    }
 
     #[test]
     fn credentials_stay_outside_the_read_boundary() {

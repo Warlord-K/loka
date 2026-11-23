@@ -1,3 +1,4 @@
+mod gateway;
 pub mod mux;
 mod proxy;
 pub mod shim;
@@ -378,6 +379,7 @@ pub struct Job<'a> {
     pub cwd: &'a Path,
     pub pids: Pids,
     pub passthrough: &'a [&'a str],
+    pub tools: crate::world::tool_catalog::Delivery,
 }
 
 pub struct Registration {
@@ -438,6 +440,16 @@ fn carried(definition: &Value, drop: &[&str]) -> Map<String, Value> {
         .collect()
 }
 
+pub const WORLD_SERVER: &str = "world";
+
+pub fn shim_args(socket: &str, name: &str, tools: crate::world::tool_catalog::Delivery) -> Vec<Value> {
+    let mut args = vec![json!("mcp-shim"), json!("--hub"), json!(socket), json!(name)];
+    if tools == crate::world::tool_catalog::Delivery::Index && name != WORLD_SERVER {
+        args.extend([json!("--tools"), json!("index")]);
+    }
+    args
+}
+
 pub fn strip_shared(servers: &mut Map<String, Value>) {
     for definition in servers.values_mut() {
         if let Some(object) = definition.as_object_mut() {
@@ -465,7 +477,7 @@ impl Hub {
                 Transport::Stdio { .. } => {
                     let mut entry = carried(definition, &["command", "args", "env", "cwd", "type"]);
                     entry.insert("command".into(), json!(self.exe));
-                    entry.insert("args".into(), json!(["mcp-shim", "--hub", self.socket.to_string_lossy(), name]));
+                    entry.insert("args".into(), Value::Array(shim_args(&self.socket.to_string_lossy(), name, job.tools)));
                     Value::Object(entry)
                 }
                 Transport::Http { .. } => {
@@ -782,7 +794,7 @@ impl Hub {
 }
 
 fn redacted(text: &str, spec: &Spec) -> String {
-    spec.secrets().iter().fold(text.to_string(), |text, secret| text.replace(secret.as_str(), "[REDACTED]"))
+    cli::Redactor::new(spec.secrets()).redact(text)
 }
 
 fn urlencode(name: &str) -> String {
@@ -795,7 +807,7 @@ async fn spawn(key: String, spec: Arc<Spec>, dir: &Path, uid: Option<JobUid>) ->
     let Transport::Stdio { command, args, env } = &spec.transport else {
         bail!("only command servers run in the hub");
     };
-    let secrets = spec.secrets();
+    let secrets = cli::Redactor::new(spec.secrets());
     let (command, args, env, dir) = (command.clone(), args.clone(), env.clone(), dir.to_path_buf());
     let mut child = JobUid::scope(uid.clone(), async move {
         let mut cmd = cli::job_command(&command);
@@ -848,8 +860,7 @@ async fn spawn(key: String, spec: Arc<Spec>, dir: &Path, uid: Option<JobUid>) ->
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let line = secrets.iter().fold(line, |line, secret| line.replace(secret.as_str(), "[REDACTED]"));
-                debug!(server = %name, line = %crate::cli::truncate_for_log(&line, 500), "MCP server stderr");
+                debug!(server = %name, line = %secrets.clip(&line, 500), "MCP server stderr");
             }
         });
     }

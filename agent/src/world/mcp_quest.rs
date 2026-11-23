@@ -173,36 +173,73 @@ mod tests {
         assert!(pick(&work, "").is_none());
     }
 
+    const TOOL_SOURCES: [&str; 12] = [
+        include_str!("mcp.rs"),
+        include_str!("mcp_control.rs"),
+        include_str!("mcp_govern.rs"),
+        include_str!("mcp_quest.rs"),
+        include_str!("feeds_tools.rs"),
+        include_str!("items_tools.rs"),
+        include_str!("loka_tools.rs"),
+        include_str!("music_tools.rs"),
+        include_str!("reports_tools.rs"),
+        include_str!("canvas_tools.rs"),
+        include_str!("practice_tools.rs"),
+        include_str!("teams_tools.rs"),
+    ];
+
+    const TASK_TEMPLATE: &str = include_str!("../../templates/world_task.txt");
+
+    fn is_tool(name: &str) -> bool {
+        TOOL_SOURCES.iter().any(|source| source.contains(&format!("tool(\"{name}\"")) || source.contains(&format!("\"{name}\",\n")))
+    }
+
+    fn json_keys(text: &str) -> impl Iterator<Item = &str> {
+        text.match_indices("\":").filter_map(|(end, _)| text[..end].rsplit('"').next()).map(|key| key.trim_end_matches('\\'))
+    }
+
+    fn names_that_are_not_tools() -> Vec<String> {
+        let quest_options = super::super::with_quest_options(json!({}));
+        let readiness = loka_shared::readiness::evaluate(&Default::default());
+        let fields = TOOL_SOURCES.iter().chain([&TASK_TEMPLATE]).flat_map(|text| json_keys(text)).chain(quest_options.as_object().into_iter().flat_map(|o| o.keys().map(String::as_str)));
+        fields
+            .chain(super::super::super::prompts::REPORT_KEYS.iter().copied())
+            .chain([super::super::super::tool_catalog::FIND_TOOLS, super::super::super::tool_catalog::USE_TOOL, "tool_search"])
+            .chain(loka_shared::powers::ALL.iter().map(|(power, _)| *power))
+            .chain(loka_shared::run_causes::Cause::ALL.iter().map(|cause| cause.as_str()))
+            .chain(loka_shared::cleanup::CleanupKind::ALL.iter().map(|kind| kind.key()))
+            .chain(loka_shared::world::APPROVAL_MODES)
+            .chain(readiness.features.iter().map(|feature| feature.key))
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn unknown_tools<'a>(prose: &'a str, not_tools: &[String]) -> Vec<&'a str> {
+        prose
+            .split(|c: char| !(c.is_ascii_lowercase() || c == '_'))
+            .filter(|word| word.contains('_') && !word.starts_with('_') && !word.ends_with('_'))
+            .filter(|word| !is_tool(word) && !not_tools.iter().any(|name| name == word))
+            .collect()
+    }
+
     #[test]
     fn every_tool_a_feature_names_exists() {
-        let sources = [
-            include_str!("mcp.rs"),
-            include_str!("mcp_control.rs"),
-            include_str!("mcp_govern.rs"),
-            include_str!("mcp_quest.rs"),
-            include_str!("feeds_tools.rs"),
-            include_str!("items_tools.rs"),
-            include_str!("loka_tools.rs"),
-            include_str!("music_tools.rs"),
-            include_str!("reports_tools.rs"),
-            include_str!("canvas_tools.rs"),
-            include_str!("practice_tools.rs"),
-            include_str!("teams_tools.rs"),
-        ]
-        .join("\n");
-        let defined = |name: &str| sources.contains(&format!("tool(\"{name}\"")) || sources.contains(&format!("\"{name}\",\n"));
+        let not_tools = names_that_are_not_tools();
         for feature in features::FEATURES {
             for name in feature.tools {
-                assert!(defined(name), "feature {} names {name}, which is not a Loka tool", feature.key);
+                assert!(is_tool(name), "feature {} names {name}, which is not a Loka tool", feature.key);
             }
             let prose = format!("{} {}", feature.line.unwrap_or(""), feature.guide);
-            for word in prose.split(|c: char| !(c.is_ascii_lowercase() || c == '_')) {
-                if word.contains('_') && !word.starts_with('_') && !word.ends_with('_') && !FIELDS.contains(&word) && !loka_shared::powers::ALL.iter().any(|(power, _)| *power == word) {
-                    assert!(defined(word), "feature {} mentions {word}, which is not a Loka tool", feature.key);
-                }
-            }
+            let unknown = unknown_tools(&prose, &not_tools);
+            assert!(unknown.is_empty(), "feature {} mentions {unknown:?}, which are not Loka tools", feature.key);
         }
     }
 
-    const FIELDS: &[&str] = &["upload_ids", "upload_id", "remove_arrows", "start_task", "milestones_done", "part_of", "time_limit_minutes", "plan_first", "ci_feedback", "read_only", "slack_channel", "slack_thread", "attempt_variants", "review_comments", "start_line", "never_started", "cli_error", "no_report", "timed_out", "task_id", "github_feed", "live_voice", "delete_after_days", "run_logs"];
+    #[test]
+    fn a_guide_naming_a_missing_tool_fails_while_code_owned_names_pass() {
+        let not_tools = names_that_are_not_tools();
+        let owned = "Resume with start_task on the task_id after no_verdict or no_report, with plan_first, milestones_done, start_line, assign_others, run_logs, read_only and live_voice.";
+        assert!(unknown_tools(owned, &not_tools).is_empty(), "{:?}", unknown_tools(owned, &not_tools));
+        assert_eq!(unknown_tools("Call creat_task, then show_ui after no_verdicts.", &not_tools), vec!["creat_task", "no_verdicts"]);
+    }
 }

@@ -668,7 +668,7 @@ impl Ctx<'_> {
             .runs
             .iter()
             .filter(|r| matches!(r.run.status.as_str(), "queued" | "running"))
-            .map(|r| json!({ "id": r.run.id, "kind": r.run.kind, "status": r.run.status, "started_at": r.run.started_at }))
+            .map(|r| json!({ "id": r.run.id, "kind": r.run.kind, "status": r.run.status, "waiting_for": r.waiting_for, "started_at": r.run.started_at }))
             .collect();
         let cost: f64 = room.runs.iter().map(|r| r.run.cost_usd).sum();
         Ok(json!({

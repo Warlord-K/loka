@@ -20,13 +20,24 @@ pub struct Wired {
     pub pids: crate::mcp_hub::Pids,
 }
 
-pub fn world_server(agent_id: Uuid) -> Map<String, Value> {
-    world_server_for(agent_id, None, false)
+pub async fn tool_delivery(cli: &str, model: &str, granted: &BTreeMap<String, String>) -> super::tool_catalog::Delivery {
+    let claude = match cli {
+        "claude" => super::tool_catalog::ClaudeFacts {
+            version: crate::claude::detect::detected().await.ok().and_then(|launch| launch.caps.version.clone()),
+            first_party: crate::claude::detect::route_is_first_party(&crate::claude::detect::host_route_lookup(granted)),
+        },
+        _ => Default::default(),
+    };
+    super::tool_catalog::delivery_for(cli, model, &claude)
 }
 
-pub fn world_server_for(agent_id: Uuid, quick: Option<Uuid>, aside: bool) -> Map<String, Value> {
+pub fn world_server(agent_id: Uuid, delivery: super::tool_catalog::Delivery) -> Map<String, Value> {
+    world_server_for(agent_id, None, None, delivery)
+}
+
+pub fn world_server_for(agent_id: Uuid, quick: Option<Uuid>, aside: Option<Uuid>, delivery: super::tool_catalog::Delivery) -> Map<String, Value> {
     let mut servers = Map::new();
-    if let Some(mut world) = super::mcp::config_json_for(agent_id, quick, aside)
+    if let Some(mut world) = super::mcp::config_json_for(agent_id, quick, aside, delivery)
         .and_then(|j| serde_json::from_str::<Value>(&j).ok())
         .and_then(|v| v.pointer("/mcpServers/world").cloned())
     {
@@ -53,7 +64,7 @@ pub fn without_duplicates(servers: Map<String, Value>) -> Map<String, Value> {
     out
 }
 
-pub async fn wire(mut servers: Map<String, Value>, owner: Option<Uuid>, agent: Uuid, cwd: &Path) -> Result<Wired> {
+pub async fn wire(mut servers: Map<String, Value>, owner: Option<Uuid>, agent: Uuid, cwd: &Path, tools: super::tool_catalog::Delivery) -> Result<Wired> {
     let pids: crate::mcp_hub::Pids = Default::default();
     if servers.is_empty() {
         return Ok(Wired { mcp_json: None, _registration: None, pids });
@@ -64,7 +75,7 @@ pub async fn wire(mut servers: Map<String, Value>, owner: Option<Uuid>, agent: U
     }
     let (servers, registration) = match crate::mcp_hub::get() {
         Some(hub) => {
-            let job = crate::mcp_hub::Job { isolation: crate::mcp_hub::isolation_for(owner, agent), agent, cwd, pids: pids.clone(), passthrough: &[] };
+            let job = crate::mcp_hub::Job { isolation: crate::mcp_hub::isolation_for(owner, agent), agent, cwd, pids: pids.clone(), passthrough: &[], tools };
             let prepared = hub.prepare(job, &servers).await?;
             (prepared.servers, prepared.registration)
         }
@@ -79,7 +90,7 @@ pub async fn wire(mut servers: Map<String, Value>, owner: Option<Uuid>, agent: U
     Ok(Wired { mcp_json: Some(Value::Object(root).to_string()), _registration: registration, pids })
 }
 
-pub async fn for_agent(ctx: &Ctx, agent_id: Uuid, include_world: bool) -> Result<Kit> {
+pub async fn for_agent(ctx: &Ctx, agent_id: Uuid) -> Result<Kit> {
     let mut servers = ctx
         .config
         .mcp_config_json()
@@ -112,10 +123,7 @@ pub async fn for_agent(ctx: &Ctx, agent_id: Uuid, include_world: bool) -> Result
         }
         servers.insert(row.name, definition);
     }
-    let mut servers = without_duplicates(servers);
-    if include_world {
-        servers.extend(world_server(agent_id));
-    }
+    let servers = without_duplicates(servers);
     let (skills_index, skill_files) = skills_index(ctx, agent_id).await;
     Ok(Kit {
         servers,

@@ -19,17 +19,224 @@ pub(crate) struct Launch {
     pub path: Option<OsString>,
     pub caps: Arc<Caps>,
     pub auto_refused: bool,
+    pub plan_signed_in: bool,
+    pub uses_plan: bool,
 }
 
 impl Launch {
     #[cfg(test)]
     pub(crate) fn assume(program: impl Into<PathBuf>) -> Self {
-        Self { program: program.into(), path: None, caps: Arc::new(Caps::unknown()), auto_refused: false }
+        Self { program: program.into(), path: None, caps: Arc::new(Caps::unknown()), auto_refused: false, plan_signed_in: false, uses_plan: false }
     }
 
     pub(crate) fn configure(&self, cmd: &mut tokio::process::Command) {
         if let Some(path) = &self.path {
             cmd.env("PATH", path);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UserSettings {
+    ReadByCli,
+    AppliedByLoka,
+}
+
+pub(crate) struct SignIn {
+    env: ClaudeEnv,
+    plan: bool,
+}
+
+impl SignIn {
+    pub(crate) fn settle(cmd: &mut tokio::process::Command, source: UserSettings, launch: &Launch) -> Self {
+        let env = ClaudeEnv::of(cmd, source);
+        let plan = plan_wins(&env, launch.plan_signed_in);
+        if source == UserSettings::AppliedByLoka {
+            for (name, value) in env.settings.iter().filter(|(name, _)| !(plan && API_KEY_ENV.contains(&name.as_str()))) {
+                cmd.env(name, value);
+            }
+        }
+        if plan {
+            for name in API_KEY_ENV {
+                cmd.env_remove(name);
+            }
+        }
+        Self { env, plan }
+    }
+
+    pub(crate) fn reads_user_settings(&self) -> bool {
+        self.env.source == UserSettings::ReadByCli
+    }
+
+    pub(crate) fn settings(&self, settings: Option<serde_json::Value>) -> Option<serde_json::Value> {
+        let blanked: Vec<&str> = if self.plan && self.reads_user_settings() {
+            API_KEY_ENV.iter().copied().filter(|name| self.env.settings.contains_key(*name)).collect()
+        } else {
+            Vec::new()
+        };
+        let extra = (self.env.source == UserSettings::AppliedByLoka).then_some(&self.env.extra).filter(|extra| !extra.is_empty());
+        if blanked.is_empty() && extra.is_none() {
+            return settings;
+        }
+        let mut settings = settings.unwrap_or_else(|| serde_json::json!({}));
+        for (key, value) in extra.into_iter().flatten() {
+            settings[key] = value.clone();
+        }
+        for name in blanked {
+            if !settings["env"].is_object() {
+                settings["env"] = serde_json::json!({});
+            }
+            settings["env"][name] = serde_json::json!("");
+        }
+        Some(settings)
+    }
+}
+
+pub(crate) const API_KEY_ENV: &[&str] = &["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
+pub(crate) const PLAN_TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+const PLAN_AUTH_METHODS: &[&str] = &["claude.ai", "oauth_token"];
+const SIGN_IN_TTL: Duration = Duration::from_secs(5 * 60);
+
+const BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
+const ANTHROPIC_HOST: &str = "api.anthropic.com";
+
+const CLOUD_ROUTES: &[&str] = &["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"];
+
+pub(crate) fn route_is_first_party(get: &dyn Fn(&str) -> Option<String>) -> bool {
+    let switched_on = |name: &str| get(name).is_some_and(|value| !matches!(value.trim().to_ascii_lowercase().as_str(), "" | "0" | "false"));
+    if CLOUD_ROUTES.iter().any(|name| switched_on(name)) {
+        return false;
+    }
+    match get(BASE_URL_ENV).map(|url| url.trim().to_string()).filter(|url| !url.is_empty()) {
+        None => true,
+        Some(url) => url::Url::parse(&url).ok().and_then(|url| url.host_str().map(|host| host.eq_ignore_ascii_case(ANTHROPIC_HOST))) == Some(true),
+    }
+}
+
+pub(crate) fn host_route_lookup(granted: &BTreeMap<String, String>) -> impl Fn(&str) -> Option<String> {
+    let settings = string_values(super::user_auth_settings().and_then(|mut settings| settings.remove("env")));
+    let granted = granted.clone();
+    move |name: &str| settings.get(name).cloned().or_else(|| granted.get(name).cloned()).or_else(|| std::env::var(name).ok())
+}
+
+pub(crate) struct ClaudeEnv {
+    process: HashMap<String, String>,
+    settings: HashMap<String, String>,
+    extra: serde_json::Map<String, serde_json::Value>,
+    source: UserSettings,
+}
+
+fn string_values(env: Option<serde_json::Value>) -> HashMap<String, String> {
+    env.and_then(|env| env.as_object().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(name, value)| Some((name, value.as_str()?.to_string())))
+        .collect()
+}
+
+impl ClaudeEnv {
+    pub(crate) fn of(cmd: &tokio::process::Command, source: UserSettings) -> Self {
+        let process = crate::key_proxy::env_of(cmd);
+        let file = super::config_dir_from(&|name| process.get(name).cloned()).map(|dir| dir.join("settings.json"));
+        let (settings, extra) = match (source, file) {
+            (UserSettings::ReadByCli, Some(path)) => (string_values(super::settings_at(&path).and_then(|mut settings| settings.remove("env"))), serde_json::Map::new()),
+            (UserSettings::AppliedByLoka, Some(path)) => {
+                let mut auth = super::auth_settings_at(&path).unwrap_or_default();
+                (string_values(auth.remove("env")), auth)
+            }
+            _ => Default::default(),
+        };
+        Self { process, settings, extra, source }
+    }
+
+    #[cfg(test)]
+    fn from_pairs(process: &[(&str, &str)], settings: &[(&str, &str)]) -> Self {
+        let map = |pairs: &[(&str, &str)]| pairs.iter().map(|(name, value)| (name.to_string(), value.to_string())).collect();
+        Self { process: map(process), settings: map(settings), extra: Default::default(), source: UserSettings::ReadByCli }
+    }
+
+    fn merged(&self) -> HashMap<String, String> {
+        let mut env = self.process.clone();
+        env.extend(self.settings.iter().map(|(name, value)| (name.clone(), value.clone())));
+        env
+    }
+
+    fn get(&self, name: &str) -> Option<String> {
+        self.settings.get(name).or_else(|| self.process.get(name)).cloned()
+    }
+
+    fn has(&self, name: &str) -> bool {
+        self.get(name).is_some_and(|v| !v.trim().is_empty())
+    }
+
+    fn config_dir(&self) -> Option<PathBuf> {
+        super::config_dir_from(&|name| self.process.get(name).cloned())
+    }
+
+    pub(crate) fn first_party_route(&self) -> bool {
+        route_is_first_party(&|name| self.get(name))
+    }
+
+    fn routes_to_a_gateway(&self) -> bool {
+        self.get(BASE_URL_ENV).filter(|url| !url.trim().is_empty()).is_some_and(|url| {
+            url::Url::parse(url.trim()).ok().and_then(|url| url.host_str().map(|host| host.eq_ignore_ascii_case(ANTHROPIC_HOST))) != Some(true)
+        })
+    }
+
+    fn key_could_lose_to_the_plan(&self) -> bool {
+        API_KEY_ENV.iter().any(|name| self.has(name)) && !self.routes_to_a_gateway()
+    }
+}
+
+pub(crate) fn plan_wins(env: &ClaudeEnv, stored_plan_login: bool) -> bool {
+    env.key_could_lose_to_the_plan() && (env.has(PLAN_TOKEN_ENV) || stored_plan_login)
+}
+
+fn needs_sign_in_check(env: &ClaudeEnv) -> bool {
+    env.key_could_lose_to_the_plan() && !env.has(PLAN_TOKEN_ENV)
+}
+
+pub(crate) fn plan_auth_method(status: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(status.trim())
+        .ok()
+        .and_then(|status| status.get("authMethod").and_then(serde_json::Value::as_str).map(|method| PLAN_AUTH_METHODS.contains(&method)))
+        .unwrap_or(false)
+}
+
+const SIGN_IN_ROUTES: &[&str] = &[BASE_URL_ENV, "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"];
+
+type SignInKey = (PathBuf, Option<PathBuf>, Vec<Option<String>>);
+type SignInCache = Mutex<HashMap<SignInKey, (Instant, bool)>>;
+
+fn sign_in_cache() -> &'static SignInCache {
+    static CACHE: std::sync::OnceLock<SignInCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+async fn stored_plan_login(launch: &Launch, env: &ClaudeEnv) -> bool {
+    let key = (launch.program.clone(), env.config_dir(), SIGN_IN_ROUTES.iter().map(|name| env.get(name)).collect());
+    if let Some((at, signed_in)) = sign_in_cache().lock().unwrap().get(&key) {
+        if at.elapsed() < SIGN_IN_TTL {
+            return *signed_in;
+        }
+    }
+    let signed_in = probe_plan_login(launch, env).await;
+    sign_in_cache().lock().unwrap().insert(key, (Instant::now(), signed_in));
+    signed_in
+}
+
+async fn probe_plan_login(launch: &Launch, env: &ClaudeEnv) -> bool {
+    let mut cmd = crate::cli::job_command(&launch.program);
+    cmd.env_clear().envs(env.merged());
+    for name in API_KEY_ENV.iter().chain([&PLAN_TOKEN_ENV]) {
+        cmd.env_remove(name);
+    }
+    cmd.args(["--setting-sources", "", "auth", "status", "--json"]).kill_on_drop(true).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    match tokio::time::timeout(HELP_TIMEOUT, cmd.output()).await {
+        Ok(Ok(out)) => plan_auth_method(&String::from_utf8_lossy(&out.stdout)),
+        _ => {
+            warn!("Could not ask Claude Code whether it is signed in with a plan");
+            false
         }
     }
 }
@@ -271,7 +478,7 @@ pub(crate) fn wants_auto(opts: &crate::cli::CliOptions<'_>) -> bool {
 
 pub(crate) async fn detected() -> Result<Launch> {
     let (program, path) = locate().ok_or_else(|| anyhow::anyhow!(NOT_FOUND))?;
-    let mut launch = Launch { program, path, caps: Arc::new(Caps::unknown()), auto_refused: false };
+    let mut launch = Launch { program, path, caps: Arc::new(Caps::unknown()), auto_refused: false, plan_signed_in: false, uses_plan: false };
     launch.caps = caps_for(&launch).await;
     if let Some(message) = launch.caps.outdated() {
         anyhow::bail!(message);
@@ -286,12 +493,33 @@ pub(crate) fn version() -> Option<String> {
 pub(crate) async fn prepare(opts: &crate::cli::CliOptions<'_>) -> Result<Launch> {
     let mut launch = detected().await?;
     launch.auto_refused = wants_auto(opts) && (!launch.caps.mode("auto") || auto_refused(opts));
+    let cmd = super::run_command(opts, &launch)?;
+    let env = ClaudeEnv::of(&cmd, super::user_settings(opts, &cmd));
+    launch.plan_signed_in = needs_sign_in_check(&env) && stored_plan_login(&launch, &env).await;
+    launch.uses_plan = plan_wins(&env, launch.plan_signed_in);
     Ok(launch)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_first_party_route_counts_as_one() {
+        let route = |pairs: &[(&str, &str)]| {
+            let map: HashMap<String, String> = pairs.iter().map(|(name, value)| (name.to_string(), value.to_string())).collect();
+            route_is_first_party(&|name| map.get(name).cloned())
+        };
+        assert!(route(&[]));
+        assert!(route(&[("ANTHROPIC_BASE_URL", "https://api.anthropic.com")]));
+        assert!(route(&[("ANTHROPIC_BASE_URL", "https://API.anthropic.com/")]));
+        assert!(route(&[("CLAUDE_CODE_USE_BEDROCK", "0")]));
+        assert!(!route(&[("ANTHROPIC_BASE_URL", "http://localhost:4000")]));
+        assert!(!route(&[("ANTHROPIC_BASE_URL", "https://openrouter.ai/api")]));
+        assert!(!route(&[("CLAUDE_CODE_USE_BEDROCK", "1")]));
+        assert!(!route(&[("CLAUDE_CODE_USE_VERTEX", "true")]));
+        assert!(!route(&[("CLAUDE_CODE_USE_FOUNDRY", "1")]));
+    }
 
     const HELP: &str = r#"Usage: claude [options] [command] [prompt]
   --effort <level>                      Effort level for the current session
@@ -381,6 +609,121 @@ mod tests {
             provider_keys: Default::default(),
             readable_files: Vec::new(),
         }
+    }
+
+    #[test]
+    fn plan_sign_in_is_read_from_the_cli_auth_method() {
+        assert!(plan_auth_method(r#"{"loggedIn": true, "authMethod": "claude.ai", "apiProvider": "firstParty"}"#));
+        assert!(plan_auth_method(r#"{"loggedIn": true, "authMethod": "oauth_token"}"#));
+        assert!(!plan_auth_method(r#"{"loggedIn": true, "authMethod": "api_key"}"#));
+        assert!(!plan_auth_method(r#"{"loggedIn": true, "authMethod": "third_party", "apiProvider": "bedrock"}"#));
+        assert!(!plan_auth_method(r#"{"loggedIn": false, "authMethod": "none"}"#));
+        assert!(!plan_auth_method("Not logged in"));
+    }
+
+    #[test]
+    fn the_sign_in_is_checked_only_when_a_key_would_otherwise_win() {
+        let with = |names: &[&str]| ClaudeEnv::from_pairs(&names.iter().map(|name| (*name, "set")).collect::<Vec<_>>(), &[]);
+        assert!(!needs_sign_in_check(&with(&[])), "neither");
+        assert!(!needs_sign_in_check(&with(&["CLAUDE_CODE_OAUTH_TOKEN"])), "plan token only");
+        assert!(!needs_sign_in_check(&with(&["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"])), "the token already wins");
+        assert!(needs_sign_in_check(&with(&["ANTHROPIC_API_KEY"])), "key only");
+        assert!(needs_sign_in_check(&with(&["ANTHROPIC_AUTH_TOKEN"])), "bearer token only");
+        assert!(plan_wins(&with(&["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]), false));
+        assert!(plan_wins(&with(&["ANTHROPIC_API_KEY"]), true));
+        assert!(!plan_wins(&with(&["ANTHROPIC_API_KEY"]), false));
+        assert!(!plan_wins(&with(&["CLAUDE_CODE_OAUTH_TOKEN"]), true), "nothing to withhold");
+        let routed = |url: &str| ClaudeEnv::from_pairs(&[("ANTHROPIC_BASE_URL", url), ("ANTHROPIC_AUTH_TOKEN", "set"), ("CLAUDE_CODE_OAUTH_TOKEN", "set")], &[]);
+        assert!(!plan_wins(&routed("https://gateway.example.com/v1"), true), "a gateway keeps its own credentials, so the plan login never goes to it");
+        assert!(!needs_sign_in_check(&routed("http://127.0.0.1:4000")));
+        assert!(plan_wins(&routed("https://api.anthropic.com"), false), "the Anthropic API itself is no gateway");
+        let settings_gateway = ClaudeEnv::from_pairs(
+            &[("ANTHROPIC_AUTH_TOKEN", "set"), ("ANTHROPIC_BASE_URL", "https://api.anthropic.com")],
+            &[("ANTHROPIC_BASE_URL", "https://gateway.example.com")],
+        );
+        assert!(!plan_wins(&settings_gateway, true), "a gateway set in settings.json wins over the process env, as in Claude Code");
+        assert!(!needs_sign_in_check(&settings_gateway));
+    }
+
+    #[test]
+    fn a_gateway_from_the_job_users_settings_keeps_its_token() {
+        let root = std::env::temp_dir().join(format!("claude-gateway-{}", uuid::Uuid::new_v4()));
+        let config = root.join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("settings.json"), r#"{"env": {"ANTHROPIC_BASE_URL": "https://llm-gateway.example.com"}}"#).unwrap();
+        let run = |plan_signed_in: bool| {
+            let mut cmd = tokio::process::Command::new("claude");
+            cmd.env("CLAUDE_CONFIG_DIR", &config).env("ANTHROPIC_AUTH_TOKEN", "gateway-token");
+            let env = ClaudeEnv::of(&cmd, UserSettings::ReadByCli);
+            SignIn::settle(&mut cmd, UserSettings::ReadByCli, &Launch { plan_signed_in, ..Launch::assume("claude") });
+            let kept = cmd.as_std().get_envs().any(|(name, value)| name == "ANTHROPIC_AUTH_TOKEN" && value.is_some());
+            (needs_sign_in_check(&env), kept)
+        };
+        assert_eq!(run(true), (false, true), "the plan login is never sent to a gateway named only in settings.json");
+        std::fs::write(config.join("settings.json"), r#"{"env": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}}"#).unwrap();
+        assert_eq!(run(true), (true, false), "the Anthropic API in settings.json still lets the plan win");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn the_remembered_sign_in_is_kept_apart_per_provider_route() {
+        let dir = std::env::temp_dir().join(format!("claude-sign-in-routes-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("claude");
+        std::fs::write(&program, "#!/bin/sh\nif [ -n \"$CLAUDE_CODE_USE_BEDROCK\" ]; then printf '%s\\n' '{\"authMethod\":\"third_party\"}'; else printf '%s\\n' '{\"authMethod\":\"claude.ai\"}'; fi\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let config = dir.join("config");
+        let config = config.to_string_lossy();
+        let bedrock = ClaudeEnv::from_pairs(&[("PATH", "/usr/bin:/bin"), ("CLAUDE_CONFIG_DIR", &config), ("ANTHROPIC_API_KEY", "set"), ("CLAUDE_CODE_USE_BEDROCK", "1")], &[]);
+        let direct = ClaudeEnv::from_pairs(&[("PATH", "/usr/bin:/bin"), ("CLAUDE_CONFIG_DIR", &config), ("ANTHROPIC_API_KEY", "set")], &[]);
+        let launch = Launch::assume(program);
+        assert!(!stored_plan_login(&launch, &bedrock).await);
+        assert!(stored_plan_login(&launch, &direct).await, "a Bedrock answer for one run is never reused for a direct one");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_sign_in_is_remembered_per_config_dir_of_the_job_user() {
+        let job = ClaudeEnv::from_pairs(&[("HOME", "/runner/tmp/2001")], &[]);
+        let other_job = ClaudeEnv::from_pairs(&[("HOME", "/runner/tmp/2002")], &[]);
+        let shared = ClaudeEnv::from_pairs(&[("HOME", "/runner/tmp/2001"), ("CLAUDE_CONFIG_DIR", "/persist/claude")], &[]);
+        assert_eq!(job.config_dir(), Some(PathBuf::from("/runner/tmp/2001/.claude")));
+        assert_ne!(job.config_dir(), other_job.config_dir());
+        assert_eq!(shared.config_dir(), Some(PathBuf::from("/persist/claude")), "an explicit config dir wins over the job home");
+    }
+
+    #[tokio::test]
+    async fn the_stored_sign_in_check_asks_the_cli_without_any_key() {
+        let dir = std::env::temp_dir().join(format!("claude-sign-in-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = |name: &str, body: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            path
+        };
+        let plan = fake(
+            "plan",
+            r#"if [ -n "$ANTHROPIC_API_KEY$ANTHROPIC_AUTH_TOKEN$CLAUDE_CODE_OAUTH_TOKEN" ] || [ "$1 $2 $3" != "--setting-sources  auth" ]; then printf '%s\n' '{"loggedIn":true,"authMethod":"api_key"}'; elif [ "$ANTHROPIC_SMALL_FAST_MODEL" != "haiku" ]; then printf '%s\n' '{"loggedIn":false}'; else printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai"}'; fi"#,
+        );
+        let signed_out = fake("signed-out", r#"printf '%s\n' '{"loggedIn":false,"authMethod":"none"}'"#);
+        let broken = fake("broken", "exit 1");
+        let env = ClaudeEnv::from_pairs(
+            &[("PATH", "/usr/bin:/bin"), ("ANTHROPIC_API_KEY", "sk-ant-api03-key"), ("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-token")],
+            &[("ANTHROPIC_AUTH_TOKEN", "sk-ant-api03-from-settings"), ("ANTHROPIC_SMALL_FAST_MODEL", "haiku")],
+        );
+        assert!(probe_plan_login(&Launch::assume(plan), &env).await, "a stored plan login is found, asked on the final env without any key or token and without re-reading settings.json");
+        assert!(!probe_plan_login(&Launch::assume(signed_out), &env).await, "no plan login, so the key stays the fallback");
+        assert!(!probe_plan_login(&Launch::assume(broken), &env).await, "an unreadable answer keeps the key");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

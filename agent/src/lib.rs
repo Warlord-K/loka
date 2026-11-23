@@ -1,5 +1,12 @@
 extern crate self as loka_agent;
 
+#[cfg(test)]
+mod test_env;
+#[cfg(test)]
+fn passed_on_to_clis(_: &str) -> bool {
+    false
+}
+
 #[path = "world/prompts.rs"]
 mod prompts;
 
@@ -26,6 +33,9 @@ mod practice_tools;
 
 #[path = "world/teams_tools.rs"]
 mod teams_tools;
+
+#[path = "world/tool_catalog.rs"]
+pub mod tool_catalog;
 
 #[path = "world/mcp.rs"]
 pub mod mcp;

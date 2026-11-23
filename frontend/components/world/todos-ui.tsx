@@ -12,7 +12,7 @@ import { matchesQuery, worldApi, type Todo, type WorldAgent } from "@/lib/world"
 import { BTN_PRIMARY_SM, BTN_SECONDARY_SM, CHUNKY, ITEM_CARD, MODAL, PILL_INFO, BTN_DANGER_GHOST, BTN_SECONDARY, PIXEL } from "./styles";
 import { BoardColumn } from "./board-kit";
 import { MOVE_FAILED, moveFailureNote, placeOpenTodo } from "@/lib/todo-board";
-import { applyLatest, latestOnly } from "@/lib/latest";
+import { latestOnly } from "@/lib/latest";
 import { AgentFace } from "./channel-ui";
 import { Shimmer } from "./work-ui";
 import { CLOSE_BTN } from "./settings-shell";
@@ -365,6 +365,7 @@ function localInput(iso: string | null): string {
 }
 
 function TodoDetail({
+  active,
   todo,
   agent,
   now,
@@ -374,6 +375,7 @@ function TodoDetail({
   agents,
   onDecided,
 }: {
+  active: boolean;
   agents: WorldAgent[];
   onDecided: () => void;
   todo: Todo;
@@ -397,14 +399,14 @@ function TodoDetail({
   saveRef.current = save;
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
+      if (!active || e.key !== "Escape") return;
       e.stopPropagation();
       saveRef.current();
       onClose();
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [onClose]);
+  }, [active, onClose]);
   useEffect(() => box.current?.focus(), []);
   const setTimer = (when: Date) => {
     if (when.getTime() <= Date.now()) {
@@ -626,14 +628,11 @@ function sortOpen(list: Todo[]): Todo[] {
   return [...list].sort((a, b) => a.priority - b.priority || (a.position ?? Number.MAX_SAFE_INTEGER) - (b.position ?? Number.MAX_SAFE_INTEGER) || a.added_at.localeCompare(b.added_at));
 }
 
-let pendingTodo: string | null = null;
-
 export function focusTodo(id: string) {
-  pendingTodo = id;
-  window.dispatchEvent(new Event("world:todo-focus"));
+  window.dispatchEvent(new CustomEvent("world:todo-focus", { detail: { id } }));
 }
 
-export function TodoBoard({ agents, filter = "" }: { agents: WorldAgent[]; filter?: string }) {
+export function TodoBoard({ active = true, agents, filter = "", focus, onNavigate }: { active?: boolean; agents: WorldAgent[]; filter?: string; focus?: { todo: Todo; nonce: number } | null; onNavigate?: (todo: Todo) => void }) {
   const [todos, setTodos] = useState<Todo[]>(() => todoCache.list ?? []);
   const [loaded, setLoaded] = useState(() => todoCache.list !== null);
   useEffect(() => {
@@ -662,23 +661,21 @@ export function TodoBoard({ agents, filter = "" }: { agents: WorldAgent[]; filte
       .catch(() => setLoaded(true));
   }, []);
 
+  const focusedNonce = useRef(0);
   useEffect(() => {
-    const take = () => {
-      const id = pendingTodo;
-      if (!id) return;
-      pendingTodo = null;
-      const current = todoSelection.begin();
-      const local = todos.find((t) => t.id === id);
-      void applyLatest(() => local ?? worldApi.todo(id), current, (todo) => {
-        setOutsideBoard(local ? null : todo);
-        setOpened(todo.id);
-      }).catch(() => {});
-    };
-    take();
-    window.addEventListener("world:todo-focus", take);
-    return () => window.removeEventListener("world:todo-focus", take);
-  }, [todos, todoSelection]);
+    if (!focus || focus.nonce === focusedNonce.current) return;
+    focusedNonce.current = focus.nonce;
+    todoSelection.begin();
+    const local = todos.find((todo) => todo.id === focus.todo.id);
+    setOutsideBoard(local ? null : focus.todo);
+    setOpened(focus.todo.id);
+  }, [focus, todos, todoSelection]);
   const openCard = (id: string | null) => {
+    const todo = id ? todos.find((item) => item.id === id) ?? (outsideBoard?.id === id ? outsideBoard : null) : null;
+    if (todo && onNavigate) {
+      onNavigate(todo);
+      return;
+    }
     todoSelection.begin();
     setOutsideBoard(null);
     setOpened(id);
@@ -941,6 +938,7 @@ export function TodoBoard({ agents, filter = "" }: { agents: WorldAgent[]; filte
       {detail && (
         <TodoDetail
           key={detail.id}
+          active={active}
           todo={detail}
           agent={by(detail.added_by_agent)}
           now={now}

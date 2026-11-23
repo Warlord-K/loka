@@ -1,11 +1,11 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowSquareOut, CaretRight, Check, ClockCounterClockwise, Hourglass, Link as LinkIcon, Robot } from "@phosphor-icons/react";
+import { ArrowSquareOut, CaretRight, Check, ClockCounterClockwise, Hourglass, Link as LinkIcon, Play, Robot } from "@phosphor-icons/react";
 import { AgentFace } from "./channel-ui";
 import { cn } from "@/lib/utils";
-import { causeLabel, formatUsage, worldApi, type AgentMessage, type QuestPart, type QuestRoomPage, type QuestRoomTask, type QuestTiming, type RunEvent, type SessionBrief, type SessionRun, type WorldAgent, type WorldEvent } from "@/lib/world";
-import { BTN_SECONDARY_SM, CHUNKY, ICON_BTN, ITEM_CARD, PANEL, ICON_BTN_MD } from "./styles";
+import { causeLabel, formatUsage, WAITING_FOR_DISK, worldApi, WorldApiError, type AgentMessage, type QuestPart, type QuestRoomPage, type QuestRoomTask, type QuestTiming, type RunEvent, type SessionBrief, type SessionRun, type WorldAgent, type WorldEvent } from "@/lib/world";
+import { BTN_PRIMARY_SM, BTN_SECONDARY_SM, CHUNKY, ICON_BTN, ITEM_CARD, PANEL, ICON_BTN_MD } from "./styles";
 import { AttachButton, AttachmentGrid, CornerCopy, DayDivider, MessageStamp, NewMessagesPill, PendingStrip, PrChip, QuestCard, RichText, useAgentHandles, useAttachments, useFollowBottom } from "./chat-kit";
 import { ReportCard, ROLE_LABEL, RunTurn, runIsLive, StatusLine, useEscape, useWorldRefresh, type Progress } from "./panels";
 import { formatTiming, paceLabel, StatusIcon, statusLabel } from "./quest-ui";
@@ -14,12 +14,17 @@ import { VoiceField } from "./voice-ui";
 import { WSelect } from "./controls";
 import { useDraft } from "./drafts";
 import { OpenWorkshop } from "./workbench/open-workshop";
+import { WatchBrowserButton } from "./browser-view";
+import { useFeature } from "./setup-hint";
 import { MilestoneList, milestoneProgress } from "./milestones-ui";
 import { CloseButton, EmptyState } from "./settings-shell";
 import { MessageToolbar } from "./message-row";
 import { worldUrl } from "./message-links";
 import { useCopy } from "@/lib/copy";
 import { githubLine, githubLink, isGithubEvent } from "./github-ui";
+import { guardedDetailLoader } from "@/lib/exact-world-navigation";
+import { navigationDetails } from "@/lib/navigation-details";
+import { questNeedsYou, sessionAwaitsPlan } from "@/lib/quest-status";
 
 type RoomRun = QuestRoomPage["room"]["runs"][number];
 
@@ -28,7 +33,7 @@ type Entry =
   | { kind: "event"; at: string; key: string; event: WorldEvent }
   | { kind: "run"; at: string; key: string; run: RoomRun };
 
-const QUIET_EVENTS = /^(run\.(?!failed$|timed_out$|retrying$)|session\.|agent\.)/;
+export const QUIET_EVENTS = /^(run\.(?!failed$|timed_out$|retrying$)|session\.|agent\.)/;
 
 const RUN_LABEL: Record<string, string> = {
   task: "worked on the quest",
@@ -43,7 +48,7 @@ function str(v: unknown): string {
 }
 
 function openQuest(part: QuestPart) {
-  window.dispatchEvent(new CustomEvent("world:open-quest", { detail: { taskId: part.id, agentId: part.assigned_agent_id } }));
+  window.dispatchEvent(new CustomEvent("world:open-quest", { detail: { taskId: part.id, agentId: part.assigned_agent_id, loaded: true } }));
 }
 
 function questLink(taskId: string): string {
@@ -54,18 +59,34 @@ function withoutQuestLink(body: string, taskId: string): string {
   return body.replace(new RegExp(`\\s*${questLink(taskId)}\\s*$`), "").trim();
 }
 
-function eventLine(e: WorldEvent, who: string): string {
+function newestMessageAt(messages: AgentMessage[]): string | undefined {
+  return messages.reduce((newest, message) => {
+    const at = message.edited_at && message.edited_at > message.created_at ? message.edited_at : message.created_at;
+    return at > newest ? at : newest;
+  }, "") || undefined;
+}
+
+function reviewMiss(review: unknown): string {
+  const cause = str(((review ?? {}) as Record<string, unknown>).cause);
+  return cause ? causeLabel(cause).toLowerCase() : "";
+}
+
+export function eventLine(e: WorldEvent, who: string): string {
   const p = e.payload ?? {};
   if (e.type === "task.finished") {
     const timing = formatTiming(p.timing as QuestTiming | undefined);
     const why = str(p.cause) ? `${causeLabel(str(p.cause))}. ${str(p.reason)}` : str(p.error);
-    const line = why ? `The quest needs attention. ${why}` : str(p.pr_url) ? `${who} finished and opened a PR` : `${who} finished the quest`;
+    const miss = reviewMiss(p.review);
+    const done = str(p.pr_url) ? `${who} finished and opened a PR` : `${who} finished the quest`;
+    const line = why ? `The quest needs attention. ${why}` : miss ? `${done}, but the review ${miss}` : done;
     return timing ? `${line}. Took ${timing}` : line;
   }
   if (isGithubEvent(e.type)) return githubLine(e);
   switch (e.type) {
     case "run.retrying":
       return `${who} hit a snag (${str(p.reason) || causeLabel(str(p.cause))}), so Loka is trying again by itself`;
+    case "run.waiting":
+      return p.waiting === false ? `There is room on the device again, so ${who}'s work can start` : `The device is low on disk space, so ${who}'s work waits and starts by itself once there is room`;
     case "run.failed":
     case "run.timed_out":
       return `${who}'s run stopped. ${str(p.cause) ? `${causeLabel(str(p.cause))}. ${str(p.reason)}` : str(p.error)}${p.auto_retried ? " Loka had already tried again once." : ""}`;
@@ -100,6 +121,8 @@ function eventLine(e: WorldEvent, who: string): string {
     }
     case "review.finished": {
       const r = (p.review ?? {}) as Record<string, unknown>;
+      const miss = reviewMiss(r);
+      if (miss) return `The review ${miss}`;
       return `Review finished${str(r.verdict) ? `: ${str(r.verdict)}` : ""}`;
     }
     case "milestones.updated":
@@ -128,10 +151,6 @@ function duration(run: SessionRun): string {
   return `${Math.floor(secs / 3600)}h ${Math.round((secs % 3600) / 60)}m`;
 }
 
-function followupText(prompt: string): string | null {
-  return prompt.match(/^\[follow-up from ([^\]\n]+)\]\n([\s\S]*?)\n\nAnswer briefly\./)?.[2]?.trim() ?? null;
-}
-
 function RunCard({
   run,
   session,
@@ -158,7 +177,7 @@ function RunCard({
   const textDone = useRef(false);
 
   useEffect(() => {
-    if (run.kind !== "followup" && !open) return;
+    if (!open) return;
     if (textDone.current && !live) return;
     let gone = false;
     worldApi
@@ -172,7 +191,7 @@ function RunCard({
     return () => {
       gone = true;
     };
-  }, [run.id, run.kind, open, live, run.status]);
+  }, [run.id, open, live, run.status]);
 
   const settled = useRef(false);
   useEffect(() => {
@@ -193,10 +212,10 @@ function RunCard({
     };
   }, [open, run.id, tick, live]);
 
-  const asked = run.kind === "followup" && text ? followupText(text.prompt) : null;
+  const asked = run.kind === "followup" && run.request?.from ? (run.request.text ?? null) : null;
   const usage = formatUsage(run.cost_usd, run.input_tokens + run.cached_input_tokens + run.output_tokens);
   const role = ROLE_LABEL[session.role] ?? session.role;
-  const statusText = live ? (run.status === "queued" ? "waiting to start" : "working now") : run.status === "completed" ? "done" : run.status.replace("_", " ");
+  const statusText = live ? (run.status === "queued" ? (run.waiting_for === "disk" ? WAITING_FOR_DISK.toLowerCase() : "waiting to start") : "working now") : run.status === "completed" ? "done" : run.status.replace("_", " ");
   const fullRun: SessionRun = { ...run, prompt: text?.prompt ?? "", output: text?.output ?? null };
 
   return (
@@ -298,6 +317,8 @@ function MessageRow({ message, taskId, meId, byId, handles, onOpenAgent, onOpenS
 
 export function QuestRoom({
   taskId,
+  initial,
+  initialRequest,
   agents,
   meId,
   onClose,
@@ -305,6 +326,8 @@ export function QuestRoom({
   onOpenSession,
 }: {
   taskId: string;
+  initial?: QuestRoomPage;
+  initialRequest?: number;
   agents: WorldAgent[];
   meId: string | null;
   onClose: () => void;
@@ -312,43 +335,66 @@ export function QuestRoom({
   onOpenSession: (sessionId: string, agentId: string) => void;
 }) {
   useEscape(onClose);
-  const [task, setTask] = useState<QuestRoomTask | null>(null);
-  const [sessions, setSessions] = useState<SessionBrief[]>([]);
-  const [runs, setRuns] = useState<RoomRun[]>([]);
-  const [events, setEvents] = useState<WorldEvent[]>([]);
-  const [messages, setMessages] = useState<AgentMessage[]>([]);
+  const [task, setTask] = useState<QuestRoomTask | null>(initial?.task ?? null);
+  const [sessions, setSessions] = useState<SessionBrief[]>(initial?.room.sessions ?? []);
+  const [runs, setRuns] = useState<RoomRun[]>(initial?.room.runs ?? []);
+  const [events, setEvents] = useState<WorldEvent[]>(initial?.room.events ?? []);
+  const [messages, setMessages] = useState<AgentMessage[]>(initial?.room.messages ?? []);
   const [failed, setFailed] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
-  const cursor = useRef<number | undefined>(undefined);
-  const since = useRef<string | undefined>(undefined);
-  const loading = useRef(false);
+  const cursor = useRef(initial?.room.cursor);
+  const since = useRef(newestMessageAt(initial?.room.messages ?? []));
+  const loadRequest = useRef(0);
+  const detailLoader = useRef(guardedDetailLoader()).current;
+  const loading = useRef<number | null>(null);
   const again = useRef(false);
+  const activeTask = useRef(taskId);
+  activeTask.current = taskId;
+  const activeInitialRequest = useRef(initialRequest);
+  activeInitialRequest.current = initialRequest;
   const byId = useMemo(() => new Map(agents.map((a) => [a.id, a])), [agents]);
   const handles = useAgentHandles(agents);
 
+  const applyPage = useCallback(({ task: nextTask, room }: QuestRoomPage) => {
+    setTask(nextTask);
+    setSessions(room.sessions);
+    setRuns(room.runs);
+    setEvents(room.events);
+    setMessages(room.messages);
+    setFailed(null);
+    cursor.current = room.cursor;
+    since.current = newestMessageAt(room.messages);
+    setTick((n) => n + 1);
+  }, []);
+
   const refresh = useCallback(() => {
-    if (loading.current) {
+    if (activeTask.current !== taskId) return;
+    if (loading.current !== null) {
       again.current = true;
       return;
     }
-    loading.current = true;
-    worldApi
-      .questRoom(taskId, cursor.current, since.current)
-      .then(({ task: t, room }) => {
+    const request = ++loadRequest.current;
+    const navigationRequest = activeInitialRequest.current;
+    const requestedCursor = cursor.current;
+    const requestedSince = since.current;
+    loading.current = request;
+    const intent = detailLoader.begin(() => loading.current === request && activeInitialRequest.current === navigationRequest && activeTask.current === taskId);
+    navigationDetails
+      .quest(intent, taskId, requestedCursor, requestedSince)
+      .then((page) => {
+        if (!page || !intent.current()) return;
+        const { task: t, room } = page;
         setTask(t);
         setSessions(room.sessions);
         setRuns(room.runs);
         setFailed(null);
-        const first = cursor.current === undefined;
+        const first = requestedCursor === undefined;
         cursor.current = room.cursor;
         if (first) setEvents(room.events);
         else if (room.events.length) setEvents((prev) => [...prev, ...room.events.filter((e) => !prev.some((p) => p.seq === e.seq))]);
         if (room.messages.length) {
-          const newest = room.messages.reduce((m, x) => {
-            const at = x.edited_at && x.edited_at > x.created_at ? x.edited_at : x.created_at;
-            return at > m ? at : m;
-          }, since.current ?? "");
-          since.current = newest || since.current;
+          const newest = newestMessageAt(room.messages);
+          if (newest && (!since.current || newest > since.current)) since.current = newest;
           setMessages((prev) => {
             const fresh = new Map(room.messages.map((m) => [m.id, m]));
             return [...prev.map((m) => fresh.get(m.id) ?? m), ...room.messages.filter((m) => !prev.some((p) => p.id === m.id))];
@@ -357,25 +403,22 @@ export function QuestRoom({
         setTick((n) => n + 1);
       })
       .catch((error: unknown) => {
+        if (!intent.current()) return;
         const msg = error instanceof Error ? error.message : "";
         setFailed(msg.startsWith("403") ? "You cannot open this quest's room." : msg.startsWith("404") ? "This quest no longer exists." : "Could not load the room. It will retry on the next update.");
       })
       .finally(() => {
-        loading.current = false;
+        if (!intent.current()) return;
+        loading.current = null;
         if (again.current) {
           again.current = false;
           window.setTimeout(refresh, 400);
         }
       });
-  }, [taskId]);
+  }, [taskId, detailLoader]);
 
-  useEffect(() => {
-    cursor.current = undefined;
-    since.current = undefined;
-    setEvents([]);
-    setMessages([]);
-    refresh();
-  }, [refresh]);
+  const initialRef = useRef(initial);
+  initialRef.current = initial;
 
   const pending = useRef<number | null>(null);
   const refreshSoon = useCallback(() => {
@@ -404,6 +447,26 @@ export function QuestRoom({
     [taskId, sessionIds, roomAgents],
   );
   useWorldRefresh(refreshSoon, match);
+  useEffect(() => {
+    loadRequest.current++;
+    detailLoader.invalidate();
+    loading.current = null;
+    again.current = false;
+    if (initialRef.current) {
+      applyPage(initialRef.current);
+    } else {
+      cursor.current = undefined;
+      since.current = undefined;
+      setEvents([]);
+      setMessages([]);
+    }
+    refresh();
+    return () => {
+      detailLoader.invalidate();
+      loading.current = null;
+      again.current = false;
+    };
+  }, [taskId, initialRequest, applyPage, detailLoader, refresh]);
 
   const [progress, setProgress] = useState<Progress | null>(null);
   const progressTick = useRef(0);
@@ -490,9 +553,28 @@ export function QuestRoom({
       setNote(chosen === "main" ? null : steering ? "Passed into the running work." : "Sent. The session picks it up next.");
       refresh();
     } catch (error) {
-      setNote(error instanceof Error && /^4\d\d /.test(error.message) ? error.message.slice(4) : "Could not send that.");
+      setNote(error instanceof WorldApiError ? error.message : error instanceof Error && /^4\d\d /.test(error.message) ? error.message.slice(4) : "Could not send that.");
     } finally {
       setSending(false);
+    }
+  };
+
+  const [resuming, setResuming] = useState(false);
+  const [resumeNote, setResumeNote] = useState<string | null>(null);
+  const resumeState = !liveRun && task?.resume ? task.resume : null;
+  const resumable = !!resumeState?.can;
+  const resume = async () => {
+    if (resuming) return;
+    setResuming(true);
+    setResumeNote(null);
+    try {
+      const outcome = await worldApi.resumeQuest(taskId);
+      setResumeNote(outcome.result === "resumed" ? "Picking the quest back up." : `${main?.name ?? "The agent"} is opening a fresh session to carry on.`);
+      refresh();
+    } catch (error) {
+      setResumeNote(error instanceof WorldApiError ? error.message : "Could not resume the quest.");
+    } finally {
+      setResuming(false);
     }
   };
 
@@ -515,14 +597,18 @@ export function QuestRoom({
   const nowText = useMemo(() => {
     if (!liveRun) return null;
     const who = byId.get(liveRun.agent_id)?.name ?? "The agent";
-    if (liveRun.status === "queued") return `${who} is waiting for a free slot`;
+    if (liveRun.status === "queued") return liveRun.waiting_for === "disk" ? `${who} is waiting for disk space on its device` : `${who} is waiting for a free slot`;
     return progress?.text ?? `${who} is ${liveRun.kind === "review" ? "reviewing" : "working"}`;
   }, [liveRun, progress, byId]);
 
   const cost = sessions.reduce((n, s) => n + s.cost_usd, 0);
   const tokens = sessions.reduce((n, s) => n + s.tokens, 0);
   const usage = formatUsage(cost, tokens);
+  const openClarification = [...messages]
+    .reverse()
+    .find((message) => message.meta?.clarification && !messages.some((answer) => answer.meta?.answers === message.id));
   const workshopSession = executor ?? reviewer;
+  const browserFeature = useFeature("browser");
   const [linkCopied, copyLink] = useCopy();
 
   return (
@@ -538,6 +624,7 @@ export function QuestRoom({
             <h2 className="mt-1 text-w-xl font-semibold leading-tight text-w-strong">{task?.title ?? <Shimmer>Opening the room</Shimmer>}</h2>
           </div>
           <div className="flex shrink-0 items-center gap-1.5">
+            {main && meId && main.owner_user_id === meId && browserFeature?.state === "ready" && <WatchBrowserButton agentId={main.id} questId={taskId} questTitle={task?.title} className={cn(BTN_SECONDARY_SM, "hidden h-10 sm:inline-flex")} />}
             {workshopSession && <OpenWorkshop detail={{ sessionId: executor?.id ?? null, taskId, agentId: workshopSession.agent_id }} label="Workshop" className="hidden h-10 rounded-lg px-2.5 text-w-xs sm:inline-flex" />}
             <button type="button" onClick={() => void copyLink(worldUrl("quest", taskId))} title={linkCopied ? "Link copied" : "Copy a link to this quest"} aria-label={linkCopied ? "Link copied" : "Copy a link to this quest"} className={ICON_BTN_MD}>
               {linkCopied ? <Check size={16} weight="bold" className="text-w-ok" /> : <LinkIcon size={16} weight="bold" />}
@@ -558,7 +645,20 @@ export function QuestRoom({
                 Part of {task.parent.title}
               </button>
             )}
-            {task.plan_first && <span>{sessions.some((s) => s.plan_state === "awaiting") ? "Plan waiting for your approval" : "Plan first"}</span>}
+            {sessions.some((s) => s.plan_state === "clarifying") ? (
+              <span>
+                Waiting for your answers
+                {openClarification && byId.get(openClarification.agent_id)?.owner_user_id === meId ? (
+                  <> · <RichText text={`[Answer the questions](msg:${openClarification.id})`} handles={handles} onOpenAgent={onOpenAgent} /></>
+                ) : task.assigned_agent_id && byId.get(task.assigned_agent_id)?.owner_user_id === meId ? (
+                  <button type="button" className="ml-1.5 text-w-link hover:underline" onClick={() => onOpenAgent(task.assigned_agent_id!)}>Answer in chat</button>
+                ) : null}
+              </span>
+            ) : questNeedsYou(task) ? (
+              <span className="font-semibold text-w-alert">Needs you: the plan is waiting for your approval</span>
+            ) : task.plan_first ? (
+              <span>Plan first</span>
+            ) : null}
             {!!task.attempts && task.attempts > 1 && <span>Best of {task.attempts}</span>}
             {task.pace && task.pace !== "normal" && <span>{paceLabel(task.pace)}</span>}
             {usage && <span className="font-mono text-w-2xs text-w-muted">{usage} so far</span>}
@@ -616,6 +716,20 @@ export function QuestRoom({
             </p>
           </div>
         )}
+        {resumable && (
+          <div className="mt-2 flex flex-wrap items-center gap-2 rounded-lg border-2 border-w-line bg-w-card/70 px-2.5 py-1.5">
+            <span className="min-w-0 flex-1 text-w-sm">
+              {resumeNote ?? (task?.resume?.mode === "fresh" ? "Its session is gone. Resuming opens a fresh one on the same branch and hands over the last report." : "Resuming carries on in the same session and quest folder.")}
+            </span>
+            <button type="button" onClick={() => void resume()} disabled={resuming} className={BTN_PRIMARY_SM}>
+              <Play size={12} weight="fill" />
+              {resuming ? "Resuming..." : "Resume quest"}
+            </button>
+          </div>
+        )}
+        {resumeState && !resumeState.can && resumeState.reason && (
+          <p className="mt-2 rounded-lg border-2 border-w-line bg-w-card/70 px-2.5 py-1.5 text-w-sm">Cannot resume yet: {resumeState.reason}.</p>
+        )}
         {nowText && (
           <div className="mt-2 flex flex-wrap items-center gap-2 rounded-lg border-2 border-w-teal bg-w-aqua/50 px-2.5 py-1.5">
             <span className="text-w-xs font-semibold text-w-link">Now</span>
@@ -643,7 +757,7 @@ export function QuestRoom({
                 key={s.id}
                 agent={byId.get(s.agent_id)}
                 label={s.attempt ? `${ROLE_LABEL[s.role] ?? s.role} ${s.attempt}` : (ROLE_LABEL[s.role] ?? s.role)}
-                detail={s.running ? "working" : s.plan_state === "awaiting" ? "plan waiting" : s.attempt_state === "won" ? "won" : s.attempt_state === "lost" ? "lost" : s.status}
+                detail={s.running ? "working" : s.plan_state === "clarifying" ? "waiting for answers" : sessionAwaitsPlan(s) ? "plan waiting" : s.attempt_state === "won" ? "won" : s.attempt_state === "lost" ? "lost" : s.status}
                 live={s.running}
                 onClick={() => onOpenSession(s.id, s.agent_id)}
               />

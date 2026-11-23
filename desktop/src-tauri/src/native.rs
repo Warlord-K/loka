@@ -102,6 +102,7 @@ struct DesktopStatus {
     start_at_login: bool,
     slack: SlackView,
     features: Vec<&'static str>,
+    terminals_per_place: usize,
 }
 
 #[derive(Deserialize)]
@@ -782,6 +783,7 @@ async fn status(window: &WebviewWindow) -> Result<DesktopStatus, String> {
         start_at_login: app.autolaunch().is_enabled().unwrap_or(false),
         slack,
         features: FEATURES.to_vec(),
+        terminals_per_place: crate::workbench::TERMS_PER_KEY,
     })
 }
 
@@ -1795,6 +1797,7 @@ mod tests {
             start_at_login: false,
             slack: SlackView::default(),
             features: FEATURES.to_vec(),
+            terminals_per_place: crate::workbench::TERMS_PER_KEY,
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(!json.contains("token"));

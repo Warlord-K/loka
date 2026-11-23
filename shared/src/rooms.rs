@@ -74,7 +74,7 @@ impl WorldStore {
                UNION
                SELECT * FROM world_events WHERE session_id = ANY($2) AND seq > $3 AND seq <= $5
              ) e
-             WHERE e.type NOT IN ('agent.progress', 'agent.status', 'message.created', 'run.activity')
+             WHERE e.type NOT IN ('agent.progress', 'agent.status', 'message.created', 'run.activity', 'task.changed')
              ORDER BY seq DESC LIMIT $4",
         )
         .bind(task_id)

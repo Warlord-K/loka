@@ -459,15 +459,21 @@ impl WorldStore {
     }
 
     pub async fn channel_thread(&self, channel_id: Uuid, root: i64, limit: i64) -> Result<Vec<ChannelMessage>> {
+        self.channel_thread_with_reply(channel_id, root, limit, None).await
+    }
+
+    pub async fn channel_thread_with_reply(&self, channel_id: Uuid, root: i64, limit: i64, reply: Option<i64>) -> Result<Vec<ChannelMessage>> {
         let mut rows = sqlx::query_as::<_, ChannelMessage>(&format!(
-            "{MESSAGE_SELECT} WHERE m.channel_id = $1 AND m.reply_to = $2 ORDER BY m.id DESC LIMIT $3"
+            "{MESSAGE_SELECT} WHERE m.channel_id = $1 AND m.reply_to = $2
+             ORDER BY (m.id = $4) DESC NULLS LAST, m.id DESC LIMIT $3"
         ))
         .bind(channel_id)
         .bind(root)
         .bind(limit)
+        .bind(reply)
         .fetch_all(self.pool())
         .await?;
-        rows.reverse();
+        rows.sort_by_key(|message| message.id);
         if let Some(first) = sqlx::query_as::<_, ChannelMessage>(&format!(
             "{MESSAGE_SELECT} WHERE m.channel_id = $1 AND m.id = $2 AND m.reply_to IS NULL"
         ))
@@ -885,6 +891,12 @@ mod tests {
         assert_eq!(repliers, vec!["agent", "user"], "latest replier first");
         let thread = store.channel_thread(channel.id, root.id, THREAD_LIMIT).await?;
         assert_eq!(thread.iter().map(|m| m.id).collect::<Vec<_>>(), vec![root.id, reply.id, nested.id]);
+        let recent = store.channel_thread(channel.id, root.id, 1).await?;
+        assert_eq!(recent.iter().map(|m| m.id).collect::<Vec<_>>(), vec![root.id, nested.id]);
+        let focused = store.channel_thread_with_reply(channel.id, root.id, 1, Some(reply.id)).await?;
+        assert_eq!(focused.iter().map(|m| m.id).collect::<Vec<_>>(), vec![root.id, reply.id]);
+        let unrelated = store.channel_thread_with_reply(channel.id, root.id, 1, Some(i64::MAX)).await?;
+        assert_eq!(unrelated.iter().map(|m| m.id).collect::<Vec<_>>(), vec![root.id, nested.id]);
 
         let other = store.create_channel(None, &format!("other{tag}"), None, owner).await?;
         assert!(store.post_channel_reply(&other, Author::User(owner), "wrong place", Value::Null, Some(root.id)).await.is_err());

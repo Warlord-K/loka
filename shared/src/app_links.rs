@@ -32,6 +32,10 @@ pub fn report_url(id: Uuid) -> String {
     format!("{}/world?report={id}", app_url())
 }
 
+pub fn workspace_url(id: Uuid) -> String {
+    format!("{}/world?report={id}&workspace=1", app_url())
+}
+
 pub fn canvas_item_url(id: Uuid, item: &str) -> String {
     format!("{}/world?report={id}&item={}", app_url(), urlencoding::encode(item))
 }

@@ -70,11 +70,11 @@ pub async fn process(ctx: &Ctx, agent_id: Uuid) -> Result<()> {
             Ok(()) => ctx.store.finish_inbox(&ids, "done", None).await?,
             Err(e) => {
                 warn!(agent = %agent.slug, error = %e, "Turn failed, requeueing events");
-                ctx.store.requeue_inbox(&ids, &e.to_string()).await?;
+                ctx.store.requeue_inbox(&ids, &loka_shared::cli_errors::chain(&e)).await?;
                 ctx.store
-                    .set_agent_status(agent_id, "error", Some(&loka_shared::cli_errors::status_detail(&e.to_string())))
+                    .set_agent_status(agent_id, "error", Some(&loka_shared::cli_errors::status_detail(&loka_shared::cli_errors::chain(&e))))
                     .await?;
-                ctx.store.pause_for_rejected_key(&agent, &e.to_string()).await?;
+                ctx.store.pause_for_rejected_key(&agent, &loka_shared::cli_errors::chain(&e)).await?;
                 return Err(e);
             }
         }
@@ -89,7 +89,7 @@ async fn reset_context(ctx: &Ctx, agent: &WorldAgent, items: &[InboxItem]) {
     let ids: Vec<i64> = items.iter().map(|i| i.id).collect();
     if let Err(e) = reset_steps(ctx, agent, &ids).await {
         warn!(agent = %agent.slug, error = %e, "Context reset failed");
-        let _ = ctx.store.finish_inbox(&ids, "failed", Some(&loka_shared::cli_errors::error_text(&e.to_string()))).await;
+        let _ = ctx.store.finish_inbox(&ids, "failed", Some(&loka_shared::cli_errors::error_text(&loka_shared::cli_errors::chain(&e)))).await;
     }
 }
 
@@ -98,7 +98,7 @@ async fn compact_on_request(ctx: &Ctx, agent: &WorldAgent, items: &[InboxItem], 
     let main = match ctx.store.main_session(agent.id).await {
         Ok(main) => main.filter(|main| main.cli_session_id.is_some()),
         Err(e) => {
-            let _ = ctx.store.requeue_inbox(&ids, &e.to_string()).await;
+            let _ = ctx.store.requeue_inbox(&ids, &loka_shared::cli_errors::chain(&e)).await;
             return;
         }
     };
@@ -128,7 +128,7 @@ async fn reset_steps(ctx: &Ctx, agent: &WorldAgent, ids: &[i64]) -> Result<()> {
         return Ok(());
     }
     ctx.warm.evict(main.id).await;
-    let kit = super::kit::for_agent(ctx, agent.id, true).await?;
+    let kit = super::kit::for_agent(ctx, agent.id).await?;
     let provider_keys = ctx.store.provider_keys_for_agent(agent.id).await?;
     let environment = ctx.store.secrets_for_agent(agent.id).await?;
     let omp = ctx.store.resolved_omp_config(agent.id, &main.backend).await?;
@@ -146,6 +146,7 @@ async fn reset_steps(ctx: &Ctx, agent: &WorldAgent, ids: &[i64]) -> Result<()> {
             fork_from: None,
             prompt: prompts::RESET_PROMPT,
             timeout_secs: TURN_TIMEOUT.as_secs() as i32,
+            request: None,
         })
         .await?;
     let sid = match &main.cli_session_id {
@@ -153,7 +154,10 @@ async fn reset_steps(ctx: &Ctx, agent: &WorldAgent, ids: &[i64]) -> Result<()> {
         None if main.backend == "claude" => Some(Uuid::new_v4().to_string()),
         None => None,
     };
-    let wired = super::kit::wire(kit.servers.clone(), agent.owner_user_id, agent.id, &home).await?;
+    let delivery = super::kit::tool_delivery(&main.backend, &main.model, &environment).await;
+    let mut servers = kit.servers.clone();
+    servers.extend(super::kit::world_server(agent.id, delivery));
+    let wired = super::kit::wire(servers, agent.owner_user_id, agent.id, &home, delivery).await?;
     let opts = CliOptions {
         working_dir: &home,
         prompt: prompts::RESET_PROMPT,
@@ -208,7 +212,7 @@ async fn reset_steps(ctx: &Ctx, agent: &WorldAgent, ids: &[i64]) -> Result<()> {
             }
         }
         Ok(Err(e)) => {
-            let error = redact_secrets(&format!("{e:#}"), environment.values());
+            let error = redact_secrets(&loka_shared::cli_errors::chain(&e), environment.values());
             finish_failed(ctx, run.id, &error).await;
             if loka_shared::cli_errors::is_context_too_long(&error) {
                 system_note(ctx, agent, loka_shared::context::RESET_KEPT_NOTES).await?;
@@ -245,12 +249,17 @@ async fn take_turn(ctx: &Ctx, agent: &WorldAgent, items: &[InboxItem]) -> Result
     let (main, handoff) = ensure_main_session(ctx, agent).await?;
     let tasks = referenced_tasks(ctx, items).await;
     let rules = ctx.store.rules_for(agent.owner_user_id, agent.org_id).await?;
-    let kit = super::kit::for_agent(ctx, agent.id, true).await?;
+    let kit = super::kit::for_agent(ctx, agent.id).await?;
     let provider_keys = ctx.store.provider_keys_for_agent(agent.id).await?;
     let environment = ctx.store.secrets_for_agent(agent.id).await?;
     let omp = ctx.store.resolved_omp_config(agent.id, &main.backend).await?;
     let teams = ctx.store.teams_of_agent(agent.id).await.unwrap_or_default();
-    let rules_text = [prompts::rules(&rules, "talk", &ctx.owner), prompts::teams(&teams, agent.id, "talk"), kit.skills_index.clone()]
+    let rules_text = [
+        prompts::rules(&rules, "talk", &ctx.owner),
+        prompts::before_big_work(ctx.store.agent_before_big_work(agent).await?).to_string(),
+        prompts::teams(&teams, agent.id, "talk"),
+        kit.skills_index.clone(),
+    ]
         .into_iter()
         .filter(|t| !t.is_empty())
         .collect::<Vec<_>>()
@@ -321,14 +330,18 @@ async fn take_turn(ctx: &Ctx, agent: &WorldAgent, items: &[InboxItem]) -> Result
             fork_from: None,
             prompt: &prompt,
             timeout_secs: TURN_TIMEOUT.as_secs() as i32,
+            request: None,
         })
         .await?;
-    let (progress_tx, progress) = spawn_progress(ctx.store.clone(), agent.id, run.id);
+    let (progress_tx, progress) = spawn_progress(ctx.store.clone(), agent.id, run.id, crate::cli::host_redactor().extended(environment.values()));
     let pids = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
     let progress_tx = runs::record_pids(progress_tx, pids.clone());
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<String>();
     let stop_watch = runs::spawn_stop_watch(ctx, run.id, stop_tx);
-    let wired = super::kit::wire(kit.servers.clone(), agent.owner_user_id, agent.id, &home).await?;
+    let delivery = super::kit::tool_delivery(&main.backend, options.model.as_deref().unwrap_or(&main.model), &environment).await;
+    let mut servers = kit.servers.clone();
+    servers.extend(super::kit::world_server(agent.id, delivery));
+    let wired = super::kit::wire(servers, agent.owner_user_id, agent.id, &home, delivery).await?;
     let opts = CliOptions {
         working_dir: &home,
         prompt: &prompt,
@@ -384,7 +397,7 @@ async fn take_turn(ctx: &Ctx, agent: &WorldAgent, items: &[InboxItem]) -> Result
     let (result, timing) = match outcome {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
-            let error = redact_secrets(&format!("{e:#}"), environment.values());
+            let error = redact_secrets(&loka_shared::cli_errors::chain(&e), environment.values());
             finish_failed(ctx, run.id, &error).await;
             if rewind.anchor().is_some() && ctx.store.fall_back_to_replay(main.id).await.unwrap_or(false) {
                 warn!(agent = %agent.slug, error = %error, "CLI rewind failed, restarting from the kept transcript");
@@ -439,7 +452,7 @@ async fn take_turn(ctx: &Ctx, agent: &WorldAgent, items: &[InboxItem]) -> Result
         .map(|action| redact_action(action, &environment))
         .collect::<Vec<_>>();
     info!(agent = %agent.slug, events = items.len(), actions = actions.len(), cost = acc.cost_usd, "Turn complete");
-    apply_actions(ctx, agent, &main, run.id, items, &text, actions, problems).await?;
+    apply_actions(ctx, agent, &main, run.id, items, &tasks, &text, actions, problems).await?;
     log_timing(agent, &main.backend, prep_ms, cli_ms, post_started.elapsed().as_millis() as u64, turn_started, timing.as_ref());
     let used = if main.backend == "claude" { runs::context_tokens(&result.usage) } else { result.usage.context_tokens as i64 };
     if let Some(limit) = prompts::compact_threshold().filter(|limit| prompts::compacts(&main.backend) && used > *limit) {
@@ -498,12 +511,7 @@ fn log_timing(
 }
 
 fn redact_secrets<'a>(text: &str, values: impl Iterator<Item = &'a String>) -> String {
-    let mut values: Vec<&String> = values.chain(crate::cli::host_secrets()).filter(|value| !value.is_empty()).collect();
-    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-    values.dedup();
-    values
-        .into_iter()
-        .fold(text.replace('\0', ""), |text, value| text.replace(value, "[REDACTED]"))
+    crate::cli::host_redactor().extended(values).redact(text)
 }
 
 fn redact_action(
@@ -524,9 +532,11 @@ fn redact_action(
         },
         Action::Status { text } => Action::Status { text: redact(text) },
         Action::Escalate { text } => Action::Escalate { text: redact(text) },
-        Action::Ask { text, choices } => Action::Ask {
+        Action::Ask { text, choices, clarify_request, clarify_source } => Action::Ask {
             text: redact(text),
             choices: choices.into_iter().map(redact).collect(),
+            clarify_request,
+            clarify_source,
         },
         Action::Drafts { text, items } => Action::Drafts {
             text: redact(text),
@@ -569,6 +579,7 @@ async fn compact(
             fork_from: None,
             prompt: prompts::COMPACT_PROMPT,
             timeout_secs: TURN_TIMEOUT.as_secs() as i32,
+            request: None,
         })
         .await
     else {
@@ -628,7 +639,7 @@ async fn compact(
             true
         }
         Ok(Err(e)) => {
-            let error = redact_secrets(&e.to_string(), environment.values());
+            let error = redact_secrets(&loka_shared::cli_errors::chain(&e), environment.values());
             finish_failed(ctx, run.id, &error).await;
             false
         }
@@ -646,6 +657,7 @@ async fn apply_actions(
     main: &AgentSession,
     run_id: Uuid,
     items: &[InboxItem],
+    tasks: &[AgentTask],
     text: &str,
     actions: Vec<Action>,
     mut problems: Vec<String>,
@@ -669,7 +681,8 @@ async fn apply_actions(
                     super::quests::seed_milestones(&ctx.store, agent.id, id, milestones).await;
                     let choice = reviewer.as_ref().and_then(ReviewerChoice::from_value);
                     match runs::start_task(ctx, agent, main, id, brief.as_deref(), review.unwrap_or(false) || choice.is_some(), choice.as_ref()).await {
-                        Ok(()) => {
+                        Ok(outcome) => {
+                            info!(agent = %agent.slug, task = %id, resumed = outcome.resumed, session = %outcome.session_id, run = %outcome.run_id, "Start queued a run");
                             started.push(id);
                             if let Some(minutes) = time_limit_minutes {
                                 if let Err(e) = ctx.store.set_task_time_limit(id, Some(*minutes)).await {
@@ -702,6 +715,13 @@ async fn apply_actions(
                         .collect(),
                     _ => Vec::new(),
                 };
+                let clarify_request = match action {
+                    Action::Ask { clarify_request: true, clarify_source, .. } => {
+                        prompts::clarification_origin(items, tasks, clarify_source.as_deref())
+                    }
+                    _ => None,
+                };
+                let clarification = clarify_request.is_some();
                 let msg = ctx
                     .store
                     .insert_message(NewMessage {
@@ -713,7 +733,7 @@ async fn apply_actions(
                         session_id: Some(main.id),
                         run_id: Some(run_id),
                         meta: if drafts.is_empty() {
-                            json!({ "kind": "ask", "choices": choices })
+                            json!({ "kind": "ask", "choices": choices, "clarify_request": clarify_request })
                         } else {
                             json!({ "kind": "ask", "choices": [], "drafts": drafts })
                         },
@@ -736,7 +756,7 @@ async fn apply_actions(
                             .agent(agent.id)
                             .session(main.id)
                             .run(run_id)
-                            .payload(json!({ "text": text, "agent": agent.name, "message_id": msg.id, "choices": choices })),
+                            .payload(json!({ "text": text, "agent": agent.name, "message_id": msg.id, "choices": choices, "clarification": clarification })),
                         None,
                     )
                     .await?;
@@ -761,14 +781,16 @@ async fn apply_actions(
         let Some(id) = item.payload.get("task_id").and_then(Value::as_str).and_then(|s| s.parse::<Uuid>().ok()) else {
             continue;
         };
+        let resume = item.payload.get("resume").and_then(Value::as_bool) == Some(true);
         if started.contains(&id)
-            || replied
+            || (replied && !resume)
             || ctx.store.quest_has_parts(id).await.unwrap_or(false)
             || super::quests::assigned_elsewhere(&ctx.store, id, agent.id).await
         {
             continue;
         }
-        let brief = (!text.trim().is_empty()).then_some(text);
+        let note = item.payload.get("brief").and_then(Value::as_str).filter(|note| !note.trim().is_empty());
+        let brief = note.or((!text.trim().is_empty()).then_some(text));
         if let Err(e) = runs::start_task(ctx, agent, main, id, brief, false, None).await {
             warn!(agent = %agent.slug, task = %id, error = %e, "Could not auto-start task");
             problems.push(format!("Could not start task {id}: {e}"));
@@ -923,7 +945,7 @@ async fn finish_failed(ctx: &Ctx, run_id: Uuid, error: &str) {
         .await;
 }
 
-async fn ensure_main_session(ctx: &Ctx, agent: &WorldAgent) -> Result<(AgentSession, Option<String>)> {
+pub(super) async fn ensure_main_session(ctx: &Ctx, agent: &WorldAgent) -> Result<(AgentSession, Option<String>)> {
     let mut handoff = None;
     if let Some(s) = ctx.store.main_session(agent.id).await? {
         if s.backend == agent.cli {
@@ -976,6 +998,7 @@ async fn write_handoff(ctx: &Ctx, agent: &WorldAgent, old: &AgentSession) -> Res
             fork_from: None,
             prompt,
             timeout_secs: TURN_TIMEOUT.as_secs() as i32,
+            request: None,
         })
         .await;
     let opts = CliOptions {
@@ -1030,7 +1053,7 @@ async fn write_handoff(ctx: &Ctx, agent: &WorldAgent, old: &AgentSession) -> Res
         }
         other => {
             let error = redact_secrets(&match other {
-                Ok(Err(e)) => e.to_string(),
+                Ok(Err(e)) => loka_shared::cli_errors::chain(&e),
                 _ => "timed out".to_string(),
             }, environment.values());
             warn!(agent = %agent.slug, error = %error, "Handoff failed; starting fresh");
@@ -1098,6 +1121,7 @@ fn spawn_progress(
     store: loka_shared::world::WorldStore,
     agent_id: Uuid,
     run_id: Uuid,
+    redactor: cli::Redactor,
 ) -> (cli::EventSender, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<cli::StreamEvent>();
     let task = tokio::spawn(async move {
@@ -1110,7 +1134,7 @@ fn spawn_progress(
                 continue;
             }
             last = Instant::now();
-            let text = loka_shared::progress::phrase(&tool, &input_summary);
+            let text = loka_shared::progress::phrase(&tool, &redactor.clip(&input_summary, cli::TOOL_INPUT_MAX_CHARS));
             let _ = store.emit_progress(agent_id, run_id, "turn", &text).await;
         }
     });

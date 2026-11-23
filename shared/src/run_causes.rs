@@ -28,18 +28,63 @@ pub enum Cause {
     NeverStarted,
     CliError,
     NoReport,
+    NoVerdict,
     TimedOut,
     Stopped,
 }
 
 impl Cause {
+    pub const ALL: [Cause; 6] = [Cause::NeverStarted, Cause::CliError, Cause::NoReport, Cause::NoVerdict, Cause::TimedOut, Cause::Stopped];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Cause::NeverStarted => "never_started",
             Cause::CliError => "cli_error",
             Cause::NoReport => "no_report",
+            Cause::NoVerdict => "no_verdict",
             Cause::TimedOut => "timed_out",
             Cause::Stopped => "stopped",
+        }
+    }
+}
+
+pub const MISSED_REPORT: &str = "It ended without the report block, even after Loka reminded it twice to finish and write one.";
+
+pub const MISSED_VERDICT: &str = "It ended without a verdict, even after Loka asked it once to finish and give one.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Required {
+    Report,
+    Verdict,
+}
+
+impl Required {
+    pub fn for_run(kind: &str) -> Option<Required> {
+        match kind {
+            "task" | "followup" => Some(Required::Report),
+            "review" => Some(Required::Verdict),
+            _ => None,
+        }
+    }
+
+    pub fn cause(self) -> Cause {
+        match self {
+            Required::Report => Cause::NoReport,
+            Required::Verdict => Cause::NoVerdict,
+        }
+    }
+
+    pub fn missed(self) -> &'static str {
+        match self {
+            Required::Report => MISSED_REPORT,
+            Required::Verdict => MISSED_VERDICT,
+        }
+    }
+
+    fn block(self) -> &'static str {
+        match self {
+            Required::Report => "the report block",
+            Required::Verdict => "a verdict",
         }
     }
 }
@@ -147,13 +192,16 @@ pub fn diagnose(end: &RunEnd) -> Diagnosis {
             "The CLI exited at once without doing anything.".to_string(),
             None,
         ),
-        None => (
-            Cause::NoReport,
-            None,
-            "report",
-            format!("It worked for {} steps but ended without the report block.", end.turns),
-            None,
-        ),
+        None => {
+            let required = Required::for_run(end.kind).unwrap_or(Required::Report);
+            (
+                required.cause(),
+                None,
+                "report",
+                format!("It worked for {} steps but ended without {}.", end.turns, required.block()),
+                None,
+            )
+        }
     };
     let stage = match end.kind {
         "review" => "review",
@@ -297,6 +345,28 @@ mod tests {
         assert_eq!((d.cause, d.stage.as_str()), (Cause::NoReport, "report"));
         assert!(!d.transient());
         assert_eq!(diagnose(&end(None, "Cannot do this.", 0)).cause, Cause::NoReport);
+    }
+
+    #[test]
+    fn every_run_kind_declares_what_it_must_return() {
+        let contracts = [
+            ("task", Some(Required::Report)),
+            ("followup", Some(Required::Report)),
+            ("review", Some(Required::Verdict)),
+            ("publish", None),
+            ("turn", None),
+            ("aside", None),
+            ("quick", None),
+            ("direct", None),
+        ];
+        for (kind, required) in contracts {
+            assert_eq!(Required::for_run(kind), required, "{kind}");
+        }
+        let review = diagnose(&RunEnd { kind: "review", error: None, output: "Waiting on the test run.", turns: 9, timed_out: false });
+        assert_eq!((review.cause, review.stage.as_str()), (Cause::NoVerdict, "review"));
+        assert!(review.reason.ends_with("ended without a verdict.") && !review.transient());
+        assert_eq!(Required::Verdict.cause().as_str(), "no_verdict");
+        assert!(Required::Report.missed().contains("report block") && Required::Verdict.missed().contains("verdict"));
     }
 
     #[test]

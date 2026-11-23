@@ -12,7 +12,7 @@ fn item_schema(with_file: bool) -> Value {
     let n = |d: &str| json!({ "type": "number", "description": d });
     let mut props = json!({
         "id": s("Your own short id (letters, digits, - or _) so arrows and later updates can name it; made up when left out"),
-        "kind": { "type": "string", "enum": canvas::KINDS, "description": "image, video, model (GLB 3D), note (markdown card), sticky, ref (a live card for a quest, report, canvas, chat message, to-do or agent), run (bash step with a Run button), frame (a captioned group box), ink, ui (a live json-render card, the same spec as show_ui)" },
+        "kind": { "type": "string", "enum": canvas::KINDS, "description": "image, video, model (GLB 3D), note (markdown card), sticky, ref (a live card for a quest, report, canvas, chat message, to-do or agent), run (bash step with a Run button), frame (a captioned group box), ink, ui (a live json-render card, the same spec as show_ui), embed (a live terminal or running quest your person watches on the board)" },
         "x": n("Left edge in canvas units; new items go in a row under everything when left out"),
         "y": n("Top edge"),
         "w": n("Width, 24 to 4000"),
@@ -22,6 +22,10 @@ fn item_schema(with_file: bool) -> Value {
         "upload_id": s("Upload id for image, video or model (show_media and chat uploads give them)"),
         "target": s("For ref: quest:<id>, report:<id>, msg:<id>, msg:ch<id>, todo:<id> or agent:<slug>"),
         "spec": { "type": "object", "description": "For ui: a json-render spec ({root, elements}) exactly as show_ui takes it; buttons and forms on it reply to you" },
+        "embed": { "type": "object", "description": "For embed: {kind: terminal, target: <device id>} for a live shell on one of your person's devices (devices tool), or {kind: quest, target: <quest id>} for a running quest's live card. Browser embeds are refused for now", "properties": {
+            "kind": { "type": "string", "enum": canvas::EMBED_KINDS.iter().map(|k| k.kind).collect::<Vec<_>>() },
+            "target": { "type": "string" }
+        }, "required": ["kind", "target"] },
         "command": s("For run: the shell command; your person gets a Run button"),
         "color": { "type": "string", "enum": canvas::COLORS, "description": "Sticky colour" },
         "locked": { "type": "boolean", "description": "Mark a settled choice as locked" }
@@ -175,7 +179,7 @@ fn with_refs(args: &Value) -> Result<Vec<canvas::ItemInput>> {
 }
 
 async fn ref_notes(store: &WorldStore, owner: Uuid, org: Uuid, canvas: &Canvas, ids: &[String]) -> Result<String> {
-    let targets: Vec<String> = canvas.items.iter().filter(|i| ids.contains(&i.id)).filter_map(|i| i.target.clone()).collect();
+    let targets: Vec<String> = canvas.items.iter().filter(|i| ids.contains(&i.id)).filter_map(|i| i.target.clone().or_else(|| i.embed.as_ref().filter(|e| e.kind == "quest").map(|e| format!("quest:{}", e.target)))).collect();
     if targets.is_empty() {
         return Ok(String::new());
     }
@@ -423,6 +427,20 @@ mod tests {
             let err = refs_arg(&json!({ "refs": [bad] })).unwrap_err().to_string();
             assert!(err.contains("is not a Loka ref"), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn embed_items_read_from_tool_input_and_the_schema_lists_every_kind() {
+        let items = items_arg(&json!({ "items": [{ "kind": "embed", "embed": { "kind": "quest", "target": "abcdef12" }, "caption": "Watch it" }] }), "items").unwrap();
+        let embed = items[0].embed.as_ref().unwrap();
+        assert_eq!((items[0].kind.as_deref(), embed.kind.as_str(), embed.target.as_str()), (Some("embed"), "quest", "abcdef12"));
+        assert!(items_arg(&json!({ "items": [{ "kind": "embed", "embed": { "kind": "quest" } }] }), "items").is_err());
+        let schema = item_schema(false);
+        assert_eq!(schema["properties"]["embed"]["properties"]["kind"]["enum"], json!(["terminal", "quest", "browser"]));
+        assert!(schema["properties"]["kind"]["enum"].as_array().unwrap().contains(&json!("embed")));
+        let mut canvas = Canvas::default();
+        let refused = canvas.apply_ops(vec![Op::Add { items: items_arg(&json!({ "items": [{ "kind": "embed", "embed": { "kind": "browser", "target": "https://example.com" } }] }), "items").unwrap(), edges: vec![] }], "agent");
+        assert!(refused.unwrap_err().to_string().contains("cannot be watched inside Loka yet"));
     }
 
     #[tokio::test]

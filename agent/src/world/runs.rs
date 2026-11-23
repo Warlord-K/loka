@@ -4,17 +4,20 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use loka_shared::milestones::{finished_status, MilestoneStore};
 use loka_shared::models::AgentTask;
+use loka_shared::run_causes::Required;
 use loka_shared::runners::RunnerUsage;
 use loka_shared::world::{
-    resume_prompt, AgentSession, NewEvent, NewRun, NewSession, ReviewerChoice, RunOutcome, SessionRun, TaskResume, WorldAgent,
+    AgentSession, FollowupAdvance, NewEvent, NewRun, NewSession, ReviewerChoice, RunOutcome, SessionRun, TaskResume, WorldAgent,
 };
 use serde_json::{json, Value};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use super::quests::{Finish, FollowupStep, Started};
 use super::{prompts, Ctx};
 use crate::cli::{self, CliOptions, CliResult, StreamEvent, Usage};
 use crate::git::{github, workspace};
+use crate::quest_storage::{self, Layout};
 
 const TASK_MAX_TURNS: u32 = 200;
 const REVIEW_MAX_TURNS: u32 = 60;
@@ -43,43 +46,22 @@ pub struct Accounted {
 }
 pub fn account(session: &AgentSession, result: &CliResult) -> Accounted {
     let u = result.usage;
-    let prev_f = |k: &str| session.usage_baseline.get(k).and_then(Value::as_f64).unwrap_or(0.0);
-    let mut baseline = session.usage_baseline.clone();
-    if !baseline.is_object() {
-        baseline = json!({});
-    }
-    let usage = if session.backend == "codex" {
-        let total = RunnerUsage {
-            input_tokens: u.input_tokens,
-            cached_input_tokens: u.cached_input_tokens,
-            output_tokens: u.output_tokens,
-            context_tokens: 0,
-        };
-        let delta = total.since(&session.usage_baseline);
-        total.record(&mut baseline);
-        Usage {
-            input_tokens: delta.input_tokens,
-            cached_input_tokens: delta.cached_input_tokens,
-            output_tokens: delta.output_tokens,
+    let reported = loka_shared::run_recording::Reported {
+        cost_usd: result.cost_usd,
+        usage: RunnerUsage { input_tokens: u.input_tokens, cached_input_tokens: u.cached_input_tokens, output_tokens: u.output_tokens, context_tokens: 0 },
+    };
+    let billed = loka_shared::run_recording::account(&session.backend, &session.model, &session.usage_baseline, &reported);
+    Accounted {
+        usage: Usage {
+            input_tokens: billed.input_tokens as u64,
+            cached_input_tokens: billed.cached_input_tokens as u64,
+            output_tokens: billed.output_tokens as u64,
             context_tokens: u.context_tokens,
-        }
-    } else {
-        u
-    };
-    let cost_usd = if loka_shared::backends::cost_per_run(&session.backend) && result.cost_usd > 0.0 {
-        result.cost_usd
-    } else if result.cost_usd > 0.0 {
-        let before = prev_f("cost_usd");
-        if let Some(obj) = baseline.as_object_mut() {
-            obj.insert("cost_usd".into(), json!(result.cost_usd));
-        }
-        loka_shared::pricing::session_cost_delta(result.cost_usd, before, &session.model, usage.input_tokens, usage.cached_input_tokens, usage.output_tokens)
-    } else {
-        loka_shared::pricing::cost(&session.model, usage.input_tokens, usage.cached_input_tokens, usage.output_tokens)
-    };
-    Accounted { usage, baseline, cost_usd }
+        },
+        baseline: billed.baseline,
+        cost_usd: billed.cost_usd,
+    }
 }
-
 
 async fn work_rules(ctx: &Ctx, agent_id: Uuid) -> String {
     let agent = ctx.store.get_agent(agent_id).await.ok().flatten();
@@ -123,45 +105,28 @@ pub async fn start_task(
     brief: Option<&str>,
     review: bool,
     reviewer: Option<&ReviewerChoice>,
-) -> Result<()> {
+) -> Result<Started> {
     let task = ctx
         .db
         .get_task(task_id)
         .await?
         .ok_or_else(|| anyhow!("task {task_id} not found"))?;
-    match ctx
+    let resume = ctx
         .store
-        .resume_task_session(agent.id, task.id, &resume_prompt(&agent.name, brief))
-        .await?
-    {
-        TaskResume::Busy(session_id) => {
-            return Err(anyhow!(
-                "it is already being worked on in session {session_id}; use message_session to steer that session instead of starting it again"
-            ))
-        }
-        TaskResume::AwaitingPlan(session_id) => {
-            return Err(anyhow!("session {session_id} has a plan that {}", loka_shared::quests::PLAN_WAITING))
-        }
-        TaskResume::Resumed { session_id, run_id } => {
-            ctx.db.update_status(task.id, "in_progress").await?;
-            ctx.store
-                .emit(
-                    NewEvent::new("task.started")
-                        .agent(agent.id)
-                        .session(session_id)
-                        .run(run_id)
-                        .task(Some(task.id))
-                        .payload(json!({ "task_id": task.id, "title": task.title, "repo": task.repo, "resumed": true })),
-                    None,
-                )
-                .await?;
-            ctx.store
-                .post_quest_started(agent.id, task.id, session_id, &task.title, brief.filter(|b| !b.trim().is_empty()))
-                .await?;
-            info!(agent = %agent.slug, task = %task.id, "Task session resumed");
-            return Ok(());
-        }
-        TaskResume::Fresh => {}
+        .resume_task_session(agent.id, task.id, &agent.name, brief)
+        .await?;
+    if let Some(problem) = resume.problem() {
+        return Err(anyhow!(problem));
+    }
+    if let TaskResume::Resumed { session_id, run_id } = resume {
+        ctx.db.update_status(task.id, "in_progress").await?;
+        ctx.store.announce_resumed(agent.id, task.id, session_id, run_id, brief).await?;
+        info!(agent = %agent.slug, task = %task.id, "Task session resumed");
+        return Ok(Started { resumed: true, session_id, run_id });
+    }
+    let layout = Layout::local(&ctx.config.workspaces_dir);
+    if let Err(short) = quest_storage::make_room(&layout, &ctx.config.workspaces_dir).await {
+        return Err(anyhow!(loka_shared::run_recording::no_room_to_start_message(short.free, short.freed)));
     }
     let options = ctx.store.quest_options(task.id).await?;
     let mut dirs = Vec::new();
@@ -184,7 +149,7 @@ pub async fn start_task(
                 .session(session.id)
                 .run(run.id)
                 .task(Some(task.id))
-                .payload(super::quests::started_payload(&task, &options, opened.len())),
+                .payload(super::quests::started_payload(&task, &options, opened.len(), run.id)),
             None,
         )
         .await?;
@@ -195,7 +160,7 @@ pub async fn start_task(
         .post_quest_started(agent.id, task.id, session.id, &task.title, brief.filter(|b| !b.trim().is_empty()))
         .await?;
     info!(agent = %agent.slug, task = %task.id, "Task session queued");
-    Ok(())
+    Ok(Started { resumed: false, session_id: session.id, run_id: run.id })
 }
 
 async fn prepare_workspace(ctx: &Ctx, task: &AgentTask, attempt: i16) -> Result<PathBuf> {
@@ -253,8 +218,19 @@ pub async fn execute(ctx: &Ctx, run: SessionRun) -> Result<()> {
             .unwrap_or_else(|| super::agent_home(ctx, &agent.slug).to_string_lossy().to_string()),
     );
     if !tokio::fs::metadata(&working_dir).await.is_ok_and(|metadata| metadata.is_dir()) {
-        let error = format!("the saved workspace is missing: {}", working_dir.display());
+        let error = format!("the saved quest folder is missing: {}", working_dir.display());
         return fail(ctx, &run, &session, "failed", "run.failed", &error).await;
+    }
+    let layout = Layout::local(&ctx.config.workspaces_dir);
+    if loka_shared::runners::WORK_RUN_KINDS.contains(&run.kind.as_str()) {
+        if let Err(short) = quest_storage::make_room(&layout, &working_dir).await {
+            let error = format!("{}{}", loka_shared::run_recording::no_room_message(short.free), loka_shared::run_recording::cleared_note(short.freed));
+            return fail(ctx, &run, &session, "failed", "run.failed", &error).await;
+        }
+    }
+    let _active = quest_storage::activate(&layout, run.id, layout.quest_of(&working_dir));
+    if let Err(error) = ctx.store.release_space_wait(&run).await {
+        warn!(run = %run.id, %error, "Could not clear the disk wait of a run that is starting");
     }
 
     let (cli_sid, resume, fork) = match run.fork_from {
@@ -298,14 +274,14 @@ pub async fn execute(ctx: &Ctx, run: SessionRun) -> Result<()> {
             None => keys.values,
         },
         Err(error) => {
-            return fail(ctx, &run, &session, "failed", "run.failed", &error.to_string()).await
+            return fail(ctx, &run, &session, "failed", "run.failed", &loka_shared::cli_errors::chain(&error)).await
         }
     };
     let environment = if has_environment {
         match ctx.store.without_mcp_secrets(agent.id, granted_environment.clone()).await {
             Ok(environment) => environment,
             Err(error) => {
-                return fail(ctx, &run, &session, "failed", "run.failed", &error.to_string()).await
+                return fail(ctx, &run, &session, "failed", "run.failed", &loka_shared::cli_errors::chain(&error)).await
             }
         }
     } else {
@@ -314,28 +290,22 @@ pub async fn execute(ctx: &Ctx, run: SessionRun) -> Result<()> {
     let provider_keys = match ctx.store.provider_keys_for_agent(agent.id).await {
         Ok(keys) => keys,
         Err(error) => {
-            return fail(ctx, &run, &session, "failed", "run.failed", &error.to_string()).await
+            return fail(ctx, &run, &session, "failed", "run.failed", &loka_shared::cli_errors::chain(&error)).await
         }
     };
-    let redactor = SecretRedactor::new(granted_environment.values().chain(provider_keys.values()));
+    let redactor = cli::host_redactor().extended(granted_environment.values().chain(provider_keys.values()));
     let kit = match run.kind.as_str() {
         "aside" => Ok(None),
         "review" => super::kit::for_review(ctx, agent.id).await.map(Some),
-        _ => super::kit::for_agent(ctx, agent.id, false).await.map(Some),
+        _ => super::kit::for_agent(ctx, agent.id).await.map(Some),
     };
     let kit = match kit {
         Ok(kit) => kit,
-        Err(error) => {
-            let error = redactor.redact(&error.to_string());
-            return fail(ctx, &run, &session, "failed", "run.failed", &error).await;
-        }
+        Err(error) => return fail_with(ctx, &run, &session, &error, &redactor).await,
     };
     let omp = match ctx.store.resolved_omp_config(agent.id, &session.backend).await {
         Ok(omp) => omp,
-        Err(error) => {
-            let error = redactor.redact(&error.to_string());
-            return fail(ctx, &run, &session, "failed", "run.failed", &error).await;
-        }
+        Err(error) => return fail_with(ctx, &run, &session, &error, &redactor).await,
     };
     let mut prompt = match kit.as_ref().map(|k| k.skills_index.as_str()).filter(|i| !i.is_empty()) {
         Some(index) => format!("{}\n\n{index}", run.prompt),
@@ -379,7 +349,7 @@ pub async fn execute(ctx: &Ctx, run: SessionRun) -> Result<()> {
                 environment.insert(loka_shared::command_rules::ENV.to_string(), serde_json::to_string(&policy).unwrap_or_default());
             }
             Ok(_) => {}
-            Err(error) => return fail(ctx, &run, &session, "failed", "run.failed", &error.to_string()).await,
+            Err(error) => return fail(ctx, &run, &session, "failed", "run.failed", &loka_shared::cli_errors::chain(&error)).await,
         }
     }
     let max_turns = match run.kind.as_str() {
@@ -388,23 +358,19 @@ pub async fn execute(ctx: &Ctx, run: SessionRun) -> Result<()> {
         "quick" => loka_shared::quick::MAX_TURNS,
         _ => TASK_MAX_TURNS,
     };
-    let (event_tx, activity) = spawn_activity(
-        ctx.store.clone(),
-        run.clone(),
-        !aside,
-        redactor.clone(),
-    );
+    let (event_tx, activity) = spawn_activity(ctx.store.clone(), run.clone(), redactor.clone());
     let pids = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
     let event_tx = record_pids(event_tx, pids.clone());
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<String>();
     let stop_watch = spawn_stop_watch(ctx, run.id, stop_tx);
     let mcp_has_secrets = kit.as_ref().is_some_and(|kit| kit.has_secret_refs);
     let owner_aside = aside && !loka_shared::world::toolless_aside(session.asked_by.as_ref());
+    let delivery = super::kit::tool_delivery(&session.backend, &session.model, &environment).await;
     let servers = if owner_aside {
-        super::kit::world_server_for(agent.id, None, true)
+        super::kit::world_server_for(agent.id, None, Some(session.id), delivery)
     } else if quick {
         let mut servers = kit.map(|kit| kit.servers).unwrap_or_default();
-        servers.extend(super::kit::world_server_for(agent.id, Some(session.id), false));
+        servers.extend(super::kit::world_server_for(agent.id, Some(session.id), None, delivery));
         servers
     } else {
         kit.map(|kit| kit.servers).unwrap_or_default()
@@ -428,12 +394,9 @@ pub async fn execute(ctx: &Ctx, run: SessionRun) -> Result<()> {
     } else {
         None
     };
-    let wired = match super::kit::wire(servers, agent.owner_user_id, agent.id, &working_dir).await {
+    let wired = match super::kit::wire(servers, agent.owner_user_id, agent.id, &working_dir, delivery).await {
         Ok(wired) => wired,
-        Err(error) => {
-            let error = redactor.redact(&error.to_string());
-            return fail(ctx, &run, &session, "failed", "run.failed", &error).await;
-        }
+        Err(error) => return fail_with(ctx, &run, &session, &error, &redactor).await,
     };
     let mcp_config_json = wired.mcp_json.clone();
     let quest = match run.task_id {
@@ -521,66 +484,8 @@ pub async fn execute(ctx: &Ctx, run: SessionRun) -> Result<()> {
 
     match outcome {
         Ok(Ok(result)) => {
-            let acc = account(&session, &result);
-            let output = redactor.redact(&result.output);
-            let report = prompts::parse_report(&result.output).map(|report| redactor.redact_report(report));
-            let live = ctx.store
-                .finish_run(
-                    run.id,
-                    RunOutcome {
-                        status: "completed",
-                        output: Some(&output),
-                        error: None,
-                        cost_usd: acc.cost_usd,
-                        input_tokens: acc.usage.input_tokens as i64,
-                        cached_input_tokens: acc.usage.cached_input_tokens as i64,
-                        output_tokens: acc.usage.output_tokens as i64,
-                    },
-                )
-                .await?;
-            ctx.store
-                .update_session_after_run(
-                    session.id,
-                    session_id_after_run(
-                        &session.backend,
-                        fork,
-                        result.session_id.as_deref(),
-                        cli_sid.as_deref(),
-                    ),
-                    acc.baseline,
-                    context_tokens(&result.usage),
-                )
-                .await?;
-            if !live {
-                warn!(run = %run.id, "Run finished after it was already closed, keeping the earlier outcome");
-                return Ok(());
-            }
-            if run.kind == "task" {
-                let report_value = match report.as_ref() {
-                    Some(report) => serde_json::to_value(report).unwrap_or_else(|_| json!({ "summary": output.as_str() })),
-                    None => json!({ "summary": tail(&output, 1500) }),
-                };
-                ctx.store
-                    .set_session_status(session.id, "active", Some(&report_value.to_string()))
-                    .await?;
-            }
-            emit_run(ctx, &run, "run.completed", json!({ "cost_usd": acc.cost_usd })).await?;
-            let session = ctx.store.get_session(session.id).await?.unwrap_or(session);
-            if session.role == "task" && session.planning() && matches!(run.kind.as_str(), "task" | "followup") {
-                return super::quests::plan_step(&ctx.store, &agent, &session, &run, &output).await;
-            }
-            match run.kind.as_str() {
-                "task" => after_task(ctx, &agent, &session, &run, report.as_ref(), &output).await,
-                "review" => after_review(ctx, &agent, &session, &run, &output).await,
-                "aside" => after_aside(ctx, &agent, &session, Ok(&output)).await,
-                "quick" => {
-                    let text = prompts::plain_dashes(&prompts::split_actions(&output).0);
-                    let text = if text.trim().is_empty() { "Done.".to_string() } else { text };
-                    ctx.store.record_quick_reply(&agent, &session, run.id, &text, false).await.map(|_| ())
-                }
-                "followup" => after_followup(ctx, &agent, &session, &run, &output, report.as_ref()).await,
-                _ => Ok(()),
-            }
+            let saved_session_id = session_id_after_run(&session.backend, fork, result.session_id.as_deref(), cli_sid.as_deref()).map(str::to_string);
+            settle_completed(ctx, &agent, session, &run, result, saved_session_id, &redactor).await
         }
         Ok(Err(_)) if stopped_by.is_some() => {
             let by = stopped_by.unwrap_or_default();
@@ -594,15 +499,87 @@ pub async fn execute(ctx: &Ctx, run: SessionRun) -> Result<()> {
             };
             fail(ctx, &run, &session, "failed", "run.failed", &error).await
         }
-        Ok(Err(e)) => {
-            let error = redactor.redact(&e.to_string());
-            fail(ctx, &run, &session, "failed", "run.failed", &error).await
-        }
+        Ok(Err(e)) => fail_with(ctx, &run, &session, &e, &redactor).await,
         Err(_) => {
             let msg = format!("timed out after {}s", run.timeout_secs);
             fail(ctx, &run, &session, "timed_out", "run.timed_out", &msg).await
         }
     }
+}
+
+async fn settle_completed(
+    ctx: &Ctx,
+    agent: &WorldAgent,
+    session: AgentSession,
+    run: &SessionRun,
+    result: CliResult,
+    saved_session_id: Option<String>,
+    redactor: &cli::Redactor,
+) -> Result<()> {
+    let output = redactor.redact(&result.output);
+    let report = prompts::parse_report(&result.output).map(|report| redact_report(redactor, report));
+    let reported = loka_shared::run_recording::Reported {
+        cost_usd: result.cost_usd,
+        usage: RunnerUsage {
+            input_tokens: result.usage.input_tokens,
+            cached_input_tokens: result.usage.cached_input_tokens,
+            output_tokens: result.usage.output_tokens,
+            context_tokens: 0,
+        },
+    };
+    let live = ctx.store
+        .complete_run(run, &output, &reported, saved_session_id.as_deref(), context_tokens(&result.usage))
+        .await?;
+    if !live {
+        warn!(run = %run.id, "Run finished after it was already closed, keeping the earlier outcome");
+        return Ok(());
+    }
+    if run.kind == "task" {
+        let report_value = match report.as_ref() {
+            Some(report) => serde_json::to_value(report).unwrap_or_else(|_| json!({ "summary": output.as_str() })),
+            None => json!({ "summary": tail(&output, 1500) }),
+        };
+        ctx.store
+            .set_session_status(session.id, "active", Some(&report_value.to_string()))
+            .await?;
+    }
+    let session = ctx.store.get_session(session.id).await?.unwrap_or(session);
+    if !prompts::contract_open(&run.kind, &session, &output) {
+        ctx.store.announce_completed(run.id).await?;
+    }
+    let settled = after_completed(ctx, agent, &session, run, report.as_ref(), &output).await;
+    let announced = ctx.store.announce_completed(run.id).await;
+    settled.and(announced.map(|_| ()))
+}
+
+async fn after_completed(
+    ctx: &Ctx,
+    agent: &WorldAgent,
+    session: &AgentSession,
+    run: &SessionRun,
+    report: Option<&prompts::Report>,
+    output: &str,
+) -> Result<()> {
+    if super::quests::prework_step(&ctx.store, agent, session, run, output).await? {
+        return Ok(());
+    }
+    match run.kind.as_str() {
+        "task" => after_task(ctx, agent, session, run, report, output).await,
+        "review" => after_review(ctx, agent, session, run, output).await,
+        "aside" => after_aside(ctx, agent, session, Ok(output)).await,
+        "quick" => {
+            let text = prompts::plain_dashes(&prompts::split_actions(output).0);
+            let text = if text.trim().is_empty() { "Done.".to_string() } else { text };
+            ctx.store.record_quick_reply(agent, session, run.id, &text, false).await.map(|_| ())
+        }
+        "followup" => after_followup(ctx, agent, session, run, output, report).await,
+        _ => Ok(()),
+    }
+}
+
+async fn fail_with(ctx: &Ctx, run: &SessionRun, session: &AgentSession, error: &anyhow::Error, redactor: &cli::Redactor) -> Result<()> {
+    let text = redactor.redact(&loka_shared::cli_errors::chain(error));
+    fail(ctx, run, session, "failed", "run.failed", &text).await
 }
 
 async fn fail(
@@ -614,6 +591,10 @@ async fn fail(
     error: &str,
 ) -> Result<()> {
     warn!(run = %run.id, status, error, "Run did not complete");
+    if status == "failed" && ctx.store.requeue_for_space(run, error).await? {
+        info!(run = %run.id, kind = %run.kind, "Run refused for lack of disk space goes back to the queue to wait for room");
+        return Ok(());
+    }
     let finish = ctx.store
         .finish_run(
             run.id,
@@ -776,21 +757,6 @@ async fn handle_failure(
     Ok(())
 }
 
-async fn emit_run(ctx: &Ctx, run: &SessionRun, event: &str, payload: Value) -> Result<()> {
-    ctx.store
-        .emit(
-            NewEvent::new(event)
-                .agent(run.agent_id)
-                .session(run.session_id)
-                .run(run.id)
-                .task(run.task_id)
-                .payload(payload),
-            None,
-        )
-        .await?;
-    Ok(())
-}
-
 async fn after_task(
     ctx: &Ctx,
     agent: &WorldAgent,
@@ -806,16 +772,17 @@ async fn after_task(
     if !ctx.store.complete_task_run(session.id, run.created_at).await? {
         return Ok(());
     }
-    let done = report.and_then(|r| r.status.as_deref()) == Some("done");
-    advance_task(ctx, agent, session, run.task_id, done, true).await
+    advance_task(ctx, agent, session, run.task_id).await
 }
 
 async fn missing_report(ctx: &Ctx, session: &AgentSession, run: &SessionRun, output: &str) -> Result<bool> {
     let diagnosis = ctx.store.record_run_end(run.id, &run.kind, None, output, false).await?;
     if diagnosis.cause == loka_shared::run_causes::Cause::NeverStarted {
-        return Ok(ctx.store.auto_retry(run.id, &diagnosis).await?.is_some());
+        let retried = ctx.store.auto_retry(run.id, &diagnosis).await?.is_some();
+        ctx.store.announce_completed(run.id).await?;
+        return Ok(retried);
     }
-    if ctx.store.nudge_for_report(session.id).await?.is_some() {
+    if ctx.store.settle_missing(run.id, session.id, Required::Report, output).await?.handled() {
         return Ok(true);
     }
     let task = match session.task_id {
@@ -833,25 +800,21 @@ async fn missing_report(ctx: &Ctx, session: &AgentSession, run: &SessionRun, out
     Ok(false)
 }
 
-async fn advance_task(
-    ctx: &Ctx,
-    agent: &WorldAgent,
-    session: &AgentSession,
-    task_id: Option<Uuid>,
-    done: bool,
-    review: bool,
-) -> Result<()> {
+async fn advance_task(ctx: &Ctx, agent: &WorldAgent, session: &AgentSession, task_id: Option<Uuid>) -> Result<()> {
+    let session = &ctx.store.get_session(session.id).await?.unwrap_or_else(|| session.clone());
+    let report = prompts::stored_report(session.summary.as_deref()).unwrap_or_default();
     let task = match task_id {
         Some(id) => ctx.db.get_task(id).await?,
         None => None,
     };
+    let step = super::quests::finish_step(&report, ctx.reviews_enabled && session.wants_review(), None);
     if session.racing() {
-        return attempt_done(ctx, agent, session, done).await;
+        return attempt_done(ctx, agent, session, !matches!(step, Finish::Fail(_))).await;
     }
-    if let (true, true, Some(task)) = (review && ctx.reviews_enabled && session.wants_review(), done, task) {
-        return queue_review(ctx, agent, session, &task).await;
+    match (step, task) {
+        (Finish::Review, Some(task)) => queue_review(ctx, agent, session, &task).await,
+        _ => finalize(ctx, agent, session, None).await,
     }
-    finalize(ctx, agent, session, None).await
 }
 
 async fn attempt_done(ctx: &Ctx, agent: &WorldAgent, session: &AgentSession, ok: bool) -> Result<()> {
@@ -927,6 +890,7 @@ async fn queue_review(ctx: &Ctx, agent: &WorldAgent, session: &AgentSession, tas
             fork_from: None,
             prompt: &prompt,
             timeout_secs: task_timeout(),
+            request: None,
         })
         .await?;
     ctx.store
@@ -1019,27 +983,48 @@ async fn after_followup(
             Some((agent.id, "session.replied")),
         )
         .await?;
-    if session.role == "task" && session.status == "active" {
-        if unreported && missing_report(ctx, session, run, output).await? {
-            return Ok(());
-        }
-        if !ctx.store.complete_followup(session.id).await? {
-            return Ok(());
-        }
-        let session = ctx.store.get_session(session.id).await?.unwrap_or_else(|| session.clone());
-        let done = prompts::stored_report(session.summary.as_deref())
-            .and_then(|report| report.status)
-            .as_deref()
-            == Some("done");
-        let sync = followup_pr_sync(ctx, &session, run, done).await;
-        if sync == loka_shared::runners::PrSync::Merged && !session.racing() {
-            if let Some(url) = quest_pr_url(ctx, run.task_id).await? {
-                return super::watch::settle_merged(&ctx.store, &ctx.db, &session, &url).await;
-            }
-        }
-        advance_task(ctx, agent, &session, run.task_id, done, sync.needs_review()).await?;
+    if session.role != "task" {
+        return Ok(());
     }
-    Ok(())
+    let FollowupAdvance::Advance { was_completed } = ctx.store.complete_followup(session.id).await? else {
+        return Ok(());
+    };
+    let mut session = ctx.store.get_session(session.id).await?.unwrap_or_else(|| session.clone());
+    let nudge_available = if !was_completed && unreported {
+        ctx.store.set_session_status(session.id, "active", None).await?;
+        let handled = missing_report(ctx, &session, run, output).await?;
+        session = ctx.store.get_session(session.id).await?.unwrap_or(session);
+        handled
+    } else {
+        false
+    };
+    let report = prompts::stored_report(session.summary.as_deref()).unwrap_or_default();
+    let task = match run.task_id {
+        Some(id) => ctx.db.get_task(id).await?,
+        None => None,
+    };
+    let has_repo = task.as_ref().is_some_and(|task| task.repo.is_some());
+    let sync = followup_pr_sync(ctx, &session, run, report.status.as_deref() == Some("done")).await;
+    let verdict = super::quests::review_on_record(&ctx.store, session.id, run.id, sync)
+        .await?
+        .map(|output| review_verdict_value(&output));
+    let step = super::quests::followup_step(was_completed, &report, ctx.reviews_enabled, session.wants_review(), nudge_available, has_repo, sync, verdict.as_ref());
+    if session.racing() && !matches!(step, FollowupStep::Nudge | FollowupStep::Leave) {
+        return attempt_done(ctx, agent, &session, !matches!(step, FollowupStep::Fail(_) | FollowupStep::Salvage)).await;
+    }
+    match (step, task) {
+        (FollowupStep::Nudge | FollowupStep::Leave, _) => Ok(()),
+        (FollowupStep::Review, Some(task)) => queue_review(ctx, agent, &session, &task).await,
+        (FollowupStep::Settle, task) => {
+            if sync == loka_shared::runners::PrSync::Merged {
+                if let Some(url) = task.and_then(|task| task.pr_url) {
+                    return super::watch::settle_merged(&ctx.store, &ctx.db, &session, &url).await;
+                }
+            }
+            finalize(ctx, agent, &session, verdict).await
+        }
+        (FollowupStep::Review | FollowupStep::Salvage | FollowupStep::Fail(_), _) => finalize(ctx, agent, &session, None).await,
+    }
 }
 
 async fn followup_pr_sync(ctx: &Ctx, session: &AgentSession, run: &SessionRun, done: bool) -> loka_shared::runners::PrSync {
@@ -1090,9 +1075,8 @@ async fn after_review(
         .and_then(|a| a.get("manual"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if prompts::needs_verdict(output)
-        && loka_shared::quests::compare_candidates(review).is_none()
-        && ctx.store.nudge_for_verdict(review.id).await?.is_some()
+    if prompts::contract_open("review", review, output)
+        && ctx.store.settle_missing(run.id, review.id, Required::Verdict, output).await?.handled()
     {
         return Ok(());
     }
@@ -1171,20 +1155,13 @@ async fn settle_review(
                 fork_from: None,
                 prompt: &prompt,
                 timeout_secs: task_timeout(),
+                request: Some(loka_shared::run_request::RunRequest::fix(&findings)),
             })
             .await?;
         ctx.store
             .set_run_activity(&run, &format!("Fixing review notes on \"{}\" (round {round})", task.title))
             .await?;
         return Ok(());
-    }
-    if verdict.is_none() && ctx.store.review_runs_since_work(task_session.id).await? < 2 {
-        if let Some(task) = match task_session.task_id {
-            Some(task_id) => ctx.db.get_task(task_id).await?,
-            None => None,
-        } {
-            return queue_review(ctx, agent, &task_session, &task).await;
-        }
     }
     finalize(ctx, agent, &task_session, Some(verdict_value)).await
 }
@@ -1208,7 +1185,7 @@ async fn finalize(
     let parsed: prompts::Report = prompts::stored_report(task_session.summary.as_deref()).unwrap_or_default();
     let mut pr_url = None;
     let diagnosis = ctx.store.latest_diagnosis(task_session.id).await?;
-    let mut error = match (completion_error(&parsed, verdict.as_ref(), ctx.reviews_enabled && task_session.wants_review()), &diagnosis) {
+    let mut error = match (super::quests::finish_error(&parsed, verdict.as_ref()), &diagnosis) {
         (Some(_), Some(diagnosis)) if parsed.status.is_none() => Some(diagnosis.reason.clone()),
         (error, _) => error,
     };
@@ -1231,12 +1208,13 @@ async fn finalize(
     let mut publish_secs = None;
     let mut changes_requested = false;
     if let Some(task) = task.as_ref() {
-        if error.is_none() {
+        if error.is_none() || parsed.synthesized {
             if let (Some(repo), Some(wd)) = (task.repo.as_deref(), task_session.working_dir.as_deref()) {
                 let publishing = Instant::now();
                 match open_pr(ctx, task, repo, Path::new(wd), &parsed).await {
                     Ok(url) => pr_url = url,
-                    Err(e) => error = Some(e.to_string()),
+                    Err(e) if error.is_none() => error = Some(loka_shared::cli_errors::chain(&e)),
+                    Err(e) => warn!(task = %task.id, error = %e, "Could not publish the work of a run that ended without its report"),
                 }
                 publish_secs = Some(publishing.elapsed().as_secs());
             }
@@ -1327,42 +1305,6 @@ async fn finalize(
             .await?;
     }
     Ok(())
-}
-
-fn completion_error(
-    report: &prompts::Report,
-    verdict: Option<&Value>,
-    reviews_enabled: bool,
-) -> Option<String> {
-    if report.synthesized {
-        return Some(prompts::SYNTHESIZED_ERROR.to_string());
-    }
-    match report.status.as_deref() {
-        Some("done") => {}
-        Some("blocked") => {
-            return Some(match report.summary.as_deref().filter(|summary| !summary.trim().is_empty()) {
-                Some(summary) => format!("Task reported blocked: {summary}"),
-                None => "Task reported blocked".to_string(),
-            });
-        }
-        Some(status) => return Some(format!("Task reported unsupported status: {status}")),
-        None => return Some("Task did not provide a valid completion report".to_string()),
-    }
-    if !reviews_enabled {
-        return None;
-    }
-    let summary = verdict
-        .and_then(|value| value.get("summary"))
-        .and_then(Value::as_str)
-        .filter(|summary| !summary.trim().is_empty());
-    match verdict.and_then(|value| value.get("verdict")).and_then(Value::as_str) {
-        Some("review failed") => Some(match summary {
-            Some(summary) => format!("Independent review failed: {summary}"),
-            None => "Independent review failed".to_string(),
-        }),
-        Some(_) => None,
-        None => Some("Independent review did not provide a valid verdict".to_string()),
-    }
 }
 
 fn reported_pr_to_keep(found: Option<&github::HeadPr>, report: &prompts::Report, repo: &str) -> Option<(String, i32)> {
@@ -1539,8 +1481,7 @@ fn spawn_steering(ctx: &Ctx, run: SessionRun, sender: cli::SteerSender) -> tokio
 fn spawn_activity(
     store: loka_shared::world::WorldStore,
     run: SessionRun,
-    record_activity: bool,
-    redactor: SecretRedactor,
+    redactor: cli::Redactor,
 ) -> (cli::EventSender, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
     let activity = tokio::spawn(async move {
@@ -1548,8 +1489,9 @@ fn spawn_activity(
         let mut last = Instant::now() - STATUS_THROTTLE;
         let mut last_usage = Instant::now() - LIVE_USAGE_EVERY;
         let mut session: Option<AgentSession> = None;
+        let shows_activity = loka_shared::run_recording::shows_activity(&run.kind);
         while let Some(event) = rx.recv().await {
-            let clip = |t: &str| redactor.redact(t).chars().take(2000).collect::<String>();
+            let event = event.redacted_clip(&redactor, loka_shared::run_recording::EVENT_MAX_CHARS);
             if let StreamEvent::Usage(usage) = &event {
                 if last_usage.elapsed() >= LIVE_USAGE_EVERY {
                     last_usage = Instant::now();
@@ -1572,18 +1514,17 @@ fn spawn_activity(
                     continue;
                 }
                 StreamEvent::Spawned { .. } | StreamEvent::Usage(_) => continue,
-                _ if !record_activity => continue,
-                StreamEvent::ToolUse { tool, input_summary } => store.insert_run_event(run_id, "tool", Some(tool), &clip(input_summary)).await,
-                StreamEvent::ToolResult { tool, output } => store.insert_run_event(run_id, "result", Some(tool), &clip(output)).await,
-                StreamEvent::AssistantText(text) => store.insert_run_event(run_id, "text", None, &clip(text)).await,
-                StreamEvent::Error(err) => store.insert_run_event(run_id, "error", None, &clip(err)).await,
+                StreamEvent::ToolUse { tool, input_summary } => store.insert_run_event(run_id, "tool", Some(tool), input_summary).await,
+                StreamEvent::ToolResult { tool, output } => store.insert_run_event(run_id, "result", Some(tool), output).await,
+                StreamEvent::AssistantText(text) => store.insert_run_event(run_id, "text", None, text).await,
+                StreamEvent::Error(err) => store.insert_run_event(run_id, "error", None, err).await,
             };
             if let StreamEvent::ToolUse { tool, input_summary } = event {
-                if last.elapsed() < STATUS_THROTTLE {
+                if !shows_activity || last.elapsed() < STATUS_THROTTLE {
                     continue;
                 }
                 last = Instant::now();
-                let detail: String = loka_shared::progress::phrase(&tool, &redactor.redact(&input_summary))
+                let detail: String = loka_shared::progress::phrase(&tool, &input_summary)
                     .chars()
                     .take(120)
                     .collect();
@@ -1594,41 +1535,21 @@ fn spawn_activity(
     (tx, activity)
 }
 
-#[derive(Clone)]
-struct SecretRedactor {
-    values: std::sync::Arc<Vec<String>>,
-}
-
-impl SecretRedactor {
-    fn new<'a>(values: impl Iterator<Item = &'a String>) -> Self {
-        let mut values: Vec<String> = values.chain(crate::cli::host_secrets()).filter(|value| !value.is_empty()).cloned().collect();
-        values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-        values.dedup();
-        Self { values: std::sync::Arc::new(values) }
-    }
-
-    fn redact(&self, text: &str) -> String {
-        self.values
-            .iter()
-            .fold(text.to_string(), |text, value| text.replace(value, "[REDACTED]"))
-    }
-
-    fn redact_report(&self, mut report: prompts::Report) -> prompts::Report {
-        report.summary = report.summary.map(|value| self.redact(&value));
-        report.decisions = report.decisions.into_iter().map(|value| self.redact(&value)).collect();
-        report.followups = report.followups.into_iter().map(|value| self.redact(&value)).collect();
-        report.pr_title = report.pr_title.map(|value| self.redact(&value));
-        report.pr_body = report.pr_body.map(|value| self.redact(&value));
-        report.pr_url = report.pr_url.map(|value| self.redact(&value));
-        report.commit_message = report.commit_message.map(|value| self.redact(&value));
-        report
-    }
+fn redact_report(redactor: &cli::Redactor, mut report: prompts::Report) -> prompts::Report {
+    report.summary = report.summary.map(|value| redactor.redact(&value));
+    report.decisions = report.decisions.into_iter().map(|value| redactor.redact(&value)).collect();
+    report.followups = report.followups.into_iter().map(|value| redactor.redact(&value)).collect();
+    report.pr_title = report.pr_title.map(|value| redactor.redact(&value));
+    report.pr_body = report.pr_body.map(|value| redactor.redact(&value));
+    report.pr_url = report.pr_url.map(|value| redactor.redact(&value));
+    report.commit_message = report.commit_message.map(|value| redactor.redact(&value));
+    report
 }
 
 fn review_verdict_value(output: &str) -> Value {
     match prompts::readable_verdict(output) {
         Some(_) => extract_raw(output, "verdict").unwrap_or_default(),
-        None => json!({ "verdict": prompts::NO_VERDICT, "summary": tail(output, 800), "note": prompts::UNREADABLE_VERDICT_NOTE }),
+        None => prompts::no_verdict(tail(output, 800)),
     }
 }
 
@@ -1653,8 +1574,12 @@ fn task_timeout() -> i32 {
 }
 
 #[cfg(test)]
+#[path = "contract.rs"]
+mod contract;
+
+#[cfg(test)]
 mod tests {
-    use super::{completion_error, reported_pr_to_keep, review_verdict_value, session_id_after_run, SecretRedactor};
+    use super::{redact_report, reported_pr_to_keep, review_verdict_value, session_id_after_run};
     use crate::git::github::{HeadPr, PrInfo};
 
     #[test]
@@ -1667,7 +1592,8 @@ mod tests {
             let value = review_verdict_value(output);
             assert_eq!(value["verdict"], super::prompts::NO_VERDICT);
             assert_eq!(value["note"], super::prompts::UNREADABLE_VERDICT_NOTE);
-            assert!(completion_error(&super::prompts::Report { status: Some("done".into()), ..Default::default() }, Some(&value), true).is_none());
+            let done = super::prompts::Report { status: Some("done".into()), ..Default::default() };
+            assert_eq!(super::super::quests::finish_step(&done, true, Some(&value)), super::Finish::Publish);
         }
         let readable = review_verdict_value("<!-- verdict {\"verdict\":\"approve\",\"summary\":\"ok\"} verdict -->");
         assert_eq!(readable["verdict"], "approve");
@@ -1685,7 +1611,294 @@ mod tests {
     }
     use crate::world::prompts::Report;
     use loka_shared::progress::phrase as activity_phrase;
-    use serde_json::json;
+
+    pub(super) async fn test_ctx() -> anyhow::Result<Option<super::Ctx>> {
+        use crate::config::Config;
+        use loka_shared::{db::Database, world::WorldStore};
+        let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
+            return Ok(None);
+        };
+        let db = Database::connect(&url).await?;
+        let store = WorldStore::new(db.pool().clone());
+        let config = Config {
+            database_url: url,
+            github_token: String::new(),
+            repos_dir: std::env::temp_dir(),
+            workspaces_dir: std::env::temp_dir(),
+            backends: Default::default(),
+            repos: Vec::new(),
+            skills: Vec::new(),
+            mcp_servers: Vec::new(),
+            signing: None,
+        };
+        Ok(Some(super::Ctx {
+            config,
+            db,
+            store,
+            worker: "test".into(),
+            owner: "the team".into(),
+            max_review_rounds: 1,
+            reviews_enabled: true,
+            warm: crate::world::warm::Pool::new(1),
+            bus: Default::default(),
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_report_that_never_came_still_finalizes_the_quest_as_failed_with_its_reason() -> anyhow::Result<()> {
+        use loka_shared::world::WorldStore;
+        use uuid::Uuid;
+        let Some(ctx) = test_ctx().await? else {
+            return Ok(());
+        };
+        let pool = ctx.db.pool().clone();
+        let store: WorldStore = ctx.store.clone();
+        let tag = Uuid::new_v4().simple().to_string();
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email) VALUES ($1) RETURNING id")
+            .bind(format!("silent-{tag}@example.test"))
+            .fetch_one(&pool)
+            .await?;
+        let agent_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id) VALUES ($1, 'Bun', 'codex', 'gpt', $2) RETURNING id",
+        )
+        .bind(format!("silent-{tag}"))
+        .bind(owner)
+        .fetch_one(&pool)
+        .await?;
+        let task: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_tasks (user_id, title, status, assigned_agent_id, repo) VALUES ($1, 'ship it', 'in_progress', $2, 'acme/app') RETURNING id",
+        )
+        .bind(owner)
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await?;
+        let report = Report::synthesized("No commit or push performed.", Some("Commits ahead of main:\nabc fix"));
+        let session: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_sessions (agent_id, role, backend, model, cli_session_id, task_id, status, working_dir, summary)
+             VALUES ($1, 'task', 'codex', 'gpt', 'thread-1', $2, 'active', $3, $4) RETURNING id",
+        )
+        .bind(agent_id)
+        .bind(task)
+        .bind(format!("{}/tasks/{task}/app", std::env::temp_dir().display()))
+        .bind(serde_json::to_string(&report)?)
+        .fetch_one(&pool)
+        .await?;
+        let agent = store.get_agent(agent_id).await?.expect("agent");
+        let session = store.get_session(session).await?.expect("session");
+
+        super::finalize(&ctx, &agent, &session, None).await?;
+
+        let (status, error, pr): (String, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT status, error_message, pr_url FROM agent_tasks WHERE id = $1").bind(task).fetch_one(&pool).await?;
+        assert_eq!(status, "failed", "a quest without its report never counts as done");
+        assert_eq!(error.as_deref(), Some(crate::world::prompts::SYNTHESIZED_ERROR), "a publish that could not run never replaces the reason");
+        assert_eq!(pr, None);
+        let finished: Vec<bool> = sqlx::query_scalar(
+            "SELECT COALESCE((payload#>>'{report,synthesized}')::boolean, false) FROM world_events WHERE task_id = $1 AND type = 'task.finished'",
+        )
+        .bind(task)
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(finished, [true]);
+
+        super::finalize(&ctx, &agent, &store.get_session(session.id).await?.expect("session"), None).await?;
+        let announced: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_events WHERE task_id = $1 AND type = 'task.finished'")
+            .bind(task)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(announced, 1, "a stale re-finish never announces the quest twice");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_done_follow_up_finishes_the_quest_from_every_starting_state() -> anyhow::Result<()> {
+        use uuid::Uuid;
+        let Some(ctx) = test_ctx().await? else {
+            return Ok(());
+        };
+        let pool = ctx.db.pool().clone();
+        let earlier = |status: &str, summary: &str| serde_json::to_string(&Report { status: Some(status.into()), summary: Some(summary.into()), ..Default::default() });
+        let starts = [
+            ("review", "completed", earlier("done", "First version")?, None),
+            ("done", "completed", earlier("done", "First version")?, None),
+            ("failed", "failed", earlier("blocked", "Waiting for Loka to publish")?, Some("Task reported blocked: Waiting for Loka to publish")),
+        ];
+        for (quest_status, session_status, summary, error) in starts {
+            let tag = Uuid::new_v4().simple().to_string();
+            let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email) VALUES ($1) RETURNING id")
+                .bind(format!("follow-{tag}@example.test"))
+                .fetch_one(&pool)
+                .await?;
+            let agent_id: Uuid = sqlx::query_scalar(
+                "INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id) VALUES ($1, 'Bun', 'claude', 'haiku', $2) RETURNING id",
+            )
+            .bind(format!("follow-{tag}"))
+            .bind(owner)
+            .fetch_one(&pool)
+            .await?;
+            let task: Uuid = sqlx::query_scalar(
+                "INSERT INTO agent_tasks (user_id, title, status, error_message, assigned_agent_id) VALUES ($1, 'ship it', $2, $3, $4) RETURNING id",
+            )
+            .bind(owner)
+            .bind(quest_status)
+            .bind(error)
+            .bind(agent_id)
+            .fetch_one(&pool)
+            .await?;
+            let session: Uuid = sqlx::query_scalar(
+                "INSERT INTO agent_sessions (agent_id, role, backend, model, cli_session_id, task_id, status, summary, review)
+                 VALUES ($1, 'task', 'claude', 'haiku', 'cli-1', $2, $3, $4, FALSE) RETURNING id",
+            )
+            .bind(agent_id)
+            .bind(task)
+            .bind(session_status)
+            .bind(&summary)
+            .fetch_one(&pool)
+            .await?;
+            let agent = ctx.store.get_agent(agent_id).await?.expect("agent");
+            let first = ctx.store.start_followup(&ctx.store.get_session(session).await?.expect("session"), "One more tweak.", "Abhi", false).await?;
+            let second = ctx.store.start_followup(&ctx.store.get_session(session).await?.expect("session"), "And the docs.", "Abhi", false).await?;
+            let output = "Done.\n<!-- report {\"status\": \"done\", \"summary\": \"Second version\"} report -->";
+            let report = super::prompts::parse_report(output);
+            let finished = || async {
+                sqlx::query_as::<_, (String, Option<String>)>(
+                    "SELECT payload->>'status', payload#>>'{report,summary}' FROM world_events WHERE task_id = $1 AND type = 'task.finished' ORDER BY seq",
+                )
+                .bind(task)
+                .fetch_all(&pool)
+                .await
+            };
+            for (run, last) in [(&first, false), (&second, true)] {
+                sqlx::query("UPDATE session_runs SET status = 'completed', started_at = NOW(), finished_at = NOW() WHERE id = $1")
+                    .bind(run.id)
+                    .execute(&pool)
+                    .await?;
+                let current = ctx.store.get_session(session).await?.expect("session");
+                super::after_completed(&ctx, &agent, &current, run, report.as_ref(), output).await?;
+                let announced = finished().await?;
+                match last {
+                    false => assert!(announced.is_empty(), "{quest_status}: a follow-up still waiting holds the publish"),
+                    true => assert_eq!(
+                        announced,
+                        [("done".to_string(), Some("Second version".to_string()))],
+                        "{quest_status}: a done follow-up publishes and announces the quest"
+                    ),
+                }
+            }
+            let (status, error): (String, Option<String>) =
+                sqlx::query_as("SELECT status, error_message FROM agent_tasks WHERE id = $1").bind(task).fetch_one(&pool).await?;
+            assert_eq!((status.as_str(), error), ("done", None), "{quest_status}: the quest finishes done");
+            assert_eq!(ctx.store.get_session(session).await?.expect("session").status, "completed", "{quest_status}");
+        }
+        Ok(())
+    }
+
+    fn quiet_worktree(dir: &std::path::Path) -> anyhow::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        let git = |args: &[&str]| -> anyhow::Result<()> {
+            let status = std::process::Command::new("git")
+                .args(["-c", "user.name=Loka", "-c", "user.email=loka@example.test", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"])
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00Z")
+                .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00Z")
+                .stdout(std::process::Stdio::null())
+                .status()?;
+            anyhow::ensure!(status.success(), "git {args:?} failed");
+            Ok(())
+        };
+        git(&["init", "-q", "-b", "main"])?;
+        git(&["commit", "-q", "--allow-empty", "-m", "first"])
+    }
+
+    #[tokio::test]
+    async fn a_done_follow_up_that_changed_nothing_gets_its_review_instead_of_failing() -> anyhow::Result<()> {
+        use uuid::Uuid;
+        let Some(ctx) = test_ctx().await? else {
+            return Ok(());
+        };
+        let pool = ctx.db.pool().clone();
+        let done = serde_json::to_string(&Report { status: Some("done".into()), summary: Some("First version".into()), ..Default::default() })?;
+        let starts = [
+            ("failed", "failed", Some("Independent review failed: timed out")),
+            ("review", "completed", None),
+            ("in_progress", "active", None),
+        ];
+        for (quest_status, session_status, error) in starts {
+            let tag = Uuid::new_v4().simple().to_string();
+            let dir = std::env::temp_dir().join(format!("loka-unchanged-{tag}"));
+            quiet_worktree(&dir)?;
+            let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email) VALUES ($1) RETURNING id")
+                .bind(format!("unchanged-{tag}@example.test"))
+                .fetch_one(&pool)
+                .await?;
+            let agent_id: Uuid = sqlx::query_scalar(
+                "INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id) VALUES ($1, 'Bun', 'claude', 'haiku', $2) RETURNING id",
+            )
+            .bind(format!("unchanged-{tag}"))
+            .bind(owner)
+            .fetch_one(&pool)
+            .await?;
+            let task: Uuid = sqlx::query_scalar(
+                "INSERT INTO agent_tasks (user_id, title, status, error_message, assigned_agent_id, repo) VALUES ($1, 'ship it', $2, $3, $4, 'acme/app') RETURNING id",
+            )
+            .bind(owner)
+            .bind(quest_status)
+            .bind(error)
+            .bind(agent_id)
+            .fetch_one(&pool)
+            .await?;
+            let session: Uuid = sqlx::query_scalar(
+                "INSERT INTO agent_sessions (agent_id, role, backend, model, cli_session_id, task_id, status, summary, working_dir)
+                 VALUES ($1, 'task', 'claude', 'haiku', 'cli-1', $2, $3, $4, $5) RETURNING id",
+            )
+            .bind(agent_id)
+            .bind(task)
+            .bind(session_status)
+            .bind(&done)
+            .bind(dir.display().to_string())
+            .fetch_one(&pool)
+            .await?;
+            sqlx::query(
+                "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, prompt, created_at)
+                 VALUES ($1, $2, $3, 'task', 'completed', 'work', NOW() - INTERVAL '3 minutes')",
+            )
+            .bind(session)
+            .bind(agent_id)
+            .bind(task)
+            .execute(&pool)
+            .await?;
+            let agent = ctx.store.get_agent(agent_id).await?.expect("agent");
+            let run = ctx.store.start_followup(&ctx.store.get_session(session).await?.expect("session"), "Anything left?", "Abhi", false).await?;
+            sqlx::query("UPDATE session_runs SET status = 'completed', started_at = NOW(), finished_at = NOW() WHERE id = $1")
+                .bind(run.id)
+                .execute(&pool)
+                .await?;
+            let output = "Nothing left.\n<!-- report {\"status\": \"done\", \"summary\": \"Nothing left\"} report -->";
+            let current = ctx.store.get_session(session).await?.expect("session");
+            super::after_completed(&ctx, &agent, &current, &run, super::prompts::parse_report(output).as_ref(), output).await?;
+
+            let reviews: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM session_runs r JOIN agent_sessions s ON s.id = r.session_id
+                 WHERE s.parent_session_id = $1 AND s.role = 'review' AND r.kind = 'review' AND r.status = 'queued'",
+            )
+            .bind(session)
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(reviews, 1, "{quest_status}: work that was never reviewed gets its review");
+            let finished: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_events WHERE task_id = $1 AND type = 'task.finished'")
+                .bind(task)
+                .fetch_one(&pool)
+                .await?;
+            assert_eq!(finished, 0, "{quest_status}: nothing finishes or publishes before the review");
+            let status: String = sqlx::query_scalar("SELECT status FROM agent_tasks WHERE id = $1").bind(task).fetch_one(&pool).await?;
+            assert_ne!(status, "failed", "{quest_status}: a missing review never fails the quest");
+            let unchanged: bool = sqlx::query_scalar("SELECT unchanged_work FROM session_runs WHERE id = $1").bind(run.id).fetch_one(&pool).await?;
+            assert!(unchanged, "{quest_status}: the follow-up is recorded as one that changed nothing");
+            std::fs::remove_dir_all(&dir)?;
+        }
+        Ok(())
+    }
 
     #[test]
     fn turns_tool_calls_into_plain_phrases() {
@@ -1707,47 +1920,9 @@ mod tests {
     }
 
     #[test]
-    fn completion_requires_done_report() {
-        let missing = Report::default();
-        assert!(completion_error(&missing, None, false).is_some());
-
-        let blocked = Report {
-            status: Some("blocked".to_string()),
-            summary: Some("needs credentials".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(
-            completion_error(&blocked, None, false).as_deref(),
-            Some("Task reported blocked: needs credentials")
-        );
-    }
-
-    #[test]
-    fn review_that_wants_changes_or_is_unreadable_does_not_fail_the_work() {
-        let done = Report { status: Some("done".to_string()), ..Default::default() };
-        assert!(completion_error(&done, None, false).is_none());
-        assert!(completion_error(&done, Some(&json!({ "verdict": "approve" })), true).is_none());
-        assert!(completion_error(&done, None, true).is_some());
-        assert!(completion_error(&done, Some(&json!({ "verdict": "changes", "summary": "test is failing" })), true).is_none());
-        assert!(completion_error(&done, Some(&json!({ "verdict": "review failed", "summary": "timed out" })), true).is_some());
-        assert!(completion_error(&done, Some(&json!({ "verdict": "no verdict" })), true).is_none());
-    }
-
-    #[test]
-    fn redacts_exact_values_including_unicode() {
-        let values = ["short".to_string(), "密钥-value".to_string()];
-        let redactor = SecretRedactor::new(values.iter());
-        assert_eq!(
-            redactor.redact("short and 密钥-value remain private"),
-            "[REDACTED] and [REDACTED] remain private"
-        );
-    }
-
-    #[test]
     fn preserves_report_status_when_secret_matches_control_value() {
-        let values = ["done".to_string()];
-        let redactor = SecretRedactor::new(values.iter());
-        let report = redactor.redact_report(crate::world::prompts::parse_report(
+        let redactor = crate::cli::Redactor::new(["done"]);
+        let report = redact_report(&redactor, crate::world::prompts::parse_report(
             r#"<!-- report {"status":"done","summary":"done"} report -->"#,
         ).unwrap());
         assert_eq!(report.status.as_deref(), Some("done"));

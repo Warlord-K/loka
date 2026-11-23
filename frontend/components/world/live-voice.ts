@@ -16,6 +16,7 @@ import {
   type CallEvent,
   type SessionStep,
 } from "@/lib/call-turns";
+import { AudioSlot, CallSpeaker } from "@/lib/call-speaker";
 
 export type LivePhase = "connecting" | "listening" | "hearing" | "thinking" | "speaking";
 
@@ -23,11 +24,13 @@ export type LiveHandlers = {
   onPhase: (phase: LivePhase) => void;
   onCaption: (key: string, who: "you" | "them", text: string, partial?: boolean) => void;
   onError: (message: string | null) => void;
+  onSound: (blocked: boolean) => void;
   onEnd: () => void;
 };
 
 export type LiveCall = {
   setMuted: (muted: boolean) => void;
+  hear: () => void;
   level: () => number;
   elapsed: () => number;
   usdPerMinute: number;
@@ -37,30 +40,61 @@ export type LiveCall = {
 
 export class LiveUnavailable extends Error {}
 
-const SOUND_BLOCKED = "This device is not playing the call's sound. Click anywhere in Loka to turn it on, and check your speaker or headphones.";
-
 const DUCKED_GAIN = 0.15;
 
 const CLIENT_BARGE_MS = 600;
 
-let primed: AudioContext | null = null;
+type CallAudio = { ctx: AudioContext; speaker: CallSpeaker };
+
+function openAudio(): CallAudio {
+  const ctx = new AudioContext();
+  return { ctx, speaker: new CallSpeaker(ctx) };
+}
+
+function disposeAudio({ ctx, speaker }: CallAudio) {
+  speaker.close();
+  void ctx.close().catch(() => undefined);
+}
+
+const callAudio = new AudioSlot<CallAudio>(openAudio, (audio) => audio.ctx.state !== "closed", disposeAudio);
 
 export function primeLiveAudio() {
   try {
-    if (!primed || primed.state === "closed") primed = new AudioContext();
-    void primed.resume().catch(() => undefined);
-    const buf = primed.createBuffer(1, 1, primed.sampleRate);
-    const src = primed.createBufferSource();
+    const { ctx, speaker } = callAudio.prime();
+    void speaker.start();
+    const buf = ctx.createBuffer(1, 1, ctx.sampleRate);
+    const src = ctx.createBufferSource();
     src.buffer = buf;
-    src.connect(primed.destination);
+    src.connect(speaker.input);
     src.start();
   } catch {}
 }
 
-function takeAudio(): AudioContext {
-  const ctx = primed && primed.state !== "closed" ? primed : new AudioContext();
-  primed = null;
-  return ctx;
+async function wireAudio({ ctx, speaker }: CallAudio, stream: MediaStream) {
+  void speaker.start();
+  await ctx.resume().catch(() => undefined);
+  const mic = ctx.createMediaStreamSource(stream);
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = 512;
+  mic.connect(analyser);
+  const workletUrl = URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" }));
+  try {
+    await ctx.audioWorklet.addModule(workletUrl);
+  } finally {
+    URL.revokeObjectURL(workletUrl);
+  }
+  const tap = new AudioWorkletNode(ctx, "live-tap");
+  const sink = ctx.createGain();
+  sink.gain.value = 0;
+  mic.connect(tap);
+  tap.connect(sink);
+  sink.connect(ctx.destination);
+  const out = ctx.createGain();
+  out.connect(speaker.input);
+  const outTap = ctx.createAnalyser();
+  outTap.fftSize = 512;
+  out.connect(outTap);
+  return { analyser, tap, out, outTap };
 }
 
 function rms(buf: Uint8Array): number {
@@ -129,11 +163,18 @@ async function fetchGreeting(base: string): Promise<Greeting | null> {
   return { text, rate, pcm: new Int16Array(bytes.buffer, 0, bytes.length >> 1) };
 }
 
-export async function startLive(agentId: string, h: LiveHandlers, quickId: string | null = null): Promise<LiveCall> {
+export function startLive(agentId: string, h: LiveHandlers, quickId: string | null = null, about: string | null = null): Promise<LiveCall> {
+  return callAudio.use((take) => openLive(agentId, h, quickId, about, take));
+}
+
+async function openLive(agentId: string, h: LiveHandlers, quickId: string | null, about: string | null, take: () => CallAudio): Promise<LiveCall> {
   const base = quickId ? `/api/world/quick/${quickId}/voice` : `/api/world/agents/${agentId}/voice`;
   const pendingGreeting = fetchGreeting(base);
   const greeting = await Promise.race([pendingGreeting, new Promise<null>((resolve) => window.setTimeout(() => resolve(null), 900))]);
-  const res = await post(greeting ? `${base}?greeted=true` : base);
+  const query = new URLSearchParams();
+  if (greeting) query.set("greeted", "true");
+  if (about && !quickId) query.set("about", about);
+  const res = await post(query.size ? `${base}?${query}` : base);
   if (res.status === 503) throw new LiveUnavailable("Live voice is not set up on this server.");
   if (!res.ok) {
     const refusal = quickId ? ((await res.json().catch(() => null)) as { error?: string } | null)?.error : null;
@@ -144,26 +185,17 @@ export async function startLive(agentId: string, h: LiveHandlers, quickId: strin
   const callId = crypto.randomUUID();
 
   const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
-  const ctx = takeAudio();
-  await ctx.resume().catch(() => undefined);
-  const mic = ctx.createMediaStreamSource(stream);
-  const analyser = ctx.createAnalyser();
-  analyser.fftSize = 512;
-  mic.connect(analyser);
-  const workletUrl = URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" }));
-  await ctx.audioWorklet.addModule(workletUrl);
-  URL.revokeObjectURL(workletUrl);
-  const tap = new AudioWorkletNode(ctx, "live-tap");
-  const sink = ctx.createGain();
-  sink.gain.value = 0;
-  mic.connect(tap);
-  tap.connect(sink);
-  sink.connect(ctx.destination);
-  const out = ctx.createGain();
-  out.connect(ctx.destination);
-  const outTap = ctx.createAnalyser();
-  outTap.fftSize = 512;
-  out.connect(outTap);
+  let audio: CallAudio;
+  let nodes: Awaited<ReturnType<typeof wireAudio>>;
+  try {
+    audio = take();
+    nodes = await wireAudio(audio, stream);
+  } catch (e) {
+    stream.getTracks().forEach((t) => t.stop());
+    throw e;
+  }
+  const { ctx, speaker } = audio;
+  const { analyser, tap, out, outTap } = nodes;
 
   const releaseSounds = holdSounds();
   const releaseMusic = holdMusic();
@@ -206,9 +238,7 @@ export async function startLive(agentId: string, h: LiveHandlers, quickId: strin
   let bargeIns = 0;
   let audioChunks = 0;
   let droppedChunks = 0;
-  let audioState = "";
-  let soundBlocked = false;
-  let soundTimer = 0;
+  let lastAudioState = "";
   let sessionSettled = false;
   let sessionTimer = 0;
   let clientTurns: ClientTurns<string> | null = null;
@@ -221,11 +251,7 @@ export async function startLive(agentId: string, h: LiveHandlers, quickId: strin
   let clientDropped = "";
   let switchTimer = 0;
   const serverDetection = cfg.session.turn_detection ?? null;
-  let shown: string | null = null;
-  const report = (message: string | null) => {
-    shown = message;
-    h.onError(message);
-  };
+  const report = (message: string | null) => h.onError(message);
   let configured = false;
   let flushTimer = 0;
   let flushDue = 0;
@@ -348,8 +374,8 @@ export async function startLive(agentId: string, h: LiveHandlers, quickId: strin
     ...guard.stats(),
     audio_chunks: audioChunks,
     dropped_chunks: droppedChunks,
-    audio_state: audioState || undefined,
-    sound_blocked: soundBlocked,
+    audio_state: lastAudioState || ctx.state,
+    ...speaker.stats(),
     turns: clientTurns ? "client" : "server",
     client_commits: clientCommits,
     client_dropped: clientDropped || undefined,
@@ -377,43 +403,14 @@ export async function startLive(agentId: string, h: LiveHandlers, quickId: strin
     sources.clear();
     playhead = ctx.currentTime;
   };
-  const soundBack = () => {
-    window.removeEventListener("pointerdown", unblock, true);
-    window.removeEventListener("keydown", unblock, true);
-    if (!closed && shown === SOUND_BLOCKED) report(null);
-  };
-  const unblock = () => {
-    void ctx
-      .resume()
-      .then(() => {
-        if (ctx.state === "running") soundBack();
-      })
-      .catch(() => undefined);
-  };
-  const ensureSound = () => {
-    audioState = ctx.state;
-    if (closed || ctx.state === "running") return;
-    void ctx.resume().catch(() => undefined);
-    if (soundTimer) return;
-    soundTimer = window.setTimeout(() => {
-      soundTimer = 0;
-      if (closed || ctx.state === "running") return;
-      soundBlocked = true;
-      report(SOUND_BLOCKED);
-      window.addEventListener("pointerdown", unblock, true);
-      window.addEventListener("keydown", unblock, true);
-    }, 1500);
-  };
-  ctx.onstatechange = () => {
-    if (closed) return;
-    if (ctx.state === "running") soundBack();
-    else ensureSound();
-  };
+  speaker.subscribe((blocked) => {
+    if (!closed) h.onSound(blocked);
+  });
   const setGain = (value: number) => out.gain.setTargetAtTime(value, ctx.currentTime, 0.03);
   const play = (b64: string) => {
     const pcm = fromBase64(b64);
     if (!pcm.length) return;
-    ensureSound();
+    speaker.check();
     const buf = ctx.createBuffer(1, pcm.length, rate);
     const ch = buf.getChannelData(0);
     for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
@@ -753,7 +750,7 @@ export async function startLive(agentId: string, h: LiveHandlers, quickId: strin
     const src = ctx.createBufferSource();
     src.buffer = buf;
     src.connect(out);
-    ensureSound();
+    speaker.check();
     const at = ctx.currentTime + 0.02;
     src.start(at);
     playhead = at + buf.duration;
@@ -896,6 +893,7 @@ export async function startLive(agentId: string, h: LiveHandlers, quickId: strin
       analyser.getByteTimeDomainData(levels);
       return rms(levels);
     },
+    hear: () => void speaker.hear(),
     elapsed,
     close: async () => {
       if (closed) return;
@@ -906,12 +904,9 @@ export async function startLive(agentId: string, h: LiveHandlers, quickId: strin
       window.clearTimeout(settleTimer);
       window.clearTimeout(stopTimer);
       window.clearTimeout(waiting);
-      window.clearTimeout(soundTimer);
       window.clearTimeout(sessionTimer);
       window.clearTimeout(createTimer);
       window.clearTimeout(switchTimer);
-      window.removeEventListener("pointerdown", unblock, true);
-      window.removeEventListener("keydown", unblock, true);
       window.clearInterval(vad);
       window.removeEventListener("world-event", onWorld);
       stopPlayback();
@@ -928,6 +923,8 @@ export async function startLive(agentId: string, h: LiveHandlers, quickId: strin
       closeUser();
       keepCutTurns();
       if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close(1000);
+      lastAudioState = ctx.state;
+      speaker.close();
       await ctx.close().catch(() => undefined);
       await flush(true);
       h.onEnd();

@@ -121,12 +121,16 @@ impl Pool {
     ) -> Result<(CliResult, Timing)> {
         crate::cli::check_model(opts.model)?;
         let started = Instant::now();
-        let key = fingerprint(backend, opts);
+        let launch = match backend {
+            "codex" | "omp" | "cursor" | "opencode" => None,
+            _ => Some(claude::detect::prepare(opts).await?),
+        };
+        let key = fingerprint(backend, opts, launch.as_ref().is_some_and(|launch| launch.uses_plan));
         let taken = self.procs.lock().unwrap().remove(&session_id);
         let reusable = match taken {
             Some(mut warm) => {
                 let alive = warm.proc.alive();
-                if alive && warm.key == key && Some(warm.last_run) == latest_run {
+                if alive && current(&warm.key, &key, warm.last_run, latest_run) {
                     Some(warm)
                 } else {
                     let changed = changed(&warm.key, &key);
@@ -155,8 +159,8 @@ impl Pool {
                 last_used: Instant::now(),
                 turns: 0,
                 uid: JobUid::current(),
-                proc: Proc::spawn(backend, opts).await.inspect_err(|e| {
-                    warn!(backend, error = %crate::remote_runner::redact(&format!("{e:#}"), &opts.secret_values()), "Could not start warm session")
+                proc: Proc::spawn(backend, opts, launch).await.inspect_err(|e| {
+                    warn!(backend, error = %opts.redactor().redact(&format!("{e:#}")), "Could not start warm session")
                 })?,
             },
         };
@@ -176,7 +180,7 @@ impl Pool {
             Err(e) => {
                 let tail = warm.proc.stderr_tail();
                 warm.shutdown().await;
-                warn!(backend, stderr = %crate::remote_runner::redact(&tail, &opts.secret_values()), "Warm session turn failed");
+                warn!(backend, stderr = %opts.redactor().redact(&tail), "Warm session turn failed");
                 if tail.is_empty() || opts.sensitive || opts.mcp_has_secrets {
                     Err(e)
                 } else {
@@ -207,13 +211,13 @@ impl Pool {
 }
 
 impl Proc {
-    async fn spawn(backend: &str, opts: &CliOptions<'_>) -> Result<Self> {
+    async fn spawn(backend: &str, opts: &CliOptions<'_>, launch: Option<claude::detect::Launch>) -> Result<Self> {
         match backend {
             "codex" => Ok(Self::Codex(AppServer::spawn(opts).await?)),
             "omp" => Ok(Self::Omp(crate::omp::WarmOmp::spawn(opts).await?)),
             "cursor" => Ok(Self::Acp(crate::acp::AcpProc::spawn(crate::cursor::acp_setup(opts).await?, opts).await?, "cursor")),
             "opencode" => Ok(Self::Acp(crate::acp::AcpProc::spawn(crate::opencode::acp_setup(opts).await?, opts).await?, "opencode")),
-            _ => Ok(Self::Claude(ClaudeProc::spawn(opts).await?)),
+            _ => Ok(Self::Claude(ClaudeProc::spawn(opts, launch).await?)),
         }
     }
 
@@ -270,8 +274,11 @@ impl Proc {
 }
 
 impl ClaudeProc {
-    async fn spawn(opts: &CliOptions<'_>) -> Result<Self> {
-        let launch = claude::detect::prepare(opts).await?;
+    async fn spawn(opts: &CliOptions<'_>, launch: Option<claude::detect::Launch>) -> Result<Self> {
+        let launch = match launch {
+            Some(launch) => launch,
+            None => claude::detect::prepare(opts).await?,
+        };
         let mcp = match opts.mcp_config_json.as_deref() {
             Some(json) => Some(claude::write_mcp_config_temp_file(json).await?),
             None => None,
@@ -288,7 +295,7 @@ impl ClaudeProc {
         crate::cli::announce_spawn(opts.event_tx.as_ref(), &child);
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("claude stdin missing"))?;
         let stdout = BufReader::new(child.stdout.take().ok_or_else(|| anyhow!("claude stdout missing"))?).lines();
-        let stderr = stderr_tail(child.stderr.take());
+        let stderr = stderr_tail(child.stderr.take(), opts.redactor());
         Ok(Self { child, stdin, stdout, stderr, replays, expect, _mcp: mcp })
     }
 
@@ -299,10 +306,11 @@ impl ClaudeProc {
         let mut reader = TurnReader::new(started).expecting(self.expect);
         let mut steer = if self.replays { opts.steer.take() } else { None };
         let steering = steer.is_some();
-        let mut state = claude::SteerState::new();
+        let mut state = claude::SteerState::new(opts.max_turns);
         let mut outputs: Vec<String> = Vec::new();
         let interrupt_after = crate::cli::steer_interrupt_after();
         let hang_after = crate::cli::tool_hang_after();
+        let background_cap = crate::cli::background_wait_cap();
         let mut watchdog = tokio::time::interval(Duration::from_secs(15));
         watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let finished: Result<()> = loop {
@@ -341,6 +349,10 @@ impl ClaudeProc {
                         }
                     }
                     if !state.pending() {
+                        if state.background.keep_open(Instant::now(), background_cap) {
+                            info!("Warm Claude turn ended with background tasks running, keeping the turn open");
+                            continue;
+                        }
                         break Ok(());
                     }
                 }
@@ -365,6 +377,12 @@ impl ClaudeProc {
                             if let Err(error) = state.write(&mut self.stdin, &crate::cli::hang_notice(age), true).await {
                                 break Err(error);
                             }
+                        }
+                    }
+                    if let Some(note) = state.background.note(Instant::now(), background_cap) {
+                        info!("Asking warm Claude to finish after its background tasks");
+                        if let Err(error) = state.write(&mut self.stdin, &note, false).await {
+                            break Err(error);
                         }
                     }
                 }
@@ -395,7 +413,7 @@ impl ClaudeProc {
     }
 }
 
-type Fingerprint = [(&'static str, u64); 14];
+type Fingerprint = [(&'static str, u64); 15];
 
 fn part(value: impl Hash) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -403,7 +421,7 @@ fn part(value: impl Hash) -> u64 {
     h.finish()
 }
 
-fn fingerprint(backend: &str, opts: &CliOptions<'_>) -> Fingerprint {
+fn fingerprint(backend: &str, opts: &CliOptions<'_>, uses_plan: bool) -> Fingerprint {
     [
         ("backend", part(backend)),
         ("working_dir", part(opts.working_dir)),
@@ -419,7 +437,12 @@ fn fingerprint(backend: &str, opts: &CliOptions<'_>) -> Fingerprint {
         ("readable_files", part(&opts.readable_files)),
         ("steer", part(opts.steer.is_set())),
         ("approval", part(format!("{:?}", opts.approval))),
+        ("sign_in", part(uses_plan)),
     ]
+}
+
+fn current(before: &Fingerprint, now: &Fingerprint, last_run: Uuid, latest_run: Option<Uuid>) -> bool {
+    before == now && Some(last_run) == latest_run
 }
 
 fn changed(before: &Fingerprint, after: &Fingerprint) -> String {
@@ -465,6 +488,19 @@ mod tests {
 
     fn pool() -> Arc<Pool> {
         Arc::new(Pool { capacity: 1, idle: Duration::from_secs(60), procs: Default::default() })
+    }
+
+    #[test]
+    fn a_warm_claude_session_on_the_key_restarts_once_the_plan_is_signed_in() {
+        let dir = std::env::temp_dir();
+        let opts = options(&dir, "hi", "sonnet", None, false);
+        let run = Uuid::new_v4();
+        let on_key = super::fingerprint("claude", &opts, false);
+        assert!(super::current(&on_key, &super::fingerprint("claude", &opts, false), run, Some(run)));
+        let on_plan = super::fingerprint("claude", &opts, true);
+        assert!(!super::current(&on_key, &on_plan, run, Some(run)), "the session started on the key is replaced");
+        assert_eq!(super::changed(&on_key, &on_plan), "sign_in");
+        assert!(!super::current(&on_plan, &on_key, run, Some(run)), "and back to the key when the plan signs out");
     }
 
     #[tokio::test]

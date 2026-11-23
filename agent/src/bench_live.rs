@@ -210,13 +210,13 @@ async fn measure(backend: &str, op: &str, run: usize, dir: &Path, model: &str, s
                     "in": result.usage.input_tokens,
                     "cached": result.usage.cached_input_tokens,
                     "out": result.usage.output_tokens,
-                    "reply": cli::truncate_for_log(&result.output, 60),
+                    "reply": cli::host_redactor().clip(&result.output, 60),
                 }),
             );
             Some(result)
         }
         Err(error) => {
-            report(backend, op, run, json!({ "ms": total, "error": cli::truncate_for_log(&format!("{error:#}"), 300) }));
+            report(backend, op, run, json!({ "ms": total, "error": cli::host_redactor().clip(&format!("{error:#}"), 300) }));
             None
         }
     }
@@ -262,7 +262,7 @@ async fn steer_once(backend: &str, run: usize, dir: &Path, model: &str, interrup
                 "cost": result.cost_usd,
             }),
         ),
-        Err(error) => report(backend, op, run, json!({ "ms": total, "error": cli::truncate_for_log(&format!("{error:#}"), 300) })),
+        Err(error) => report(backend, op, run, json!({ "ms": total, "error": cli::host_redactor().clip(&format!("{error:#}"), 300) })),
     }
 }
 
@@ -302,7 +302,7 @@ async fn warm_turns(backend: &str, run: usize, dir: &Path, model: &str) {
                 latest = Some(run_id);
             }
             Err(error) => {
-                report(backend, "warm", run, json!({ "error": cli::truncate_for_log(&format!("{error:#}"), 300) }));
+                report(backend, "warm", run, json!({ "error": cli::host_redactor().clip(&format!("{error:#}"), 300) }));
                 return;
             }
         }

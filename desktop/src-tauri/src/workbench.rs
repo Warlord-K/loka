@@ -23,7 +23,7 @@ const READ_CAP: u64 = 5 * 1024 * 1024;
 const SCROLLBACK: usize = 256 * 1024;
 const FIND_CAP: usize = 500;
 const FILES_CAP: usize = 50_000;
-const TERMS_PER_KEY: usize = 8;
+pub const TERMS_PER_KEY: usize = 8;
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 pub struct Workbench {
@@ -81,7 +81,7 @@ impl Workbench {
         }
         let count = terms.values().filter(|term| term.key == key).count();
         if count >= TERMS_PER_KEY {
-            return Err("Close a terminal first; this workspace has 8 open.".into());
+            return Err(format!("This Mac runs at most {TERMS_PER_KEY} terminals here at once. Close one to open another."));
         }
         let term = spawn_term(key, root, cols, rows, count, sink)?;
         let id = uuid::Uuid::new_v4().to_string();

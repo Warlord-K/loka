@@ -28,8 +28,7 @@ import {
 import { cn } from "@/lib/utils";
 import type { AcademyTarget, AdventureCard, Attempt, ChallengeCard, ChallengeDetail, DialogueLine, NpcLine, Progress, Region, Unlock } from "@/lib/loka";
 import type { WorldAgent, WorldEvent } from "@/lib/world";
-import { portraitUrl } from "./characters";
-import { AgentAvatar } from "./channel-ui";
+import { AgentAvatar, usePortrait, type Portrait } from "./channel-ui";
 import { useDraft } from "./drafts";
 import { lokaApi, LokaFailure, GEAR_ACCESSORY, shareProgress, useCosmetics, useWorldEvent } from "./loka-client";
 import { RichText } from "./chat-kit";
@@ -112,7 +111,8 @@ export function NpcTalkSheet({
   const dialogue = (Array.isArray(npc.data.dialogue) ? npc.data.dialogue : []) as DialogueLine[];
   const [line, setLine] = useState<DialogueLine | null>(dialogue[0] ?? null);
   const greeting = typeof npc.data.greeting === "string" ? npc.data.greeting : null;
-  const portrait = useMemo(() => portraitUrl(lookOfNpc(npc, agents), 6), [npc, agents]);
+  const npcLook = useMemo(() => lookOfNpc(npc, agents), [npc, agents]);
+  const portrait = usePortrait(npcLook, 6);
   const scroller = useRef<HTMLDivElement>(null);
   const waitingRef = useRef(waiting);
   waitingRef.current = waiting;
@@ -232,7 +232,7 @@ export function NpcTalkSheet({
   );
 }
 
-function Bubble({ portrait, name, children }: { portrait: string; name: string; children: string }) {
+function Bubble({ portrait, name, children }: { portrait: Portrait | null; name: string; children: string }) {
   return (
     <div className="flex items-start gap-2">
       <AgentAvatar portrait={portrait} size="2.5rem" rounded="rounded-md" />
@@ -292,6 +292,8 @@ export function AcademySheet({
   onOpenAgent,
   onClose,
   onFix,
+  onNavigate,
+  navigationCurrent,
 }: {
   meId: string | null;
   target: AcademyTarget;
@@ -301,12 +303,14 @@ export function AcademySheet({
   onOpenAgent: (id: string) => void;
   onClose: () => void;
   onFix: (fix: "budget" | "keys") => void;
+  onNavigate: () => number;
+  navigationCurrent: (request: number | undefined) => boolean;
 }) {
   const [tab, setTab] = useState<"courses" | "progress">(initialTab);
   const [open, setOpen] = useState<string | null>(target.challengeId ?? null);
   const [attempt, setAttempt] = useState<string | null>(target.attemptId ?? null);
-  const [resolving, setResolving] = useState<string | null>(target.reportId ?? null);
-  const [creating, setCreating] = useState(Boolean(target.newPractice));
+  const [resolving, setResolving] = useState<{ reportId: string; request?: number } | null>(target.reportId ? { reportId: target.reportId, request: target.request } : null);
+  const [creating, setCreating] = useState<{ request?: number } | null>(target.newPractice ? { request: target.request } : null);
   const [course, setCourse] = useState<string | null>(target.courseId ?? null);
   const [cards, setCards] = useState<ChallengeCard[] | null>(null);
   const [adventures, setAdventures] = useState<AdventureCard[]>([]);
@@ -329,16 +333,21 @@ export function AcademySheet({
   useEffect(load, [load]);
   useEffect(() => setTab(initialTab), [initialTab]);
   useEffect(() => {
-    setOpen(target.challengeId ?? null);
+    const linked = target.reportId ? cards?.find((card) => card.report_id === target.reportId) : null;
+    setOpen(target.challengeId ?? linked?.id ?? null);
     setAttempt(target.attemptId ?? null);
-    setResolving(target.reportId ?? null);
-    setCreating(Boolean(target.newPractice));
+    setResolving(target.reportId && !linked ? { reportId: target.reportId, request: target.request } : null);
+    setCreating(target.newPractice ? { request: target.request } : null);
     setCourse(target.courseId ?? null);
     if (target.challengeId || target.reportId || target.courseId) setTab("courses");
   }, [target]);
   useEffect(() => {
     if (!resolving || cards === null) return;
-    const reportId = resolving;
+    if (!navigationCurrent(resolving.request)) {
+      setResolving(null);
+      return;
+    }
+    const { reportId, request } = resolving;
     const hit = cards.find((c) => c.report_id === reportId);
     if (hit) {
       setOpen(hit.id);
@@ -350,12 +359,20 @@ export function AcademySheet({
       .practiceThis(reportId)
       .then((made) => {
         if (!live) return;
+        if (!navigationCurrent(request)) {
+          setResolving((current) => current === resolving ? null : current);
+          return;
+        }
         setOpen(made.challenge_id);
         setResolving(null);
         load();
       })
       .catch(() => {
         if (!live) return;
+        if (!navigationCurrent(request)) {
+          setResolving((current) => current === resolving ? null : current);
+          return;
+        }
         setResolving(null);
         keepInReports(reportId);
         openReport(reportId, attempt ? `${ATTEMPT_ITEM}${attempt}` : null);
@@ -363,7 +380,7 @@ export function AcademySheet({
     return () => {
       live = false;
     };
-  }, [resolving, cards, attempt, load]);
+  }, [resolving, cards, attempt, load, navigationCurrent]);
   useWorldEvent(
     useCallback(
       (ev: WorldEvent) => {
@@ -374,6 +391,8 @@ export function AcademySheet({
     ),
   );
   const openCard = (card: ChallengeCard) => {
+    onNavigate();
+    setResolving(null);
     setAttempt(null);
     setOpen(card.id);
   };
@@ -391,10 +410,12 @@ export function AcademySheet({
         id={open}
         meId={meId}
         attempt={attempt}
+        focusRequest={target.request}
         agents={agents}
         onOpenAgent={onOpenAgent}
         waitingOn={waitingOn}
         onBack={() => {
+          onNavigate();
           setOpen(null);
           setAttempt(null);
           load();
@@ -415,7 +436,7 @@ export function AcademySheet({
       <div className="mb-6 flex items-center gap-3">
         <div role="tablist" aria-label="Academy" className={SEGMENT}>
           {(["courses", "progress"] as const).map((t) => (
-            <button key={t} type="button" role="tab" aria-selected={tab === t} onClick={() => setTab(t)} className={cn(SEGMENT_ITEM, "px-3.5 py-1.5 text-w-sm", tab === t ? SEGMENT_ON : SEGMENT_OFF)}>
+            <button key={t} type="button" role="tab" aria-selected={tab === t} onClick={() => { onNavigate(); setResolving(null); setTab(t); }} className={cn(SEGMENT_ITEM, "px-3.5 py-1.5 text-w-sm", tab === t ? SEGMENT_ON : SEGMENT_OFF)}>
               {t === "courses" ? "Courses" : "Progress"}
             </button>
           ))}
@@ -426,7 +447,7 @@ export function AcademySheet({
             Level {progress.level} · {progress.xp} xp
           </span>
         )}
-        <button type="button" onClick={() => setCreating(true)} className={cn(BTN_SECONDARY, !progress && "ml-auto")} title="Write or draw on a canvas and a coach agent checks each attempt">
+        <button type="button" onClick={() => { const request = onNavigate(); setResolving(null); setCreating({ request }); }} className={cn(BTN_SECONDARY, !progress && "ml-auto")} title="Write or draw on a canvas and a coach agent checks each attempt">
           <Student size={14} weight="bold" />
           <span className="hidden @md:inline">New practice</span>
         </button>
@@ -435,12 +456,12 @@ export function AcademySheet({
       <AnimatePresence>
         {creating && (
           <NewPracticeDialog
-            key="new-practice"
+            key={`new-practice:${creating.request ?? "initial"}`}
             agents={agents}
-            onClose={() => setCreating(false)}
+            onClose={() => setCreating(null)}
             onCreated={(reportId) => {
-              setCreating(false);
-              setResolving(reportId);
+              setCreating(null);
+              setResolving({ reportId, request: creating.request });
               load();
             }}
           />
@@ -508,6 +529,7 @@ function parseChoices(answer: string): number[] {
 function LessonCanvas({
   reportId,
   attempt,
+  focusRequest,
   agents,
   meId,
   onOpenAgent,
@@ -515,6 +537,7 @@ function LessonCanvas({
 }: {
   reportId: string;
   attempt: string | null;
+  focusRequest?: number;
   agents: WorldAgent[];
   meId: string | null;
   onOpenAgent: (id: string) => void;
@@ -543,7 +566,7 @@ function LessonCanvas({
   if (!detail) return gone ? <p className="text-w-sm text-w-muted">This lesson's canvas is gone.</p> : <Shimmer>Opening the canvas</Shimmer>;
   return (
     <div className="h-[min(46rem,78vh)] min-h-[28rem] overflow-hidden rounded-xl border-2 border-w-ink bg-w-card">
-      <PracticeView embedded detail={detail} agents={agents} meId={meId} focusItem={attempt ? `${ATTEMPT_ITEM}${attempt}` : null} onOpenAgent={onOpenAgent}
+      <PracticeView embedded detail={detail} agents={agents} meId={meId} focusItem={attempt ? `${ATTEMPT_ITEM}${attempt}` : null} focusRequest={focusRequest} onOpenAgent={onOpenAgent}
         onChanged={() => {
           load();
           onLessonChanged();
@@ -557,6 +580,7 @@ function ChallengeView({
   id,
   meId,
   attempt,
+  focusRequest,
   agents,
   onOpenAgent,
   waitingOn,
@@ -568,6 +592,7 @@ function ChallengeView({
   id: string;
   meId: string | null;
   attempt: string | null;
+  focusRequest?: number;
   agents: WorldAgent[];
   onOpenAgent: (id: string) => void;
   waitingOn: string | null;
@@ -712,7 +737,7 @@ function ChallengeView({
         )}
         {card.type === "canvas" ? (
           card.report_id ? (
-            <LessonCanvas reportId={card.report_id} attempt={attempt} agents={agents} meId={meId} onOpenAgent={onOpenAgent} onLessonChanged={load} />
+            <LessonCanvas reportId={card.report_id} attempt={attempt} focusRequest={focusRequest} agents={agents} meId={meId} onOpenAgent={onOpenAgent} onLessonChanged={load} />
           ) : (
             <p className="text-w-sm text-w-muted">This lesson's canvas is gone.</p>
           )

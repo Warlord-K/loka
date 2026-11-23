@@ -5,6 +5,7 @@ use loka_shared::context::{ForkChoice, QuestContext};
 use loka_shared::milestones::{self, MilestoneStore};
 use loka_shared::models::AgentTask;
 use loka_shared::quests::{QuestChoice, QuestOptions, PLAN_FIRST};
+use loka_shared::world::BeforeBigWork;
 use loka_shared::world::{AgentSession, InboxItem, NewEvent, NewMessage, NewRun, NewSession, ReviewerChoice, SessionRun, TaskRef, WorldAgent, WorldStore};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -38,13 +39,13 @@ pub async fn assigned_elsewhere(store: &WorldStore, task_id: Uuid, agent_id: Uui
 
 pub const MIN_TASK_PREFIX: usize = 8;
 
-pub fn unique_task(raw: &str, matches: &[TaskRef]) -> Result<Uuid, String> {
+pub fn unique_task(raw: &str, matches: &[TaskRef], action: &str) -> Result<TaskRef, String> {
     let raw = raw.trim();
     match matches {
-        [] => Err(format!("Could not start task {raw}: no task of yours has that id. list_tasks shows the ids.")),
-        [one] => Ok(one.id),
+        [] => Err(format!("Could not {action} {raw}: no task of yours has that id. list_tasks shows the ids.")),
+        [one] => Ok(one.clone()),
         many => Err(format!(
-            "Could not start task {raw}: it matches {} tasks ({}). Use more characters of the id.",
+            "Could not {action} {raw}: it matches {} tasks ({}). Use more characters of the id.",
             many.len(),
             many.iter().map(|t| format!("{} {}", t.id, t.title)).collect::<Vec<_>>().join(", ")
         )),
@@ -57,7 +58,7 @@ pub enum TaskKey {
     Prefix(String),
 }
 
-pub fn task_key(raw: &str) -> Result<TaskKey, String> {
+pub fn task_key(raw: &str, action: &str) -> Result<TaskKey, String> {
     let raw = raw.trim();
     if let Ok(id) = raw.parse::<Uuid>() {
         return Ok(TaskKey::Full(id));
@@ -66,25 +67,34 @@ pub fn task_key(raw: &str) -> Result<TaskKey, String> {
     if hex {
         Ok(TaskKey::Prefix(raw.to_lowercase()))
     } else {
-        Err(format!("Could not start task {raw}: that is not a task id. Use the full id or its first {MIN_TASK_PREFIX} characters."))
+        Err(format!("Could not {action} {raw}: that is not a task id. Use the full id or its first {MIN_TASK_PREFIX} characters."))
     }
 }
 
-pub async fn start_target(store: &WorldStore, agent: &WorldAgent, raw: &str) -> Result<Uuid, String> {
-    let id = match task_key(raw)? {
-        TaskKey::Full(id) => id,
-        TaskKey::Prefix(prefix) => {
-            let matches = store
-                .find_tasks_by_prefix_in(agent.org_id, &prefix)
-                .await
-                .map_err(|e| format!("Could not start task {prefix}: looking it up failed ({e})."))?;
-            unique_task(&prefix, &matches)?
-        }
+pub async fn find_task(store: &WorldStore, org: Option<Uuid>, raw: &str, action: &str) -> Result<TaskRef, String> {
+    let key = match task_key(raw, action)? {
+        TaskKey::Full(id) => id.to_string(),
+        TaskKey::Prefix(prefix) => prefix,
     };
+    let matches = store
+        .find_tasks_by_prefix_in(org, &key)
+        .await
+        .map_err(|e| format!("Could not {action} {key}: looking it up failed ({e})."))?;
+    unique_task(&key, &matches, action)
+}
+
+pub async fn start_target(store: &WorldStore, agent: &WorldAgent, raw: &str) -> Result<Uuid, String> {
+    let id = find_task(store, agent.org_id, raw, "start task").await?.id;
     if assigned_elsewhere(store, id, agent.id).await {
         return Err(format!("Could not start task {id}: it is assigned to another agent. Ask that agent, or reassign it first."));
     }
     Ok(id)
+}
+
+pub struct Started {
+    pub resumed: bool,
+    pub session_id: Uuid,
+    pub run_id: Uuid,
 }
 
 pub const PROBLEM_KIND: &str = "actions.problem";
@@ -120,12 +130,26 @@ pub async fn tell_agent(store: &WorldStore, agent: &WorldAgent, run_id: Uuid, it
     if fresh.is_empty() {
         return Ok(());
     }
-    let retrying = items.iter().any(|item| item.kind == PROBLEM_KIND);
-    let wake = (!retrying).then_some((agent.id, PROBLEM_KIND));
+    let wake = problem_wake(store, agent.id, items).await.then_some((agent.id, PROBLEM_KIND));
     store
         .emit(NewEvent::new(PROBLEM_KIND).agent(agent.id).run(run_id).payload(json!({ "problems": fresh })), wake)
         .await?;
     Ok(())
+}
+
+const PROBLEM_WAKES_PER_HOUR: i64 = 3;
+
+async fn problem_wake(store: &WorldStore, agent_id: Uuid, items: &[InboxItem]) -> bool {
+    if !items.iter().any(|item| item.kind == PROBLEM_KIND) {
+        return true;
+    }
+    let recent: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_events WHERE agent_id = $1 AND type = $2 AND created_at > NOW() - INTERVAL '1 hour'")
+        .bind(agent_id)
+        .bind(PROBLEM_KIND)
+        .fetch_one(store.pool())
+        .await
+        .unwrap_or(PROBLEM_WAKES_PER_HOUR);
+    recent < PROBLEM_WAKES_PER_HOUR
 }
 
 pub const REPO_NOTES_PROMPT_CAP: usize = 4096;
@@ -197,6 +221,26 @@ pub struct QuestStart<'a> {
     pub options: &'a QuestOptions,
 }
 
+const AUTOMATIC_PLAN_POLICY: &str = "[before big work: always show a plan]";
+
+pub fn before_big_work_policy(mode: BeforeBigWork, quick: bool) -> &'static str {
+    match (mode, quick) {
+        (BeforeBigWork::AskWhenUnclear, true) => "[before big work: ask when unclear]\nThis is a small, clear quest, so start it now. Ask only when a missing fact makes progress impossible.",
+        (BeforeBigWork::AskWhenUnclear, false) => "[before big work: ask when unclear]\nBefore editing on non-trivial work, use read-only inspection to decide whether missing facts could change the result. If so, ask 1 to 3 specific questions, with short choices when practical, and end with this block instead of a report:\n<!-- clarify\n{\"text\":\"The numbered questions\",\"choices\":[\"A useful choice\"]}\nclarify -->\nSmall clear work starts immediately. Once answered, do not ask the settled questions again. Clarifying missing facts up front is different from asking permission between steps.",
+        (BeforeBigWork::JustBuild, _) => "[before big work: just build]\nMake reasonable assumptions and keep moving. Ask only when a missing fact makes progress impossible. Then end with <!-- clarify {\"text\":\"The numbered questions\",\"choices\":[\"A useful choice\"]} clarify --> instead of a report.",
+        (BeforeBigWork::AlwaysShowPlan, true) => "[before big work: small work starts now]\nThis is a small, clear quest, so start it now without a plan.",
+        (BeforeBigWork::AlwaysShowPlan, false) => "[before big work: always show a plan]\nFor non-trivial work, inspect first without editing, then end with the plan block described by the task instructions. A direct instruction from the user to build now wins. When facts needed for the plan are missing, ask 1 to 3 specific questions first and end with <!-- clarify {\"text\":\"The numbered questions\",\"choices\":[\"A useful choice\"]} clarify -->.",
+    }
+}
+
+fn automatic_plan_policy(prompt: &str) -> bool {
+    prompt
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("[before big work:"))
+        .is_some_and(|line| line == AUTOMATIC_PLAN_POLICY)
+}
+
 pub async fn open_sessions(store: &WorldStore, start: QuestStart<'_>, dirs: &[String]) -> Result<Vec<(AgentSession, SessionRun)>> {
     let QuestStart { agent, main, task, brief, review, reviewer, rules, options } = start;
     let racing = dirs.len() > 1;
@@ -212,6 +256,8 @@ pub async fn open_sessions(store: &WorldStore, start: QuestStart<'_>, dirs: &[St
             .unwrap_or_default(),
         _ => String::new(),
     };
+    let handoff = store.quest_handoff(task.id).await.ok().flatten();
+    let before_big_work = store.agent_before_big_work(agent).await?;
     let mut opened = Vec::new();
     let mut choice = None;
     for (i, dir) in dirs.iter().enumerate() {
@@ -253,18 +299,25 @@ pub async fn open_sessions(store: &WorldStore, start: QuestStart<'_>, dirs: &[St
         if !notes.is_empty() {
             prompt.push_str(&format!("\n\n{notes}"));
         }
+        if let Some(handoff) = &handoff {
+            prompt.push_str(&format!("\n\n{handoff}"));
+        }
         if let Some(brief) = brief {
             prompt.push_str(&format!("\n\nYour brief:\n{brief}"));
         }
         if racing {
             store.mark_attempt(session.id, attempt).await?;
             prompt.push_str(&format!(
-                "\n\nYou are attempt {attempt} of {} at this quest. The other attempts work on the same task at the same time in their own workspaces, and an independent judge picks the one that ships. Work only in your workspace and do your best complete version.",
+                "\n\nYou are attempt {attempt} of {} at this quest. The other attempts work on the same task at the same time in their own quest folders, and an independent judge picks the one that ships. Work only in your quest folder and do your best complete version.",
                 dirs.len()
             ));
-        } else if options.plan_first {
-            store.begin_plan(session.id).await?;
-            prompt.push_str(&format!("\n\n{PLAN_FIRST}"));
+        } else {
+            let policy = before_big_work_policy(before_big_work, options.quick());
+            prompt.push_str(&format!("\n\n{policy}"));
+            if options.plan_first {
+                store.begin_plan(session.id).await?;
+                prompt.push_str(&format!("\n\n{PLAN_FIRST}"));
+            }
         }
         if !fork {
             prompt = format!("{}\n\n{}", store.fresh_start_memory(agent, &fresh_intro(agent, &backend, too_large)).await?, prompts::unforked(&prompt));
@@ -279,6 +332,7 @@ pub async fn open_sessions(store: &WorldStore, start: QuestStart<'_>, dirs: &[St
                 fork_from: fork.then_some(main.id),
                 prompt: &prompt,
                 timeout_secs: loka_shared::world::default_task_timeout_secs(),
+                request: Some(loka_shared::run_request::RunRequest::task(task.description.as_deref(), brief)),
             })
             .await?;
         opened.push((session, run));
@@ -308,8 +362,8 @@ pub async fn label_attempts(store: &WorldStore, task: &AgentTask, opened: &[(Age
     Ok(())
 }
 
-pub fn started_payload(task: &AgentTask, options: &QuestOptions, attempts: usize) -> Value {
-    let mut payload = json!({ "task_id": task.id, "title": task.title, "repo": task.repo });
+pub fn started_payload(task: &AgentTask, options: &QuestOptions, attempts: usize, run_id: Uuid) -> Value {
+    let mut payload = json!({ "task_id": task.id, "title": task.title, "repo": task.repo, "run_id": run_id, "queued": true });
     if attempts > 1 {
         payload["attempts"] = json!(attempts);
     }
@@ -335,6 +389,49 @@ pub async fn plan_step(store: &WorldStore, agent: &WorldAgent, session: &AgentSe
     store
         .post_plan(agent.id, &agent.name, task_id, &title, session.id, run.id, &prompts::plan_text(output))
         .await
+}
+
+pub async fn prework_step(store: &WorldStore, agent: &WorldAgent, session: &AgentSession, run: &SessionRun, output: &str) -> Result<bool> {
+    if session.role != "task" || session.racing() || !matches!(run.kind.as_str(), "task" | "followup") {
+        return Ok(false);
+    }
+    if !session.planning() && prompts::parse_report(output).and_then(|report| report.status).is_some() {
+        return Ok(false);
+    }
+    let answer_followup = run.kind == "followup" && run.prompt.starts_with("[questions answered by ");
+    if run.kind == "followup" && !answer_followup && !session.planning() {
+        return Ok(false);
+    }
+    if let Some(request) = prompts::parse_clarification(output) {
+        if !matches!(session.plan_state.as_deref(), Some("awaiting" | "approved" | "clarifying")) {
+            return store
+                .post_clarification(
+                    agent,
+                    session,
+                    run,
+                    loka_shared::quests::QuestClarification {
+                        text: &request.text,
+                        choices: &request.choices,
+                        plan_after: session.planning(),
+                        always_plan: automatic_plan_policy(&run.prompt),
+                    },
+                )
+                .await;
+        }
+    }
+    if automatic_plan_policy(&run.prompt) && prompts::has_plan(output) {
+        let task_id = session.task_id.ok_or_else(|| anyhow!("plan session has no quest"))?;
+        if !session.planning() && !store.begin_automatic_plan(agent.id, task_id, session.id, answer_followup).await? {
+            return Ok(true);
+        }
+        plan_step(store, agent, session, run, output).await?;
+        return Ok(true);
+    }
+    if session.planning() {
+        plan_step(store, agent, session, run, output).await?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 pub async fn candidates(store: &WorldStore, ids: &[Uuid]) -> Result<Vec<AgentSession>> {
@@ -408,6 +505,7 @@ pub async fn queue_compare(
             fork_from: None,
             prompt: &prompt,
             timeout_secs: loka_shared::world::default_task_timeout_secs(),
+            request: None,
         })
         .await?;
     store
@@ -455,6 +553,19 @@ pub async fn settle(store: &WorldStore, agent: &WorldAgent, task_id: Uuid, winne
 mod tests {
     use super::*;
 
+    #[test]
+    fn before_big_work_modes_keep_small_work_moving() {
+        let ask = before_big_work_policy(BeforeBigWork::AskWhenUnclear, false);
+        assert!(ask.contains("1 to 3 specific questions") && ask.contains("<!-- clarify"));
+        assert!(before_big_work_policy(BeforeBigWork::JustBuild, false).contains("reasonable assumptions"));
+        assert!(before_big_work_policy(BeforeBigWork::AlwaysShowPlan, false).contains("plan block"));
+        assert!(before_big_work_policy(BeforeBigWork::AskWhenUnclear, true).contains("start it now"));
+        assert!(before_big_work_policy(BeforeBigWork::AlwaysShowPlan, true).contains("without a plan"));
+        assert!(automatic_plan_policy(&format!("user said {AUTOMATIC_PLAN_POLICY}\n\n{}", before_big_work_policy(BeforeBigWork::AlwaysShowPlan, false))));
+        assert!(!automatic_plan_policy(&format!("user said {AUTOMATIC_PLAN_POLICY}\n\n{}", before_big_work_policy(BeforeBigWork::AskWhenUnclear, false))));
+        assert!(!automatic_plan_policy(before_big_work_policy(BeforeBigWork::AlwaysShowPlan, true)));
+    }
+
     #[tokio::test]
     async fn start_target_resolves_ids_and_tell_agent_reaches_the_inbox() -> Result<()> {
         use loka_shared::db::Database;
@@ -501,7 +612,8 @@ mod tests {
         let unknown = start_target(&store, mine, "deadbeef").await.unwrap_err();
         assert!(unknown.contains("no task"), "{unknown}");
         let unknown_full = Uuid::new_v4();
-        assert_eq!(start_target(&store, mine, &unknown_full.to_string()).await, Ok(unknown_full));
+        let unknown_full = start_target(&store, mine, &unknown_full.to_string()).await.unwrap_err();
+        assert!(unknown_full.contains("no task"), "{unknown_full}");
         let short = start_target(&store, mine, "50eed2").await.unwrap_err();
         assert!(short.contains("not a task id"), "{short}");
         let elsewhere = start_target(&store, mine, &ids[2].to_string()).await.unwrap_err();
@@ -567,7 +679,17 @@ mod tests {
             .bind(PROBLEM_KIND)
             .fetch_one(&pool)
             .await?;
-        assert_eq!(pending, 1);
+        assert_eq!(pending, 2, "a repeated problem in a retry turn still reaches the agent");
+        let retry_item = |id: i64| InboxItem { id, agent_id: mine.id, kind: PROBLEM_KIND.into(), event_seq: None, payload: json!({}), status: "processing".into(), attempts: 1, created_at: chrono::Utc::now() };
+        for n in 0..4 {
+            tell_agent(&store, mine, later_run, &[retry_item(n)], &[format!("Still failing {n}")]).await?;
+        }
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_inbox WHERE agent_id = $1 AND kind = $2 AND status = 'pending'")
+            .bind(mine.id)
+            .bind(PROBLEM_KIND)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(pending, 3, "retry turns wake the agent at most {PROBLEM_WAKES_PER_HOUR} times an hour so it cannot loop");
         Ok(())
     }
 
@@ -578,22 +700,22 @@ mod tests {
     #[test]
     fn full_ids_and_prefixes_are_told_apart() {
         let full = "50eed204-1111-4222-8333-944455556666";
-        assert_eq!(task_key(full), Ok(TaskKey::Full(full.parse().unwrap())));
-        assert_eq!(task_key(" 50EED204 "), Ok(TaskKey::Prefix("50eed204".into())));
-        assert_eq!(task_key("50eed204-1111"), Ok(TaskKey::Prefix("50eed204-1111".into())));
-        assert!(task_key("50eed2").unwrap_err().contains("not a task id"));
-        assert!(task_key("not-a-task-id").is_err());
-        assert!(task_key("").is_err());
+        assert_eq!(task_key(full, "start task"), Ok(TaskKey::Full(full.parse().unwrap())));
+        assert_eq!(task_key(" 50EED204 ", "start task"), Ok(TaskKey::Prefix("50eed204".into())));
+        assert_eq!(task_key("50eed204-1111", "start task"), Ok(TaskKey::Prefix("50eed204-1111".into())));
+        assert!(task_key("50eed2", "start task").unwrap_err().contains("not a task id"));
+        assert!(task_key("not-a-task-id", "start task").is_err());
+        assert!(task_key("", "start task").is_err());
     }
 
     #[test]
     fn a_unique_prefix_resolves_and_bad_ones_say_why() {
         let a = task_ref("50eed204-1111-4222-8333-944455556666", "Fix start_task");
         let b = task_ref("50eed204-9999-4222-8333-944455556666", "Other quest");
-        assert_eq!(unique_task("50eed204-1", std::slice::from_ref(&a)), Ok(a.id));
-        let ambiguous = unique_task("50eed204", &[a.clone(), b.clone()]).unwrap_err();
+        assert_eq!(unique_task("50eed204-1", std::slice::from_ref(&a), "start task").map(|task| task.id), Ok(a.id));
+        let ambiguous = unique_task("50eed204", &[a.clone(), b.clone()], "start task").unwrap_err();
         assert!(ambiguous.contains("50eed204") && ambiguous.contains("matches 2 tasks") && ambiguous.contains("Other quest"));
-        let unknown = unique_task("deadbeef", &[]).unwrap_err();
+        let unknown = unique_task("deadbeef", &[], "start task").unwrap_err();
         assert!(unknown.contains("deadbeef") && unknown.contains("no task"));
     }
 
@@ -643,5 +765,149 @@ mod tests {
         assert!(wakes_main(&pace("quick"), &open, None, false));
         let found = prompts::Report { findings: Some("# Notes".into()), ..done };
         assert!(wakes_main(&pace("urgent"), &found, None, false));
+    }
+
+    #[test]
+    fn one_finish_rule_reviews_what_was_never_reviewed_and_never_dead_ends() {
+        use loka_shared::runners::PrSync;
+        let report = |status: Option<&str>| prompts::Report { status: status.map(String::from), summary: Some("Ship it".into()), ..Default::default() };
+        let done = report(Some("done"));
+        let approve = json!({ "verdict": "approve" });
+        let changes = json!({ "verdict": "changes", "summary": "test is failing" });
+        let unreadable = json!({ "verdict": prompts::NO_VERDICT });
+        let crashed = json!({ "verdict": "review failed", "summary": "timed out" });
+
+        assert_eq!(finish_step(&done, true, None), Finish::Review, "wanted and never reviewed: review it");
+        assert_eq!(finish_step(&done, false, None), Finish::Publish, "review off: publish");
+        for verdict in [&approve, &changes, &unreadable] {
+            assert_eq!(finish_step(&done, true, Some(verdict)), Finish::Publish, "{verdict}: a finished review publishes");
+            assert_eq!(finish_step(&done, false, Some(verdict)), Finish::Publish, "{verdict}");
+        }
+        assert_eq!(finish_step(&done, true, Some(&crashed)), Finish::Fail("Independent review failed: timed out".into()));
+        assert_eq!(finish_error(&done, Some(&json!({ "verdict": "review failed" }))).as_deref(), Some("Independent review failed"));
+
+        let blocked = report(Some("blocked"));
+        assert_eq!(finish_step(&blocked, true, None), Finish::Fail("Task reported blocked: Ship it".into()));
+        assert_eq!(finish_step(&blocked, false, Some(&approve)), Finish::Fail("Task reported blocked: Ship it".into()));
+        assert_eq!(finish_step(&prompts::Report::default(), true, None), Finish::Fail("Task did not provide a valid completion report".into()));
+        let quiet = prompts::Report { status: Some("blocked".into()), summary: Some(" ".into()), ..Default::default() };
+        assert_eq!(finish_step(&quiet, false, None), Finish::Fail("Task reported blocked".into()));
+        let lost = prompts::Report::synthesized("No commit performed.", None);
+        assert_eq!(finish_step(&lost, true, None), Finish::Fail(prompts::SYNTHESIZED_ERROR.into()));
+
+        for was_completed in [false, true] {
+            for has_repo in [false, true] {
+                for sync in [PrSync::Changed, PrSync::Unchanged] {
+                    let step = |reviews: bool, wants: bool, verdict: Option<&Value>| followup_step(was_completed, &done, reviews, wants, false, has_repo, sync, verdict);
+                    assert_eq!(step(true, true, None), FollowupStep::Review, "{sync:?}: a done follow-up whose work has no review gets one");
+                    assert_eq!(step(true, true, Some(&approve)), FollowupStep::Settle, "{sync:?}: reviewed work publishes without a new review");
+                    assert_eq!(step(true, true, Some(&changes)), FollowupStep::Settle, "{sync:?}: rounds ran out, the work still publishes");
+                    assert_eq!(step(true, false, None), FollowupStep::Settle, "{sync:?}: review off");
+                    assert_eq!(step(false, true, None), FollowupStep::Settle, "{sync:?}: reviews off everywhere");
+                    assert_eq!(followup_step(was_completed, &done, true, true, false, has_repo, PrSync::Merged, None), FollowupStep::Settle, "a merged PR settles");
+                }
+            }
+        }
+        assert_eq!(followup_step(false, &blocked, true, true, false, true, PrSync::Unchanged, None), FollowupStep::Fail("Task reported blocked: Ship it".into()));
+        assert_eq!(followup_step(true, &blocked, true, true, false, true, PrSync::Unchanged, None), FollowupStep::Leave);
+    }
+}
+
+pub fn incomplete_report(report: &prompts::Report) -> Option<String> {
+    if report.status.as_deref() == Some("done") {
+        return None;
+    }
+    if report.synthesized {
+        return Some(prompts::SYNTHESIZED_ERROR.to_string());
+    }
+    let summary = report.summary.as_deref().filter(|summary| !summary.trim().is_empty());
+    Some(match (report.status.as_deref(), summary) {
+        (status, Some(summary)) => format!("Task reported {}: {summary}", status.unwrap_or("no status")),
+        (Some(status), None) => format!("Task reported {status}"),
+        (None, None) => "Task did not provide a valid completion report".to_string(),
+    })
+}
+
+pub fn salvages(report: &prompts::Report, has_repo: bool) -> bool {
+    report.synthesized && has_repo
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FollowupStep {
+    Nudge,
+    Salvage,
+    Fail(String),
+    Leave,
+    Review,
+    Settle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Finish {
+    Publish,
+    Review,
+    Fail(String),
+}
+
+pub fn finish_error(report: &prompts::Report, verdict: Option<&Value>) -> Option<String> {
+    if let Some(error) = incomplete_report(report) {
+        return Some(error);
+    }
+    if verdict.and_then(|value| value.get("verdict")).and_then(Value::as_str) != Some("review failed") {
+        return None;
+    }
+    Some(match verdict.and_then(|value| value.get("summary")).and_then(Value::as_str).filter(|summary| !summary.trim().is_empty()) {
+        Some(summary) => format!("Independent review failed: {summary}"),
+        None => "Independent review failed".to_string(),
+    })
+}
+
+pub fn finish_step(report: &prompts::Report, review_wanted: bool, verdict: Option<&Value>) -> Finish {
+    if let Some(error) = finish_error(report, verdict) {
+        Finish::Fail(error)
+    } else if review_wanted && verdict.is_none() {
+        Finish::Review
+    } else {
+        Finish::Publish
+    }
+}
+
+pub async fn review_on_record(store: &WorldStore, session_id: Uuid, run_id: Uuid, pr_sync: loka_shared::runners::PrSync) -> Result<Option<String>> {
+    if pr_sync == loka_shared::runners::PrSync::Unchanged {
+        store.mark_unchanged_work(run_id).await?;
+    }
+    store.latest_review_output(session_id).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn followup_step(
+    was_completed: bool,
+    report: &prompts::Report,
+    reviews_enabled: bool,
+    wants_review: bool,
+    nudge_available: bool,
+    has_repo: bool,
+    pr_sync: loka_shared::runners::PrSync,
+    verdict: Option<&Value>,
+) -> FollowupStep {
+    if let Some(error) = incomplete_report(report) {
+        if was_completed {
+            return FollowupStep::Leave;
+        }
+        if report.status.is_none() && nudge_available {
+            return FollowupStep::Nudge;
+        }
+        if salvages(report, has_repo) {
+            return FollowupStep::Salvage;
+        }
+        return FollowupStep::Fail(error);
+    }
+    if pr_sync == loka_shared::runners::PrSync::Merged {
+        return FollowupStep::Settle;
+    }
+    match finish_step(report, reviews_enabled && wants_review, verdict) {
+        Finish::Review => FollowupStep::Review,
+        Finish::Publish => FollowupStep::Settle,
+        Finish::Fail(error) => FollowupStep::Fail(error),
     }
 }

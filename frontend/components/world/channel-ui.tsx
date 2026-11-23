@@ -1,8 +1,12 @@
 "use client";
 
+import { useSyncExternalStore } from "react";
 import { cn } from "@/lib/utils";
 import { residentFor, type WorldAgent } from "@/lib/world";
 import { portraitUrl } from "./characters";
+import { context, makeCanvas } from "./pixels";
+import { artVersion, figurePortrait, onNewArtStatus } from "./sprites";
+import type { LokaLook } from "./types";
 
 const PALETTE = ["#0fa3a3", "#e0663d", "#7b5cc4", "#3f8f4f", "#c99a1a", "#c4507a", "#3a6fb5", "#8a5a3b"];
 
@@ -30,18 +34,58 @@ export function PersonAvatar({ id, name, size = 36, soft = false, className }: {
   );
 }
 
-const portraitCache = new Map<string, string>();
+export interface Portrait {
+  url: string | null;
+  smooth: boolean;
+}
 
-export function portraitOf(agent: WorldAgent, scale = 3): string | null {
+const CLASSIC_ROWS = 17;
+const LOADING: Portrait = { url: null, smooth: true };
+const classicPortraits = new Map<string, Portrait>();
+const newArtPortraits = new WeakMap<HTMLCanvasElement, Map<number, Portrait>>();
+
+function scaledUrl(src: HTMLCanvasElement, scale: number): string {
+  const k = Math.max(1, Math.ceil((2 * CLASSIC_ROWS * scale) / src.height));
+  const out = makeCanvas(src.width * k, src.height * k);
+  context(out).drawImage(src, 0, 0, out.width, out.height);
+  return out.toDataURL("image/png");
+}
+
+export function lookPortrait(look: LokaLook, scale = 3): Portrait | null {
   if (typeof document === "undefined") return null;
-  const look = residentFor(agent).look;
-  const key = `${scale}:${JSON.stringify(look)}`;
-  let url = portraitCache.get(key);
-  if (!url) {
-    url = portraitUrl(look, scale);
-    portraitCache.set(key, url);
+  const figure = figurePortrait(look);
+  if (figure === undefined) return LOADING;
+  if (figure) {
+    const sizes = newArtPortraits.get(figure) ?? new Map<number, Portrait>();
+    newArtPortraits.set(figure, sizes);
+    const made = sizes.get(scale) ?? { url: scaledUrl(figure, scale), smooth: true };
+    sizes.set(scale, made);
+    return made;
   }
-  return url;
+  const key = `${scale}:${JSON.stringify(look)}`;
+  let classic = classicPortraits.get(key);
+  if (!classic) {
+    classic = { url: portraitUrl(look, scale), smooth: false };
+    classicPortraits.set(key, classic);
+  }
+  return classic;
+}
+
+export function portraitOf(agent: WorldAgent, scale = 3): Portrait | null {
+  return lookPortrait(residentFor(agent).look, scale);
+}
+
+export function useArtVersion(): number {
+  return useSyncExternalStore(onNewArtStatus, artVersion, () => 0);
+}
+
+export function usePortrait(look: LokaLook | null, scale = 3): Portrait | null {
+  useArtVersion();
+  return look ? lookPortrait(look, scale) : null;
+}
+
+export function portraitRendering(portrait: Portrait): string {
+  return portrait.smooth ? "[image-rendering:auto]" : "[image-rendering:pixelated]";
 }
 
 type Size = number | string;
@@ -57,6 +101,7 @@ function sharpScale(size: Size): number {
 }
 
 export function AgentFace({ agent, size = 22, soft = true, tall, rounded, className }: { agent: WorldAgent; size?: Size; soft?: boolean; tall?: boolean; rounded?: string; className?: string }) {
+  useArtVersion();
   return <AgentAvatar portrait={portraitOf(agent, sharpScale(size))} emoji={agent.avatar_emoji} size={size} soft={soft} tall={tall} rounded={rounded} className={className} />;
 }
 
@@ -69,7 +114,7 @@ export function AgentAvatar({
   rounded,
   className,
 }: {
-  portrait?: string | null;
+  portrait?: Portrait | null;
   emoji?: string | null;
   size?: Size;
   soft?: boolean;
@@ -91,7 +136,7 @@ export function AgentAvatar({
       )}
     >
       {portrait ? (
-        <img src={portrait} alt="" className="block h-full w-auto max-w-none [image-rendering:pixelated]" />
+        portrait.url && <img src={portrait.url} alt="" className={cn("block h-full w-auto max-w-none", portraitRendering(portrait))} />
       ) : (
         <span className="self-center" style={{ fontSize: `calc(${height} * 0.5)` }}>
           {emoji ?? "🤖"}

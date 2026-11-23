@@ -114,8 +114,15 @@ export function onNewArtStatus(listener: () => void): () => void {
   };
 }
 
+let artChanges = 0;
+
 function announce(): void {
+  artChanges += 1;
   for (const listener of listeners) listener();
+}
+
+export function artVersion(): number {
+  return artChanges;
 }
 
 let choice = 0;
@@ -135,6 +142,7 @@ export function showNewArt(on: boolean): void {
   if (enabled === next) return;
   enabled = next;
   version += 1;
+  announce();
 }
 
 function loadImage(src: string, ms: number): Promise<HTMLImageElement> {
@@ -222,9 +230,10 @@ function fetchSheet(set: SpriteSet, name: string, tries: number): void {
       inflight.delete(name);
       const recovered = set.sheets.get(name) === "failed";
       set.sheets.set(name, img);
-      if (!recovered) return;
-      figureByLook.clear();
-      version += 1;
+      if (recovered) {
+        figureByLook.clear();
+        version += 1;
+      }
       announce();
     },
     (error) => {
@@ -307,10 +316,12 @@ function swapMap(swaps: Record<string, Swap>, colours: Record<string, string>): 
   return out;
 }
 
-function cut(atlas: HTMLImageElement, at: Point, size: Point, map: Map<number, [number, number, number]>): HTMLCanvasElement {
+function cut(atlas: HTMLImageElement, at: Point, size: Point, map: Map<number, [number, number, number]>, mirror = false): HTMLCanvasElement {
   const c = makeCanvas(size[0], size[1]);
   const ctx = context(c, { willReadFrequently: map.size > 0 });
+  if (mirror) ctx.setTransform(-1, 0, 0, 1, size[0], 0);
   ctx.drawImage(atlas, at[0], at[1], size[0], size[1], 0, 0, size[0], size[1]);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
   if (!map.size) return c;
   const img = ctx.getImageData(0, 0, size[0], size[1]);
   const d = img.data;
@@ -387,7 +398,7 @@ function figureFor(set: SpriteSet, look: LokaLook, { body, key: cacheKey }: Figu
     const art: Worn["art"] = {};
     for (const view of ["front", "side", "back"] as View[]) {
       const c = accessoryView(acc, spec, view);
-      if (c) art[view] = { img: cut(sheets[i] as HTMLImageElement, c.at, c.size, map), cut: c };
+      if (c) art[view] = { img: cut(sheets[i] as HTMLImageElement, c.at, c.size, map, c.mirror), cut: c };
     }
     return { spec: acc, art };
   });
@@ -440,6 +451,36 @@ export async function figurePreview(look: LokaLook): Promise<string | null> {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   return null;
+}
+
+const PORTRAIT_SHARE = 0.62;
+const PORTRAIT_RATIO = 14 / 17;
+const portraits = new WeakMap<Figure, HTMLCanvasElement>();
+
+export function figurePortrait(look: LokaLook): HTMLCanvasElement | null | undefined {
+  if (!enabled || !active) return null;
+  const shown = withArtOnly(active.manifest, withoutHeadwear(look), canonicalBody, innate);
+  const id = figureKey(active, shown);
+  const figure = id ? figureFor(active, shown, id) : null;
+  if (!figure) return figure;
+  const hit = portraits.get(figure);
+  if (hit) return hit;
+  const pose = figure.poses.down;
+  const src = pose.idle[0];
+  const data = context(src, { willReadFrequently: true }).getImageData(0, 0, src.width, src.height).data;
+  let top = 0;
+  while (top < src.height && !rowHasInk(data, src.width, top)) top += 1;
+  const h = Math.max(1, Math.round((pose.anchor[1] - top) * PORTRAIT_SHARE));
+  const w = Math.max(1, Math.round(h * PORTRAIT_RATIO));
+  const out = makeCanvas(w, h);
+  context(out).drawImage(src, Math.round(pose.anchor[0] - w / 2), top, w, h, 0, 0, w, h);
+  portraits.set(figure, out);
+  return out;
+}
+
+function rowHasInk(data: Uint8ClampedArray, width: number, y: number): boolean {
+  for (let x = 0; x < width; x++) if (data[(y * width + x) * 4 + 3]) return true;
+  return false;
 }
 
 function padding(spec: BodySpec, worn: Worn[]): { left: number; right: number; top: number; bottom: number } {

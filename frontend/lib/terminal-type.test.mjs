@@ -32,24 +32,15 @@ test("a fresh shell is given time to turn on pasting before a command is typed",
   assert.equal(readyToType({ bracketed: false, sinceLive: BRACKET_WAIT_MS * 2, sinceOutput: 10 }), true);
 });
 
-test("a command for a shell that is still opening is queued, not dropped", async () => {
+test("a command for a shell that is still opening is queued, and one for another device opens a new tab instead of ending a shell", async () => {
   const { planRequest } = await import("./terminal-type.ts");
   assert.equal(planRequest({ phase: "starting", current: "mac", target: "mac" }), "queue");
   assert.equal(planRequest({ phase: "connecting", current: "mac", target: "mac" }), "queue");
   assert.equal(planRequest({ phase: "live", current: "mac", target: "mac" }), "type");
-  assert.equal(planRequest({ phase: "connecting", current: "mac", target: "cloud" }), "ask");
+  assert.equal(planRequest({ phase: "connecting", current: "mac", target: "cloud" }), "new_tab");
+  assert.equal(planRequest({ phase: "live", current: "mac", target: "cloud" }), "new_tab");
   assert.equal(planRequest({ phase: "ended", current: "mac", target: "cloud" }), "open");
   assert.equal(planRequest({ phase: "idle", current: null, target: null }), "none");
-});
-
-test("staying on a device that is still connecting waits for it, and switching opens the other one", async () => {
-  const { planSwitch } = await import("./terminal-type.ts");
-  assert.deepEqual(planSwitch({ go: false, phase: "connecting", current: "mac", target: "cloud" }), { plan: "queue", device: "mac" });
-  assert.deepEqual(planSwitch({ go: false, phase: "starting", current: "mac", target: "cloud" }), { plan: "queue", device: "mac" });
-  assert.deepEqual(planSwitch({ go: false, phase: "live", current: "mac", target: "cloud" }), { plan: "type", device: "mac" });
-  assert.deepEqual(planSwitch({ go: false, phase: "ended", current: "mac", target: "cloud" }), { plan: "open", device: "mac" });
-  assert.deepEqual(planSwitch({ go: true, phase: "connecting", current: "mac", target: "cloud" }), { plan: "open", device: "cloud" });
-  assert.deepEqual(planSwitch({ go: false, phase: "idle", current: null, target: "cloud" }), { plan: "none", device: null });
 });
 
 test("the quote and the note say a copied command was copied, and name the device a typed one went to", async () => {

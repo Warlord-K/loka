@@ -3,9 +3,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { BookmarkSimple, Lightning, Phone, Plus, User, X } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
+import type { NavigationRequest } from "@/lib/exact-world-navigation";
 import { QUICK_KEEP, QUICK_SKIP, WorldApiError, worldApi, type AgentMessage, type QuickBrief, type QuickChat, type WorldAgent, type WorldEvent } from "@/lib/world";
 import { runtimeName } from "@/lib/model-names";
 import { latestOnly, startRechecks } from "@/lib/latest";
+import { chatWaiting } from "@/lib/thread-wait";
 import { AgentFace, PersonAvatar } from "./channel-ui";
 import { AskChoices, AttachButton, AttachmentGrid, NewMessagesPill, PendingStrip, RichText, useAgentHandles, useAttachments, useFollowBottom, useRefetchOnResume } from "./chat-kit";
 import { useDraft } from "./drafts";
@@ -37,6 +39,8 @@ export function QuickChatWindow({
   initialAgentId,
   initialSessionId,
   onOpenAgent,
+  onBeginNavigation,
+  onNavigate,
   onClose,
   call,
   onCall,
@@ -49,6 +53,8 @@ export function QuickChatWindow({
   initialAgentId?: string | null;
   initialSessionId?: string | null;
   onOpenAgent: (id: string) => void;
+  onBeginNavigation: () => NavigationRequest;
+  onNavigate: (select: () => void, request?: NavigationRequest) => void;
   onClose: () => void;
   call: { quickId: string | null; minimised: boolean };
   onCall: (agentId: string, sessionId: string) => void;
@@ -123,7 +129,7 @@ export function QuickChatWindow({
     if (sessionRef.current) loadChat(sessionRef.current);
   });
 
-  const waiting = !!chat && (chat.busy || chat.messages[chat.messages.length - 1]?.author_kind === "user");
+  const waiting = chatWaiting(chat?.busy);
   useEffect(() => {
     if (!sessionId || !waiting) return;
     return startRechecks(() => loadChat(sessionId));
@@ -170,7 +176,7 @@ export function QuickChatWindow({
         icon={Lightning}
         subtitle="Talk with an agent's memory on the side. Their work carries on, and nothing is kept unless you say so."
         actions={
-          <button type="button" onClick={() => startNew()} className={BTN_SECONDARY}>
+          <button type="button" onClick={() => onNavigate(() => startNew())} className={BTN_SECONDARY}>
             <Plus size={14} weight="bold" />
             New chat
           </button>
@@ -188,7 +194,7 @@ export function QuickChatWindow({
         >
           <ul className="flex-1 space-y-0.5 overflow-y-auto p-2">
             <li>
-              <button type="button" onClick={() => startNew()} className={cn("w-full rounded-lg px-2.5 py-2 text-left text-w-sm transition-colors", sessionId === null ? NAV_ON : NAV_OFF)}>
+              <button type="button" onClick={() => onNavigate(() => startNew())} className={cn("w-full rounded-lg px-2.5 py-2 text-left text-w-sm transition-colors", sessionId === null ? NAV_ON : NAV_OFF)}>
                 <span className="flex items-center gap-2 font-semibold">
                   <Plus size={14} weight="bold" />
                   New chat
@@ -206,7 +212,7 @@ export function QuickChatWindow({
                 <li key={q.id} className="group relative">
                   <button
                     type="button"
-                    onClick={() => pickChat(q.id)}
+                    onClick={() => onNavigate(() => pickChat(q.id))}
                     className={cn("w-full rounded-lg px-2.5 py-2 pr-8 text-left text-w-sm transition-colors", sessionId === q.id ? NAV_ON : NAV_OFF)}
                   >
                     <span className="block truncate font-semibold text-w-strong">{q.title || "Quick chat"}</span>
@@ -236,7 +242,7 @@ export function QuickChatWindow({
           agents={agents}
           agent={chatAgent}
           agentId={agentId}
-          onPickAgent={setAgentId}
+          onPickAgent={(id) => onNavigate(() => setAgentId(id))}
           chat={sessionId ? chat : null}
           sessionId={sessionId}
           loadFailed={loadFailed}
@@ -246,11 +252,14 @@ export function QuickChatWindow({
           calling={call.quickId !== null && call.quickId === sessionId ? (call.minimised ? "away" : "here") : null}
           onCall={() => sessionId && chatAgent && onCall(chatAgent.id, sessionId)}
           onCallSlot={onCallSlot}
-          onStarted={(id, first) => {
-            setSessionId(id);
+          onBeginNavigation={onBeginNavigation}
+          onStarted={(id, first, request) => {
             CHATS.delete(id);
-            if (first) setChat({ id, agent_id: agentId, title: null, backend: "", model: "", status: "active", thread_root: null, busy: true, messages: [first] });
             loadList();
+            onNavigate(() => {
+              setSessionId(id);
+              if (first) setChat({ id, agent_id: agentId, title: null, backend: "", model: "", status: "active", thread_root: null, busy: true, messages: [first] });
+            }, request);
           }}
           onRefresh={() => sessionId && loadChat(sessionId)}
         />
@@ -273,6 +282,7 @@ function Conversation({
   calling,
   onCall,
   onCallSlot,
+  onBeginNavigation,
   onStarted,
   onRefresh,
 }: {
@@ -289,7 +299,8 @@ function Conversation({
   calling: "here" | "away" | null;
   onCall: () => void;
   onCallSlot: (el: HTMLElement, on: boolean) => void;
-  onStarted: (id: string, first: AgentMessage | null) => void;
+  onBeginNavigation: () => NavigationRequest;
+  onStarted: (id: string, first: AgentMessage | null, request: NavigationRequest) => void;
   onRefresh: () => void;
 }) {
   const [draft, setDraft] = useDraft(`quick:${sessionId ?? `new:${agentId}`}`);
@@ -319,7 +330,7 @@ function Conversation({
   const last = messages[messages.length - 1];
   const follow = useFollowBottom(endRef, last?.id, sessionId);
   const runner = useRunCommand(agent, meId, { where: agent ? (agent.runner_name ? `on ${agent.runner_name}, output goes to ${agent.name}'s main chat` : `on ${agent.name}'s device, output goes to its main chat`) : undefined });
-  const thinking = !!chat && (chat.busy || last?.author_kind === "user");
+  const thinking = chatWaiting(chat?.busy);
 
   useEffect(() => {
     if (!window.matchMedia("(pointer: fine)").matches) return;
@@ -340,8 +351,9 @@ function Conversation({
         await worldApi.quickSend(sessionId, { text, attachments: files.ready, spoken: dictated || undefined, quote });
         onRefresh();
       } else {
+        const request = onBeginNavigation();
         const started = await worldApi.quickStart(agentId, { text, attachments: files.ready, spoken: dictated || undefined });
-        onStarted(started.session_id, started.message);
+        onStarted(started.session_id, started.message, request);
       }
       files.clear();
       setDictated(false);

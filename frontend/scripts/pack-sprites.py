@@ -236,7 +236,7 @@ def body_spec(cast, entry, sheet, side_faces):
     }
 
 
-def accessory_spec(entry, sheet):
+def accessory_spec(key, entry, sheet):
     sizes = {}
     for cls, cut in (entry.get("sizes") or {}).items():
         sizes[str(cls)] = {
@@ -244,12 +244,18 @@ def accessory_spec(entry, sheet):
             for view, v in cut.items()
             if view in VIEWS
         }
-    return {
+    spec = {
         "slot": entry["attach_to"],
         "basis": "body" if entry.get("size_basis") == "body_width" else "head",
         "atlas": sheet,
         "sizes": sizes,
     }
+    if any("side" in cut for cut in sizes.values()):
+        faces = entry.get("side_faces")
+        if faces not in ("left", "right"):
+            raise SystemExit(f"cast accessory {key}: side art needs side_faces \"left\" or \"right\", the way its side view looks")
+        spec["sideFaces"] = faces
+    return spec
 
 
 def pack_cast(cast_dir, out):
@@ -268,7 +274,7 @@ def pack_cast(cast_dir, out):
     for key, entry in (cast.get("accessories") or {}).items():
         name = Path(entry["atlas"]).name
         shutil.copyfile(cast_dir / entry["atlas"], target / "accessories" / name)
-        accessories[key] = accessory_spec(entry, f"cast/accessories/{name}")
+        accessories[key] = accessory_spec(key, entry, f"cast/accessories/{name}")
     return bodies, accessories, cast.get("sources_url")
 
 

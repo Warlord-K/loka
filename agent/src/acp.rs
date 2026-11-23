@@ -168,7 +168,7 @@ impl AcpProc {
         crate::cli::announce_spawn(opts.event_tx.as_ref(), &child);
         let stdin = child.stdin.take().context("ACP stdin missing")?;
         let stdout = BufReader::new(child.stdout.take().context("ACP stdout missing")?).lines();
-        let stderr = stderr_tail(child.stderr.take());
+        let stderr = stderr_tail(child.stderr.take(), opts.redactor());
         let mut proc = Self { child, stdin, stdout, stderr, next_id: 0, session: String::new(), cost_seen: 0.0, lean: opts.lean, _keep: keep };
         proc.request("initialize", json!({ "protocolVersion": 1, "clientCapabilities": {} }), &mut TurnState::default(), None).await?;
         let cwd = opts.working_dir.display().to_string();
@@ -372,7 +372,7 @@ fn observe(update: &Value, turn: &mut TurnState, events: Option<(&crate::cli::Ev
                 _ => turn.texts.push((message, chunk)),
             }
             if let Some((tx, _)) = events {
-                let _ = tx.send(StreamEvent::AssistantText(turn.output().trim().chars().take(300).collect()));
+                let _ = tx.send(StreamEvent::AssistantText(turn.output().trim().to_string()));
             }
         }
         "tool_call" => {
@@ -389,7 +389,7 @@ fn observe(update: &Value, turn: &mut TurnState, events: Option<(&crate::cli::Ev
                 let Some(output) = update.get("rawOutput").or_else(|| update.get("content")) else {
                     return;
                 };
-                let output = crate::cli::truncate_for_log(crate::cli::summarize_tool_output(output).trim(), crate::cli::TOOL_OUTPUT_MAX_CHARS);
+                let output = crate::cli::summarize_tool_output(output).trim().to_string();
                 if !output.is_empty() {
                     let _ = tx.send(StreamEvent::ToolResult { tool: text("/title"), output });
                 }
@@ -481,5 +481,26 @@ mod tests {
         assert_eq!(turn.output(), "pong");
         assert_eq!(turn.last_message.as_deref(), Some("m2"));
         assert_eq!((turn.context, turn.cost), (900, Some(0.5)));
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use crate::cli::straddle::{around, assert_whole_then_hidden, drain, pads};
+    use serde_json::json;
+    use std::time::Instant;
+
+    #[test]
+    fn the_acp_parser_sends_whole_text_so_a_secret_across_any_cut_is_hidden() {
+        for pad in pads() {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut turn = super::TurnState::default();
+            let events = Some((&tx, Instant::now()));
+            super::observe(&json!({"sessionUpdate": "agent_message_chunk", "messageId": "m1", "content": {"text": around(pad)}}), &mut turn, events);
+            super::observe(&json!({"sessionUpdate": "tool_call", "title": "Bash", "rawInput": {"command": around(pad)}}), &mut turn, events);
+            super::observe(&json!({"sessionUpdate": "tool_call_update", "title": "Bash", "rawOutput": around(pad)}), &mut turn, events);
+            drop(tx);
+            assert_whole_then_hidden(drain(rx), 3, "acp", pad);
+        }
     }
 }

@@ -25,12 +25,16 @@ function money(n: number): string {
   return n >= 0.01 ? `$${n.toFixed(2)}` : n > 0 ? "under $0.01" : "$0";
 }
 
-function openChannel(id: string | null) {
-  if (id) window.dispatchEvent(new CustomEvent("world:open-channel", { detail: { id } }));
+function canOpenTeam(team: Team, meId: string | null) {
+  return team.owner_user_id === meId || team.members.some((member) => member.member_kind === "user" && member.member_id === meId);
+}
+
+function openChannel(id: string | null, loaded: boolean) {
+  if (id) window.dispatchEvent(new CustomEvent("world:open-channel", { detail: { id, loaded } }));
 }
 
 function openQuest(taskId: string, agentId: string | null) {
-  window.dispatchEvent(new CustomEvent("world:open-quest", { detail: { taskId, agentId } }));
+  window.dispatchEvent(new CustomEvent("world:open-quest", { detail: { taskId, agentId, loaded: true } }));
 }
 
 function emptyDraft(): TeamDraft {
@@ -49,7 +53,6 @@ function TeamEditor({
 }: {
   agents: WorldAgent[];
   meId: string | null;
-  portraits: Record<string, string>;
   team: Team | null;
   onDone: () => void;
 }) {
@@ -240,12 +243,13 @@ function TeamCard({
   team,
   byId,
   canEdit,
+  canOpenChannel,
   onEdit,
 }: {
   team: Team;
   byId: Map<string, WorldAgent>;
-  portraits: Record<string, string>;
   canEdit: boolean;
+  canOpenChannel: boolean;
   onEdit: () => void;
 }) {
   const [questing, setQuesting] = useState(false);
@@ -324,7 +328,7 @@ function TeamCard({
       </ul>
       <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-w-xs text-w-muted">
         {team.channel_id && (
-          <button type="button" onClick={() => openChannel(team.channel_id)} className="flex items-center gap-1 font-medium text-w-link transition-opacity hover:opacity-80">
+          <button type="button" onClick={() => openChannel(team.channel_id, canOpenChannel)} className="flex items-center gap-1 font-medium text-w-link transition-opacity hover:opacity-80">
             <Hash size={12} weight="bold" />
             {team.channel_name}
           </button>
@@ -361,7 +365,6 @@ export function TeamsView({
   teams,
   agents,
   meId,
-  portraits,
   canWrite,
   focusId,
   onFocusChange,
@@ -369,7 +372,6 @@ export function TeamsView({
   teams: Team[];
   agents: WorldAgent[];
   meId: string | null;
-  portraits: Record<string, string>;
   canWrite: boolean;
   focusId?: string | null;
   onFocusChange?: (id: string | null) => void;
@@ -377,7 +379,7 @@ export function TeamsView({
   const [editing, setEditing] = useState<Team | "new" | null>(null);
   const byId = useMemo(() => new Map(agents.map((a) => [a.id, a])), [agents]);
   const mine = useMemo(() => agents.filter((a) => a.owner_user_id === meId), [agents, meId]);
-  const shownTeams = focusId ? teams.filter((team) => team.id === focusId) : teams;
+  const shownTeams = focusId ? teams.filter((team) => team.id === focusId && canOpenTeam(team, meId)) : teams;
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
       <div className="w-full space-y-5 px-4 py-5 sm:px-5 xl:px-8">
@@ -399,7 +401,7 @@ export function TeamsView({
           )}
         </div>
         {canWrite && editing === null && teams.length === 0 && <StarterTeamCard agentCount={agents.length} />}
-        {editing === "new" && <TeamEditor agents={mine} meId={meId} portraits={portraits} team={null} onDone={() => setEditing(null)} />}
+        {editing === "new" && <TeamEditor agents={mine} meId={meId} team={null} onDone={() => setEditing(null)} />}
         {teams.length === 0 && editing === null ? (
           <EmptyState icon={UsersFour} title="No teams yet" description="Group agents into a team with a lead, a purpose and its own channel." />
         ) : (
@@ -407,10 +409,10 @@ export function TeamsView({
             {shownTeams.map((t) =>
               editing !== null && editing !== "new" && editing.id === t.id ? (
                 <li key={t.id} className="@4xl:col-span-2">
-                  <TeamEditor agents={mine} meId={meId} portraits={portraits} team={editing} onDone={() => setEditing(null)} />
+                  <TeamEditor agents={mine} meId={meId} team={editing} onDone={() => setEditing(null)} />
                 </li>
               ) : (
-                <TeamCard key={t.id} team={t} byId={byId} portraits={portraits} canEdit={canWrite && t.owner_user_id === meId} onEdit={() => setEditing(t)} />
+                <TeamCard key={t.id} team={t} byId={byId} canEdit={canWrite && t.owner_user_id === meId} canOpenChannel={canOpenTeam(t, meId)} onEdit={() => setEditing(t)} />
               ),
             )}
           </ul>

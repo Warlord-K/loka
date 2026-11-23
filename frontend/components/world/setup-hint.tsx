@@ -59,6 +59,7 @@ const ACTION_LABEL: Record<SetupAction, string> = {
   devices: "Open devices",
   keys: "Open environment",
   github: "Open GitHub",
+  storage: "Open storage",
 };
 
 export function SetupHint({

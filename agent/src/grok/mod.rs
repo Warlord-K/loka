@@ -3,7 +3,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
-use crate::cli::{collect_stderr, configure_child_environment, CliOptions, CliResult, StreamEvent};
+use crate::cli::{collect_stderr, configure_child_environment, CliOptions, CliResult, Redactor, StreamEvent};
 
 const AGENT_PREAMBLE: &str = "\
 You are Loka, an autonomous coding agent. You work independently without \
@@ -18,6 +18,22 @@ Git commit rules:\n\
 - NEVER add Signed-off-by trailers to commits";
 
 const TEXT_FLUSH_CHARS: usize = 200;
+
+fn ready_text(unflushed: &mut String, redactor: &Redactor, last: bool) -> Option<String> {
+    *unflushed = redactor.redact(unflushed);
+    if last {
+        let text = std::mem::take(unflushed);
+        return (!text.is_empty()).then_some(text);
+    }
+    let held = redactor.longest().saturating_sub(1);
+    let total = unflushed.chars().count();
+    if total < TEXT_FLUSH_CHARS + held {
+        return None;
+    }
+    let split = unflushed.char_indices().nth(total - held).map_or(unflushed.len(), |(at, _)| at);
+    let kept = unflushed.split_off(split);
+    Some(std::mem::replace(unflushed, kept))
+}
 
 pub async fn run(opts: CliOptions<'_>) -> Result<CliResult> {
     if opts.mcp_has_secrets {
@@ -111,6 +127,7 @@ async fn run_inner(opts: &CliOptions<'_>, prompt_path: &std::path::Path) -> Resu
 
     let mut output = String::new();
     let mut unflushed = String::new();
+    let redactor = opts.redactor();
     let mut session_id: Option<String> = None;
     let mut error_message: Option<String> = None;
 
@@ -128,12 +145,9 @@ async fn run_inner(opts: &CliOptions<'_>, prompt_path: &std::path::Path) -> Resu
                 if let Some(data) = json.get("data").and_then(|v| v.as_str()) {
                     output.push_str(data);
                     unflushed.push_str(data);
-                    if unflushed.chars().count() >= TEXT_FLUSH_CHARS {
+                    if let Some(text) = ready_text(&mut unflushed, &redactor, false) {
                         if let Some(tx) = &opts.event_tx {
-                            let _ =
-                                tx.send(StreamEvent::AssistantText(std::mem::take(&mut unflushed)));
-                        } else {
-                            unflushed.clear();
+                            let _ = tx.send(StreamEvent::AssistantText(text));
                         }
                     }
                 }
@@ -160,9 +174,9 @@ async fn run_inner(opts: &CliOptions<'_>, prompt_path: &std::path::Path) -> Resu
         }
     }
 
-    if !unflushed.is_empty() {
+    if let Some(text) = ready_text(&mut unflushed, &redactor, true) {
         if let Some(tx) = &opts.event_tx {
-            let _ = tx.send(StreamEvent::AssistantText(std::mem::take(&mut unflushed)));
+            let _ = tx.send(StreamEvent::AssistantText(text));
         }
     }
 
@@ -205,4 +219,33 @@ async fn run_inner(opts: &CliOptions<'_>, prompt_path: &std::path::Path) -> Resu
         usage: Default::default(),
         checkpoint: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ready_text, TEXT_FLUSH_CHARS};
+    use crate::cli::Redactor;
+
+    #[test]
+    fn a_secret_split_across_streamed_chunks_is_hidden_in_every_flushed_piece() {
+        let secret = "sk-live-0123456789abcdef";
+        let redactor = Redactor::new([secret]);
+        let text = format!("{}{secret}{}", "a".repeat(TEXT_FLUSH_CHARS * 3 - 10), "b".repeat(TEXT_FLUSH_CHARS));
+        for chunk in [1usize, 7, 24, 61, 199] {
+            let mut unflushed = String::new();
+            let mut shown = Vec::new();
+            let chars: Vec<char> = text.chars().collect();
+            for piece in chars.chunks(chunk) {
+                unflushed.extend(piece);
+                shown.extend(ready_text(&mut unflushed, &redactor, false));
+            }
+            shown.extend(ready_text(&mut unflushed, &redactor, true));
+            for piece in &shown {
+                for start in 0..=secret.len() - loka_shared::redaction::MIN_SECRET_BYTES {
+                    assert!(!piece.contains(&secret[start..start + loka_shared::redaction::MIN_SECRET_BYTES]), "chunk {chunk}: a piece of the secret was flushed");
+                }
+            }
+            assert!(shown.iter().map(String::len).sum::<usize>() > text.len() - secret.len(), "chunk {chunk}: text was lost");
+        }
+    }
 }

@@ -60,6 +60,7 @@ pub async fn resolved(state: &AppState, user: uuid::Uuid) -> Result<Value, Statu
     if let Some(fields) = result.as_object_mut() {
         fields.insert("opencodeEnabled".into(), Value::Bool(opencode));
         fields.insert("providers".into(), Value::Array(providers));
+        fields.insert("terminalsPerDevice".into(), json!(loka_shared::terminal::max_per_device()));
     }
     Ok(result)
 }

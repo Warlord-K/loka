@@ -6,6 +6,7 @@ import { cn } from "@/lib/utils";
 import { worldApi, type SessionBrief, type WorldAgent, type WorldEvent } from "@/lib/world";
 import { SessionDetail, sessionTitle, useWorldRefresh } from "../panels";
 import { PIXEL } from "../styles";
+import { AgentFace } from "../channel-ui";
 import { Shimmer } from "../work-ui";
 import { sessionKeyFor, setOpenWorkshop, wb, type OpenWorkshopDetail, type WbChange, type WbMatch, type WbOpen } from "./bridge";
 import { EditorPane, type EditorHandle, type Tab, type TabMode } from "./editor-pane";
@@ -389,7 +390,7 @@ export function Workbench({
 
   useEffect(() => {
     if (!session || !key) {
-      if (session && !key) setProblem("This session has no workspace.");
+      if (session && !key) setProblem("This session has no folder.");
       return;
     }
     let gone = false;
@@ -662,7 +663,8 @@ export function Workbench({
       <span className={cn(PIXEL, "hidden text-w-md sm:inline")}>Workshop</span>
       {session && (
         <span className="min-w-0 truncate text-w-sm text-[#9c8a9a]">
-          {agent ? `${agent.avatar_emoji} ${agent.name} · ` : ""}
+          {agent && <AgentFace agent={agent} size={16} className="mr-1.5 align-middle" />}
+          {agent ? `${agent.name} · ` : ""}
           {sessionTitle(session, agent?.name)}
         </span>
       )}
@@ -881,7 +883,7 @@ export function Workbench({
                               onClick={() => void addTab(a)}
                               className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-w-xs hover:bg-[#241a29] disabled:opacity-60"
                             >
-                              <span aria-hidden>{a.avatar_emoji}</span>
+                              <AgentFace agent={a} size={16} />
                               <span className="min-w-0 flex-1 truncate">{a.name}</span>
                               {addingFor === a.id ? <Shimmer className="text-w-2xs">opening</Shimmer> : <span className="truncate text-w-2xs text-[#7d6b7b]">{a.id === agent?.id || extraAgents.has(a.id) ? "new session" : a.model}</span>}
                             </button>

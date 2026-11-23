@@ -46,6 +46,7 @@ pub struct QuestHit {
     pub status: String,
     pub assigned_agent_id: Option<Uuid>,
     pub updated_at: Option<DateTime<Utc>>,
+    pub plan_waiting: bool,
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]
@@ -372,7 +373,7 @@ impl WorldStore {
         let quests = async {
             if write {
                 sqlx::query_as::<_, QuestHit>(&format!(
-                "SELECT t.id, t.title, t.status, t.assigned_agent_id, t.updated_at
+                "SELECT t.id, t.title, t.status, t.assigned_agent_id, t.updated_at, {plan_waiting} AS plan_waiting
                  FROM agent_tasks t
                  LEFT JOIN agent_profiles a ON a.id = t.assigned_agent_id
                  WHERE t.org_id = $5 AND (t.assigned_agent_id IS NOT NULL
@@ -380,7 +381,8 @@ impl WorldStore {
                    AND ($2 OR t.user_id = $1 OR (a.org_id = $5 AND (a.visibility = 'public' OR a.owner_user_id = $1)))
                    AND ({quest_title} ILIKE $3 OR {quest_description} ILIKE $3 OR t.id::text LIKE $6)
                  ORDER BY COALESCE(t.id::text LIKE $6, false) DESC, t.updated_at DESC NULLS LAST
-                 LIMIT $4"
+                 LIMIT $4",
+                plan_waiting = crate::world::plan_waiting_sql("t")
                 ))
             .bind(user)
             .bind(admin)

@@ -41,6 +41,10 @@ impl WorldStore {
     }
 
     pub async fn message_replies(&self, agent_id: Uuid, root: Uuid, viewer: Uuid, limit: i64) -> Result<Vec<AgentMessage>> {
+        self.message_replies_with_reply(agent_id, root, viewer, limit, None).await
+    }
+
+    pub async fn message_replies_with_reply(&self, agent_id: Uuid, root: Uuid, viewer: Uuid, limit: i64, reply: Option<Uuid>) -> Result<Vec<AgentMessage>> {
         let owner: Option<Uuid> = sqlx::query_scalar("SELECT owner_user_id FROM agent_profiles WHERE id = $1")
             .bind(agent_id)
             .fetch_optional(self.pool())
@@ -65,13 +69,14 @@ impl WorldStore {
                SELECT m.*, s.role AS session_role FROM agent_messages m
                LEFT JOIN agent_sessions s ON s.id = m.session_id
                WHERE m.agent_id = $1 AND m.reply_to = $2 AND {filter}
-               ORDER BY m.created_at DESC LIMIT $4
+               ORDER BY (m.id = $5) DESC NULLS LAST, m.created_at DESC LIMIT $4
              ) r ORDER BY r.created_at"
         ))
         .bind(agent_id)
         .bind(root)
         .bind(viewer)
         .bind(limit)
+        .bind(reply)
         .fetch_all(self.pool())
         .await?;
         rows.insert(0, first);
@@ -168,6 +173,11 @@ mod tests {
                 Some(root.id),
             )
             .await?;
+        sqlx::query("UPDATE agent_messages SET created_at = CASE id WHEN $1 THEN NOW() - INTERVAL '1 second' ELSE NOW() END WHERE id IN ($1, $2)")
+            .bind(first.id)
+            .bind(answer.id)
+            .execute(&pool)
+            .await?;
         assert_eq!(store.agent_thread_root(agent, first.id, owner).await?, Some(root.id));
         assert_eq!(store.agent_thread_root(agent, root.id, bob).await?, None, "bob cannot reply in the owner's thread");
         let timeline = store.list_messages(agent, owner, 50).await?;
@@ -178,7 +188,12 @@ mod tests {
         assert_eq!(kinds, vec!["agent", "user"], "latest replier first");
         let thread = store.message_replies(agent, root.id, owner, REPLY_LIMIT).await?;
         assert_eq!(thread.iter().map(|m| m.id).collect::<Vec<_>>(), vec![root.id, first.id, answer.id]);
+        let recent = store.message_replies(agent, root.id, owner, 1).await?;
+        assert_eq!(recent.iter().map(|m| m.id).collect::<Vec<_>>(), vec![root.id, answer.id]);
+        let focused = store.message_replies_with_reply(agent, root.id, owner, 1, Some(first.id)).await?;
+        assert_eq!(focused.iter().map(|m| m.id).collect::<Vec<_>>(), vec![root.id, first.id]);
         assert!(store.message_replies(agent, root.id, bob, REPLY_LIMIT).await?.is_empty());
+        assert!(store.message_replies_with_reply(agent, root.id, bob, 1, Some(first.id)).await?.is_empty());
         let transcript = store.agent_thread_transcript(agent, root.id, 10).await?;
         assert!(transcript.contains("plan the launch") && transcript.ends_with(&format!("ag{tag}: on it")));
         Ok(())

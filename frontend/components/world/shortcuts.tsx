@@ -8,6 +8,8 @@ import { cn } from "@/lib/utils";
 import { MODAL, SCRIM, PIXEL } from "./styles";
 import { Keys } from "./keycap";
 import { CLOSE_BTN } from "./settings-shell";
+import { keyProfile, terminalShortcutRows } from "@/lib/terminal-keys";
+import { isDesktopApp } from "@/lib/desktop";
 
 export const SHORTCUTS: [string | string[], string][] = [
   [["⌘/Ctrl", "K"], "Search agents, messages and commands"],
@@ -27,6 +29,7 @@ export const SHORTCUTS: [string | string[], string][] = [
   ["O", "Workshop: work with an agent in a folder"],
   ["L", "Lists"],
   ["R", "Reports"],
+  ["B", "Workspace"],
   ["M", "Map"],
   ["T", "Terminal"],
   ["N", "Notifications"],
@@ -35,10 +38,10 @@ export const SHORTCUTS: [string | string[], string][] = [
   ["Esc", "Close a window"],
 ];
 
-export function ShortcutList({ className }: { className?: string }) {
+function KeyRows({ rows }: { rows: [string | string[], string][] }) {
   return (
-    <dl className={cn("grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-w-sm", className)}>
-      {SHORTCUTS.map(([k, v]) => (
+    <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-w-sm">
+      {rows.map(([k, v]) => (
         <div key={v} className="contents">
           <dt>
             <Keys keys={Array.isArray(k) ? k : [k]} />
@@ -47,6 +50,18 @@ export function ShortcutList({ className }: { className?: string }) {
         </div>
       ))}
     </dl>
+  );
+}
+
+export function ShortcutList({ className }: { className?: string }) {
+  return (
+    <div className={cn("flex flex-col gap-3", className)}>
+      <KeyRows rows={SHORTCUTS} />
+      <div className="flex flex-col gap-1.5">
+        <h3 className="text-w-xs font-semibold text-w-muted">In the terminal</h3>
+        <KeyRows rows={terminalShortcutRows(keyProfile(isDesktopApp()))} />
+      </div>
+    </div>
   );
 }
 

@@ -1,5 +1,5 @@
 ---
-description: Onboard a new repository — explore its structure, generate a profile summary, and update workspace context.
+description: Onboard a new repository - explore its structure, generate a profile summary, and update workspace context.
 phase: both
 ---
 When asked to add or onboard a repository:

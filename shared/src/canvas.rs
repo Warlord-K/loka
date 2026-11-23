@@ -24,11 +24,90 @@ const MIN_SIZE: f64 = 24.0;
 const MAX_SIZE: f64 = 4000.0;
 const GAP: f64 = 48.0;
 
-pub const KINDS: [&str; 10] = ["image", "video", "model", "note", "sticky", "ref", "run", "frame", "ink", "ui"];
+pub const KINDS: [&str; 11] = ["image", "video", "model", "note", "sticky", "ref", "run", "frame", "ink", "ui", "embed"];
 pub const COLORS: [&str; 6] = ["lemon", "rose", "mint", "aqua", "honey", "sand"];
 pub const LAYOUTS: [&str; 3] = ["row", "grid", "flow"];
 pub const MODEL_MIME: &str = "model/gltf-binary";
 const REF_KINDS: [&str; 6] = ["quest", "report", "msg", "todo", "agent", "practice"];
+
+pub struct EmbedKind {
+    pub kind: &'static str,
+    pub size: (f64, f64),
+    pub refused: Option<&'static str>,
+}
+
+pub const EMBED_KINDS: [EmbedKind; 3] = [
+    EmbedKind { kind: "terminal", size: (560.0, 340.0), refused: None },
+    EmbedKind { kind: "quest", size: (380.0, 300.0), refused: None },
+    EmbedKind {
+        kind: "browser",
+        size: (640.0, 420.0),
+        refused: Some("a browser embed cannot be watched inside Loka yet; add a terminal or a running quest instead"),
+    },
+];
+
+pub fn embed_kind(kind: &str) -> Option<&'static EmbedKind> {
+    EMBED_KINDS.iter().find(|k| k.kind == kind)
+}
+
+pub fn placeable_embeds() -> Vec<&'static str> {
+    EMBED_KINDS.iter().filter(|k| k.refused.is_none()).map(|k| k.kind).collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Embed {
+    pub kind: String,
+    pub target: String,
+}
+
+pub fn terminal_target(target: &str) -> Option<(Uuid, Option<&str>)> {
+    let (device, shell) = match target.split_once('/') {
+        Some((device, shell)) => (device, Some(shell)),
+        None => (target, None),
+    };
+    let device = Uuid::parse_str(device).ok()?;
+    match shell {
+        Some(s) if s.is_empty() || s.len() > 64 || !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') => None,
+        _ => Some((device, shell)),
+    }
+}
+
+fn quest_target_ok(target: &str) -> bool {
+    let hex: String = target.chars().filter(|c| *c != '-').collect();
+    (8..=32).contains(&hex.len()) && hex.chars().all(|c| c.is_ascii_hexdigit()) && target.len() <= 36
+}
+
+pub fn embed_problem(embed: &Embed) -> Option<String> {
+    let names = placeable_embeds().join(" or ");
+    let Some(kind) = embed_kind(&embed.kind) else {
+        return Some(format!("an embed is a {names}"));
+    };
+    if let Some(refused) = kind.refused {
+        return Some(refused.to_string());
+    }
+    let fits = match kind.kind {
+        "terminal" => terminal_target(&embed.target).is_some(),
+        _ => quest_target_ok(&embed.target),
+    };
+    (!fits).then(|| match kind.kind {
+        "terminal" => "a terminal embed's target is one of your person's device ids, optionally followed by /<shell id>".to_string(),
+        _ => "a quest embed's target is the quest id or its first 8 or more characters".to_string(),
+    })
+}
+
+fn embed_line(embed: &Embed, resolved: &HashMap<String, String>) -> String {
+    match embed.kind.as_str() {
+        "quest" => {
+            let key = format!("quest:{}", embed.target);
+            match resolved.get(&key) {
+                Some(found) => format!("live {found} ({key})"),
+                None => format!("live quest card ({key})"),
+            }
+        }
+        "terminal" => format!("live terminal on device {}", embed.target.split('/').next().unwrap_or("")),
+        other => format!("live {other}"),
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Canvas {
@@ -64,6 +143,8 @@ pub struct Item {
     pub points: Option<Vec<[f64; 2]>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embed: Option<Embed>,
     #[serde(default)]
     pub by: String,
 }
@@ -94,6 +175,7 @@ pub struct ItemInput {
     pub locked: Option<bool>,
     pub points: Option<Vec<[f64; 2]>>,
     pub spec: Option<Value>,
+    pub embed: Option<Embed>,
     pub by: Option<String>,
 }
 
@@ -143,7 +225,72 @@ pub enum Op {
 impl Op {
     fn reshapes(&self) -> bool {
         matches!(self, Op::Add { .. } | Op::Remove { .. } | Op::Connect { .. } | Op::Disconnect { .. })
-            || matches!(self, Op::Update { items } if items.iter().any(|i| i.text.is_some() || i.caption.is_some() || i.upload_id.is_some() || i.command.is_some() || i.target.is_some() || i.spec.is_some()))
+            || matches!(self, Op::Update { items } if items.iter().any(|i| i.text.is_some() || i.caption.is_some() || i.upload_id.is_some() || i.command.is_some() || i.target.is_some() || i.spec.is_some() || i.embed.is_some()))
+    }
+
+    fn activity(&self, before: &Canvas, added: &[String]) -> Option<Activity> {
+        let ids = |list: &[String]| list.iter().take(ACTIVITY_ITEMS).cloned().collect::<Vec<_>>();
+        let ends = |edge: &EdgeInput| vec![edge.from.trim().to_string(), edge.to.trim().to_string()];
+        let (verb, items) = match self {
+            Op::Add { items, edges } if items.is_empty() => ("connect", edges.first().map(ends).unwrap_or_default()),
+            Op::Add { .. } => ("add", ids(added)),
+            Op::Update { items } => {
+                let moves = items.iter().all(|i| {
+                    i.text.is_none() && i.caption.is_none() && i.upload_id.is_none() && i.target.is_none() && i.command.is_none() && i.color.is_none() && i.locked.is_none() && i.points.is_none() && i.spec.is_none()
+                });
+                let resizes = moves && items.iter().any(|i| i.w.is_some() || i.h.is_some());
+                (if resizes { "resize" } else if moves { "move" } else { "edit" }, items.iter().filter_map(|i| i.id.as_deref().map(|id| id.trim().to_string())).take(ACTIVITY_ITEMS).collect())
+            }
+            Op::Remove { ids: gone } => ("remove", gone.iter().filter(|id| before.items.iter().any(|i| &i.id == *id)).take(ACTIVITY_ITEMS).cloned().collect()),
+            Op::Connect { edges } => ("connect", edges.first().map(ends).unwrap_or_default()),
+            Op::Disconnect { ids: gone } => ("disconnect", before.edges.iter().find(|e| gone.contains(&e.id)).map(|e| vec![e.from.clone(), e.to.clone()]).unwrap_or_default()),
+            Op::Layout { ids: arranged, .. } => ("arrange", ids(arranged)),
+        };
+        (!items.is_empty()).then_some(Activity { verb, items })
+    }
+}
+
+pub const ACTIVITY_ITEMS: usize = 8;
+pub const MAX_QUOTED_ITEMS: usize = 12;
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Activity {
+    pub verb: &'static str,
+    pub items: Vec<String>,
+}
+
+pub fn activity_of(ops: &[Op], before: &Canvas, added: &[String]) -> Option<Activity> {
+    ops.iter().find_map(|op| op.activity(before, added))
+}
+
+pub const PRESENCE_EVENT: &str = "presence.canvas";
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct Presence {
+    #[serde(default)]
+    pub x: Option<f64>,
+    #[serde(default)]
+    pub y: Option<f64>,
+    #[serde(default)]
+    pub item: Option<String>,
+    #[serde(default)]
+    pub leaving: bool,
+}
+
+impl Presence {
+    pub fn checked(self) -> Result<Presence> {
+        if self.leaving {
+            return Ok(Presence { leaving: true, ..Default::default() });
+        }
+        let (Some(x), Some(y)) = (self.x, self.y) else { bail!("presence needs x and y, or leaving") };
+        if !x.is_finite() || !y.is_finite() || x.abs() > MAX_COORD || y.abs() > MAX_COORD {
+            bail!("x and y must be board positions");
+        }
+        let item = match self.item.as_deref().map(str::trim).filter(|i| !i.is_empty()) {
+            Some(item) => Some(clean_id(item)?),
+            None => None,
+        };
+        Ok(Presence { x: Some(x.round()), y: Some(y.round()), item, leaving: false })
     }
 }
 
@@ -189,13 +336,13 @@ pub struct CanvasHit {
 pub fn item_hits_sql(pattern: &str) -> String {
     format!(
         "COALESCE((SELECT jsonb_agg(jsonb_build_object('id', found.i->>'id', 'kind', found.i->>'kind',
-             'label', left(regexp_replace(COALESCE(found.i->>'caption', found.i->>'text', found.i->>'target', found.i->>'command', found.card, 'ui card'), '\\s+', ' ', 'g'), 160)))
+             'label', left(regexp_replace(COALESCE(found.i->>'caption', found.i->>'text', found.i->>'target', found.i->>'command', found.card, CASE WHEN found.i ? 'embed' THEN 'live ' || (found.i->'embed'->>'kind') END, 'ui card'), '\\s+', ' ', 'g'), 160)))
            FROM (SELECT x.i, x.card FROM (
                    SELECT value AS i,
                           CASE WHEN value->>'kind' = 'ui' THEN (SELECT string_agg(s #>> '{{}}', ' ') FROM jsonb_path_query(value->'spec', '{UI_TEXT_PATH}', '{{}}', true) s) END AS card
                    FROM jsonb_array_elements(CASE WHEN r.kind = 'canvas' AND jsonb_typeof(r.canvas->'items') = 'array' THEN r.canvas->'items' ELSE '[]'::jsonb END)) x
                  WHERE x.i->>'kind' <> 'ink'
-                   AND concat_ws(' ', x.i->>'text', x.i->>'caption', x.i->>'target', x.i->>'command', x.card) ILIKE {pattern}
+                   AND concat_ws(' ', x.i->>'text', x.i->>'caption', x.i->>'target', x.i->>'command', x.card, x.i->'embed'->>'kind', x.i->'embed'->>'target') ILIKE {pattern}
                  LIMIT 3) found), '[]'::jsonb)"
     )
 }
@@ -341,7 +488,7 @@ impl Canvas {
 
     pub fn item_line(&self, id: &str) -> Option<String> {
         let item = self.items.iter().find(|i| i.id == id)?;
-        let spec = item.spec.as_ref().map(spec_text);
+        let spec = item.spec.as_ref().map(spec_text).or_else(|| item.embed.as_ref().map(|e| embed_line(e, &HashMap::new())));
         let label = item.caption.as_deref().or(item.text.as_deref()).or(item.target.as_deref()).or(item.command.as_deref()).or(spec.as_deref()).unwrap_or("");
         let label: String = label.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(160).collect();
         Some(if label.is_empty() { format!("{} {}", item.kind, item.id) } else { format!("{} {}: {label}", item.kind, item.id) })
@@ -364,7 +511,10 @@ impl Canvas {
         if !taken.insert(id.clone()) {
             bail!("item id {id} is already on the canvas");
         }
-        let (w, h) = default_size(&kind);
+        let (w, h) = match input.embed.as_ref().and_then(|e| embed_kind(&e.kind.trim().to_lowercase())) {
+            Some(embed) if kind == "embed" => embed.size,
+            _ => default_size(&kind),
+        };
         let by = match (by, input.by.as_deref()) {
             ("person", Some("agent")) => "agent",
             _ => by,
@@ -385,6 +535,7 @@ impl Canvas {
             locked: false,
             points: None,
             spec: None,
+            embed: None,
             by: by.to_string(),
         };
         apply(&mut item, input)?;
@@ -548,7 +699,16 @@ impl Canvas {
                 "run" => need(item.command.is_some(), "a command")?,
                 "ink" => need(item.points.as_ref().is_some_and(|p| p.len() >= 2), "at least two points")?,
                 "ui" => need(item.spec.is_some(), "a spec (the same json-render spec as show_ui)")?,
+                "embed" => {
+                    let embed = item.embed.as_ref().ok_or_else(|| anyhow!("embed item {} needs an embed like {{\"kind\": \"quest\", \"target\": \"<quest id>\"}}", item.id))?;
+                    if let Some(problem) = embed_problem(embed) {
+                        bail!("embed item {}: {problem}", item.id);
+                    }
+                }
                 _ => {}
+            }
+            if item.embed.is_some() && item.kind != "embed" {
+                bail!("only embed items carry an embed; {} is a {}", item.id, item.kind);
             }
             if item.color.as_deref().is_some_and(|c| !COLORS.contains(&c)) {
                 bail!("color is one of {}", COLORS.join(", "));
@@ -584,10 +744,15 @@ impl Canvas {
                 "ref" => item.target.clone().unwrap_or_default(),
                 "run" => format!("```bash\n{}\n```", item.command.as_deref().unwrap_or("")),
                 "ui" => format!("```ui\n{}\n```", item.spec.as_ref().map(Value::to_string).unwrap_or_default()),
+                "embed" => match item.embed.as_ref() {
+                    Some(e) if e.kind == "quest" => format!("quest:{}", e.target),
+                    Some(e) => format!("Live {}", e.kind),
+                    None => continue,
+                },
                 _ => continue,
             };
             out.push(line);
-            if !caption.is_empty() && matches!(item.kind.as_str(), "note" | "ref" | "run" | "ui") {
+            if !caption.is_empty() && matches!(item.kind.as_str(), "note" | "ref" | "run" | "ui" | "embed") {
                 out.push(format!("_{caption}_"));
             }
         }
@@ -595,7 +760,11 @@ impl Canvas {
     }
 
     pub fn targets(&self) -> Vec<String> {
-        let mut out: Vec<String> = self.items.iter().filter_map(|i| i.target.clone()).collect();
+        let mut out: Vec<String> = self
+            .items
+            .iter()
+            .filter_map(|i| i.target.clone().or_else(|| i.embed.as_ref().filter(|e| e.kind == "quest").map(|e| format!("quest:{}", e.target))))
+            .collect();
         out.sort();
         out.dedup();
         out
@@ -617,6 +786,7 @@ impl Canvas {
             "run" => item.command.as_deref().map(|c| format!("runs `{}`", flat(c))),
             "ui" => item.spec.as_ref().map(spec_text),
             "image" | "video" | "model" => item.upload_id.map(|u| format!("/api/world/uploads/{u}")),
+            "embed" => item.embed.as_ref().map(|e| embed_line(e, resolved)),
             _ => None,
         };
         let text = match (caption, body) {
@@ -669,6 +839,9 @@ impl Canvas {
             }
             if let Some(t) = &item.target {
                 line.push_str(&format!(" -> {t}"));
+            }
+            if let Some(e) = &item.embed {
+                line.push_str(&format!(" embed {} -> {}", e.kind, e.target));
             }
             if let Some(c) = &item.caption {
                 line.push_str(&format!(" caption \"{}\"", c.chars().take(120).collect::<String>()));
@@ -724,7 +897,10 @@ pub fn quote_source(source: &str) -> Option<(&str, Option<&str>)> {
         None => (rest, None),
     };
     let id_ok = (6..=36).contains(&id.len()) && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
-    let item_ok = item.is_none_or(|i| clean_id(i).is_ok_and(|c| c == i));
+    let item_ok = item.is_none_or(|i| {
+        let parts: Vec<&str> = i.split('+').collect();
+        parts.len() <= MAX_QUOTED_ITEMS && parts.iter().all(|p| clean_id(p).is_ok_and(|c| c == *p))
+    });
     (id_ok && item_ok).then_some((id, item))
 }
 
@@ -765,6 +941,13 @@ fn apply(item: &mut Item, input: ItemInput) -> Result<()> {
     if let Some(spec) = input.spec {
         item.spec = Some(crate::ui_cards::normalize(&spec).map_err(|e| anyhow!("ui item: {e}"))?);
     }
+    if let Some(embed) = input.embed {
+        let embed = Embed { kind: embed.kind.trim().to_lowercase(), target: embed.target.trim().to_string() };
+        if let Some(problem) = embed_problem(&embed) {
+            bail!("{problem}");
+        }
+        item.embed = Some(embed);
+    }
     if let Some(points) = input.points {
         if points.len() > MAX_INK_POINTS {
             bail!("a pen stroke has at most {MAX_INK_POINTS} points");
@@ -802,6 +985,30 @@ fn mime_fits(kind: &str, mime: &str) -> bool {
     }
 }
 
+pub async fn canvas_presence_on<C>(conn: &mut C, report: &Report, user: Uuid, presence: Presence) -> Result<()>
+where
+    for<'c> &'c mut C: sqlx::PgExecutor<'c>,
+{
+    let name = crate::world::display_name_on(&mut *conn, user).await?.unwrap_or_else(|| "Someone".to_string());
+    crate::signals::send(&mut *conn, presence_event(report, user, &name, &presence), report.org_id).await
+}
+
+pub fn presence_event(report: &Report, user: Uuid, name: &str, presence: &Presence) -> NewEvent {
+    NewEvent::new(PRESENCE_EVENT).actor(Some(user)).payload(json!({
+        "report_id": report.id,
+        "org_id": report.org_id,
+        "owner_user_id": report.owner_user_id,
+        "visibility": report.visibility,
+        "user_id": user,
+        "name": name,
+        "x": presence.x,
+        "y": presence.y,
+        "item_id": presence.item,
+        "leaving": presence.leaving,
+        "quiet": true,
+    }))
+}
+
 impl WorldStore {
     pub(crate) async fn check_canvas_uploads(&self, owner: Uuid, org: Option<Uuid>, canvas: &Canvas, before: &Canvas) -> Result<()> {
         let known: HashSet<Uuid> = before.upload_ids().into_iter().collect();
@@ -817,6 +1024,49 @@ impl WorldStore {
             };
             if !mime_fits(&item.kind, mime) {
                 bail!("upload {id} is {mime}, which does not fit a {} item", item.kind);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn check_canvas_embeds(conn: &mut sqlx::PgConnection, owner: Uuid, org: Option<Uuid>, canvas: &mut Canvas, before: &Canvas) -> Result<()> {
+        for item in canvas.items.iter_mut() {
+            let Some(embed) = item.embed.as_mut() else { continue };
+            if before.items.iter().any(|b| b.id == item.id && b.embed.as_ref() == Some(&*embed)) {
+                continue;
+            }
+            match embed.kind.as_str() {
+                "terminal" => {
+                    let (device, _) = terminal_target(&embed.target).ok_or_else(|| anyhow!("embed item {} has an unreadable terminal target", item.id))?;
+                    let own: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM world_runners WHERE id = $1 AND owner_user_id = $2)")
+                        .bind(device)
+                        .bind(owner)
+                        .fetch_one(&mut *conn)
+                        .await?;
+                    if !own {
+                        bail!("device {device} is not one of your person's devices, so its terminal cannot go on this canvas");
+                    }
+                }
+                "quest" => {
+                    let hex: String = embed.target.chars().filter(|c| *c != '-').collect::<String>().to_lowercase();
+                    let found: Vec<Uuid> = sqlx::query_scalar(
+                        "SELECT t.id FROM agent_tasks t LEFT JOIN agent_profiles x ON x.id = t.assigned_agent_id
+                         WHERE ($1::uuid IS NULL OR t.org_id = $1) AND (t.user_id = $2 OR x.owner_user_id = $2 OR x.visibility = 'public')
+                           AND replace(t.id::text, '-', '') LIKE $3
+                         LIMIT 2",
+                    )
+                    .bind(org)
+                    .bind(owner)
+                    .bind(format!("{hex}%"))
+                    .fetch_all(&mut *conn)
+                    .await?;
+                    match found.as_slice() {
+                        [one] => embed.target = one.to_string(),
+                        [] => bail!("no quest {} that your person can see", embed.target),
+                        _ => bail!("quest {} matches more than one quest; use more of its id", embed.target),
+                    }
+                }
+                other => bail!("an embed is a {}, not {other}", placeable_embeds().join(" or ")),
             }
         }
         Ok(())
@@ -843,6 +1093,7 @@ impl WorldStore {
         }
         let before = Canvas::parse(current.canvas.as_ref())?;
         let mut canvas = before.clone();
+        let planned = matches!(by, ReportActor::Agent(_)).then(|| ops.clone());
         let added = canvas.apply_ops(ops, if matches!(by, ReportActor::User(_)) { "person" } else { "agent" })?;
         canvas.validate()?;
         if canvas == before {
@@ -850,6 +1101,7 @@ impl WorldStore {
             return Ok(Some((current, added)));
         }
         self.check_canvas_uploads(current.owner_user_id, current.org_id, &canvas, &before).await?;
+        Self::check_canvas_embeds(&mut tx, current.owner_user_id, current.org_id, &mut canvas, &before).await?;
         let body = canvas.summary();
         let links = self.resolve_report_links(&mut *tx, current.owner_user_id, current.org_id, &body, Some(id)).await?;
         let value = canvas.to_value();
@@ -867,8 +1119,14 @@ impl WorldStore {
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
-        self.report_event("report.updated", &report, by, merged || !reshapes).await?;
+        let activity = planned.and_then(|ops| activity_of(&ops, &before, &added));
+        self.report_event_with("report.updated", &report, by, merged || !reshapes, activity.as_ref()).await?;
         Ok(Some((report, added)))
+    }
+
+    pub async fn canvas_presence(&self, report: &Report, user: Uuid, presence: Presence) -> Result<()> {
+        let mut conn = self.pool().acquire().await?;
+        canvas_presence_on(&mut *conn, report, user, presence).await
     }
 
     pub async fn describe_refs(&self, viewer: Uuid, org: Uuid, targets: &[String]) -> Result<HashMap<String, String>> {
@@ -892,7 +1150,7 @@ impl WorldStore {
         for (kind, ids) in &wanted {
             let (sql, alias) = match *kind {
                 "quest" => (
-                    "SELECT t.id, t.title AS a, t.status AS b, '' AS c FROM agent_tasks t LEFT JOIN agent_profiles x ON x.id = t.assigned_agent_id
+                    "SELECT t.id, t.title AS a, t.status AS b, CASE WHEN {plan_waiting} THEN 'plan_waiting' ELSE '' END AS c FROM agent_tasks t LEFT JOIN agent_profiles x ON x.id = t.assigned_agent_id
                      WHERE t.org_id = $1 AND (t.user_id = $2 OR x.owner_user_id = $2 OR x.visibility = 'public') AND {match}
                      ORDER BY t.created_at DESC LIMIT 200",
                     "t",
@@ -932,7 +1190,7 @@ impl WorldStore {
                     "g",
                 ),
             };
-            let sql = sql.replace("{thread}", &crate::guests::thread_filter("m.agent_id", "$2"));
+            let sql = sql.replace("{thread}", &crate::guests::thread_filter("m.agent_id", "$2")).replace("{plan_waiting}", &crate::world::plan_waiting_sql("t"));
             let mut found = Vec::new();
             if !ids.full.is_empty() {
                 found.extend(
@@ -986,6 +1244,7 @@ impl WorldStore {
                     .map(|(_, author, channel, body)| format!("Message from {author} in #{channel}: {}", flat(body, 400)))
             } else {
                 rows.get(kind).and_then(|found| pick_ref(found, kind, raw)).map(|row| match kind {
+                    "quest" if row.c == "plan_waiting" => format!("Quest \"{}\" ({}, {})", flat(&row.a, 160), row.b.replace('_', " "), crate::world::PLAN_WAITING_NOTE),
                     "quest" => format!("Quest \"{}\" ({})", flat(&row.a, 160), row.b.replace('_', " ")),
                     "report" => format!("{} \"{}\": {}", if row.b == "canvas" { "Canvas" } else { "Report" }, flat(&row.a, 160), flat(&row.c, 200)),
                     "todo" => format!("To-do \"{}\" ({})", flat(&row.a, 200), row.b),
@@ -1028,9 +1287,13 @@ impl WorldStore {
                 (canvas, HashMap::new(), whole)
             }
         };
-        let context = match item.and_then(|i| canvas.describe_item(i, &resolved, 1500)) {
-            Some(line) => format!("The quoted item: {line}\n\n{whole}"),
-            None => whole,
+        let picked: Vec<&str> = item.map(|i| i.split('+').collect()).unwrap_or_default();
+        let cap = if picked.len() > 1 { (3000 / picked.len()).max(240) } else { 1500 };
+        let lines: Vec<String> = picked.iter().filter_map(|i| canvas.describe_item(i, &resolved, cap)).collect();
+        let context = match lines.as_slice() {
+            [] => whole,
+            [line] => format!("The quoted item: {line}\n\n{whole}"),
+            many => format!("The quoted items:\n{}\n\n{whole}", many.iter().map(|l| format!("- {l}")).collect::<Vec<_>>().join("\n")),
         };
         quote["context"] = json!(context.chars().take(crate::quotes::CONTEXT_CHARS).collect::<String>());
         Ok(())
@@ -1168,6 +1431,7 @@ impl WorldStore {
                 "org_id": report.org_id,
                 "owner_user_id": report.owner_user_id,
                 "mark_id": m.id,
+                "item_id": m.item_id,
                 "status": m.status,
                 "quiet": true,
             }));
@@ -1240,7 +1504,8 @@ mod tests {
         let Ok(url) = std::env::var("REPORTS_TEST_DATABASE_URL") else {
             return Ok(());
         };
-        let pool = PgPoolOptions::new().max_connections(4).connect(&url).await?;
+        let options = url.parse::<sqlx::postgres::PgConnectOptions>()?.statement_cache_capacity(0);
+        let pool = PgPoolOptions::new().max_connections(1).connect_with(options).await?;
         let store = WorldStore::new(pool.clone());
         let tag = Uuid::new_v4().simple().to_string();
         let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email, name) VALUES ($1, 'Canvas owner') RETURNING id")
@@ -1264,10 +1529,22 @@ mod tests {
         assert!(refused.is_err());
         let (moved, _) = store.change_canvas(report.id, by, parse_ops(&json!([{ "op": "connect", "edges": [{ "from": "a", "to": "b", "label": "then" }] }, { "op": "layout", "ids": ["b", "a"], "mode": "row" }]))?).await?.unwrap();
         assert_eq!(moved.revision, 2);
+        let latest = |kind: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Value>("SELECT payload FROM world_events WHERE type = $1 AND payload->>'report_id' = $2 ORDER BY seq DESC LIMIT 1")
+                    .bind(kind)
+                    .bind(report.id.to_string())
+                    .fetch_one(&pool)
+                    .await
+            }
+        };
+        assert_eq!(latest("report.updated").await?["activity"], json!({ "verb": "connect", "items": ["a", "b"] }));
         let (again, _) = store.change_canvas(report.id, by, parse_ops(&json!({ "op": "update", "items": [{ "id": "a", "locked": true }] }))?).await?.unwrap();
         assert_eq!(again.revision, 2);
         let (by_person, _) = store.change_canvas(report.id, ReportActor::User(owner), parse_ops(&json!({ "op": "add", "items": [{ "id": "s", "kind": "sticky", "text": "hmm" }] }))?).await?.unwrap();
         assert_eq!(by_person.revision, 3);
+        assert!(latest("report.updated").await?.get("activity").is_none());
         let old = store.report_revision(report.id, 1).await?.unwrap();
         assert_eq!(Canvas::parse(old.canvas.as_ref())?.items.len(), 2);
         let restored = store.restore_report_revision(report.id, 1, ReportActor::User(owner)).await?.unwrap();
@@ -1284,6 +1561,7 @@ mod tests {
         assert_eq!(brief.iter().find(|b| b.id == report.id).map(|b| (b.kind.as_str(), b.open_marks)), Some(("canvas", 1)));
         let done = store.resolve_canvas_mark(&restored, mark.id, by, Some("Made B heavier".into()), false).await?.unwrap();
         assert_eq!((done.status.as_str(), done.resolved_by_agent_id), ("resolved", Some(agent)));
+        assert_eq!(latest("canvas.mark_resolved").await?["item_id"], json!("b"));
         let b = Canvas::parse(restored.canvas.as_ref())?.items.into_iter().find(|i| i.id == "b").unwrap();
         let stuck = parse_ops(&json!({ "op": "add", "items": [{ "id": "s2", "kind": "sticky", "text": "heavier?", "x": b.x + 20.0, "y": b.y + 20.0 }] }))?;
         let (current, _) = store.change_canvas(report.id, ReportActor::User(owner), stuck).await?.unwrap();
@@ -1371,7 +1649,8 @@ mod tests {
         let Ok(url) = std::env::var("REPORTS_TEST_DATABASE_URL") else {
             return Ok(());
         };
-        let pool = PgPoolOptions::new().max_connections(4).connect(&url).await?;
+        let options = url.parse::<sqlx::postgres::PgConnectOptions>()?.statement_cache_capacity(0);
+        let pool = PgPoolOptions::new().max_connections(1).connect_with(options).await?;
         let store = WorldStore::new(pool.clone());
         let tag = Uuid::new_v4().simple().to_string();
         let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email, name) VALUES ($1, 'Board owner') RETURNING id")
@@ -1440,6 +1719,11 @@ mod tests {
         assert!(shared.starts_with(&format!("The quoted item: ref t: todo:{todo}")));
         assert!(shared.contains(&word) && shared.contains(&format!("quest:{quest}")));
         assert!(!shared.contains("Oil the hinges") && !shared.contains("Ship the drawbridge"));
+        let mut several = crate::quotes::clean(Some(&json!({ "text": "Two things", "source": format!("report:{}#t+n", report.id) }))).unwrap();
+        store.expand_canvas_quote(owner, org, &mut several, QuoteCards::Resolved).await?;
+        let both = several["context"].as_str().unwrap();
+        assert!(both.starts_with("The quoted items:\n- ref t: To-do \"Oil the hinges\""), "{both}");
+        assert!(both.contains(&format!("\n- note n: Dig the {word} first")), "{both}");
         let mut hidden = crate::quotes::clean(Some(&json!({ "text": "x", "source": format!("report:{}", report.id) }))).unwrap();
         store.expand_canvas_quote(stranger, org, &mut hidden, QuoteCards::Resolved).await?;
         assert!(hidden.get("context").is_none());
@@ -1468,6 +1752,129 @@ mod tests {
         sqlx::query("DELETE FROM agent_inbox WHERE agent_id = $1").bind(agent).execute(&pool).await?;
         sqlx::query("DELETE FROM world_reports WHERE owner_user_id = $1").bind(owner).execute(&pool).await?;
         sqlx::query("DELETE FROM agent_tasks WHERE id = $1").bind(quest).execute(&pool).await?;
+        sqlx::query("DELETE FROM agent_profiles WHERE id = $1").bind(agent).execute(&pool).await?;
+        sqlx::query("DELETE FROM users WHERE id = ANY($1)").bind(vec![owner, stranger]).execute(&pool).await?;
+        Ok(())
+    }
+
+    #[test]
+    fn embeds_validate_through_one_registry_and_read_as_text() {
+        let device = Uuid::new_v4();
+        let raw = json!({ "items": [
+            { "id": "t", "kind": "embed", "embed": { "kind": "Terminal", "target": format!(" {device} ") }, "caption": "Build shell" },
+            { "id": "q", "kind": "embed", "embed": { "kind": "quest", "target": "abcdef12" }, "x": 700, "y": 0 }
+        ] });
+        let c = Canvas::from_raw(&raw, "agent").unwrap();
+        let t = c.items.iter().find(|i| i.id == "t").unwrap();
+        assert_eq!(t.embed.as_ref().map(|e| (e.kind.as_str(), e.target.clone())), Some(("terminal", device.to_string())));
+        assert_eq!((t.w, t.h), (560.0, 340.0));
+        let q = c.items.iter().find(|i| i.id == "q").unwrap();
+        assert_eq!((q.w, q.h), (380.0, 300.0));
+        assert_eq!(c.targets(), vec!["quest:abcdef12".to_string()]);
+        assert!(c.summary().contains("quest:abcdef12") && c.summary().contains("Live terminal") && c.summary().contains("_Build shell_"));
+        let resolved = HashMap::from([("quest:abcdef12".to_string(), "Quest \"Fix login\" (in progress)".to_string())]);
+        assert_eq!(c.describe_item("q", &resolved, 200).as_deref(), Some("embed q: live Quest \"Fix login\" (in progress) (quest:abcdef12)"));
+        assert!(c.describe_item("t", &resolved, 200).unwrap().contains(&format!("live terminal on device {device} (caption: Build shell)")));
+        assert!(c.outline().contains(&format!("embed terminal -> {device}")));
+        assert!(c.item_line("q").unwrap().starts_with("embed q: live quest card"));
+        assert_eq!(terminal_target(&format!("{device}/0b7e-shell")), Some((device, Some("0b7e-shell"))));
+
+        let refused = |embed: Value| Canvas::from_raw(&json!({ "items": [{ "kind": "embed", "embed": embed }] }), "agent").unwrap_err().to_string();
+        assert!(refused(json!({ "kind": "browser", "target": "https://example.com" })).contains("cannot be watched inside Loka yet"));
+        assert!(refused(json!({ "kind": "spreadsheet", "target": "x" })).contains("terminal or quest"));
+        assert!(refused(json!({ "kind": "terminal", "target": "my-mac" })).contains("device ids"));
+        assert!(refused(json!({ "kind": "terminal", "target": format!("{device}/a b") })).contains("device ids"));
+        assert!(refused(json!({ "kind": "quest", "target": "abc" })).contains("first 8"));
+        assert!(Canvas::from_raw(&json!({ "items": [{ "kind": "embed" }] }), "agent").unwrap_err().to_string().contains("needs an embed"));
+        assert!(Canvas::from_raw(&json!({ "items": [{ "kind": "note", "text": "x", "embed": { "kind": "quest", "target": "abcdef12" } }] }), "agent")
+            .unwrap_err()
+            .to_string()
+            .contains("only embed items carry an embed"));
+        let mut kept = c.clone();
+        let changed = kept.apply_ops(parse_ops(&json!({ "op": "update", "items": [{ "id": "q", "embed": { "kind": "quest", "target": "fedcba98" } }] })).unwrap(), "person");
+        assert!(changed.is_ok() && parse_ops(&json!({ "op": "update", "items": [{ "id": "q", "embed": { "kind": "quest", "target": "fedcba98" } }] })).unwrap().iter().all(Op::reshapes));
+        assert!(kept.apply_ops(parse_ops(&json!({ "op": "update", "items": [{ "id": "q", "kind": "note" }] })).unwrap(), "person").is_err());
+    }
+
+    #[tokio::test]
+    async fn embeds_need_a_target_the_owner_can_reach_and_round_trip() -> Result<()> {
+        let Ok(url) = std::env::var("REPORTS_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let pool = PgPoolOptions::new().max_connections(1).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let user = |name: &'static str, n: &'static str| {
+            sqlx::query_scalar::<_, Uuid>("INSERT INTO users (email, name) VALUES ($1, $2) RETURNING id").bind(format!("{tag}-{n}@embed.test")).bind(name)
+        };
+        let owner = user("Embed owner", "o").fetch_one(&pool).await?;
+        let stranger = user("Embed stranger", "s").fetch_one(&pool).await?;
+        let agent: Uuid = sqlx::query_scalar("INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id) VALUES ($1, 'Watcher', 'claude', 'opus', $2) RETURNING id")
+            .bind(format!("watcher-{}", &tag[..8]))
+            .bind(owner)
+            .fetch_one(&pool)
+            .await?;
+        let org: Uuid = sqlx::query_scalar("SELECT org_id FROM agent_profiles WHERE id = $1").bind(agent).fetch_one(&pool).await?;
+        let device = |who: Uuid| {
+            sqlx::query_scalar::<_, Uuid>("INSERT INTO world_runners (owner_user_id, name, platform, token_hash, status) VALUES ($1, 'mac', 'macos', $2, 'online') RETURNING id")
+                .bind(who)
+                .bind([*Uuid::new_v4().as_bytes(), *Uuid::new_v4().as_bytes()].concat())
+        };
+        let mine = device(owner).fetch_one(&pool).await?;
+        let theirs = device(stranger).fetch_one(&pool).await?;
+        let quest: Uuid = sqlx::query_scalar("INSERT INTO agent_tasks (user_id, title, repo, org_id, assigned_agent_id, status) VALUES ($1, 'Raise the portcullis', 'acme/castle', $2, $3, 'in_progress') RETURNING id")
+            .bind(owner)
+            .bind(org)
+            .bind(agent)
+            .fetch_one(&pool)
+            .await?;
+        let hidden: Uuid = sqlx::query_scalar("INSERT INTO agent_tasks (user_id, title, repo, org_id) VALUES ($1, 'Secret tunnel', 'acme/castle', $2) RETURNING id")
+            .bind(stranger)
+            .bind(org)
+            .fetch_one(&pool)
+            .await?;
+        let short = quest.simple().to_string()[..10].to_string();
+        let raw = json!({ "items": [
+            { "id": "q", "kind": "embed", "embed": { "kind": "quest", "target": short } },
+            { "id": "t", "kind": "embed", "embed": { "kind": "terminal", "target": mine.to_string() }, "caption": "this Mac" }
+        ] });
+        let new = NewReport { owner_user_id: owner, by: ReportActor::Agent(agent), title: "Watch board".into(), body: String::new(), folder: None, tags: vec![], visibility: None, pinned: false, task_id: None };
+        let report = store.create_canvas(new, Canvas::from_raw(&raw, "agent")?).await?;
+        let saved = Canvas::parse(report.canvas.as_ref())?;
+        assert_eq!(saved.items[0].embed.as_ref().map(|e| e.target.clone()), Some(quest.to_string()));
+        assert!(report.body.contains(&format!("quest:{quest}")));
+        let org = report.org_id.unwrap_or(org);
+        let (_, _, digest) = store.canvas_digest(owner, org, &report, 4000).await?;
+        assert!(digest.contains("embed q: live Quest \"Raise the portcullis\" (in progress)"), "{digest}");
+        assert!(digest.contains(&format!("embed t: live terminal on device {mine}")));
+        let hits = store.search_canvas_items(owner, org, "terminal", 10).await?;
+        assert_eq!(hits.iter().find(|h| h.id == report.id).map(|h| h.items[0]["id"].clone()), Some(json!("t")));
+
+        let by = ReportActor::User(owner);
+        let add = |embed: Value| parse_ops(&json!({ "op": "add", "items": [{ "kind": "embed", "embed": embed }] }));
+        let err = store.change_canvas(report.id, by, add(json!({ "kind": "terminal", "target": theirs.to_string() }))?).await.unwrap_err().to_string();
+        assert!(err.contains("not one of your person's devices"), "{err}");
+        let err = store.change_canvas(report.id, by, add(json!({ "kind": "quest", "target": hidden.to_string() }))?).await.unwrap_err().to_string();
+        assert!(err.contains("no quest"), "{err}");
+        let err = store.change_canvas(report.id, by, add(json!({ "kind": "browser", "target": "https://example.com" }))?).await.unwrap_err().to_string();
+        assert!(err.contains("cannot be watched inside Loka yet"), "{err}");
+        let (moved, _) = store.change_canvas(report.id, by, add(json!({ "kind": "terminal", "target": format!("{mine}/0b7e8f") }))?).await?.unwrap();
+        assert_eq!(moved.revision, 2);
+        let (resized, _) = store.change_canvas(report.id, by, parse_ops(&json!({ "op": "update", "items": [{ "id": "q", "w": 500, "h": 420 }] }))?).await?.unwrap();
+        let q = Canvas::parse(resized.canvas.as_ref())?.items.into_iter().find(|i| i.id == "q").unwrap();
+        assert_eq!((q.w, q.h, q.embed.map(|e| e.target)), (500.0, 420.0, Some(quest.to_string())));
+        let old = store.report_revision(report.id, 1).await?.unwrap();
+        assert_eq!(Canvas::parse(old.canvas.as_ref())?.items.len(), 2);
+        let (_, stranger_view, _) = store.canvas_digest(stranger, org, &report, 4000).await?;
+        assert!(!stranger_view.contains_key(&format!("quest:{quest}")));
+        let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_inbox WHERE agent_id = $1 AND kind <> 'task.assigned'").bind(agent).fetch_one(&pool).await?;
+        assert_eq!(events, 0);
+
+        sqlx::query("DELETE FROM world_events WHERE agent_id = $1 OR payload->>'owner_user_id' = $2").bind(agent).bind(owner.to_string()).execute(&pool).await?;
+        sqlx::query("DELETE FROM agent_inbox WHERE agent_id = $1").bind(agent).execute(&pool).await?;
+        sqlx::query("DELETE FROM world_reports WHERE owner_user_id = $1").bind(owner).execute(&pool).await?;
+        sqlx::query("DELETE FROM agent_tasks WHERE id = ANY($1)").bind(vec![quest, hidden]).execute(&pool).await?;
+        sqlx::query("DELETE FROM world_runners WHERE id = ANY($1)").bind(vec![mine, theirs]).execute(&pool).await?;
         sqlx::query("DELETE FROM agent_profiles WHERE id = $1").bind(agent).execute(&pool).await?;
         sqlx::query("DELETE FROM users WHERE id = ANY($1)").bind(vec![owner, stranger]).execute(&pool).await?;
         Ok(())
@@ -1506,6 +1913,120 @@ mod tests {
         assert_eq!(quote_source("report:abc#n1"), None);
         assert_eq!(quote_source("report:abcdef12#bad id"), None);
         assert_eq!(quote_source("quest:abcdef12"), None);
+        assert_eq!(quote_source("report:abcdef12#n1+n2+n3"), Some(("abcdef12", Some("n1+n2+n3"))));
+        assert_eq!(quote_source("report:abcdef12#n1++n2"), None);
+        let many = (0..=MAX_QUOTED_ITEMS).map(|i| format!("n{i}")).collect::<Vec<_>>().join("+");
+        assert_eq!(quote_source(&format!("report:abcdef12#{many}")), None);
+    }
+
+    #[tokio::test]
+    async fn presence_is_live_only_and_reaches_only_people_who_can_read_the_canvas() -> Result<()> {
+        let Ok(url) = std::env::var("REPORTS_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let options = url.parse::<sqlx::postgres::PgConnectOptions>()?.statement_cache_capacity(0);
+        let pool = PgPoolOptions::new().max_connections(1).connect_with(options).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let person = |name: &'static str, n: &'static str| {
+            sqlx::query_scalar::<_, Uuid>("INSERT INTO users (email, name) VALUES ($1, $2) RETURNING id").bind(format!("{tag}-{n}@presence.test")).bind(name)
+        };
+        let owner = person("Mei Chen", "o").fetch_one(&pool).await?;
+        let other = person("Sam Lee", "x").fetch_one(&pool).await?;
+        let canvas = |visibility: &'static str| NewReport {
+            owner_user_id: owner,
+            by: ReportActor::User(owner),
+            title: format!("Presence {visibility} {}", &tag[..8]),
+            body: String::new(),
+            folder: None,
+            tags: vec![],
+            visibility: Some(visibility.into()),
+            pinned: false,
+            task_id: None,
+        };
+        let private = store.create_canvas(canvas("private"), Canvas::default()).await?;
+        let public = store.create_canvas(canvas("public"), Canvas::default()).await?;
+        let reports = vec![private.id.to_string(), public.id.to_string()];
+        let count = "SELECT count(*) FROM world_events WHERE payload->>'report_id' = ANY($1)";
+        let before: i64 = sqlx::query_scalar(count).bind(&reports).fetch_one(&pool).await?;
+        pool.close().await;
+        let mut listener = sqlx::postgres::PgListener::connect(&url).await?;
+        sqlx::raw_sql("DEALLOCATE ALL").execute(&mut listener).await?;
+        listener.listen(crate::signals::CHANNEL).await?;
+        let wanted = [private.id, public.id];
+        let mut heard: HashMap<Uuid, crate::world::WorldEvent> = HashMap::new();
+        let at = Presence { x: Some(10.4), y: Some(-3.6), item: Some("n1".into()), leaving: false }.checked()?;
+        crate::signals::send(&mut listener, NewEvent::new(crate::typing::EVENT).payload(json!({ "typing": true, "agent": "Pace" })), private.org_id).await?;
+        canvas_presence_on(&mut listener, &private, owner, at).await?;
+        canvas_presence_on(&mut listener, &public, owner, Presence { leaving: true, ..Default::default() }.checked()?).await?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while heard.len() < wanted.len() {
+            let note = tokio::time::timeout_at(deadline, listener.recv())
+                .await
+                .map_err(|_| anyhow!("heard {} of {} canvases before the deadline", heard.len(), wanted.len()))??;
+            let Some(event) = crate::signals::decode(note.payload()).filter(|e| e.event_type == PRESENCE_EVENT) else {
+                continue;
+            };
+            if let Some(id) = event.payload["report_id"].as_str().and_then(|id| id.parse::<Uuid>().ok()).filter(|id| wanted.contains(id)) {
+                heard.insert(id, event);
+            }
+        }
+        let after: i64 = sqlx::query_scalar(count).bind(&reports).fetch_one(&mut listener).await?;
+        assert_eq!(after, before, "cursor updates for these canvases are live only and never stored");
+        let seen = &heard[&private.id];
+        assert_eq!((seen.seq, seen.event_type.as_str(), seen.org_id), (0, PRESENCE_EVENT, private.org_id));
+        assert_eq!(seen.actor_user_id, Some(owner));
+        assert_eq!((seen.payload["user_id"].clone(), seen.payload["name"].clone()), (json!(owner), json!("Mei Chen")));
+        assert_eq!((seen.payload["x"].clone(), seen.payload["y"].clone(), seen.payload["item_id"].clone()), (json!(10.0), json!(-4.0), json!("n1")));
+        assert_eq!((seen.payload["quiet"].clone(), seen.payload["leaving"].clone()), (json!(true), json!(false)));
+        assert!(crate::event_scope::org_visible(&seen.event_type));
+        let reaches = |event: &crate::world::WorldEvent, viewer: Uuid| !crate::loka::hidden_from(event, viewer);
+        assert!(reaches(seen, owner), "the owner sees their own cursor signal");
+        assert!(!reaches(seen, other), "a reader who cannot see the private canvas gets nothing");
+        let left = &heard[&public.id];
+        assert_eq!((left.payload["leaving"].clone(), left.payload["x"].clone()), (json!(true), Value::Null));
+        assert!(reaches(left, other), "anyone may see presence on a public canvas");
+        Ok(())
+    }
+
+    #[test]
+    fn presence_is_a_board_position_or_leaving() {
+        let at = |x: f64, y: f64, item: Option<&str>| Presence { x: Some(x), y: Some(y), item: item.map(String::from), leaving: false }.checked();
+        assert_eq!(at(10.4, -3.6, Some(" n1 ")).unwrap(), Presence { x: Some(10.0), y: Some(-4.0), item: Some("n1".into()), leaving: false });
+        assert_eq!(at(1.0, 2.0, Some("")).unwrap().item, None);
+        assert!(at(f64::NAN, 1.0, None).is_err());
+        assert!(at(MAX_COORD * 2.0, 1.0, None).is_err());
+        assert!(at(1.0, 1.0, Some("bad id")).is_err());
+        assert!(Presence::default().checked().is_err());
+        assert_eq!(Presence { x: Some(f64::NAN), leaving: true, ..Default::default() }.checked().unwrap(), Presence { leaving: true, ..Default::default() });
+    }
+
+    #[test]
+    fn edits_name_what_they_touched() {
+        let raw = json!({ "items": [
+            { "id": "cart", "kind": "note", "text": "Cart", "x": 0, "y": 0 },
+            { "id": "pay", "kind": "note", "text": "Pay", "x": 400, "y": 0 }
+        ], "edges": [{ "id": "e1", "from": "cart", "to": "pay" }] });
+        let before = Canvas::from_raw(&raw, "agent").unwrap();
+        let ops = |v: Value| serde_json::from_value::<Vec<Op>>(v).unwrap();
+        let of = |v: Value, added: &[&str]| activity_of(&ops(v), &before, &added.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let act = |verb: &'static str, items: &[&str]| Some(Activity { verb, items: items.iter().map(|s| s.to_string()).collect() });
+
+        assert_eq!(of(json!([{ "op": "add", "items": [{ "kind": "note", "text": "Done" }] }]), &["n3"]), act("add", &["n3"]));
+        assert_eq!(of(json!([{ "op": "add", "edges": [{ "from": "cart", "to": "pay" }] }]), &[]), act("connect", &["cart", "pay"]));
+        assert_eq!(of(json!([{ "op": "update", "items": [{ "id": "pay", "x": 10, "y": 20 }] }]), &[]), act("move", &["pay"]));
+        assert_eq!(of(json!([{ "op": "update", "items": [{ "id": "pay", "text": "Pay now" }] }]), &[]), act("edit", &["pay"]));
+        assert_eq!(of(json!([{ "op": "update", "items": [{ "id": "pay", "w": 300, "h": 200 }] }]), &[]), act("resize", &["pay"]));
+        assert_eq!(of(json!([{ "op": "remove", "ids": ["pay", "ghost"] }]), &[]), act("remove", &["pay"]));
+        assert_eq!(of(json!([{ "op": "connect", "edges": [{ "from": " cart ", "to": "pay" }] }]), &[]), act("connect", &["cart", "pay"]));
+        assert_eq!(of(json!([{ "op": "disconnect", "ids": ["e1"] }]), &[]), act("disconnect", &["cart", "pay"]));
+        assert_eq!(of(json!([{ "op": "layout", "ids": ["cart", "pay"], "mode": "row" }]), &[]), act("arrange", &["cart", "pay"]));
+        assert_eq!(of(json!([{ "op": "remove", "ids": ["ghost"] }, { "op": "layout", "ids": ["cart"], "mode": "row" }]), &[]), act("arrange", &["cart"]));
+        assert_eq!(of(json!([{ "op": "disconnect", "ids": ["nope"] }]), &[]), None);
+        let crowd: Vec<String> = (0..20).map(|i| format!("n{i}")).collect();
+        let lots = activity_of(&ops(json!([{ "op": "layout", "ids": crowd, "mode": "grid" }])), &before, &[]).unwrap();
+        assert_eq!(lots.items.len(), ACTIVITY_ITEMS);
+        assert_eq!(serde_json::to_value(act("move", &["pay"]).unwrap()).unwrap(), json!({ "verb": "move", "items": ["pay"] }));
     }
 
     fn note(text: &str) -> ItemInput {

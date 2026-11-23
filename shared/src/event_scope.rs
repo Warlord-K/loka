@@ -32,6 +32,7 @@ const ORG_VISIBLE: &[&str] = &[
     "timer.done",
     "region.",
     "report.",
+    "presence.",
     "shell.",
     "slack.",
 ];

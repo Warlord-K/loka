@@ -460,10 +460,14 @@ impl WorldStore {
         .bind(new.task_id)
         .fetch_one(self.pool())
         .await?;
-        if let Some(c) = canvas {
+        let mut new = new;
+        let mut canvas = canvas.cloned();
+        if let Some(c) = canvas.as_mut() {
             self.check_canvas_uploads(new.owner_user_id, org, c, &crate::canvas::Canvas::default()).await?;
+            Self::check_canvas_embeds(&mut *self.pool().acquire().await?, new.owner_user_id, org, c, &crate::canvas::Canvas::default()).await?;
+            new.body = c.summary();
         }
-        let canvas = canvas.map(crate::canvas::Canvas::to_value);
+        let canvas = canvas.as_ref().map(crate::canvas::Canvas::to_value);
         let links = self.resolve_report_links(self.pool(), new.owner_user_id, org, &new.body, None).await?;
         let mut tx = self.pool().begin().await?;
         let report = sqlx::query_as::<_, Report>(
@@ -852,7 +856,11 @@ impl WorldStore {
     }
 
     pub(crate) async fn report_event(&self, kind: &str, report: &Report, by: ReportActor, quiet: bool) -> Result<()> {
-        let mut event = NewEvent::new(kind).actor(by.user()).task(report.task_id).payload(json!({
+        self.report_event_with(kind, report, by, quiet, None).await
+    }
+
+    pub(crate) async fn report_event_with(&self, kind: &str, report: &Report, by: ReportActor, quiet: bool, activity: Option<&crate::canvas::Activity>) -> Result<()> {
+        let mut payload = json!({
             "report_id": report.id,
             "org_id": report.org_id,
             "title": report.title,
@@ -862,7 +870,11 @@ impl WorldStore {
             "revision": report.revision,
             "author_agent_id": by.agent(),
             "quiet": quiet,
-        }));
+        });
+        if let Some(activity) = activity {
+            payload["activity"] = json!(activity);
+        }
+        let mut event = NewEvent::new(kind).actor(by.user()).task(report.task_id).payload(payload);
         if let Some(agent) = by.agent() {
             event = event.agent(agent);
         }

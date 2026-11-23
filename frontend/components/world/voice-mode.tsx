@@ -3,10 +3,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { AnimatePresence, motion } from "framer-motion";
-import { Microphone, MicrophoneSlash, PhoneDisconnect, X } from "@phosphor-icons/react";
+import { Microphone, MicrophoneSlash, PhoneDisconnect, SpeakerHigh, X } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
 import { worldApi, type WorldAgent, type WorldEvent } from "@/lib/world";
-import { listen, micProblem, MODEL_PROBLEM, speech, voiceFor, type Vad } from "./speech";
+import { listen, micProblem, MODEL_PROBLEM, SOUND_BLOCKED, speech, voiceFor, type Vad } from "./speech";
 import { Shimmer } from "./work-ui";
 import { LiveUnavailable, primeLiveAudio, startLive, type LiveCall } from "./live-voice";
 import { useSpeechStatus } from "./voice-ui";
@@ -14,7 +14,7 @@ import { CHUNKY, SEGMENT, SEGMENT_ITEM, SEGMENT_OFF, SEGMENT_ON } from "./styles
 import { CloseButton } from "./settings-shell";
 import { SetupHint, useFeature } from "./setup-hint";
 import { callClock } from "@/lib/call-state";
-import { AgentAvatar } from "./channel-ui";
+import { AgentFace } from "./channel-ui";
 import { NOTICE_MOTION } from "./motion";
 
 type Phase = "starting" | "connecting" | "listening" | "hearing" | "transcribing" | "thinking" | "speaking" | "error";
@@ -32,6 +32,8 @@ export function engineChoice(): Engine {
 
 const PILL_FOCUS = "outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-w-teal";
 
+const NOT_HEARD = "You can't hear the call yet. Tap to hear.";
+
 const LIVE_PHASES = new Set<Phase>(["starting", "connecting", "hearing", "transcribing", "thinking"]);
 
 const LABEL: Record<Phase, string> = {
@@ -48,7 +50,7 @@ const LABEL: Record<Phase, string> = {
 export function VoiceMode({
   agent,
   quickId = null,
-  portrait,
+  about = null,
   minimised,
   slot,
   onMinimise,
@@ -58,7 +60,7 @@ export function VoiceMode({
 }: {
   agent: WorldAgent;
   quickId?: string | null;
-  portrait: string;
+  about?: string | null;
   minimised: boolean;
   slot: HTMLElement | null;
   onMinimise: () => void;
@@ -75,6 +77,7 @@ export function VoiceMode({
   const [fellBack, setFellBack] = useState(false);
   const [settled, setSettled] = useState(false);
   const [ended, setEnded] = useState(false);
+  const [unheard, setUnheard] = useState(false);
   useEffect(() => {
     const id = window.setTimeout(() => setSettled(true), 300);
     return () => window.clearTimeout(id);
@@ -110,6 +113,7 @@ export function VoiceMode({
     setNote(null);
     setError(null);
     setEnded(false);
+    setUnheard(false);
     setLines([]);
     try {
       window.localStorage.setItem(ENGINE_KEY, next);
@@ -126,13 +130,16 @@ export function VoiceMode({
         onPhase: (p) => !cancelled && setPhase(p),
         onCaption: (key, who, text, partial) => !cancelled && caption(key, who, text, partial),
         onError: (message) => !cancelled && setError(message),
+        onSound: (blocked) => !cancelled && setUnheard(blocked),
         onEnd: () => {
           if (cancelled) return;
           liveRef.current = null;
+          setUnheard(false);
           setEnded(true);
         },
       },
       quickId,
+      about,
     )
       .then((call) => {
         if (cancelled) {
@@ -165,7 +172,7 @@ export function VoiceMode({
       void liveRef.current?.close();
       liveRef.current = null;
     };
-  }, [engine, agent.id, quickId, caption]);
+  }, [engine, agent.id, quickId, about, caption]);
 
   useEffect(() => {
     liveRef.current?.setMuted(muted);
@@ -265,10 +272,15 @@ export function VoiceMode({
   }, [agent, say, engine]);
 
   const loading = engine === "device" ? (status.loading.stt ?? status.loading.tts) : null;
-  const problem = error ?? (engine === "device" ? status.error : null);
+  const deviceError = engine === "device" ? status.error : null;
+  const silent = !ended && (engine === "live" ? unheard : deviceError === SOUND_BLOCKED);
+  const problem = error ?? (deviceError === SOUND_BLOCKED ? null : deviceError);
   const elapsed = callClock(clock.seconds);
-  const statusText = ended ? (problem ? `Call ended. ${problem}` : "Call ended") : problem ?? note ?? (muted ? "Muted" : loading !== null ? `Setting up on-device voice (${loading}%)` : LABEL[phase]);
-  const statusLive = !ended && !problem && !note && !muted && (loading !== null || LIVE_PHASES.has(phase));
+  const statusText = ended
+    ? problem ? `Call ended. ${problem}` : "Call ended"
+    : silent ? NOT_HEARD : problem ?? note ?? (muted ? "Muted" : loading !== null ? `Setting up on-device voice (${loading}%)` : LABEL[phase]);
+  const statusLive = !ended && !silent && !problem && !note && !muted && (loading !== null || LIVE_PHASES.has(phase));
+  const hear = () => (engine === "live" ? liveRef.current?.hear() : speech().hear());
   const latest = lines[lines.length - 1];
   const docked = !minimised && slot;
   const showPill = !docked && (minimised || settled);
@@ -284,7 +296,7 @@ export function VoiceMode({
             {!ended && <span className="shrink-0 font-normal tabular-nums text-w-text2">{elapsed}</span>}
             {engine === "live" && clock.usd > 0 && <span className="hidden shrink-0 text-w-xs font-normal text-w-muted @md:inline">{`about $${clock.usd.toFixed(3)}`}</span>}
           </p>
-          <p className={cn("truncate text-w-xs", problem ? "text-w-danger" : "text-w-text2")} aria-live="polite" title={ended ? statusText : undefined}>
+          <p className={cn("truncate text-w-xs", problem || silent ? "text-w-danger" : "text-w-text2")} aria-live="polite" title={ended ? statusText : undefined}>
             {statusLive ? <Shimmer>{statusText}</Shimmer> : statusText}
           </p>
         </div>
@@ -303,6 +315,18 @@ export function VoiceMode({
             </button>
           ))}
         </div>
+        {silent && (
+          <button
+            type="button"
+            onClick={hear}
+            aria-label="Tap to hear the call"
+            title="Play the call's sound on this device"
+            className={cn(CHUNKY, "flex h-10 shrink-0 items-center gap-1.5 bg-w-teal px-3 text-w-sm font-semibold text-w-strong hover:brightness-105")}
+          >
+            <SpeakerHigh size={18} weight="bold" />
+            <span className="hidden @sm:inline">Tap to hear</span>
+          </button>
+        )}
         {ended ? (
           <CloseButton onClose={onHangUp} label="Close the ended call" />
         ) : (
@@ -359,14 +383,17 @@ export function VoiceMode({
             >
               <button
                 type="button"
-                onClick={onRestore}
+                onClick={() => {
+                  if (silent) hear();
+                  onRestore();
+                }}
                 aria-label={`Back to the call with ${agent.name}, ${statusText}, ${elapsed}`}
                 title="Back to the call"
                 className={cn(PILL_FOCUS, "flex min-w-0 items-center gap-2 pl-1.5 pr-3 hover:bg-w-sand")}
               >
-                <AgentAvatar portrait={portrait} emoji={agent.avatar_emoji} size="2rem" soft rounded="rounded-md" />
+                <AgentFace agent={agent} size="2rem" soft rounded="rounded-md" />
                 <span className="min-w-0 max-w-[9rem] truncate font-semibold text-w-strong sm:max-w-[14rem]">{agent.name}</span>
-                <span className={cn("shrink-0", ended ? "text-w-danger" : "tabular-nums text-w-text2")}>{ended ? "Call ended" : elapsed}</span>
+                <span className={cn("shrink-0", ended || silent ? "text-w-danger" : "tabular-nums text-w-text2")}>{ended ? "Call ended" : silent ? "Tap to hear" : elapsed}</span>
               </button>
               {!ended && (
                 <button

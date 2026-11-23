@@ -151,6 +151,9 @@ impl WorldStore {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        if let Err(error) = crate::runners::RunnerStore::new(self.pool().clone()).assign_default_runner(agent_id).await {
+            tracing::warn!(%error, %agent_id, "could not pick a default device for a fork");
+        }
         Ok(Some(Fork { agent_id, wanted_keys: wanted }))
     }
 }

@@ -384,11 +384,13 @@ export const LOKA_ROUTES = {
 export const OPEN_ACADEMY = "world:open-academy";
 
 export type AcademyTarget = {
+  tab?: "courses" | "progress";
   challengeId?: string | null;
   reportId?: string | null;
   attemptId?: string | null;
   courseId?: string | null;
   newPractice?: boolean;
+  request?: number;
 };
 
 export function openAcademy(target: AcademyTarget | string | null = null) {

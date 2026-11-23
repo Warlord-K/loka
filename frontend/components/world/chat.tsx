@@ -1,8 +1,10 @@
 "use client";
 
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { ArrowLeft, CaretRight, ChatsCircle, Hash, PencilSimple, Plus, Star, UserCircle, UsersThree, X } from "@phosphor-icons/react";
 import { latestOnly } from "@/lib/latest";
+import { conversationIsForeground, conversationIsForegroundNow, guardedDetailLoader, type ConversationForeground, type NavigationRequest } from "@/lib/exact-world-navigation";
+import { navigationDetails } from "@/lib/navigation-details";
 import { useTeams } from "@/lib/teams";
 import { cn } from "@/lib/utils";
 import { Shimmer, StatusMark } from "./work-ui";
@@ -27,7 +29,7 @@ import { useDraft, useDraftKeys } from "./drafts";
 import { channelRef, useMessageJump } from "./message-links";
 import { QuotedBlock, QuotePreview, quoteProps, useQuote } from "./quote";
 import { AttachButton, AttachmentGrid, DayDivider, MessageEditor, NewMessagesPill, PendingStrip, RichText, useAgentHandles, useAttachments, useFollowBottom, usePersonHandles, useRefetchOnResume } from "./chat-kit";
-import { AgentAvatar, AgentFace, PersonAvatar, portraitOf, startsGroup } from "./channel-ui";
+import { AgentAvatar, AgentFace, PersonAvatar, portraitOf, startsGroup, useArtVersion } from "./channel-ui";
 import { mentionHandle, useMentionPicker, type MentionCandidate } from "./mention-picker";
 import { EmptyState, GHOST_ICON_BTN, WindowHeader } from "./settings-shell";
 import { escapeTaken } from "@/lib/escape";
@@ -83,7 +85,15 @@ export function ChatPanel({
   focusAgent = null,
   focusChannel = null,
   onSelect,
+  onNavigate,
+  onBeginNavigation,
+  foreground: rootForeground,
+  onClearMessageFocus,
+  compact = false,
 }: {
+  foreground: ConversationForeground;
+  onClearMessageFocus?: () => void;
+  compact?: boolean;
   meId: string | null;
   agents: WorldAgent[];
   canPost?: boolean;
@@ -91,14 +101,16 @@ export function ChatPanel({
   initialAgent?: string | null;
   talkable?: WorldAgent[];
   mainId?: string | null;
-  renderAgent?: (agent: WorldAgent, nav: { back: () => void; open: (id: string) => void }) => ReactNode;
+  renderAgent?: (agent: WorldAgent, nav: { back: () => void; open: (id: string) => void; foreground: ConversationForeground }) => ReactNode;
   onClose: () => void;
   onOpenAgent: (id: string) => void;
   onUnreadChange: () => void;
   agentUnread?: Record<string, number>;
   focusAgent?: { id: string; nonce: number } | null;
-  focusChannel?: { id: string; nonce: number } | null;
+  focusChannel?: { id: string; nonce: number; thread?: { root: number; reply: number }; message?: ChannelMessage; detail?: ChannelDetail } | null;
   onSelect?: (selection: { agentId: string | null; channelId: string | null }) => void;
+  onNavigate?: (target: { kind: "channel" | "chat-agent" | "chat-person"; id: string; loaded?: boolean; detail?: ChannelDetail }, request?: NavigationRequest) => void;
+  onBeginNavigation?: () => NavigationRequest;
 }) {
   const [channels, setChannelState] = useState<ChannelSummary[]>(() => chatCache.channels);
   const [people, setPeopleState] = useState<Person[]>(() => chatCache.people);
@@ -116,6 +128,25 @@ export function ChatPanel({
   const activeChannel = useRef<string | null>(null);
   activeChannel.current = agentId ? null : current;
   const [listOpen, setListOpen] = useState(false);
+  const narrow = useSyncExternalStore(
+    useCallback((notify) => {
+      const query = window.matchMedia("not all and (min-width: 640px)");
+      query.addEventListener("change", notify);
+      return () => query.removeEventListener("change", notify);
+    }, []),
+    () => window.matchMedia("not all and (min-width: 640px)").matches,
+    () => false,
+  );
+  const mobile = compact || narrow;
+  const conversationForeground = { ...rootForeground, mobileList: mobile && listOpen };
+  const conversationVisible = conversationIsForeground(conversationForeground, "chat");
+  const foreground = useRef(conversationForeground);
+  foreground.current = conversationForeground;
+  const wasForeground = useRef(conversationVisible);
+  const backToChats = useCallback(() => {
+    onBeginNavigation?.();
+    setListOpen(true);
+  }, [onBeginNavigation]);
   const listPane = usePaneWidth("chat.list", 18, 12, 30);
   const threadPane = usePaneWidth("chat.thread", 26, 18, 44);
   const setCurrent = useCallback((id: string | null) => {
@@ -127,23 +158,22 @@ export function ChatPanel({
   const openAgentChat = useCallback(
     (id: string) => {
       if (!talkable.some((a) => a.id === id)) return onOpenAgent(id);
+      selectionVersion.current++;
       setAgentId(id);
       setListOpen(false);
     },
     [talkable, onOpenAgent],
   );
-  const focusedNonce = useRef(focusAgent?.nonce ?? 0);
+  const selectAgent = (id: string) => {
+    if (onNavigate && talkable.some((agent) => agent.id === id)) onNavigate({ kind: "chat-agent", id });
+    else openAgentChat(id);
+  };
+  const focusedNonce = useRef(focusAgent?.nonce);
   useEffect(() => {
     if (!focusAgent || focusAgent.nonce === focusedNonce.current) return;
     focusedNonce.current = focusAgent.nonce;
     openAgentChat(focusAgent.id);
   }, [focusAgent, openAgentChat]);
-  const focusedChannelNonce = useRef(focusChannel?.nonce ?? 0);
-  useEffect(() => {
-    if (!focusChannel || focusChannel.nonce === focusedChannelNonce.current) return;
-    focusedChannelNonce.current = focusChannel.nonce;
-    setCurrent(focusChannel.id);
-  }, [focusChannel, setCurrent]);
   const unreadRef = useRef(onUnreadChange);
   unreadRef.current = onUnreadChange;
   const onSelectRef = useRef(onSelect);
@@ -152,10 +182,23 @@ export function ChatPanel({
     onSelectRef.current?.({ agentId, channelId: agentId ? null : current });
   }, [agentId, current]);
   const selectedAgent = agentId ? talkable.find((a) => a.id === agentId) ?? null : null;
-  const [channelDetail, setDetail] = useState<ChannelDetail | null>(null);
+  const [channelDetail, setDetail] = useState<ChannelDetail | null>(focusChannel?.detail ?? null);
+  const focusChannelRef = useRef(focusChannel);
+  focusChannelRef.current = focusChannel;
+  const usedDetail = useRef<number | undefined>(undefined);
   const [channelMessages, setMessages] = useState<ChannelMessage[]>([]);
+  const [deletedMessageKeys, setDeletedMessageKeys] = useState<Set<string>>(() => new Set());
   const detail = channelDetail?.id === current ? channelDetail : null;
-  const messages = useMemo(() => channelMessages.filter((m) => m.channel_id === current), [channelMessages, current]);
+  const loadedMessages = useMemo(
+    () => channelMessages.filter((m) => m.channel_id === current && !deletedMessageKeys.has(`${m.channel_id}:${m.id}`)),
+    [channelMessages, current, deletedMessageKeys],
+  );
+  const focusedSnapshot = focusChannel && focusChannel.id === detail?.id ? focusChannel.message : undefined;
+  const focusedMessage = focusedSnapshot && !deletedMessageKeys.has(`${focusedSnapshot.channel_id}:${focusedSnapshot.id}`) ? focusedSnapshot : undefined;
+  const messages = useMemo(() => {
+    if (!focusedMessage || loadedMessages.some((message) => message.id === focusedMessage.id)) return loadedMessages;
+    return [...loadedMessages, focusedMessage].sort((a, b) => a.id - b.id);
+  }, [focusedMessage, loadedMessages]);
   const [draft, setDraft] = useDraft(`channel:${current ?? "none"}`);
   const [creating, setCreating] = useState(false);
   const [picking, setPicking] = useState(false);
@@ -163,18 +206,31 @@ export function ChatPanel({
   const [newTopic, setNewTopic] = useState("");
   const [adding, setAdding] = useState("");
   const [editing, setEditing] = useState<number | null>(null);
-  const [thread, setThread] = useState<{ channel: string; root: number } | null>(null);
+  const [thread, setThread] = useState<{ channel: string; root: number } | null>(() =>
+    focusChannel?.thread && focusChannel.id === initialChannel ? { channel: focusChannel.id, root: focusChannel.thread.root } : null,
+  );
+  const openLocalThread = (message: ChannelMessage) => {
+    onClearMessageFocus?.();
+    setThread({ channel: message.channel_id, root: message.id });
+  };
+  const closeThread = () => {
+    setThread(null);
+    onClearMessageFocus?.();
+  };
   const endRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement | HTMLInputElement | null>(null);
 
   useEffect(() => {
+    if (!conversationVisible) return;
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && !escapeTaken(e) && onClose();
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [conversationVisible, onClose]);
 
   const [channelLists] = useState(latestOnly);
   const [channelReads] = useState(latestOnly);
+  const [channelCreates] = useState(latestOnly);
+  const channelDetailReads = useRef(guardedDetailLoader()).current;
   const loadChannels = useCallback(function loadChannels() {
     const isLatest = channelLists.begin();
     const selection = selectionVersion.current;
@@ -203,19 +259,43 @@ export function ChatPanel({
       .catch(() => {});
   }, [channelLists, channelReads, setChannels]);
 
+  const focusedChannelNonce = useRef(focusChannel?.nonce);
+  useEffect(() => {
+    if (!focusChannel || focusChannel.nonce === focusedChannelNonce.current) return;
+    focusedChannelNonce.current = focusChannel.nonce;
+    setCurrent(focusChannel.id);
+    if (focusChannel.detail) setDetail(focusChannel.detail);
+    if (!channels.some((channel) => channel.id === focusChannel.id)) loadChannels();
+    setThread(focusChannel.thread ? { channel: focusChannel.id, root: focusChannel.thread.root } : null);
+  }, [channels, focusChannel, loadChannels, setCurrent]);
+
+
   useEffect(() => {
     loadChannels();
     worldApi.people().then(setPeople).catch(() => {});
     return () => { channelLists.begin(); };
   }, [channelLists, loadChannels, setPeople]);
 
+  const removeCommittedMessage = useCallback((channel: string, id: number) => {
+    const key = `${channel}:${id}`;
+    setDeletedMessageKeys((current) => current.has(key) ? current : new Set(current).add(key));
+    setMessages((current) => current.filter((message) => message.channel_id !== channel || message.id !== id));
+  }, []);
+
   const loadCurrent = useCallback(() => {
     if (!current || agentId || activeChannel.current !== current) return;
     const isLatest = channelReads.begin();
     const stillOpen = () => isLatest() && activeChannel.current === current;
-    worldApi.channel(current).then((detail) => {
-      if (stillOpen()) setDetail(detail);
-    }).catch(() => {});
+    const detailIntent = channelDetailReads.begin(stillOpen);
+    const focused = focusChannelRef.current;
+    if (focused?.detail?.id === current && usedDetail.current !== focused.nonce) {
+      usedDetail.current = focused.nonce;
+      setDetail(focused.detail);
+    } else {
+      navigationDetails.channel(detailIntent, current).then((detail) => {
+        if (detail && detailIntent.current()) setDetail(detail);
+      }).catch(() => {});
+    }
     worldApi
       .channelMessages(current)
       .then((m) => {
@@ -227,18 +307,26 @@ export function ChatPanel({
           return keep.length ? [...keep, ...m] : m;
         });
         const last = m[m.length - 1];
-        if (last) void worldApi.markRead(current, last.id).then(() => {
+        if (last && conversationIsForegroundNow(foreground.current, "chat")) void worldApi.markRead(current, last.id).then(() => {
           loadChannels();
           unreadRef.current();
         });
       })
       .catch(() => {});
-  }, [current, agentId, channelReads, loadChannels]);
+  }, [current, agentId, channelReads, channelDetailReads, loadChannels]);
 
   useEffect(() => {
     loadCurrent();
-    return () => { channelReads.begin(); };
-  }, [channelReads, loadCurrent]);
+    return () => {
+      channelReads.begin();
+      channelDetailReads.invalidate();
+    };
+  }, [channelReads, channelDetailReads, loadCurrent]);
+  useEffect(() => {
+    const revealed = conversationVisible && !wasForeground.current;
+    wasForeground.current = conversationVisible;
+    if (revealed) loadCurrent();
+  }, [conversationVisible, loadCurrent]);
   useRefetchOnResume(() => {
     loadChannels();
     loadCurrent();
@@ -255,7 +343,8 @@ export function ChatPanel({
       }
       if (ev.type === "channel.deleted") {
         const gone = Number(ev.payload.message_id);
-        setMessages((cur) => cur.filter((m) => m.id !== gone));
+        const channel = typeof ev.payload.channel_id === "string" ? ev.payload.channel_id : "";
+        if (channel && Number.isFinite(gone)) removeCommittedMessage(channel, gone);
       }
       if (ev.type !== "channel.message" && ev.type !== "channel.edited" && ev.type !== "channel.deleted") return;
       if (ev.payload.channel_id === current) loadCurrent();
@@ -263,13 +352,13 @@ export function ChatPanel({
     };
     window.addEventListener("world-event", onEvent);
     return () => window.removeEventListener("world-event", onEvent);
-  }, [current, loadCurrent, loadChannels]);
+  }, [current, loadCurrent, loadChannels, removeCommittedMessage]);
 
   const lastId = messages[messages.length - 1]?.id;
   const follow = useFollowBottom(endRef, lastId, current);
 
-  const messagesRef = useRef(messages);
-  messagesRef.current = messages;
+  const messagesRef = useRef(loadedMessages);
+  messagesRef.current = loadedMessages;
   const loadOlder = useCallback(async () => {
     const oldest = messagesRef.current[0];
     if (!current || !oldest || oldest.channel_id !== current) return false;
@@ -282,7 +371,7 @@ export function ChatPanel({
     return true;
   }, [current]);
   const messageIds = useMemo(() => (agentId ? [] : messages.filter((m) => m.channel_id === current).map((m) => channelRef(m.id))), [messages, current, agentId]);
-  const highlighted = useMessageJump({ channelId: agentId ? null : current }, messageIds, loadOlder);
+  const highlighted = useMessageJump({ channelId: !conversationVisible || agentId ? null : current }, messageIds, loadOlder);
 
   useEffect(() => {
     if (!current || !detail || window.matchMedia("(pointer: coarse)").matches) return;
@@ -298,9 +387,9 @@ export function ChatPanel({
   const commitDelete = useCallback((item: { channel: string; id: number }) => {
     worldApi
       .deleteChannelMessage(item.channel, item.id)
-      .then(() => setMessages((cur) => cur.filter((m) => m.id !== item.id)))
+      .then(() => removeCommittedMessage(item.channel, item.id))
       .catch((e: Error) => setTrashError(e.message === "409" ? "That message has replies now, so it stays." : "Could not delete that message. Try again."));
-  }, []);
+  }, [removeCommittedMessage]);
   const removeMessage = (channel: string, id: number) => {
     if (trashRef.current) commitDelete(trashRef.current);
     setTrashError(null);
@@ -358,17 +447,25 @@ export function ChatPanel({
   const create = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newName.trim()) return;
+    const creationCurrent = channelCreates.begin();
+    const request = onBeginNavigation?.();
     const ch = await worldApi.createChannel(newName.trim(), newTopic.trim()).catch(() => null);
     if (ch) {
+      loadChannels();
+      if (!creationCurrent() || (request && !request.current())) return;
       setCreating(false);
       setNewName("");
       setNewTopic("");
-      loadChannels();
-      setCurrent(ch.id);
+      if (onNavigate) onNavigate({ kind: "channel", id: ch.id, loaded: true, detail: ch }, request);
+      else setCurrent(ch.id);
     }
   };
 
   const dm = async (p: Person) => {
+    if (onNavigate) {
+      onNavigate({ kind: "chat-person", id: p.id });
+      return;
+    }
     const ch = await worldApi.openDm(p.id).catch(() => null);
     if (ch) {
       loadChannels();
@@ -441,7 +538,7 @@ export function ChatPanel({
     const state = a.status === "error" ? "Needs a fix" : a.status === "waiting" ? "Needs you" : a.status === "thinking" ? "Thinking" : working ? `${a.jobs!.length > 1 ? `${a.jobs!.length} quests` : "On a quest"}` : "Free";
     return (
       <li key={a.id}>
-        <button type="button" onClick={() => openAgentChat(a.id)} title={`${a.name}, ${state.toLowerCase()}`} data-chat-item data-current={on || undefined} data-unread={unread > 0 || undefined} className={cn(NAV_ITEM, on ? NAV_ON : NAV_OFF)}>
+        <button type="button" onClick={() => selectAgent(a.id)} title={`${a.name}, ${state.toLowerCase()}`} data-chat-item data-current={on || undefined} data-unread={unread > 0 || undefined} className={cn(NAV_ITEM, on ? NAV_ON : NAV_OFF)}>
           <span className="relative shrink-0">
             <AgentFace agent={a} size={22} />
             {dot && (
@@ -492,7 +589,8 @@ export function ChatPanel({
     const person = people.find((p) => p.id === owner);
     return `${person ? personName(person) : "Someone"}'s agents`;
   };
-  const portraits = useMemo(() => Object.fromEntries(agents.map((a) => [a.id, portraitOf(a)])), [agents]);
+  const artVersion = useArtVersion();
+  const portraits = useMemo(() => Object.fromEntries(agents.map((a) => [a.id, portraitOf(a)])), [agents, artVersion]);
   const candidates = useMemo<MentionCandidate[]>(() => {
     const members = new Set((detail?.members ?? []).map((m) => `${m.member_kind}:${m.member_id}`));
     const list: MentionCandidate[] = [];
@@ -582,8 +680,13 @@ export function ChatPanel({
   };
 
   return (
-    <div role="dialog" aria-modal="true" aria-label="Chat" className={cn(PANEL, "pointer-events-auto flex h-full w-full flex-col overflow-hidden")}>
-      <WindowHeader title="Chat" subtitle="Channels, teams, agents and direct messages. @mention an agent to pull it in" onClose={onClose} />
+    <div
+      role={compact ? "region" : "dialog"}
+      aria-modal={compact ? undefined : true}
+      aria-label={compact ? "Channels" : "Chat"}
+      className={cn(compact ? "flex h-full w-full flex-col overflow-hidden" : PANEL, !compact && "pointer-events-auto flex h-full w-full flex-col overflow-hidden")}
+    >
+      {!compact && <WindowHeader title="Chat" subtitle="Channels, teams, agents and direct messages. @mention an agent to pull it in" onClose={onClose} />}
       <div className="relative flex min-h-0 flex-1">
         <aside
           ref={asideRef}
@@ -597,8 +700,9 @@ export function ChatPanel({
           }}
           style={listPane.style}
           className={cn(
-            "min-h-0 shrink-0 flex-col overflow-y-auto border-r-2 border-dashed border-w-line2 px-2.5 pb-4 pt-3 text-w-sm sm:flex",
-            listPane.custom ? "sm:w-[var(--pane-w)]" : "sm:w-64 lg:w-72",
+            "min-h-0 shrink-0 flex-col overflow-y-auto border-r-2 border-dashed border-w-line2 px-2.5 pb-4 pt-3 text-w-sm",
+            !compact && "sm:flex",
+            !compact && (listPane.custom ? "sm:w-[var(--pane-w)]" : "sm:w-64 lg:w-72"),
             NAV_GLIDE,
             SIDEBAR,
             listOpen ? "flex w-full" : "hidden",
@@ -614,7 +718,7 @@ export function ChatPanel({
             onArrowDown={() => asideRef.current?.querySelector<HTMLButtonElement>("button[data-chat-item]")?.focus()}
           />
           <ChatSection id="channels" unread={channelsOnly.reduce((n, c) => n + c.unread, 0)} title="Channels" count={channelsOnly.length} collapsed={folded("channels")} onToggle={toggleSection} action={
-            <button type="button" onClick={() => setCreating((c) => !c)} aria-label="New channel" title="New channel" className="grid h-6 w-6 place-items-center rounded-md transition-colors hover:bg-w-paper hover:text-w-text">
+            <button type="button" onClick={() => { onBeginNavigation?.(); setCreating((current) => !current); }} aria-label="New channel" title="New channel" className="grid h-6 w-6 place-items-center rounded-md transition-colors hover:bg-w-paper hover:text-w-text">
               <Plus size={13} weight="bold" />
             </button>
           }>
@@ -628,7 +732,7 @@ export function ChatPanel({
           <ul className="space-y-0.5">
             {channelsOnly.map((c) => (
               <li key={c.id}>
-                <button type="button" onClick={() => setCurrent(c.id)} data-chat-item data-current={(!agentId && current === c.id) || undefined} data-unread={c.unread > 0 || undefined} className={cn(NAV_ITEM, !agentId && current === c.id ? NAV_ON : NAV_OFF)}>
+                <button type="button" onClick={() => onNavigate ? onNavigate({ kind: "channel", id: c.id, loaded: true }) : setCurrent(c.id)} data-chat-item data-current={(!agentId && current === c.id) || undefined} data-unread={c.unread > 0 || undefined} className={cn(NAV_ITEM, !agentId && current === c.id ? NAV_ON : NAV_OFF)}>
                   <span className="grid h-[1.375rem] w-[1.375rem] shrink-0 place-items-center text-w-muted">
                     <Hash size={15} weight="bold" />
                   </span>
@@ -645,7 +749,7 @@ export function ChatPanel({
             <ul className="space-y-0.5">
               {teamChannels.map((c) => (
                 <li key={c.id}>
-                  <button type="button" onClick={() => setCurrent(c.id)} data-chat-item data-current={(!agentId && current === c.id) || undefined} data-unread={c.unread > 0 || undefined} className={cn(NAV_ITEM, !agentId && current === c.id ? NAV_ON : NAV_OFF)}>
+                  <button type="button" onClick={() => onNavigate ? onNavigate({ kind: "channel", id: c.id, loaded: true }) : setCurrent(c.id)} data-chat-item data-current={(!agentId && current === c.id) || undefined} data-unread={c.unread > 0 || undefined} className={cn(NAV_ITEM, !agentId && current === c.id ? NAV_ON : NAV_OFF)}>
                     <span className="grid h-[1.375rem] w-[1.375rem] shrink-0 place-items-center text-w-muted">
                       <UsersThree size={15} weight="bold" />
                     </span>
@@ -686,15 +790,15 @@ export function ChatPanel({
           )}
         </aside>
 
-        <section className={cn("min-w-0 flex-1 flex-col", listOpen ? "hidden sm:flex" : "flex")}>
+        <section className={cn("min-w-0 flex-1 flex-col", listOpen ? cn("hidden", !compact && "sm:flex") : "flex")}>
           {selectedAgent && renderAgent ? (
             <div key={selectedAgent.id} className="flex min-h-0 flex-1 animate-[fade-in_160ms_ease-out] flex-col">
-              {renderAgent(selectedAgent, { back: () => setListOpen(true), open: openAgentChat })}
+              {renderAgent(selectedAgent, { back: backToChats, open: selectAgent, foreground: conversationForeground })}
             </div>
           ) : detail ? (
             <>
               <header className="flex items-center gap-3 border-b-2 border-dashed border-w-line2 px-3 py-3 sm:px-5">
-                <button type="button" onClick={() => setListOpen(true)} aria-label="Back to chats" className={cn(GHOST_ICON_BTN, "sm:hidden")}>
+                <button type="button" onClick={backToChats} aria-label="Back to chats" className={cn(GHOST_ICON_BTN, !compact && "sm:hidden")}>
                   <ArrowLeft size={18} weight="bold" />
                 </button>
                 {detail.kind === "dm" ? (
@@ -788,7 +892,7 @@ export function ChatPanel({
                         className="sm:px-5"
                         avatar={
                           m.author_kind === "agent" ? (
-                            <button type="button" onClick={() => agent && openAgentChat(agent.id)} aria-label={`Open ${name}`}>
+                            <button type="button" onClick={() => agent && selectAgent(agent.id)} aria-label={`Open ${name}`}>
                               <AgentAvatar portrait={agent ? portraits[agent.id] : null} emoji={m.author_emoji} soft />
                             </button>
                           ) : (
@@ -796,12 +900,12 @@ export function ChatPanel({
                           )
                         }
                         header={
-                          <MessageAuthor name={name} onOpen={agent ? () => openAgentChat(agent.id) : undefined} agent={m.author_kind === "agent"} you={mine} createdAt={m.created_at} editedAt={m.edited_at}>
+                          <MessageAuthor name={name} onOpen={agent ? () => selectAgent(agent.id) : undefined} agent={m.author_kind === "agent"} you={mine} createdAt={m.created_at} editedAt={m.edited_at}>
                             {m.meta?.spoken && <SpokenMark />}
                           </MessageAuthor>
                         }
                         actions={{
-                          onReply: () => setThread({ channel: m.channel_id, root: m.id }),
+                          onReply: () => openLocalThread(m),
                           copy: m.body,
                           link: channelRef(m.id),
                           onEdit: canPost && mine && !!m.body ? () => setEditing(m.id) : undefined,
@@ -815,7 +919,7 @@ export function ChatPanel({
                             {m.meta?.quote && <QuotedBlock quote={m.meta.quote} />}
                             <div {...quoteProps(`msg:${channelRef(m.id)}`, `${name}'s message${detail.kind === "dm" ? "" : ` in #${detail.name}`}`, `channel:${m.channel_id}`)}>
                               <RunCommandContext.Provider value={runnerOf(m)}>
-                                <RichText text={m.body} handles={agentsByHandle} people={peopleByHandle} onOpenAgent={openAgentChat} onOpenPerson={openPerson} className="select-text text-w-text" />
+                                <RichText text={m.body} handles={agentsByHandle} people={peopleByHandle} onOpenAgent={selectAgent} onOpenPerson={openPerson} className="select-text text-w-text" />
                               </RunCommandContext.Provider>
                             </div>
                             {!first && m.edited_at && <span className="text-w-3xs text-w-faint">(edited)</span>}
@@ -823,7 +927,7 @@ export function ChatPanel({
                           </>
                         )}
                         <AttachmentGrid items={m.meta?.attachments ?? []} />
-                        <RepliesButton count={m.reply_count ?? 0} lastAt={m.last_reply_at} authors={m.reply_authors} agents={agents} onOpen={() => setThread({ channel: m.channel_id, root: m.id })} />
+                        <RepliesButton count={m.reply_count ?? 0} lastAt={m.last_reply_at} authors={m.reply_authors} agents={agents} onOpen={() => openLocalThread(m)} />
                       </MessageRow>
                     </Fragment>
                   );
@@ -902,7 +1006,7 @@ export function ChatPanel({
                 title="Pick a chat"
                 description="Talk to an agent, a channel or a teammate."
                 action={
-                  <button type="button" onClick={() => setListOpen(true)} className={cn(BTN_SECONDARY, "sm:hidden")}>
+                  <button type="button" onClick={backToChats} className={cn(BTN_SECONDARY, !compact && "sm:hidden")}>
                     Show chats
                   </button>
                 }
@@ -910,15 +1014,16 @@ export function ChatPanel({
             </div>
           )}
         </section>
-        {openThread !== null && current && detail && <PaneResizer pane={threadPane} edge="left" label="Resize the thread" className="hidden lg:block" />}
+        {openThread !== null && current && detail && !compact && <PaneResizer pane={threadPane} edge="left" label="Resize the thread" className="hidden lg:block" />}
         {openThread !== null && current && detail && (
           <ThreadPanel
+            visible={conversationVisible}
             style={threadPane.style}
             key={`${current}:${openThread}`}
             title="Thread"
             subtitle={detail.kind === "dm" ? dmTitle(detail) : `#${detail.name}`}
             draftKey={`channel:${current}:thread:${openThread}`}
-            load={() => worldApi.channelReplies(current, openThread).then((rows) => rows.map(threadItem))}
+            load={(intent) => navigationDetails.channelReplies(intent, current, focusChannel?.thread?.root === openThread ? focusChannel.thread.reply : openThread).then((rows) => rows?.map(threadItem))}
             refreshOn={(ev) =>
               (ev.type === "channel.message" || ev.type === "channel.edited" || ev.type === "channel.deleted") &&
               ev.payload.channel_id === current &&
@@ -933,12 +1038,13 @@ export function ChatPanel({
             canPost={canPost}
             handles={agentsByHandle}
             people={peopleByHandle}
-            onOpenAgent={openAgentChat}
+            onOpenAgent={selectAgent}
             onOpenPerson={openPerson}
             candidates={candidates}
             typing={<TypingLine channelId={current} replyTo={openThread} />}
-            onClose={() => setThread(null)}
-            className={cn("absolute inset-0 z-20 lg:static lg:shrink-0 lg:border-l-2 lg:border-dashed lg:border-w-line2", threadPane.custom ? "lg:w-[var(--pane-w)]" : "lg:w-[26rem]")}
+            focus={focusChannel?.thread?.root === openThread ? { id: String(focusChannel.thread.reply), nonce: focusChannel.nonce } : null}
+            onClose={closeThread}
+            className={cn("absolute inset-0 z-20", !compact && "lg:static lg:shrink-0 lg:border-l-2 lg:border-dashed lg:border-w-line2", !compact && (threadPane.custom ? "lg:w-[var(--pane-w)]" : "lg:w-[26rem]"))}
           />
         )}
       </div>

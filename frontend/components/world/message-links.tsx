@@ -85,10 +85,10 @@ export function channelRef(id: number): string {
 const cache = new Map<string, Promise<LinkedMessage | null>>();
 const resolved = new Map<string, LinkedMessage>();
 
-export function resolveMessage(ref: string): Promise<LinkedMessage | null> {
+export function resolveMessage(ref: string, fresh = false): Promise<LinkedMessage | null> {
   const key = ref.toLowerCase();
   const hit = cache.get(key);
-  if (hit) return hit;
+  if (hit && !fresh) return hit;
   const pending = fetch(`/api/world/messages/${encodeURIComponent(ref)}`)
     .then((r) => (r.ok ? (r.json() as Promise<LinkedMessage>) : null))
     .catch(() => null)
@@ -97,7 +97,7 @@ export function resolveMessage(ref: string): Promise<LinkedMessage | null> {
       else resolved.set(key, found);
       return found;
     });
-  cache.set(key, pending);
+  if (!fresh) cache.set(key, pending);
   return pending;
 }
 
@@ -120,11 +120,11 @@ export function openMessage(link: LinkedMessage) {
   window.dispatchEvent(new CustomEvent<LinkedMessage>("world:open-message", { detail: link }));
 }
 
-type Jump = { id: string; agentId: string | null; channelId: string | null };
+type Jump = { id: string; agentId: string | null; channelId: string | null; current: () => boolean };
 let pendingJump: Jump | null = null;
 
-export function requestJump(link: LinkedMessage) {
-  pendingJump = { id: link.ref, agentId: link.agent_id, channelId: link.channel_id };
+export function requestJump(link: LinkedMessage, current: () => boolean = () => true) {
+  pendingJump = { id: link.ref, agentId: link.agent_id, channelId: link.channel_id, current };
   window.dispatchEvent(new Event("world:message-jump"));
 }
 
@@ -155,6 +155,10 @@ export function useMessageJump(
   useEffect(() => {
     const target = pendingJump;
     if (!target) return;
+    if (!target.current()) {
+      if (pendingJump === target) pendingJump = null;
+      return;
+    }
     const mine = scope.agentId ? target.agentId === scope.agentId : !!scope.channelId && target.channelId === scope.channelId;
     if (!mine) return;
     if (ids.includes(target.id)) {
@@ -162,6 +166,7 @@ export function useMessageJump(
       pages.current = 0;
       foundRef.current?.(target.id);
       window.setTimeout(() => {
+        if (!target.current() || pendingJump && pendingJump !== target) return;
         const el = document.querySelector(`[data-message-id="${CSS.escape(target.id)}"]`);
         if (!el) return;
         const far = Math.abs(el.getBoundingClientRect().top - window.innerHeight / 2) > window.innerHeight * 1.5;
@@ -184,6 +189,7 @@ export function useMessageJump(
       .catch(() => false)
       .then((more) => {
         loading.current = false;
+        if (!target.current() || pendingJump !== target) return;
         if (!more) {
           pendingJump = null;
           pages.current = 0;

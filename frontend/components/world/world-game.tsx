@@ -1,7 +1,6 @@
 "use client";
 
-import { focusTodo } from "./todos-ui";
-import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState, type RefObject } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState, useSyncExternalStore, type CSSProperties, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import dynamic from "next/dynamic";
 import { ArrowRight, Archive, CaretDown, ArrowLeft, CaretRight, Waveform, ChatCircleDots, TerminalWindow, ClockCounterClockwise, GitFork, GearSix, MoonStars, Scroll, Sun, SunHorizon, Clock, Sword, Ear, Lightning, Pause, Play, Plus, X, House, PawPrint, Tree, MapPin, Info, Star, User as UserIcon, UsersThree, UsersFour } from "@phosphor-icons/react";
@@ -28,14 +27,22 @@ import {
   type WorldAgent,
   type WorldItem,
   type WorldEvent,
+  type Todo,
+  type ChannelMessage,
+  type ChannelDetail,
+  type QuestRoomPage,
   type Notifications,
   type RunnerView,
   type SetupAction,
+  LIVE_EVENTS,
+  SIGNAL_EVENT,
 } from "@/lib/world";
 import type { Opens, Progress, RegionDetail, Region, Surface } from "@/lib/loka";
-import { openExactDestination, revealExactMap, type ExactMapDestination, type ExactWorldLink } from "@/lib/exact-world-navigation";
+import { applyNavigationDestination, conversationIsForeground, conversationIsForegroundNow, foregroundWindowLayer, guardedDetailLoader, raiseWindowLayer, type WindowLayer, navigationRequests, resolveMessageJump, resolveExactDestination, revealExactMap, runNavigation, type ConversationForeground, type ConversationSurface, type ExactDestination, type ExactMapDestination, type ExactWorldLink, type NavigationRequest } from "@/lib/exact-world-navigation";
+import { navigationCollections, navigationDetails } from "@/lib/navigation-details";
 import { OPEN_ACADEMY, type AcademyTarget } from "@/lib/loka";
-import { portraitUrl } from "./characters";
+import { questNeedsYou } from "@/lib/quest-status";
+import { EMPTY_STORE, OPEN_WORKSPACE, layoutFor, layoutKey as workspaceLayoutKey, readStore, remember, type WorkspaceLayout, type WorkspaceStore } from "@/lib/workspace-layout";
 import { targetKey, LokaEngine, type Target, type TimeOfDay } from "./engine";
 import { arrivalFor, buildWorld, HEARTH, type World } from "./world";
 import { buildWorld as buildClassicWorld } from "./world-classic";
@@ -65,25 +72,26 @@ import { openQuickChat, QUICK_CHAT_EVENT, QuickChatWindow } from "./quick-chat";
 import { ListsPanel } from "./items-ui";
 import { TeamsView } from "./teams-ui";
 import { StarterTeamCard } from "./starter-team-ui";
-import { teamsApi, useTeams } from "@/lib/teams";
+import { TEAMS_CHANGED, TeamRequestError, teamsApi, useTeams, type Team } from "@/lib/teams";
 import { newerSeq, resyncHead, streamUrl } from "@/lib/stream-resume";
-import { REPORTS_STALE } from "@/lib/reports";
-import { ATTEMPT_ID, openPractice, practiceApi, PRACTICE_VOICE } from "@/lib/practice";
+import { REPORTS_STALE, reportsApi, type ReportDetail } from "@/lib/reports";
+import { ATTEMPT_ID, ATTEMPT_ITEM, openPractice, practiceApi, PRACTICE_VOICE } from "@/lib/practice";
 import { OPEN_CHANGELOG, primeChangelog, unseenChangelog } from "@/lib/changelog";
 import { everyoneNow, ownsAgent, ScopeToggle, useEveryone } from "./scope";
 import { playSound, unlockSounds, type SoundKind } from "./sounds";
 import { SETUP_EVENT, useFeature } from "./setup-hint";
-import { OPEN_TERMINAL_EVENT, runCommandFor, useRunCommand, type OpenTerminal } from "./run-command";
+import { OPEN_TERMINAL_EVENT, runCommandFor, useAppRunner, useRunCommand, type OpenTerminal } from "./run-command";
 import { ChatPanel } from "./chat";
 import { engineChoice, VoiceMode } from "./voice-mode";
 import { primeLiveAudio } from "./live-voice";
 import { callReducer, isCallOf, NO_CALL } from "@/lib/call-state";
+import { CALL_ABOUT_EVENT, readAbout } from "@/lib/canvas-quote";
 import { EquipCard, OmpModelsSection } from "./omp-models";
 import { ContextButton, ContextMeter, useAgentContext } from "./context-control";
 import { ApprovalRow, QuestContextRow, ReviewerRow, KitSection, MainAgentRow, PowersSection, ResetContextRow, TidyHistoryRow, UsageSection, RemoveAgentButton, ArchiveAgentRow, SchedulesSection, SubscriptionsSection, FeedsSection, TagChips } from "./agent-manage";
 import { AgentRunnerSelector, DesktopStatusButton } from "./desktop-devices";
 import { OfflineBanner } from "./offline-banner";
-import { DesktopCommandPalette, takeAgentTab, useAgentTabRequests } from "./desktop-command-palette";
+import { DesktopCommandPalette } from "./desktop-command-palette";
 import { LocalPathContext } from "./local-path";
 import type { OpenWorkshopDetail } from "./workbench/bridge";
 import { useRecentAgentTabs } from "./desktop-recent-tabs";
@@ -115,8 +123,10 @@ import {
   useAttachments,
   useTurnOptions,
 } from "./chat-kit";
+import { BrowserHelpButton, BrowserViews, WatchBrowserButton } from "./browser-view";
 import { MAIN_TARGET, QUOTE_EVENT, QuoteSelection, QuotedBlock, QuotePreview, quoteProps, sendQuote, useQuote, type MessageQuote } from "./quote";
 import { RepliesButton, ThreadPanel, type ThreadItem } from "./thread-panel";
+import { RUN_END_EVENTS } from "@/lib/thread-wait";
 import { MessageAuthor, MessageRow, MessageToolbar, type MessageActions } from "./message-row";
 import { AgentStatus, JobList, LiveJobLine, Shimmer, STATUS_LABEL, StatusMark } from "./work-ui";
 import { TYPING_EVENT } from "./typing";
@@ -124,25 +134,52 @@ import { SEEN_EVENT } from "./seen";
 import { ShellRunCard } from "./shell-run";
 import { useDraft } from "./drafts";
 import { ChangelogPanel, CreateAgentDialog, FolderWorkshop, preloadPanels, QuestRoom, ReportsPanel, TerminalPanel, UiCard, YouPanel } from "./lazy";
-import type { TerminalReader, TerminalRequest } from "./terminal";
+import type { TerminalCommand, TerminalPlace, TerminalReader, TerminalRequest } from "./terminal";
+import type { TerminalPaletteCommand } from "./desktop-command-palette";
+import { DOCK_SIZE, deviceChoices, layoutKey, loadLayout } from "@/lib/terminal-layout";
 import type { TypedReport } from "@/lib/terminal-type";
 
 const QUOTE_KEEP_MS = 10 * 60_000;
 import { attachesByDefault } from "@/lib/terminal-context";
-import { HIGHLIGHT, LinkButton, openMessage, openWorldLink, requestJump, resolveMessage, useMessageJump, WorldLinkButton, type LinkedMessage } from "./message-links";
+import { HIGHLIGHT, LinkButton, openWorldLink, requestJump, useMessageJump, WorldLinkButton, type LinkedMessage } from "./message-links";
 import { draftsFrom, MilestoneDraftEditor, MilestoneList, milestoneProgress } from "./milestones-ui";
 import { AssigneeBadge, assigneeName, paceLabel, SelectionBar, StatusIcon, statusLabel, useQuestControls, type QuestViewer } from "./quest-ui";
 import type { Accessory, Trade } from "./types";
 import { LookFields } from "./look-fields";
 import { declaredAccessories, unknownAccessories } from "@/lib/looks";
-import { atLeast, BellButton, Hotbar, HOTBAR_ICONS, PlayerCard, Toasts, type Me, type Toast } from "./hud";
+import { atLeast, BellButton, Hotbar, HOTBAR_ICONS, PlayerCard, Toasts, type BeforeBigWork, type Me, type Toast } from "./hud";
 import { CLOSE_BTN, CloseButton, EmptyState, GHOST_ICON_BTN, InfoNote, SettingsGroup, WindowHeader } from "./settings-shell";
-import { AgentAvatar, AgentFace, PersonAvatar, startsGroup } from "./channel-ui";
+import { AgentAvatar, AgentFace, PersonAvatar, startsGroup, usePortrait } from "./channel-ui";
 import { FindBar } from "./find-bar";
 import { PaneResizer, usePaneWidth } from "./pane-resizer";
 import { cliName, modelName, runtimeName } from "@/lib/model-names";
 import { SEND_RETRY_DELAYS, notSent, sendFailure } from "@/lib/send-failure";
 import { chooseNewArt, newArtOn, retryDelay, showNewArt } from "./sprites";
+
+type ReportTarget = { id: string | null; item?: string | null; title?: string; missing?: () => void; loaded?: boolean; detail?: ReportDetail; request?: number; workspace?: boolean };
+
+type NavigationTarget =
+  | { kind: "surface"; show: (request: NavigationRequest) => void; keepSideChat?: boolean; preservePanels?: boolean }
+  | { kind: "assistant" }
+  | { kind: "agent"; id: string; agent?: WorldAgent; tab?: "work" }
+  | { kind: "quest"; id: string; agentId?: string | null; loaded?: boolean; page?: QuestRoomPage }
+  | ({ kind: "report" | "canvas" } & ReportTarget)
+  | { kind: "academy"; target: AcademyTarget }
+  | { kind: "practice"; id: string }
+  | { kind: "todo"; id: string; todo?: Todo }
+  | { kind: "person"; id: string }
+  | { kind: "channel" | "chat-agent" | "chat-person"; id: string; loaded?: boolean; detail?: ChannelDetail }
+  | { kind: "message"; ref: string }
+  | (ExactWorldLink & { item?: WorldItem });
+
+type AgentMessageFocus = { agentId: string; nonce: number; surface: "chat" | "agent"; message?: AgentMessage; thread?: { root: string; reply: string } };
+
+type ResolvedNavigation =
+  | Exclude<NavigationTarget, ExactWorldLink | { kind: "assistant" } | { kind: "message"; ref: string } | { kind: "practice"; id: string } | { kind: "todo"; id: string }>
+  | (ExactDestination & { item?: WorldItem; team?: Team; teamAccess?: number })
+  | { kind: "message"; link: LinkedMessage; thread?: { root: number; reply: number }; message?: ChannelMessage; agentMessage?: AgentMessage; agentThread?: { root: string; reply: string } }
+  | { kind: "practice"; reportId: string; attemptId: string }
+  | { kind: "todo"; id: string; todo: Todo };
 
 const Workbench = dynamic(() => import("./workbench/workbench").then((m) => m.Workbench), {
   ssr: false,
@@ -162,6 +199,15 @@ const TIMES: { id: TimeOfDay; label: string; Icon: typeof Sun }[] = [
 
 const NOOP = () => {};
 const SIDE_KEY = "world.sidechat";
+const useForegroundState = useState;
+const useForegroundAction = useCallback;
+
+const subscribeDocumentVisibility = (notify: () => void) => {
+  document.addEventListener("visibilitychange", notify);
+  return () => document.removeEventListener("visibilitychange", notify);
+};
+const documentIsVisible = () => document.visibilityState === "visible";
+const documentVisibleOnServer = () => true;
 
 const WELCOMED_KEY = "world.welcomed";
 
@@ -224,7 +270,6 @@ function bellWorthy(ev: WorldEvent, me: string | undefined): boolean {
     case "task.finished":
       return typeof p.error === "string" && p.error !== "";
     case "agent.budget":
-    case "org.budget":
       return p.paused === true;
     case "agent.status":
       return p.status === "error";
@@ -360,6 +405,64 @@ function describe(e: WorldEvent, names: Map<string, string>): string | null {
   }
 }
 
+function stageInset(place: TerminalPlace): CSSProperties {
+  const size = `${place.size * 100}`;
+  if (place.dock === "bottom") return { bottom: `${size}vh` };
+  if (place.dock === "left") return { left: `${size}vw` };
+  if (place.dock === "right") return { right: `${size}vw` };
+  return {};
+}
+
+function dockBox(place: TerminalPlace): CSSProperties {
+  const size = `${place.size * 100}`;
+  if (place.dock === "bottom") return { left: 0, right: 0, bottom: 0, height: `${size}vh` };
+  if (place.dock === "left") return { top: 0, bottom: 0, left: 0, width: `${size}vw` };
+  return { top: 0, bottom: 0, right: 0, width: `${size}vw` };
+}
+
+function DockResizer({ place, onSize }: { place: TerminalPlace; onSize: (size: number) => void }) {
+  const vertical = place.dock === "bottom";
+  const sizeAt = (x: number, y: number) =>
+    place.dock === "bottom" ? 1 - y / window.innerHeight : place.dock === "left" ? x / window.innerWidth : 1 - x / window.innerWidth;
+  const clamp = (size: number) => Math.min(0.8, Math.max(0.18, size));
+  return (
+    <div
+      role="separator"
+      tabIndex={0}
+      aria-orientation={vertical ? "horizontal" : "vertical"}
+      aria-label="Resize the terminal"
+      aria-valuenow={Math.round(place.size * 100)}
+      onPointerDown={(e) => {
+        e.preventDefault();
+        const handle = e.currentTarget;
+        handle.setPointerCapture(e.pointerId);
+        const move = (ev: PointerEvent) => onSize(clamp(sizeAt(ev.clientX, ev.clientY)));
+        const end = () => {
+          handle.removeEventListener("pointermove", move);
+          handle.removeEventListener("pointerup", end);
+          handle.removeEventListener("pointercancel", end);
+        };
+        handle.addEventListener("pointermove", move);
+        handle.addEventListener("pointerup", end);
+        handle.addEventListener("pointercancel", end);
+      }}
+      onKeyDown={(e) => {
+        const grow = place.dock === "bottom" ? "ArrowUp" : place.dock === "left" ? "ArrowRight" : "ArrowLeft";
+        const shrink = place.dock === "bottom" ? "ArrowDown" : place.dock === "left" ? "ArrowLeft" : "ArrowRight";
+        if (e.key !== grow && e.key !== shrink) return;
+        e.preventDefault();
+        onSize(clamp(place.size + (e.key === grow ? 0.04 : -0.04)));
+      }}
+      className={cn(
+        "absolute z-10 outline-none hover:bg-w-term-focus/60 focus-visible:bg-w-term-focus",
+        place.dock === "bottom" && "inset-x-0 top-0 h-1.5 cursor-row-resize",
+        place.dock === "left" && "inset-y-0 right-0 w-1.5 cursor-col-resize",
+        place.dock === "right" && "inset-y-0 left-0 w-1.5 cursor-col-resize",
+      )}
+    />
+  );
+}
+
 function TerminalSlot({ node, holder }: { node: HTMLDivElement | null; holder: RefObject<HTMLDivElement | null> }) {
   const slot = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
@@ -375,12 +478,14 @@ function TerminalSlot({ node, holder }: { node: HTMLDivElement | null; holder: R
 
 function AgentDialog({
   agent,
-  portrait,
   asides,
   onAside,
   onHistory,
   agents,
   onOpenAgent,
+  onNavigate,
+  onBeginNavigation,
+  onForked,
   onAgentUpdated,
   canInstall,
   onVoice,
@@ -397,7 +502,19 @@ function AgentDialog({
   progress = null,
   onCallSlot,
   attach,
+  messageFocus,
+  foreground,
+  surface,
+  onClearMessageFocus,
+  requestedTab,
+  onRequestedTabApplied,
 }: {
+  foreground: ConversationForeground;
+  surface: ConversationSurface;
+  onClearMessageFocus?: () => void;
+  messageFocus?: AgentMessageFocus;
+  requestedTab?: { nonce: number; tab: "work" };
+  onRequestedTabApplied?: (nonce: number) => void;
   attach?: { on: string; off: string; read: () => MessageQuote | null };
   embedded?: boolean;
   compact?: boolean;
@@ -408,12 +525,14 @@ function AgentDialog({
   isMain: boolean;
   onMakeMain: () => Promise<void>;
   agent: WorldAgent;
-  portrait: string;
   asides: Set<string>;
   onAside: (sessionId: string) => void;
   onHistory: (focus?: SessionFocus) => void;
   agents: WorldAgent[];
   onOpenAgent: (id: string) => void;
+  onNavigate: (select: () => void) => void;
+  onBeginNavigation: () => NavigationRequest;
+  onForked: (agent: WorldAgent, request: NavigationRequest) => void;
   onAgentUpdated: (agent: WorldAgent) => void;
   canInstall: boolean;
   onVoice: () => void;
@@ -422,7 +541,10 @@ function AgentDialog({
   injected: { text: string; nonce: number; agentId: string } | null;
   onVoiceSent: (agentId: string) => void;
 }) {
-  const [tab, setTab] = useState<"talk" | "aside" | "work" | "settings">(() => takeAgentTab(agent.id) ?? (access.use ? "talk" : "work"));
+  const active = conversationIsForeground(foreground, surface);
+  const conversationForegroundRef = useRef(foreground);
+  conversationForegroundRef.current = foreground;
+  const [tab, setTab] = useState<"talk" | "aside" | "work" | "settings">(() => access.use ? "talk" : "work");
   const callSlotEl = useRef<HTMLElement | null>(null);
   const callSlotRef = useCallback(
     (el: HTMLDivElement | null) => {
@@ -436,8 +558,18 @@ function AgentDialog({
     },
     [onCallSlot],
   );
-  useAgentTabRequests(agent.id, setTab);
+  const appliedTabRequest = useRef<number | null>(null);
+  useEffect(() => {
+    if (!active || !requestedTab || appliedTabRequest.current === requestedTab.nonce) return;
+    setTab(requestedTab.tab);
+  }, [active, requestedTab]);
+  useEffect(() => {
+    if (!active || !requestedTab || tab !== requestedTab.tab || appliedTabRequest.current === requestedTab.nonce) return;
+    appliedTabRequest.current = requestedTab.nonce;
+    onRequestedTabApplied?.(requestedTab.nonce);
+  }, [active, onRequestedTabApplied, requestedTab, tab]);
   const [forkArmed, setForkArmed] = useState(false);
+  const browserFeature = useFeature("browser");
   const [about, setAbout] = useState(false);
   const [forking, setForking] = useState(false);
   const fork = async () => {
@@ -445,11 +577,12 @@ function AgentDialog({
       setForkArmed(true);
       return;
     }
+    const request = onBeginNavigation();
     setForking(true);
     try {
       const copy = await worldApi.fork(agent.id);
       onAgentUpdated(copy);
-      onOpenAgent(copy.id);
+      onForked(copy, request);
     } catch {
       setError("Could not fork them.");
     } finally {
@@ -468,12 +601,17 @@ function AgentDialog({
       setPausing(false);
     }
   };
-  const [messages, setMessages] = useState<AgentMessage[]>(() => MESSAGE_CACHE.get(agent.id) ?? []);
+  const [loadedMessages, setMessages] = useState<AgentMessage[]>(() => MESSAGE_CACHE.get(agent.id) ?? []);
+  const exactMessage = messageFocus?.message;
+  const messages = useMemo(() => {
+    if (!exactMessage || loadedMessages.some((message) => message.id === exactMessage.id)) return loadedMessages;
+    return [...loadedMessages, exactMessage].sort((a, b) => a.created_at.localeCompare(b.created_at));
+  }, [exactMessage, loadedMessages]);
   const [historyFor, setHistoryFor] = useState<string | null>(() => (MESSAGE_CACHE.has(agent.id) ? agent.id : null));
   const [tasks, setTasks] = useState<TaskBrief[]>(() => TASK_CACHE.get(agent.id) ?? []);
   useEffect(() => {
-    if (historyFor === agent.id) MESSAGE_CACHE.set(agent.id, messages.slice(-150));
-  }, [messages, historyFor, agent.id]);
+    if (historyFor === agent.id) MESSAGE_CACHE.set(agent.id, loadedMessages.slice(-150));
+  }, [loadedMessages, historyFor, agent.id]);
   useEffect(() => {
     TASK_CACHE.set(agent.id, tasks);
   }, [tasks, agent.id]);
@@ -493,12 +631,23 @@ function AgentDialog({
   const [fixCi, setFixCi] = useState(false);
   const [editing, setEditing] = useState<string | null>(null);
   const [thread, setThread] = useState<string | null>(null);
+  const openLocalThread = (id: string) => {
+    onClearMessageFocus?.();
+    setThread(id);
+  };
+  const focusNonce = useRef(0);
+  useEffect(() => {
+    if (!messageFocus || messageFocus.nonce === focusNonce.current) return;
+    focusNonce.current = messageFocus.nonce;
+    setThread(messageFocus.thread?.root ?? null);
+    if (messageFocus.thread) setTab("talk");
+  }, [messageFocus]);
   const [asking, setAsking] = useState(false);
   const [outgoing, setOutgoing] = useState<{ text: string; files: number; status?: string } | null>(null);
   const [waiting, setWaiting] = useState<{ after: string | undefined } | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement | HTMLInputElement | null>(null);
-  useEscape(embedded ? NOOP : onClose);
+  useEscape(embedded || !active ? NOOP : onClose);
   useEffect(() => {
     if (tab !== "talk" && tab !== "aside") return;
     if (!window.matchMedia("(pointer: fine)").matches) return;
@@ -518,31 +667,28 @@ function AgentDialog({
   }, [agent.id, tab]);
   const lastMessageId = messages.length ? messages[messages.length - 1].id : null;
   const inTalk = tab === "talk" && access.use;
+  const canMarkSeen = active && inTalk;
+  const receiptVisible = useRef(canMarkSeen);
+  receiptVisible.current = canMarkSeen;
   const markSeen = useCallback(() => {
-    if (document.visibilityState !== "visible") return;
+    if (!receiptVisible.current || !conversationIsForegroundNow(conversationForegroundRef.current, surface)) return;
     void worldApi
       .seenAgent(agent.id)
       .then(() => window.dispatchEvent(new Event("world:notes-stale")))
       .catch(() => {});
-  }, [agent.id]);
+  }, [agent.id, surface]);
   useEffect(() => {
-    if (inTalk && lastMessageId) markSeen();
-  }, [inTalk, lastMessageId, markSeen]);
+    if (canMarkSeen && lastMessageId) markSeen();
+  }, [canMarkSeen, lastMessageId, markSeen]);
   useEffect(() => {
-    if (!inTalk) return;
-    const mark = markSeen;
+    if (!canMarkSeen) return;
     const onEvent = (e: Event) => {
       const ev = (e as CustomEvent<WorldEvent>).detail;
-      if (ev.type === "message.created" && ev.agent_id === agent.id) mark();
+      if (ev.type === "message.created" && ev.agent_id === agent.id) markSeen();
     };
-    document.addEventListener("visibilitychange", mark);
     window.addEventListener("world-event", onEvent);
-    return () => {
-      document.removeEventListener("visibilitychange", mark);
-      window.removeEventListener("world-event", onEvent);
-      mark();
-    };
-  }, [inTalk, agent.id, markSeen]);
+    return () => window.removeEventListener("world-event", onEvent);
+  }, [canMarkSeen, agent.id, markSeen]);
 
   const refreshMessages = useCallback(() => {
     if (access.use)
@@ -584,8 +730,8 @@ function AgentDialog({
   const lastId = messages[messages.length - 1]?.id;
   const follow = useFollowBottom(endRef, lastId, tab);
 
-  const messagesRef = useRef(messages);
-  messagesRef.current = messages;
+  const messagesRef = useRef(loadedMessages);
+  messagesRef.current = loadedMessages;
   const loadOlder = useCallback(async () => {
     const oldest = messagesRef.current[0]?.created_at;
     if (!oldest) return false;
@@ -598,8 +744,8 @@ function AgentDialog({
     return true;
   }, [agent.id]);
   const messageIds = useMemo(() => messages.map((m) => m.id), [messages]);
-  const highlighted = useMessageJump({ agentId: agent.id }, messageIds, loadOlder, (id) => {
-    const m = messagesRef.current.find((x) => x.id === id);
+  const highlighted = useMessageJump({ agentId: active && messageFocus ? agent.id : null }, messageIds, loadOlder, (id) => {
+    const m = messagesRef.current.find((x) => x.id === id) ?? (exactMessage?.id === id ? exactMessage : undefined);
     const aside = m && (m.session_role === "aside" || (m.session_id ? asides.has(m.session_id) : false));
     setTab(aside ? "aside" : "talk");
   });
@@ -623,7 +769,7 @@ function AgentDialog({
     }
   };
   const actionsFor = (m: AgentMessage, mine: boolean): MessageActions => ({
-    onReply: tab === "talk" && m.author_kind !== "system" ? () => setThread(m.id) : undefined,
+    onReply: tab === "talk" && m.author_kind !== "system" ? () => openLocalThread(m.id) : undefined,
     copy: m.body,
     link: m.id,
     onEdit: mine ? () => setEditing(m.id) : undefined,
@@ -821,7 +967,7 @@ function AgentDialog({
               <ArrowLeft size={18} weight="bold" />
             </button>
           )}
-          <AgentAvatar portrait={portrait} emoji={agent.avatar_emoji} size={embedded ? "2.75rem" : "3.5rem"} soft rounded="rounded-xl" />
+          <AgentFace agent={agent} size={embedded ? "2.75rem" : "3.5rem"} soft rounded="rounded-xl" />
           <div className="min-w-0 flex-1">
             <div className="flex min-w-0 items-center gap-2">
               <h2 className={cn("truncate font-semibold leading-tight text-w-strong", embedded ? "text-w-lg" : "text-w-xl")}>{agent.name}</h2>
@@ -873,6 +1019,7 @@ function AgentDialog({
                 onChanged={refreshContext}
               />
             )}
+            {ownsAgent && !agent.archived_at && browserFeature?.state === "ready" && <WatchBrowserButton agentId={agent.id} iconOnly className={GHOST_ICON_BTN} />}
             {access.manage && !compact && !agent.archived_at && (
               <button
                 type="button"
@@ -978,7 +1125,7 @@ function AgentDialog({
                 {label}
               </button>
             ) : (
-              <button key={id} type="button" role="tab" aria-selected={tab === id} onClick={() => setTab(id)} className={cn(TAB, tab === id ? TAB_ON : TAB_OFF)}>
+              <button key={id} type="button" role="tab" aria-selected={tab === id} onClick={() => onNavigate(() => setTab(id))} className={cn(TAB, tab === id ? TAB_ON : TAB_OFF)}>
                 <Icon size={14} weight="bold" />
                 {label}
               </button>
@@ -1066,6 +1213,7 @@ function AgentDialog({
               </div>
             </form>}
             <AgentQuestList
+              active={active}
               tasks={tasks}
               setTasks={setTasks}
               agents={agents}
@@ -1191,7 +1339,7 @@ function AgentDialog({
                       <AttachmentGrid items={m.meta?.attachments ?? []} />
                     </div>
                     {(m.meta?.spoken || m.meta?.kind === "voice") && <SpokenMark call={m.meta?.kind === "voice"} className="mt-0.5" />}
-                    {tab === "talk" && <RepliesButton count={m.reply_count ?? 0} lastAt={m.last_reply_at} authors={m.reply_authors} agents={agents} onOpen={() => setThread(m.id)} />}
+                    {tab === "talk" && <RepliesButton count={m.reply_count ?? 0} lastAt={m.last_reply_at} authors={m.reply_authors} agents={agents} onOpen={() => openLocalThread(m.id)} />}
                     {editing !== m.id && <MessageToolbar actions={actionsFor(m, mine)} className="right-2" />}
                   </div>
                   </Fragment>
@@ -1270,7 +1418,7 @@ function AgentDialog({
                       ))}
                     </div>
                   )}
-                  {tab === "talk" && <RepliesButton count={m.reply_count ?? 0} lastAt={m.last_reply_at} authors={m.reply_authors} agents={agents} onOpen={() => setThread(m.id)} />}
+                  {tab === "talk" && <RepliesButton count={m.reply_count ?? 0} lastAt={m.last_reply_at} authors={m.reply_authors} agents={agents} onOpen={() => openLocalThread(m.id)} />}
                   {m.meta?.kind === "ui" && m.author_kind === "agent" && (
                     <div className="mt-2">
                       <UiCard
@@ -1289,10 +1437,14 @@ function AgentDialog({
                   {m.meta?.kind === "ask" && !!m.meta.drafts?.length && (
                     <DraftQueue drafts={m.meta.drafts} answered={answeredSet.has(m.id) || !ownsAgent} onAnswer={(text) => answer(m.id, text)} />
                   )}
+                  {m.meta?.kind === "ask" && m.meta.browser_help && !answered && (
+                    <BrowserHelpButton agentId={agent.id} cardId={m.id} help={m.meta.browser_help} />
+                  )}
                   {m.meta?.kind === "ask" && (
                     <AskChoices
                       choices={m.meta.choices ?? []}
                       answered={answered}
+                      allowReply={!!m.meta.clarify_request || !!m.meta.clarification}
                       onAnswer={(c) => {
                         setAnswering((prev) => new Set(prev).add(m.id));
                         void answer(m.id, c).then((ok) => {
@@ -1397,14 +1549,16 @@ function AgentDialog({
         <LocalPathContext.Provider value={ownsAgent ? agent : null}>
           <ThreadPanel
             key={thread}
+            visible={active && tab === "talk"}
+            focus={messageFocus?.thread?.root === thread ? { id: messageFocus.thread.reply, nonce: messageFocus.nonce } : null}
             title="Thread"
             subtitle={`With ${agent.name}`}
             draftKey={`agent:${agent.id}:thread:${thread}`}
             waitingFor={ownsAgent ? agent.name : undefined}
             note={ownsAgent ? <InfoNote>{`Replies here come from a copy of ${agent.name}'s memory, so their main chat carries on. Nothing is kept unless you tap Remember.`}</InfoNote> : undefined}
-            load={() =>
-              worldApi.messageReplies(agent.id, thread).then((rows) =>
-                rows.filter((m) => !(m.author_kind === "user" && m.meta?.answers && rows.some((r) => r.id === m.meta?.answers && r.meta?.memory))).map((m): ThreadItem => {
+            load={(intent) =>
+              navigationDetails.messageReplies(intent, agent.id, messageFocus?.thread?.root === thread ? messageFocus.thread.reply : thread).then((rows) =>
+                rows?.filter((m) => !(m.author_kind === "user" && m.meta?.answers && rows.some((r) => r.id === m.meta?.answers && r.meta?.memory))).map((m): ThreadItem => {
                   const speaker = m.author_kind === "agent" ? agents.find((a) => a.id === (m.author_agent_id ?? agent.id)) ?? agent : null;
                   const name = speaker ? speaker.name : m.author_kind === "system" ? "Loka" : meId && m.author_user_id === meId ? "You" : "Someone";
                   return {
@@ -1434,7 +1588,8 @@ function AgentDialog({
                 }),
               )
             }
-            refreshOn={(ev) => ev.agent_id === agent.id && (ev.type === "message.created" || ev.type === "message.edited") && (ev.payload.reply_to === thread || ev.payload.message_id === thread)}
+            working={ownsAgent ? () => worldApi.quickList({ agent: agent.id, threads: true }).then((list) => { const mine = list.find((q) => q.thread_root === thread); return mine ? mine.busy : null; }) : undefined}
+            refreshOn={(ev) => ev.agent_id === agent.id && (((ev.type === "message.created" || ev.type === "message.edited") && (ev.payload.reply_to === thread || ev.payload.message_id === thread)) || RUN_END_EVENTS.has(ev.type))}
             quoteTarget={`thread:agent:${agent.id}:${thread}`}
             send={async (text, spoken, attachments, quote) => {
               await worldApi.send(agent.id, text, attachments, turn.effective, undefined, spoken || undefined, undefined, thread, quote);
@@ -1444,7 +1599,7 @@ function AgentDialog({
             canPost={access.use}
             handles={handles}
             onOpenAgent={onOpenAgent}
-            onClose={() => setThread(null)}
+            onClose={() => { setThread(null); onClearMessageFocus?.(); }}
             className="absolute inset-0 z-20 @3xl:left-auto @3xl:w-[26rem] @3xl:border-l-2 @3xl:border-dashed @3xl:border-w-line2 @3xl:shadow-[-8px_0_24px_rgb(var(--w-ink)/0.12)]"
           />
         </LocalPathContext.Provider>
@@ -1689,6 +1844,7 @@ function AgentSettings({ agent, onUpdated }: { agent: WorldAgent; onUpdated: (ag
 }
 
 function AgentQuestList({
+  active,
   tasks,
   setTasks,
   agents,
@@ -1697,6 +1853,7 @@ function AgentQuestList({
   onOpen,
   onChanged,
 }: {
+  active: boolean;
   tasks: TaskBrief[];
   setTasks: (update: (prev: TaskBrief[]) => TaskBrief[]) => void;
   agents: WorldAgent[];
@@ -1706,7 +1863,7 @@ function AgentQuestList({
   onChanged: () => void;
 }) {
   const order = useMemo(() => tasks.map((t) => t.id), [tasks]);
-  const q = useQuestControls({ tasks, setTasks, agents, viewer, order });
+  const q = useQuestControls({ active, tasks, setTasks, agents, viewer, order });
   return (
     <div className="relative">
       <ul className="space-y-2">
@@ -1757,8 +1914,8 @@ function AgentQuestList({
                     {statusLabel(t.status)}
                   </button>
                   <span className="min-w-0 flex-1 font-medium">{t.title}</span>
-                  {t.plan_waiting ? (
-                    <span className="rounded-md bg-w-warn/20 px-1.5 py-0.5 text-w-2xs font-semibold text-w-warn" title="The plan is waiting for your approval in chat">Plan waiting</span>
+                  {questNeedsYou(t) ? (
+                    <span className="rounded-md bg-w-warn/20 px-1.5 py-0.5 text-w-2xs font-semibold text-w-warn" title="The plan is waiting for your approval in chat">Needs you</span>
                   ) : t.plan_first && t.status !== "done" ? (
                     <span className="text-w-2xs text-w-muted">Plan first</span>
                   ) : null}
@@ -1819,10 +1976,10 @@ function AgentQuestList({
 type BoardView = "residents" | "quests" | "teams";
 
 function Board({
+  active,
   agents: allAgents,
   archived = [],
   viewer,
-  portraits,
   places,
   onVisit,
   onVisitPlace,
@@ -1834,38 +1991,46 @@ function Board({
   view,
   onViewChange,
   teamFocus = null,
+  focusedTeam = null,
   onTeamFocus,
+  teams,
 }: {
+  active: boolean;
+  teams: Team[];
   view: BoardView;
   onViewChange: (view: BoardView) => void;
   teamFocus?: string | null;
+  focusedTeam?: Team | null;
   onTeamFocus?: (id: string | null) => void;
   agents: WorldAgent[];
   archived?: WorldAgent[];
   viewer: QuestViewer | null;
-  portraits: Record<string, string>;
   places: WorldItem[];
   onVisit: (id: string) => void;
-  onVisitPlace: (id: string) => boolean;
+  onVisitPlace: (id: string) => void;
   onOpen: (id: string) => void;
   onOpenQuest: (task: TaskBrief) => void;
   onCreate: () => void;
   canCreate: boolean;
   onClose: () => void;
 }) {
-  useEscape(onClose);
+  useEscape(active ? onClose : NOOP);
   const everyone = useEveryone();
   const othersAgents = allAgents.filter((a) => !ownsAgent(a, viewer?.id)).length;
   const agents = everyone ? allAgents : allAgents.filter((a) => ownsAgent(a, viewer?.id));
   const myArchived = archived.filter((a) => a.owner_user_id === viewer?.id);
-  const { teams } = useTeams(!!viewer);
   const ownAgents = allAgents.filter((a) => ownsAgent(a, viewer?.id)).length;
-  const startingOut = ownAgents <= 1 && !teams.some((t) => t.owner_user_id === viewer?.id);
+  const effectiveTeams = useMemo(() => {
+    if (!teamFocus) return teams;
+    const otherTeams = teams.filter((team) => team.id !== teamFocus);
+    return focusedTeam ? [...otherTeams, focusedTeam] : otherTeams;
+  }, [focusedTeam, teamFocus, teams]);
+  const startingOut = ownAgents <= 1 && !effectiveTeams.some((t) => t.owner_user_id === viewer?.id);
   const teamGroups = useMemo(() => {
     const ids = new Set(agents.map((a) => a.id));
     const placed = new Set<string>();
     const groups: { key: string; label: string; agents: WorldAgent[] }[] = [];
-    for (const t of teams) {
+    for (const t of effectiveTeams) {
       const members = t.members.filter((m) => m.member_kind === "agent" && ids.has(m.member_id) && !placed.has(m.member_id)).map((m) => m.member_id);
       if (members.length === 0) continue;
       members.forEach((id) => placed.add(id));
@@ -1874,7 +2039,7 @@ function Board({
     const rest = agents.filter((a) => !placed.has(a.id));
     if (groups.length > 0 && rest.length > 0) groups.push({ key: "none", label: "Not on a team", agents: rest });
     return groups.length > 0 ? groups : [{ key: "all", label: "", agents }];
-  }, [agents, teams]);
+  }, [agents, effectiveTeams]);
   const total = agents.reduce((s, a) => s + a.cost_usd, 0);
   const tokens = agents.reduce((sum, agent) => sum + agent.tokens, 0);
   const partialCost = agents.some((a) => !(a.cost_usd > 0));
@@ -1898,7 +2063,7 @@ function Board({
         {(
           [
             ["quests", "Quests", Sword, 0],
-            ["teams", "Teams", UsersFour, teams.length],
+            ["teams", "Teams", UsersFour, effectiveTeams.length],
             ["residents", "Residents", UsersThree, agents.length],
           ] as const
         ).map(([v, label, TabIcon, count]) => (
@@ -1909,7 +2074,6 @@ function Board({
             aria-selected={view === v}
             onClick={() => {
               onViewChange(v);
-              if (v !== "teams" && teamFocus) onTeamFocus?.(null);
             }}
             className={cn(TAB, view === v ? TAB_ON : TAB_OFF)}
           >
@@ -1920,9 +2084,9 @@ function Board({
         ))}
       </div>
       {view === "quests" ? (
-        <QuestBoard agents={allAgents} viewer={viewer} onOpenAgent={onOpen} onOpenQuest={onOpenQuest} />
+        <QuestBoard active={active} agents={allAgents} viewer={viewer} onOpenAgent={onOpen} onOpenQuest={onOpenQuest} />
       ) : view === "teams" ? (
-        <TeamsView teams={teams} agents={allAgents} meId={viewer?.id ?? null} portraits={portraits} canWrite={canCreate} focusId={teamFocus} onFocusChange={onTeamFocus} />
+        <TeamsView teams={effectiveTeams} agents={allAgents} meId={viewer?.id ?? null} canWrite={canCreate} focusId={teamFocus} onFocusChange={onTeamFocus} />
       ) : (
         <div className="min-h-0 flex-1 overflow-y-auto">
           <div className="w-full space-y-6 px-4 py-4 sm:px-5 sm:py-5 xl:px-8 xl:py-6">
@@ -2121,6 +2285,7 @@ export default function WorldGame() {
 function LokaGame({ initialMe }: { initialMe: Me | null }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
+  const documentVisible = useSyncExternalStore(subscribeDocumentVisibility, documentIsVisible, documentVisibleOnServer);
   useEffect(() => {
     const root = rootRef.current;
     return root ? pinClippedScroll(root) : undefined;
@@ -2150,9 +2315,9 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     if (loaded) return preloadPanels();
   }, [loaded]);
   const [focus, setFocus] = useState<Target | null>(null);
-  const [dialog, setDialog] = useState<Target | null>(null);
-  const [board, setBoard] = useState<BoardView | false>(false);
-  const [creatingAgent, setCreatingAgent] = useState(false);
+  const [dialog, setDialog] = useForegroundState<Target | null>(null);
+  const [board, setBoard] = useForegroundState<BoardView | false>(false);
+  const [creatingAgent, setCreatingAgent] = useForegroundState(false);
   const [call, callDispatch] = useReducer(callReducer, NO_CALL);
   const voiceAgentId = call.agentId;
   const [callSlot, setCallSlot] = useState<HTMLElement | null>(null);
@@ -2169,26 +2334,49 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
   const inCallRef = useRef(false);
   inCallRef.current = voiceAgentId !== null;
   const talkPressedAt = useRef(0);
+  const talkNavigation = useRef<NavigationRequest | null>(null);
   const [time, setTime] = useState<TimeOfDay>("clock");
   const [touch, setTouch] = useState(false);
   const [feed, setFeed] = useState<{ id: number; text: string; count: number }[]>([]);
   const [asides, setAsides] = useState<Set<string>>(new Set());
-  const [history, setHistory] = useState<string | null | false>(false);
-  const [quick, setQuick] = useState<{ agentId?: string; sessionId?: string } | false>(false);
-  const [historyFocus, setHistoryFocus] = useState<SessionFocus | null>(null);
-  const [notesOpen, setNotesOpen] = useState(false);
+  const [history, setHistory] = useForegroundState<string | null | false>(false);
+  const [quick, setQuick] = useForegroundState<{ agentId?: string; sessionId?: string } | false>(false);
+  const [historyFocus, setHistoryFocus] = useState<(SessionFocus & { page?: QuestRoomPage; request?: number }) | null>(null);
+  const [notesOpen, setNotesOpen] = useForegroundState(false);
   const [notes, setNotes] = useState<Notifications>({ events: [], unread: 0 });
-  const [chatOpen, setChatOpen] = useState(false);
-  const [proOpen, setProOpen] = useState(false);
-  const [listsOpen, setListsOpen] = useState(false);
+  const [windowLayers, setWindowLayers] = useForegroundState<WindowLayer[]>(["terminal", "agent", "chat"]);
+  const raiseLayer = useForegroundAction((layer: WindowLayer) => setWindowLayers((order) => raiseWindowLayer(order, layer)), []);
+  const [chatOpen, setChatOpen] = useForegroundState(false);
+  const chatOpenRef = useRef(chatOpen);
+  chatOpenRef.current = chatOpen;
+  const chatAgentsRef = useRef<WorldAgent[]>([]);
+  const [proOpen, setProOpen] = useForegroundState(false);
+  const [listsOpen, setListsOpen] = useForegroundState(false);
   const [worldLink, setWorldLink] = useState<ExactWorldLink | null>(null);
+  const [focusedTeam, setFocusedTeam] = useState<{ team: Team; access: number } | null>(null);
+  const focusedTeamRef = useRef(focusedTeam);
+  focusedTeamRef.current = focusedTeam;
   const [linkedPlaceName, setLinkedPlaceName] = useState<string | null>(null);
   const [linkedMap, setLinkedMap] = useState<{ destination: ExactMapDestination; request: number } | null>(null);
+  const navigationRequest = useRef(navigationRequests()).current;
+  const navigationDetailLoader = useRef(guardedDetailLoader()).current;
+  const teamDetailLoader = useRef(guardedDetailLoader()).current;
+  const regionDetailLoader = useRef(guardedDetailLoader()).current;
+  const travelDetailLoader = useRef(guardedDetailLoader()).current;
+  const teamAccess = useRef(0);
+  const teamListTrusted = useRef(true);
+  const rejectedTeam = useRef<{ id: string; denied: boolean } | null>(null);
+  const worldLinkRef = useRef(worldLink);
+  worldLinkRef.current = worldLink;
+  const navigateRef = useRef<(target: NavigationTarget, navigation?: NavigationRequest) => Promise<void>>(async () => {});
   const worldLinkRequest = useRef(0);
   const linkedTravelPending = useRef<number | null>(null);
   const traveling = useRef(false);
   const travelRun = useRef(0);
-  const [reports, setReports] = useState<{ id: string | null; item?: string | null } | null>(null);
+  const [reports, setReports] = useForegroundState<ReportTarget | null>(null);
+  const [focusedList, setFocusedList] = useState<WorldItem>();
+  const reportLeaveRequest = useRef<((current: () => boolean) => Promise<boolean>) | null>(null);
+  const [todoFocus, setTodoFocus] = useState<{ todo: Todo; nonce: number } | null>(null);
   const reportsVisible = useRef(false);
   const updateWorldLink = useCallback((kind: "team" | "list" | "place" | "region", id: string | null) => {
     setWorldLink(id ? { kind, id } : null);
@@ -2199,26 +2387,52 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     window.history.replaceState(null, "", `${window.location.pathname}${rest ? `?${rest}` : ""}${window.location.hash}`);
   }, []);
   const cancelPendingNavigation = useCallback(() => {
-    const request = ++worldLinkRequest.current;
+    const { request, current } = navigationRequest.begin();
+    worldLinkRequest.current = request;
     travelRun.current += 1;
     traveling.current = false;
     linkedTravelPending.current = null;
     engineRef.current?.cancelWalk();
     setLinkedMap(null);
+    return { request, current };
+  }, [navigationRequest]);
+  const commitForeground = useCallback((apply: (request: number) => void, navigation?: NavigationRequest) => {
+    const request = navigation ?? cancelPendingNavigation();
+    if (request.current()) apply(request.request);
     return request;
-  }, []);
+  }, [cancelPendingNavigation]);
   const clearWorldLink = useCallback(() => {
-    cancelPendingNavigation();
-    setLinkedPlaceName(null);
-    updateWorldLink("place", null);
-  }, [cancelPendingNavigation, updateWorldLink]);
-  const [terminalOpen, setTerminalOpen] = useState(false);
+    commitForeground(() => {
+      setLinkedPlaceName(null);
+      updateWorldLink("place", null);
+    });
+  }, [commitForeground, updateWorldLink]);
+  const [terminalOpen, setTerminalOpen] = useForegroundState(false);
+  const [terminalPlace, setTerminalPlace] = useState<TerminalPlace>({ dock: "window", size: DOCK_SIZE });
+  const [terminalCommand, setTerminalCommand] = useState<TerminalCommand | null>(null);
+  const meIdForTerminal = initialMe?.id ?? null;
+  useEffect(() => {
+    const saved = loadLayout(window.localStorage, layoutKey(meIdForTerminal));
+    if (saved) setTerminalPlace({ dock: saved.dock, size: saved.size });
+  }, [meIdForTerminal]);
+  const terminalDocked = terminalOpen && terminalPlace.dock !== "window";
+  const terminalWindowed = terminalOpen && !terminalDocked;
+  const terminalDockedRef = useRef(terminalDocked);
+  terminalDockedRef.current = terminalDocked;
+  const terminalPlaceRef = useRef(terminalPlace);
+  terminalPlaceRef.current = terminalPlace;
+  const showTerminal = useForegroundAction(() => {
+    raiseLayer("terminal");
+    setTerminalOpen(true);
+    setTerminalCommand({ id: Date.now(), action: "focus" });
+  }, [raiseLayer]);
   const [terminalRequest, setTerminalRequest] = useState<TerminalRequest | null>(null);
   const [terminalTalk, setTerminalTalk] = useState<string | null>(null);
   const terminalQuote = useRef<{ id: number; writer: string; quote: MessageQuote; wide: boolean } | null>(null);
   useEffect(() => {
     if (terminalOpen) return;
     terminalQuote.current = null;
+    setTerminalCommand(null);
     setTerminalRequest(null);
     setTerminalTalk(null);
   }, [terminalOpen]);
@@ -2252,14 +2466,14 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     } catch {}
   }, []);
   useEffect(() => {
-    if (reports || listsOpen || terminalOpen || academyHost || !side.auto) return;
+    if (reports || listsOpen || terminalWindowed || academyHost || !side.auto) return;
     try {
       const saved = JSON.parse(window.localStorage.getItem(SIDE_KEY) ?? "null") as { id?: unknown; open?: unknown; v?: unknown } | null;
       setSideState({ id: typeof saved?.id === "string" ? saved.id : side.id, open: saved?.open === true && saved.v === 2 });
     } catch {
       setSideState({ id: side.id, open: false });
     }
-  }, [reports, listsOpen, terminalOpen, academyHost, side.auto, side.id]);
+  }, [reports, listsOpen, terminalWindowed, academyHost, side.auto, side.id]);
   useEffect(() => {
     try {
       const saved = JSON.parse(window.localStorage.getItem(SIDE_KEY) ?? "null") as { id?: unknown; open?: unknown; v?: unknown } | null;
@@ -2269,24 +2483,33 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
   const sideFrom = useRef<string | null>(null);
   const sideRef = useRef(side);
   sideRef.current = side;
-  const [changelogOpen, setChangelogOpen] = useState(false);
-  const [folderShop, setFolderShop] = useState(false);
+  const [changelogOpen, setChangelogOpen] = useForegroundState(false);
+  const [folderShop, setFolderShop] = useForegroundState(false);
   const terminalFeature = useFeature("terminal");
-  const [youOpen, setYouOpen] = useState(false);
+  const browserFeature = useFeature("browser");
+  const [youOpen, setYouOpen] = useForegroundState(false);
   const [focusSection, setFocusSection] = useState<{ id: string; at: number; recordId?: string } | null>(null);
-  const [paletteOpen, setPaletteOpen] = useState(false);
-  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useForegroundState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useForegroundState(false);
   const [paletteQuery, setPaletteQuery] = useState("");
-  const [workbench, setWorkbench] = useState<OpenWorkshopDetail | null>(null);
+  const [workbench, setWorkbench] = useForegroundState<OpenWorkshopDetail | null>(null);
   const closeWorkbench = useRef<(() => boolean) | null>(null);
+  const workbenchCloseNavigation = useRef<NavigationRequest | null>(null);
   const [controlPlane, setControlPlane] = useState<"connecting" | "online" | "offline">("connecting");
   const [chatChannel, setChatChannel] = useState<string | null>(null);
   const [chatAgent, setChatAgent] = useState<string | null>(null);
+  const [agentMessageFocus, setAgentMessageFocus] = useState<AgentMessageFocus>();
+  const [agentTabRequest, setAgentTabRequest] = useState<{ agentId: string; nonce: number; tab: "work" } | null>(null);
+  const [messageJump, setMessageJump] = useState<{ link: LinkedMessage; current: () => boolean } | null>(null);
+  useEffect(() => {
+    if (messageJump?.current()) requestJump(messageJump.link, messageJump.current);
+  }, [messageJump]);
   const [chatFocus, setChatFocus] = useState<{ id: string; nonce: number } | null>(null);
-  const [chatChannelFocus, setChatChannelFocus] = useState<{ id: string; nonce: number } | null>(null);
+  const [chatChannelFocus, setChatChannelFocus] = useState<{ id: string; nonce: number; thread?: { root: number; reply: number }; message?: ChannelMessage; detail?: ChannelDetail } | null>(null);
   const [chatLast, setChatLast] = useState<{ agentId: string | null; channelId: string | null }>({ agentId: null, channelId: null });
   const [progress, setProgress] = useState<Record<string, string>>({});
   const [me, setMe] = useState<Me | null>(initialMe);
+
   const wantsNewArt = !!me?.new_art;
   const [art, setArt] = useState<"classic" | "new">(() => (wantsNewArt && newArtOn() ? "new" : "classic"));
   const [artTries, setArtTries] = useState(0);
@@ -2304,7 +2527,59 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       clearTimeout(retry);
     };
   }, [wantsNewArt, artTries]);
-  const { teams: worldTeams } = useTeams(!!me);
+  const { teams: worldTeams, reload: reloadTeams } = useTeams(!!me);
+  const activeTeams = useRef(worldTeams);
+  activeTeams.current = worldTeams;
+  const focusedTeamRecord = worldLink?.kind === "team" && focusedTeam?.access === teamAccess.current && focusedTeam.team.id === worldLink.id
+    ? focusedTeam.team
+    : null;
+  useEffect(() => {
+    teamListTrusted.current = true;
+    const rejected = rejectedTeam.current;
+    const link = worldLinkRef.current;
+    if (link?.kind !== "team") {
+      rejectedTeam.current = null;
+      return;
+    }
+    const viewer = meRef.current?.id;
+    const team = worldTeams.find((item) => item.id === link.id && (item.owner_user_id === viewer || item.members.some((member) => member.member_kind === "user" && member.member_id === viewer)));
+    if (rejected?.id === link.id) {
+      rejectedTeam.current = null;
+      if (!rejected.denied && team) setFocusedTeam({ team, access: teamAccess.current });
+      else updateWorldLink("team", null);
+      return;
+    }
+    const focused = focusedTeamRef.current;
+    if (team && focused?.access === teamAccess.current && focused.team.id === link.id) setFocusedTeam({ team, access: focused.access });
+  }, [updateWorldLink, worldTeams]);
+  useEffect(() => {
+    const reauthorize = (event: Event) => {
+      if (event.type === "world-event" && !(event as CustomEvent<{ type?: string }>).detail?.type?.startsWith("team.")) return;
+      const access = ++teamAccess.current;
+      teamListTrusted.current = false;
+      rejectedTeam.current = null;
+      setFocusedTeam(null);
+      const link = worldLinkRef.current;
+      if (link?.kind !== "team") return;
+      const intent = teamDetailLoader.begin(() => teamAccess.current === access && worldLinkRef.current?.kind === "team" && worldLinkRef.current.id === link.id);
+      void navigationDetails.team(intent, link.id).then((team) => {
+        if (team && intent.current() && worldLinkRef.current?.kind === "team" && worldLinkRef.current.id === team.id) setFocusedTeam({ team, access });
+      }).catch((error) => {
+        if (intent.current()) {
+          rejectedTeam.current = { id: link.id, denied: error instanceof TeamRequestError && (error.status === 403 || error.status === 404) };
+          reloadTeams();
+        }
+      });
+    };
+    window.addEventListener("world-event", reauthorize);
+    window.addEventListener(TEAMS_CHANGED, reauthorize);
+    window.addEventListener("world-reconnected", reauthorize);
+    return () => {
+      window.removeEventListener("world-event", reauthorize);
+      window.removeEventListener(TEAMS_CHANGED, reauthorize);
+      window.removeEventListener("world-reconnected", reauthorize);
+    };
+  }, [reloadTeams, teamDetailLoader, updateWorldLink]);
   const teamGroupsRef = useRef<string[][]>([]);
   useEffect(() => {
     teamGroupsRef.current = worldTeams.map((t) => t.members.filter((m) => m.member_kind === "agent").map((m) => m.member_id));
@@ -2378,6 +2653,21 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     if (!res.ok) return false;
     setMe((await res.json()) as Me);
     return true;
+  }, []);
+  const setBeforeBigWork = useCallback(async (value: BeforeBigWork) => {
+    try {
+      const res = await fetch("/api/world/me", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ before_big_work: value }),
+      });
+      if (!res.ok) return false;
+      const updated = (await res.json()) as Me;
+      setMe((current) => (current?.id === updated.id ? { ...current, before_big_work: updated.before_big_work } : current));
+      return true;
+    } catch {
+      return false;
+    }
   }, []);
   const setStatus = useCallback(async (emoji: string, text: string) => {
     const res = await fetch("/api/world/me", {
@@ -2463,82 +2753,62 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     keep.observe(document.head, { subtree: true, childList: true, characterData: true });
     return () => keep.disconnect();
   }, [titleUnread, titleAgent]);
-  const closeCoveringPanels = useCallback(() => {
-    setCreatingAgent(false);
-    setYouOpen(false);
-    setFolderShop(false);
-    setChangelogOpen(false);
-  }, []);
-  useEffect(() => {
-    const keepTalking = () => {
-      const id = sideFrom.current;
-      if (id) setSide({ id, open: true, auto: !sideRef.current.open || sideRef.current.auto });
-      return id;
-    };
-    const openLists = () => {
-      cancelPendingNavigation();
-      keepTalking();
+  const closeCoveringPanels = useCallback((navigation?: NavigationRequest) => {
+    commitForeground(() => {
+      setCreatingAgent(false);
+      setYouOpen(false);
+      setFolderShop(false);
+      setChangelogOpen(false);
+      setQuick(false);
       setNotesOpen(false);
-      setListsOpen(true);
-    };
+      setPaletteOpen(false);
+      setShortcutsOpen(false);
+    }, navigation);
+  }, [commitForeground]);
+  const showAuxiliary = useCallback((show: (request: number) => void, navigation?: NavigationRequest) => {
+    return commitForeground((request) => {
+      setProOpen(false);
+      setNotesOpen(false);
+      setPaletteOpen(false);
+      setShortcutsOpen(false);
+      show(request);
+    }, navigation);
+  }, [commitForeground]);
+  useEffect(() => {
+    const openLists = () => void navigateRef.current({ kind: "surface", show: () => setListsOpen(true), keepSideChat: true });
     window.addEventListener("world:open-lists", openLists);
     const onOpenReport = (e: Event) => {
-      cancelPendingNavigation();
-      keepTalking();
       const detail = (e as CustomEvent<{ id?: string | null; item?: string | null }>).detail;
-      if (!reportsVisible.current || !detail?.id) {
-        closeCoveringPanels();
-        setNotesOpen(false);
-      }
-      setReports({ id: detail?.id ?? null, item: detail?.item ?? null });
+      void navigateRef.current({ kind: "report", id: detail?.id ?? null, item: detail?.item ?? null });
     };
     window.addEventListener("world:open-report", onOpenReport);
-    const params = new URLSearchParams(window.location.search);
-    const linkedReport = params.get("report");
-    const linkedTodo = params.get("todo");
-    const linkedItem = params.get("item");
-    const linkedAttempt = params.get("practice");
-    if (linkedAttempt) {
-      params.delete("practice");
-      const rest = params.toString();
-      window.history.replaceState(null, "", `${window.location.pathname}${rest ? `?${rest}` : ""}${window.location.hash}`);
-    }
-    if (linkedAttempt && ATTEMPT_ID.test(linkedAttempt)) {
-      void practiceApi
-        .attempt(linkedAttempt.toLowerCase())
-        .then((a) => openPractice(a.report_id, a.id))
-        .catch(() => pushToast({ id: Date.now(), text: "That practice attempt was not found." }));
-    }
-    if (linkedReport || linkedTodo) {
-      params.delete("report");
-      params.delete("item");
-      params.delete("todo");
-      const rest = params.toString();
-      window.history.replaceState(null, "", `${window.location.pathname}${rest ? `?${rest}` : ""}${window.location.hash}`);
-      if (linkedReport && /^[0-9a-f-]{6,36}$/i.test(linkedReport))
-        setReports({ id: linkedReport.toLowerCase(), item: linkedItem && /^[A-Za-z0-9_-]{1,40}$/.test(linkedItem) ? linkedItem : null });
-      if (linkedTodo && /^[0-9a-f-]{6,36}$/i.test(linkedTodo)) {
-        setListsOpen(true);
-        focusTodo(linkedTodo.toLowerCase());
+    const onOpenWorkspace = (e: Event) => {
+      const id = (e as CustomEvent<{ id?: string | null } | undefined>).detail?.id ?? workspaceStoreRef.current.last;
+      if (id) {
+        void navigateRef.current({ kind: "report", id, workspace: true });
+        return;
       }
-    }
-    const onOpenChangelog = () => {
-      setNotesOpen(false);
-      setChangelogOpen(true);
+      void navigateRef.current({ kind: "report", id: null, loaded: true });
+      pushToast({ id: Date.now(), text: "Open a canvas, then press Open as workspace in its toolbar." });
     };
+    window.addEventListener(OPEN_WORKSPACE, onOpenWorkspace);
+    const onOpenChangelog = () => void navigateRef.current({ kind: "surface", show: () => setChangelogOpen(true) });
     window.addEventListener(OPEN_CHANGELOG, onOpenChangelog);
     primeChangelog();
     const fresh = unseenChangelog();
     const text = fresh.length > 0 ? `What's new: ${fresh[0].title}` : null;
-    if (text) pushToast({ id: Date.now(), text, kind: "changelog", target: "changelog", onClick: () => setChangelogOpen(true) });
+    if (text) pushToast({ id: Date.now(), text, kind: "changelog", target: "changelog", onClick: onOpenChangelog });
     return () => {
       window.removeEventListener("world:open-lists", openLists);
       window.removeEventListener("world:open-report", onOpenReport);
+      window.removeEventListener(OPEN_WORKSPACE, onOpenWorkspace);
       window.removeEventListener(OPEN_CHANGELOG, onOpenChangelog);
     };
-  }, [cancelPendingNavigation, closeCoveringPanels]);
+  }, []);
   const agentsRef = useRef<WorldAgent[]>([]);
   agentsRef.current = agents;
+  const allAgentsRef = useRef(allAgents);
+  allAgentsRef.current = allAgents;
 
   const [items, setItems] = useState<WorldItem[]>([]);
   const [mapKey, setMapKey] = useState("");
@@ -2559,12 +2829,20 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       const [list] = await Promise.all([worldApi.agents(), loadItems()]);
       setAgents(list);
       setRosterOwner(meRef.current?.id ?? null);
+      return list;
     } catch (error) {
       console.warn("world load failed", error);
     } finally {
       setLoaded(true);
     }
+    return null;
   }, [loadItems]);
+  const storeAgent = useCallback((agent: WorldAgent) => {
+    setAgents((current) => {
+      const found = current.some((item) => item.id === agent.id);
+      return found ? current.map((item) => (item.id === agent.id ? agent : item)) : [...current, agent];
+    });
+  }, []);
 
   useEffect(() => {
     void load();
@@ -2575,15 +2853,51 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
   }, [load, me?.id, rosterOwner]);
 
   const mainId = me?.main_agent_id ?? null;
-  const assistant = agents.find((a) => a.id === mainId) ?? null;
-  const portraits = useMemo(
-    () => Object.fromEntries(agents.map((a) => [a.id, portraitUrl(residentFor(a).look, 4)])),
-    [agents],
+  const [workspaceStore, setWorkspaceStore] = useState<WorkspaceStore>(EMPTY_STORE);
+  const workspaceStoreRef = useRef(workspaceStore);
+  workspaceStoreRef.current = workspaceStore;
+  const workspaceKey = workspaceLayoutKey(me?.id ?? null);
+  useEffect(() => {
+    try {
+      setWorkspaceStore(readStore(window.localStorage.getItem(workspaceKey)));
+    } catch {
+      setWorkspaceStore(EMPTY_STORE);
+    }
+  }, [workspaceKey]);
+  const rememberWorkspace = useCallback(
+    (canvas: string | null | undefined, change: Partial<WorkspaceLayout>) =>
+      setWorkspaceStore((current) => {
+        const next = remember(current, canvas, change, Date.now());
+        if (next !== current) {
+          try {
+            window.localStorage.setItem(workspaceKey, JSON.stringify(next));
+          } catch {}
+        }
+        return next;
+      }),
+    [workspaceKey],
   );
+  const rememberWorkspaceRef = useRef(rememberWorkspace);
+  rememberWorkspaceRef.current = rememberWorkspace;
+  const reportsId = reports?.id ?? null;
+  const workspaceLayout = layoutFor(workspaceStore, reportsId);
+  const changeWorkspace = useCallback((change: Partial<WorkspaceLayout>) => rememberWorkspace(reportsId, change), [rememberWorkspace, reportsId]);
+  const [workspaceFocus, setWorkspaceFocus] = useState<{ id: string; nonce: number } | null>(null);
+  const inWorkspace = Boolean(reports?.workspace && reports.id);
+  useEffect(() => {
+    if (inWorkspace && workspaceLayout.chat && !side.open && mainId) setSide({ id: mainId, open: true, auto: true });
+  }, [inWorkspace, workspaceLayout.chat, side.open, mainId, setSide]);
+  const showSideChat = (id: string | null, open: boolean) => {
+    setSide({ id, open });
+    if (inWorkspace) changeWorkspace({ chat: open });
+  };
+  const assistant = agents.find((a) => a.id === mainId) ?? null;
+  const assistantLook = useMemo(() => (assistant ? residentFor(assistant).look : null), [assistant]);
+  const assistantPortrait = usePortrait(assistantLook, 4);
   const recent = useRecentAgentTabs(me?.id, agents, Boolean(me?.id && rosterOwner === me.id));
 
-  const [sheet, setSheet] = useState<PlaceSheet | null>(null);
-  const [loka, setLoka] = useState<LokaSheet | null>(null);
+  const [sheet, setSheet] = useForegroundState<PlaceSheet | null>(null);
+  const [loka, setLoka] = useForegroundState<LokaSheet | null>(null);
   const openTargets = useMemo(() => {
     const open = new Set<string>();
     if (dialog?.kind === "resident") open.add(`agent:${dialog.id}`);
@@ -2647,13 +2961,14 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
   useEffect(() => setVisited(readVisited(me?.id ?? null)), [me?.id]);
   const loadRegion = useCallback((id: string) => {
     if (id === HEARTH) return;
-    void lokaApi
-      .region(id)
+    const intent = regionDetailLoader.begin(() => regionRef.current === id);
+    void navigationDetails
+      .region(intent, id)
       .then((d) => {
-        if (regionRef.current === id) setRegionDetail(d);
+        if (d && intent.current()) setRegionDetail(d);
       })
       .catch(() => {});
-  }, []);
+  }, [regionDetailLoader]);
   const regionKey = regionDetail
     ? `${regionDetail.region.id}:${regionDetail.region.updated_at}:${regionDetail.items.map((i) => `${i.id}:${i.updated_at}`).join(",")}`
     : "";
@@ -2675,6 +2990,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     const linkRequest = linked ? worldLinkRequest.current : null;
     if (linkedTravelPending.current === linkRequest) linkedTravelPending.current = null;
     const run = ++travelRun.current;
+    const intent = travelDetailLoader.begin(() => run === travelRun.current && (linkRequest === null || linkRequest === worldLinkRequest.current));
     traveling.current = true;
     const settle = (invalidate = false) => {
       if (run !== travelRun.current) return;
@@ -2688,7 +3004,12 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       settle(true);
     }, 4000);
     try {
-      const detail = to === HEARTH || districtOf(to) ? null : destination ? destination.region : await lokaApi.region(to);
+      const detail = to === HEARTH || districtOf(to) ? null : destination ? destination.region : await navigationDetails.region(intent, to);
+      if (detail === undefined) {
+        window.clearTimeout(release);
+        settle();
+        return;
+      }
       if (run !== travelRun.current || (linkRequest !== null && linkRequest !== worldLinkRequest.current)) {
         window.clearTimeout(release);
         settle();
@@ -2722,7 +3043,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       if (linked) clearWorldLink();
       pushToast({ id: Date.now(), text, kind: "travel" });
     }
-  }, [clearWorldLink]);
+  }, [clearWorldLink, travelDetailLoader]);
   const travelRef = useRef(travel);
   travelRef.current = travel;
   useEffect(() => {
@@ -2831,21 +3152,24 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     }, (place) => {
       if (!engine) return;
       setLinkedMap(null);
-      if (place?.kind === "npc") setLoka({ kind: "npc", id: place.id, name: place.name, data: place.data });
+      if (place?.kind === "npc") {
+        const navigation = { request: linkedMap.request, current: () => navigationRequest.current(linkedMap.request) };
+        commitForeground(() => setLoka({ kind: "npc", id: place.id, name: place.name, data: place.data }), navigation);
+      }
       else if (place && parseOpens(place.data.opens)) engine.walkTo({ kind: "place", id: `item:${place.id}` });
       else if (place && !engine.walkToPlacement(place.id)) pushToast({ id: Date.now(), text: "That place could not fit on the map yet." });
       canvasRef.current?.focus();
     });
-  }, [linkedMap, regionId, engineGen, travel, travelSettled]);
+  }, [commitForeground, linkedMap, navigationRequest, regionId, engineGen, travel, travelSettled]);
 
   useEffect(() => {
     engineRef.current?.setPlayerLook(playerLookWith(playerLookKey ? playerLookKey.split(",") : []));
   }, [playerLookKey, engineGen]);
 
-  const windowOpen = Boolean(dialog) || Boolean(sheet) || Boolean(loka) || Boolean(board) || creatingAgent || history !== false || quick !== false || chatOpen || listsOpen || Boolean(reports) || changelogOpen || terminalOpen || youOpen || folderShop;
+  const windowOpen = Boolean(dialog) || Boolean(sheet) || Boolean(loka) || Boolean(board) || creatingAgent || history !== false || quick !== false || chatOpen || listsOpen || Boolean(reports) || changelogOpen || terminalWindowed || youOpen || folderShop;
   const overlay = windowOpen || paletteOpen || Boolean(workbench);
   const hudHide = overlay ? "invisible opacity-0" : "visible opacity-100";
-  const menu = windowOpen && (creatingAgent || dialog?.kind !== "plot");
+  const menu = windowOpen && (Boolean(reports) || creatingAgent || dialog?.kind !== "plot");
   const otherMenu = Boolean(board) || creatingAgent || Boolean(voiceAgentId) || history !== false || quick !== false || chatOpen || notesOpen || listsOpen || youOpen || dialog?.kind === "plot" || paletteOpen;
   const canRead = atLeast(me, "read");
   const canWrite = atLeast(me, "write");
@@ -2927,11 +3251,11 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       } catch {
         return;
       }
-      lastSeqRef.current = newerSeq(lastSeqRef.current, ev.seq);
-      if (ev.type === "agent.typing") {
-        window.dispatchEvent(new CustomEvent(TYPING_EVENT, { detail: ev }));
+      if (LIVE_EVENTS.has(ev.type)) {
+        window.dispatchEvent(new CustomEvent(ev.type === "agent.typing" ? TYPING_EVENT : SIGNAL_EVENT, { detail: ev }));
         return;
       }
+      lastSeqRef.current = newerSeq(lastSeqRef.current, ev.seq);
       if (ev.type === "agent.seen") {
         window.dispatchEvent(new CustomEvent(SEEN_EVENT, { detail: ev }));
         return;
@@ -2986,7 +3310,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       if (ev.type.startsWith("report.") || ev.type.startsWith("canvas.")) window.dispatchEvent(new CustomEvent(REPORTS_STALE, { detail: ev.payload }));
       if (ev.type === "report.created" && ev.agent_id && !ev.payload.quiet && ev.payload.owner_user_id === meRef.current?.id) {
         const id = String(ev.payload.report_id ?? "");
-        pushToast({ id: ev.seq, kind: "report.created", target: "reports", bell: true, text: `New report: ${String(ev.payload.title ?? "")}`, onClick: () => setReports({ id }) });
+        pushToast({ id: ev.seq, kind: "report.created", target: "reports", bell: true, text: `New report: ${String(ev.payload.title ?? "")}`, onClick: () => void navigateRef.current({ kind: "report", id }) });
       }
       if (ev.type === "practice.checked" && ev.payload.owner_user_id === meRef.current?.id && typeof ev.payload.attempt_id === "string") {
         const reportId = String(ev.payload.report_id ?? "");
@@ -3002,14 +3326,14 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       }
       if (ev.type === "todo.nudge" && ev.payload.owner_user_id === meRef.current?.id) {
         playSound("timer");
-        pushToast({ id: ev.seq, kind: ev.payload.timer ? "timer.done" : "todo.nudge", target: "lists", bell: true, text: `${ev.payload.timer ? "Time's up" : "Still open"}: ${String(ev.payload.text ?? "")}`, onClick: () => setListsOpen(true) });
+        pushToast({ id: ev.seq, kind: ev.payload.timer ? "timer.done" : "todo.nudge", target: "lists", bell: true, text: `${ev.payload.timer ? "Time's up" : "Still open"}: ${String(ev.payload.text ?? "")}`, onClick: () => void navigateRef.current({ kind: "surface", show: () => setListsOpen(true), keepSideChat: true }) });
       }
       if (ev.type === "timer.done") {
         void loadItems();
         const mine = meRef.current?.id;
         if (!ev.payload.then && (!ev.payload.owner_user_id || ev.payload.owner_user_id === mine)) {
           playSound("timer");
-          pushToast({ id: ev.seq, kind: "timer.done", target: "lists", bell: true, text: `Timer done: ${String(ev.payload.label ?? "")}`, onClick: () => setListsOpen(true) });
+          pushToast({ id: ev.seq, kind: "timer.done", target: "lists", bell: true, text: `Timer done: ${String(ev.payload.label ?? "")}`, onClick: () => void navigateRef.current({ kind: "surface", show: () => setListsOpen(true), keepSideChat: true }) });
         }
       }
       if (bellWorthy(ev, meRef.current?.id)) {
@@ -3049,10 +3373,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
           target: `channel:${channelId}`,
           bell: true,
           text: `${ev.payload.author as string} mentioned you in ${ev.payload.channel as string}: ${(ev.payload.body as string).slice(0, 120)}`,
-          onClick: () => {
-            setChatChannel(channelId);
-            setChatOpen(true);
-          },
+          onClick: () => void navigateRef.current({ kind: "channel", id: channelId }),
         });
       }
       const askingAgent = ev.agent_id ? agentsRef.current.find((a) => a.id === ev.agent_id) : undefined;
@@ -3062,14 +3383,30 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
           id: ev.seq,
           kind: "attention.requested",
           target: agentId ? `agent:${agentId}` : undefined,
+          card: typeof ev.payload.message_id === "string" ? ev.payload.message_id : undefined,
+          linkedOnly: ev.payload.clarification === true,
           bell: true,
           text: `${(ev.payload.agent as string) ?? "An agent"} needs your decision: ${(ev.payload.text as string).slice(0, 140)}`,
-          onClick: () => agentId && setDialog({ kind: "resident", id: agentId }),
+          onClick: () => { if (agentId) void navigateRef.current({ kind: "agent", id: agentId }); },
         });
       }
       if (ev.type === "message.created" && ev.agent_id && ev.payload.author_kind === "user" && askingAgent?.owner_user_id === mine) {
         const target = `agent:${ev.agent_id}`;
-        dismissToasts((t) => t.kind === "attention.requested" && t.target === target);
+        const card = typeof ev.payload.answer_card === "string" ? ev.payload.answer_card : null;
+        dismissToasts((t) => t.kind === "attention.requested" && t.target === target && (!t.linkedOnly || (!!card && t.card === card)));
+      }
+      if (ev.type === "run.waiting" && ev.agent_id) {
+        const runId = ev.run_id ?? (ev.payload.run_id as string | undefined);
+        const waiting = ev.payload.waiting === false ? null : "disk";
+        setAgents((prev) =>
+          prev.map((a) =>
+            a.id === ev.agent_id && a.jobs?.some((j) => j.run_id === runId)
+              ? { ...a, jobs: a.jobs.map((j) => (j.run_id === runId ? { ...j, waiting } : j)) }
+              : a,
+          ),
+        );
+        if (!agentsRef.current.find((a) => a.id === ev.agent_id)?.jobs?.some((j) => j.run_id === runId)) refreshAgents();
+        return;
       }
       if (ev.type === "run.activity" && ev.agent_id) {
         const runId = ev.run_id ?? (ev.payload.run_id as string | undefined);
@@ -3152,12 +3489,12 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
           kind: p.status === "passed" ? "challenge.passed" : "challenge.graded",
           target: "academy",
           text: `${String(p.title ?? "Your answer")} was graded: ${p.status === "passed" ? "passed" : "not yet"}${xp ? `, +${xp} xp` : ""}${p.level_up ? `. Level ${String(p.level)}!` : ""}`,
-          onClick: () => setLoka({ kind: "academy", challengeId }),
+          onClick: () => void navigateRef.current({ kind: "academy", target: { challengeId } }),
         });
       }
       if (ev.type === "academy.unlocked" && p.unlock && typeof p.unlock === "object" && lokaRef.current?.kind !== "academy") {
         const name = String((p.unlock as { name?: unknown }).name ?? "something new");
-        pushToast({ id: ev.seq, kind: "academy.unlocked", target: "academy", text: `Unlocked ${name}. Equip it in the Academy.`, onClick: () => setLoka({ kind: "academy" }) });
+        pushToast({ id: ev.seq, kind: "academy.unlocked", target: "academy", text: `Unlocked ${name}. Equip it in the Academy.`, onClick: () => void navigateRef.current({ kind: "academy", target: {} }) });
       }
       if ((ev.type === "task.finished" || ev.type === "task.merged") && lokaRef.current?.kind === "academy" && ev.agent_id) {
         const agent = agentsRef.current.find((a) => a.id === ev.agent_id);
@@ -3170,10 +3507,9 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
           target: `history:${agentId}`,
           bell: true,
           text: `${agent?.name ?? "Your agent"} finished the quest${p.title ? `: ${String(p.title)}` : ""}. Your answer is saved. Tap to see it.`,
-          onClick: () => {
-            setHistory(agentId);
-            setHistoryFocus(taskId ? { taskId } : null);
-          },
+          onClick: () => taskId
+            ? void navigateRef.current({ kind: "quest", id: taskId, agentId, loaded: true })
+            : void navigateRef.current({ kind: "surface", show: () => setHistory(agentId) }),
         });
       }
     };
@@ -3237,108 +3573,426 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     };
   }, [showOffer]);
 
-  const closePanels = useCallback(() => {
-    closeCoveringPanels();
-    setDialog(null);
-    setBoard(false);
-    setHistory(false);
-    setHistoryFocus(null);
-    setQuick(false);
-    setNotesOpen(false);
-    setChatOpen(false);
-    setChatChannel(null);
-    setChatAgent(null);
-    setListsOpen(false);
-    setReports(null);
-    setPaletteOpen(false);
-    setSheet(null);
-    setLoka(null);
-    clearWorldLink();
-  }, [clearWorldLink, closeCoveringPanels]);
+  const clearMessageFocus = useCallback(() => {
+    setChatFocus(null);
+    setChatChannelFocus(null);
+    setAgentMessageFocus(undefined);
+    setMessageJump(null);
+  }, []);
 
-  const closePanelsForExactLink = useCallback(() => {
-    if (closeWorkbench.current?.() === false) return false;
-    closePanels();
-    setTerminalOpen(false);
-    setShortcutsOpen(false);
-  }, [closePanels]);
+  const dismissMessageFocus = useCallback(() => {
+    cancelPendingNavigation();
+    clearMessageFocus();
+  }, [cancelPendingNavigation, clearMessageFocus]);
 
-  const openAgent = useCallback((id: string) => {
-    closePanels();
-    setDialog({ kind: "resident", id });
-  }, [closePanels]);
+  const closeChat = useCallback(() => {
+    const request = cancelPendingNavigation();
+    clearMessageFocus();
+    commitForeground(() => {
+      setChatOpen(false);
+      setChatChannel(null);
+      setChatAgent(null);
+    }, request);
+  }, [cancelPendingNavigation, clearMessageFocus, commitForeground]);
+
+  const closePanelsForNavigation = useCallback((keepConversations = false, navigation?: NavigationRequest) => {
+    commitForeground(() => {
+      closeCoveringPanels(navigation);
+      setDialog((current) => keepConversations && current?.kind === "resident" ? current : null);
+      setBoard(false);
+      setHistory(false);
+      setHistoryFocus(null);
+      setQuick(false);
+      setNotesOpen(false);
+      if (!keepConversations) {
+        setChatOpen(false);
+        setChatChannel(null);
+        setChatAgent(null);
+      }
+      setAgentTabRequest(null);
+      clearMessageFocus();
+      setTodoFocus(null);
+      setFocusedList(undefined);
+      setFocusedTeam(null);
+      setListsOpen(false);
+      setReports(null);
+      setPaletteOpen(false);
+      setSheet(null);
+      setLoka(null);
+      setLinkedPlaceName(null);
+      updateWorldLink("place", null);
+    }, navigation);
+  }, [clearMessageFocus, closeCoveringPanels, commitForeground, updateWorldLink]);
+
+  const navigate = useCallback(async (target: NavigationTarget, navigation?: NavigationRequest) => {
+    const request = navigation ?? cancelPendingNavigation();
+    if (!request.current()) return;
+    const details = navigationDetailLoader.begin(request.current);
+    const exact = async <T,>(read: Promise<T | undefined>): Promise<T> => {
+      const value = await read;
+      if (value === undefined) throw new Error("stale");
+      return value;
+    };
+    await runNavigation<ResolvedNavigation>(details.current, async () => {
+      let resolved: ResolvedNavigation;
+      if (target.kind === "surface") return target;
+      if (target.kind === "academy") return target;
+      if (target.kind === "team") {
+        const viewer = meRef.current?.id;
+        const access = teamAccess.current;
+        const wanted = target.id.toLowerCase();
+        const loadedTeam = teamListTrusted.current ? activeTeams.current.find((item) => item.id === wanted && (item.owner_user_id === viewer || item.members.some((member) => member.member_kind === "user" && member.member_id === viewer))) : null;
+        const team = loadedTeam ?? await exact(navigationDetails.team(details, wanted));
+        if (access !== teamAccess.current) return null;
+        rejectedTeam.current = null;
+        resolved = { kind: "team", id: team.id, team, teamAccess: access };
+      } else if (target.kind === "list") {
+        const item = target.item ?? await exact(navigationDetails.item(details, target.id));
+        if (item.kind !== "list" && item.kind !== "timer") throw new Error("unavailable");
+        resolved = { kind: "list", id: item.id, item };
+      } else if (target.kind === "place" || target.kind === "region") {
+        const destination = await resolveExactDestination(target, {
+          team: (id) => exact(navigationDetails.team(details, id)),
+          item: (id) => exact(navigationDetails.item(details, id)),
+          region: (id) => exact(navigationDetails.region(details, id)),
+          home: HEARTH,
+        }, request.current);
+        if (!destination) return null;
+        resolved = destination;
+      } else if (target.kind === "assistant") {
+        const main = meRef.current?.main_agent_id;
+        const loaded = main ? agentsRef.current.find((item) => item.id === main) : null;
+        const agent = loaded ?? await worldApi.ensureAssistant();
+        if (!loaded) {
+          storeAgent(agent);
+          void load();
+          void reloadMe();
+        }
+        if (!request.current()) return null;
+        resolved = { kind: "agent", id: agent.id, agent };
+      } else if (target.kind === "agent") {
+        const wanted = target.id.toLowerCase();
+        const cached = allAgentsRef.current.find((item) => item.id === wanted || item.slug.toLowerCase() === wanted);
+        const fetched = !target.agent && !cached && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(wanted)
+          ? await exact(navigationDetails.agent(details, wanted))
+          : undefined;
+        const agent = target.agent ?? cached ?? fetched;
+        if (!agent) throw new Error("unavailable");
+        resolved = { kind: "agent", id: agent.id, agent: fetched, tab: target.tab };
+      } else if (target.kind === "quest") {
+        if (target.loaded) resolved = target;
+        else {
+          const page = await exact(navigationDetails.quest(details, target.id));
+          resolved = { kind: "quest", id: page.task.id, agentId: page.task.assigned_agent_id, page };
+        }
+      } else if (target.kind === "report" || target.kind === "canvas") {
+        const id = target.title ? (await exact(navigationDetails.reportFind(details, target.title))).id : target.id;
+        if (!request.current()) return null;
+        if (!id || target.loaded) resolved = { ...target, id };
+        else {
+          const detail = await exact(navigationDetails.report(details, id));
+          if (!request.current()) return null;
+          resolved = { kind: detail.report.kind === "canvas" ? "canvas" : "report", id: detail.report.id, item: target.item, detail, workspace: target.workspace };
+        }
+      } else if (target.kind === "practice") {
+        const attempt = await exact(navigationDetails.practiceAttempt(details, target.id));
+        if (!request.current()) return null;
+        resolved = { kind: "practice", reportId: attempt.report_id, attemptId: attempt.id };
+      } else if (target.kind === "todo") {
+        const todo = target.todo ?? await exact(navigationDetails.todo(details, target.id));
+        if (!request.current()) return null;
+        resolved = { kind: "todo", id: todo.id, todo };
+      } else if (target.kind === "person") {
+        throw new Error("unavailable");
+      } else if (target.kind === "channel") {
+        if (target.loaded) resolved = target;
+        else {
+          let id = target.id;
+          if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+            const channels = await exact(navigationCollections.channels(details));
+            if (!request.current()) return null;
+            const summary = channels.find((item) => item.name.toLowerCase() === id.toLowerCase());
+            if (!summary) throw new Error("unavailable");
+            id = summary.id;
+          }
+          const detail = await exact(navigationDetails.channel(details, id));
+          resolved = { kind: "channel", id: detail.id, detail };
+        }
+      } else if (target.kind === "chat-person") {
+        const channel = await worldApi.openDm(target.id);
+        resolved = { kind: "channel", id: channel.id };
+      } else if (target.kind === "chat-agent") {
+        const agent = agentsRef.current.find((item) => item.id === target.id);
+        if (!agent) throw new Error("unavailable");
+        resolved = target;
+      } else if (target.kind === "message") {
+        const link = await exact(navigationDetails.message(details, target.ref));
+        if (!request.current()) return null;
+        if (!link) throw new Error("unavailable");
+        const messageId = link.kind === "channel" ? Number(/^ch(\d+)$/.exec(link.ref)?.[1]) : NaN;
+        if (link.channel_id && Number.isSafeInteger(messageId)) {
+          const jump = await resolveMessageJump(link.channel_id, messageId, (id, root) => exact(navigationDetails.channelReplies(details, id, root)));
+          resolved = { kind: "message", link, ...jump };
+        } else if (link.agent_id) {
+          const jump = await resolveMessageJump(link.agent_id, link.ref, (id, root) => exact(navigationDetails.messageReplies(details, id, root)));
+          resolved = { kind: "message", link, agentMessage: jump.message, agentThread: jump.thread };
+        } else return null;
+      } else return null;
+      return resolved;
+    }, async () => {
+      if (reportsVisible.current && reportLeaveRequest.current && !(await reportLeaveRequest.current(request.current))) return false;
+      if (!request.current()) return false;
+      workbenchCloseNavigation.current = request;
+      try {
+        return closeWorkbench.current?.() !== false;
+      } finally {
+        workbenchCloseNavigation.current = null;
+      }
+    }, (resolved) => {
+      if (resolved.kind === "team" && resolved.teamAccess !== teamAccess.current) return;
+      const atWideWidth = window.matchMedia("(min-width: 1024px)").matches;
+      const wasChatOpen = chatOpenRef.current;
+      const showSideChat = () => {
+        const id = sideFrom.current;
+        if (id) setSide({ id, open: true, auto: !sideRef.current.open || sideRef.current.auto });
+      };
+      applyNavigationDestination(resolved, {
+        wide: atWideWidth,
+        sideChatSource: Boolean(sideFrom.current),
+      }, {
+        closePanels: (keepConversations) => closePanelsForNavigation(keepConversations, request),
+        showSideChat,
+        closeTerminal: () => {
+          if (!terminalDockedRef.current) setTerminalOpen(false);
+        },
+        showBoard: setBoard,
+        prepare: () => {
+          setShortcutsOpen(false);
+          const params = new URLSearchParams(window.location.search);
+          const before = params.toString();
+          for (const key of ["msg", "quest", "report", "item", "todo", "practice", "agent"]) params.delete(key);
+          if (resolved.kind === "agent") {
+            const slug = resolved.agent?.slug ?? allAgentsRef.current.find((agent) => agent.id === resolved.id)?.slug;
+            if (slug) params.set("agent", slug);
+          }
+          const rest = params.toString();
+          if (rest !== before) window.history.replaceState(null, "", `${window.location.pathname}${rest ? `?${rest}` : ""}${window.location.hash}`);
+        },
+        surface: (destination) => destination.show(request),
+        agent: (destination) => {
+          if (destination.agent) storeAgent(destination.agent);
+          setAgentTabRequest(destination.tab ? { agentId: destination.id, nonce: request.request, tab: destination.tab } : null);
+          raiseLayer("agent");
+          setDialog({ kind: "resident", id: destination.id });
+        },
+        quest: (destination) => {
+          setHistory(destination.agentId ?? null);
+          setHistoryFocus({ taskId: destination.id, page: destination.page, request: request.request });
+        },
+        reports: (destination) => {
+          closeCoveringPanels(request);
+          setDialog((current) => current?.kind === "plot" ? null : current);
+          setSheet(null);
+          setLoka(null);
+          setWaitingOn(null);
+          const params = new URLSearchParams(window.location.search);
+          const before = params.toString();
+          params.delete("report");
+          params.delete("item");
+          params.delete("workspace");
+          const rest = params.toString();
+          if (rest !== before) window.history.replaceState(null, "", `${window.location.pathname}${rest ? `?${rest}` : ""}${window.location.hash}`);
+          if (destination.workspace !== undefined) rememberWorkspaceRef.current(destination.id, { workspace: destination.workspace });
+          const workspace = destination.workspace ?? layoutFor(workspaceStoreRef.current, destination.id).workspace;
+          setReports({ id: destination.id, item: destination.item, detail: destination.detail, request: request.request, workspace });
+        },
+        academy: (destination) => {
+          setAcademyHost(true);
+          if (destination.kind === "academy") setLoka({ kind: "academy", ...destination.target, request: request.request });
+          else setLoka({ kind: "academy", reportId: destination.reportId, attemptId: destination.attemptId, request: request.request });
+        },
+        todo: (destination) => {
+          setTodoFocus({ todo: destination.todo, nonce: request.request });
+          setListsOpen(true);
+        },
+        person: () => undefined,
+        channel: (destination) => {
+          raiseLayer("chat");
+          setChatAgent(null);
+          setChatChannel(destination.id);
+          setChatChannelFocus({ id: destination.id, nonce: request.request, detail: destination.detail });
+          setChatOpen(true);
+        },
+        chatAgent: (destination) => {
+          raiseLayer("chat");
+          setChatChannel(null);
+          setChatAgent(destination.id);
+          setChatFocus({ id: destination.id, nonce: request.request });
+          setChatOpen(true);
+        },
+        messageAgent: (destination) => {
+          const link = destination.link;
+          if (!link.agent_id) return;
+          if (wasChatOpen && chatAgentsRef.current.some((agent) => agent.id === link.agent_id)) {
+            setAgentMessageFocus({ agentId: link.agent_id, nonce: request.request, surface: "chat", message: destination.agentMessage, thread: destination.agentThread });
+            raiseLayer("chat");
+            setChatChannel(null);
+            setChatAgent(link.agent_id);
+            setChatFocus({ id: link.agent_id, nonce: request.request });
+            setChatOpen(true);
+          } else {
+            setAgentMessageFocus({ agentId: link.agent_id, nonce: request.request, surface: "agent", message: destination.agentMessage, thread: destination.agentThread });
+            raiseLayer("agent");
+            setDialog({ kind: "resident", id: link.agent_id });
+          }
+        },
+        messageChannel: (destination) => {
+          const link = destination.link;
+          if (!link.channel_id) return;
+          raiseLayer("chat");
+          setChatAgent(null);
+          setChatChannel(link.channel_id);
+          setChatChannelFocus({ id: link.channel_id, nonce: request.request, thread: destination.thread, message: destination.message });
+          setChatOpen(true);
+        },
+        message: (destination) => {
+          if (!destination.thread && !destination.agentThread) setMessageJump({ link: destination.link, current: request.current });
+        },
+        team: (destination) => {
+          updateWorldLink(destination.kind, destination.id);
+          if (destination.team) setFocusedTeam({ team: destination.team, access: destination.teamAccess ?? teamAccess.current });
+        },
+        list: (destination) => {
+          updateWorldLink(destination.kind, destination.id);
+          setFocusedList(destination.item);
+          setListsOpen(true);
+        },
+        map: (destination) => {
+          updateWorldLink(destination.kind, destination.id);
+          if (!destination.map) return;
+          setLinkedPlaceName(destination.map.place?.name ?? null);
+          setLinkedMap({ destination: destination.map, request: request.request });
+        },
+      }, {
+        keepSideChat: resolved.kind === "surface" && resolved.keepSideChat,
+        preservePanels: resolved.kind === "surface" && resolved.preservePanels,
+        loadedList: target.kind === "list" && Boolean(target.item),
+        messageTarget: resolved.kind === "message" ? resolved.link.kind === "agent" && resolved.link.agent_id ? "agent" : resolved.link.channel_id ? "channel" : undefined : undefined,
+        threadedMessage: resolved.kind === "message" && Boolean(resolved.thread || resolved.agentThread),
+      });
+    }, () => {
+      if ((target.kind === "report" || target.kind === "canvas") && target.missing) target.missing();
+      else pushToast({ id: Date.now(), text: target.kind === "practice" ? "That practice attempt was not found." : "That link is no longer available." });
+    });
+  }, [cancelPendingNavigation, closeCoveringPanels, closePanelsForNavigation, load, navigationDetailLoader, reloadMe, setSide, storeAgent, updateWorldLink]);
+  navigateRef.current = navigate;
+  const navigateSurface = (show: (request: NavigationRequest) => void, keepSideChat?: boolean, navigation?: NavigationRequest) => void navigate({ kind: "surface", show, keepSideChat }, navigation);
+  const openTerminal = (command?: TerminalCommand["action"], tab?: string, device?: string) => {
+    const next = { id: Date.now(), action: command ?? "focus", tab, device } satisfies TerminalCommand;
+    if (terminalPlaceRef.current.dock !== "window") {
+      commitForeground(() => {
+        setTerminalOpen(true);
+        setTerminalCommand(next);
+      });
+      return;
+    }
+    navigateSurface(() => {
+      raiseLayer("terminal");
+      setTerminalOpen(true);
+      setTerminalCommand(next);
+    });
+  };
+  const runTerminalCommand = (command: TerminalPaletteCommand) => {
+    if ("dock" in command) {
+      const dock = command.dock;
+      if (dock === "window") {
+        setTerminalPlace((prev) => ({ ...prev, dock }));
+        navigateSurface(() => {
+          raiseLayer("terminal");
+          setTerminalOpen(true);
+          setTerminalCommand({ id: Date.now(), action: "focus" });
+        });
+        return;
+      }
+      commitForeground(() => {
+        setTerminalPlace((prev) => ({ ...prev, dock }));
+        setTerminalOpen(true);
+        setTerminalCommand({ id: Date.now(), action: "focus" });
+      });
+      return;
+    }
+    if ("focus" in command) openTerminal("focus", command.focus);
+    else openTerminal(command.action, undefined, command.device);
+  };
+  const openSettings = useCallback(() => {
+    void navigate({ kind: "surface", show: () => {
+      setFocusSection(null);
+      setYouOpen(true);
+    } });
+  }, [navigate]);
+
+  const openAgent = useCallback((id: string, request?: NavigationRequest, tab?: "work") => {
+    void navigate({ kind: "agent", id, tab }, request);
+  }, [navigate]);
 
   useEffect(() => {
     const onOpenAcademy = (e: Event) => {
       const target = (e as CustomEvent<AcademyTarget>).detail ?? {};
-      const id = sideFrom.current;
-      if (id) setSide({ id, open: true, auto: !sideRef.current.open || sideRef.current.auto });
-      setNotesOpen(false);
-      setReports(null);
-      setListsOpen(false);
-      setChatOpen(false);
-      setSheet(null);
-      setPaletteOpen(false);
-      setAcademyHost(true);
-      setLoka({ kind: "academy", ...target });
+      const request = target.request;
+      if (request === undefined) {
+        void navigate({ kind: "academy", target });
+        return;
+      }
+      if (!navigationRequest.current(request)) return;
+      void navigate({ kind: "academy", target }, { request, current: () => navigationRequest.current(request) });
     };
     window.addEventListener(OPEN_ACADEMY, onOpenAcademy);
     return () => window.removeEventListener(OPEN_ACADEMY, onOpenAcademy);
-  }, [setSide]);
+  }, [navigate, navigationRequest]);
   useEffect(() => setAcademyHost(loka?.kind === "academy"), [loka?.kind]);
 
   useEffect(() => {
     const onOpenAgent = (e: Event) => {
       const wanted = (e as CustomEvent<{ id?: string }>).detail?.id?.toLowerCase();
-      const found = wanted ? agentsRef.current.find((a) => a.id === wanted || a.slug.toLowerCase() === wanted) : undefined;
-      if (found) openAgent(found.id);
+      if (wanted) void navigate({ kind: "agent", id: wanted });
     };
     window.addEventListener("world:open-agent", onOpenAgent);
     return () => window.removeEventListener("world:open-agent", onOpenAgent);
-  }, [openAgent]);
+  }, [navigate]);
 
   useEffect(() => {
     const onOpenLink = (e: Event) => {
       const detail = (e as CustomEvent<ExactWorldLink>).detail;
       if (!detail?.kind || !detail.id) return;
-      const request = cancelPendingNavigation();
-      void openExactDestination(
-        detail,
-        { team: teamsApi.get, item: worldApi.item, region: lokaApi.region, home: HEARTH },
-        () => request === worldLinkRequest.current,
-        {
-          closePanels: closePanelsForExactLink,
-          updateLink: updateWorldLink,
-          showTeam: () => setBoard("teams"),
-          showList: () => setListsOpen(true),
-          showMap: (destination) => {
-            setLinkedPlaceName(destination.place?.name ?? null);
-            setLinkedMap({ destination, request: worldLinkRequest.current });
-          },
-          unavailable: () => pushToast({ id: Date.now(), text: "That link is no longer available." }),
-        },
-      );
+      void navigate(detail);
     };
     window.addEventListener("world:open-link", onOpenLink);
     return () => {
       window.removeEventListener("world:open-link", onOpenLink);
-      worldLinkRequest.current += 1;
+      navigationRequest.cancel();
     };
-  }, [cancelPendingNavigation, closePanelsForExactLink, updateWorldLink]);
+  }, [navigate, navigationRequest]);
 
   const initialWorldLink = useRef(false);
   useEffect(() => {
     if (!loaded || initialWorldLink.current) return;
     initialWorldLink.current = true;
+    if (worldLinkRequest.current) return;
     const params = new URLSearchParams(window.location.search);
-    for (const kind of ["team", "list", "place", "region"] as const) {
+    for (const kind of ["team", "list", "place", "region", "quest", "report", "todo", "practice", "msg", "agent"] as const) {
       const id = params.get(kind);
-      if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id ?? "")) {
-        window.dispatchEvent(new CustomEvent("world:open-link", { detail: { kind, id } }));
-        break;
-      }
+      if (!id) continue;
+      if (kind === "msg") void navigate({ kind: "message", ref: id });
+      else if (kind === "report") {
+        const item = params.get("item");
+        void navigate({ kind, id, item: item && /^[A-Za-z0-9_-]{1,40}$/.test(item) ? item : null, workspace: params.get("workspace") === "1" ? true : undefined });
+      } else if (kind === "practice") {
+        if (!ATTEMPT_ID.test(id)) continue;
+        void navigate({ kind, id: id.toLowerCase() });
+      } else void navigate({ kind, id: id.toLowerCase() });
+      break;
     }
-  }, [loaded]);
+  }, [loaded, navigate]);
 
   const sideHostRef = useRef(false);
   useEffect(() => {
@@ -3362,33 +4016,12 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     return () => window.removeEventListener(QUOTE_EVENT, onQuote);
   }, [openAgent, setSide]);
 
-  const linkedAgent = useRef<string | null | undefined>(undefined);
-  useEffect(() => {
-    if (linkedAgent.current === undefined) linkedAgent.current = new URLSearchParams(window.location.search).get("agent");
-    const wanted = linkedAgent.current;
-    if (!wanted || !loaded || !agents.length) return;
-    linkedAgent.current = null;
-    const found = allAgents.find((a) => a.slug === wanted || a.id === wanted);
-    if (!found) return;
-    engineRef.current?.begin();
-    setDialog({ kind: "resident", id: found.id });
-  }, [loaded, agents]);
-  const openSlug = dialog?.kind === "resident" ? allAgents.find((a) => a.id === dialog.id)?.slug ?? null : null;
-  useEffect(() => {
-    if (linkedAgent.current) return;
-    const params = new URLSearchParams(window.location.search);
-    if (params.get("agent") === openSlug) return;
-    if (openSlug) params.set("agent", openSlug);
-    else params.delete("agent");
-    const rest = params.toString();
-    window.history.replaceState(null, "", `${window.location.pathname}${rest ? `?${rest}` : ""}${window.location.hash}`);
-  }, [openSlug]);
-
-  const openSection = useCallback((id: string, recordId?: string) => {
-    closePanels();
-    setYouOpen(true);
-    setFocusSection({ id, at: Date.now(), recordId });
-  }, [closePanels]);
+  const openSection = useCallback((id: string, recordId?: string, navigation?: NavigationRequest) => {
+    void navigate({ kind: "surface", show: (request) => {
+      setYouOpen(true);
+      setFocusSection({ id, at: request.request, recordId });
+    } }, navigation);
+  }, [navigate]);
   const openDevices = useCallback(() => openSection("world-devices"), [openSection]);
 
   useEffect(() => {
@@ -3396,26 +4029,45 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       const action = (event as CustomEvent<SetupAction | string>).detail;
       if (typeof action === "string" && action.startsWith("page:")) openSection(action);
       else if (action === "github") openSection("page:github");
+      else if (action === "storage") openSection("page:storage");
       else openSection(action === "keys" ? "world-environment" : "world-devices");
     };
     const onTerminal = (event: Event) => {
       const asked = (event as CustomEvent<OpenTerminal | undefined>).detail;
+      if (terminalPlaceRef.current.dock !== "window") {
+        commitForeground(() => {
+          setTerminalOpen(true);
+          if (!asked?.command) {
+            setTerminalCommand({ id: Date.now(), action: "focus" });
+            return;
+          }
+          const writer = asked.agentId ?? null;
+          const id = Date.now();
+          terminalQuote.current = writer && asked.quote ? { id, writer, quote: asked.quote, wide: false } : null;
+          setTerminalTalk(null);
+          setTerminalRequest({ id, command: asked.command, runnerId: asked.runnerId });
+        });
+        return;
+      }
+      const request = cancelPendingNavigation();
       if (!asked?.command) {
         const id = sideFrom.current;
-        if (id) setSide({ id, open: true, auto: !sideRef.current.open || sideRef.current.auto });
-        closePanels();
-        setTerminalOpen(true);
+        void navigateRef.current({ kind: "surface", show: () => {
+          if (id) setSide({ id, open: true, auto: !sideRef.current.open || sideRef.current.auto });
+          showTerminal();
+        } }, request);
         return;
       }
       const writer = asked.agentId ?? null;
       const wide = window.matchMedia("(min-width: 1024px)").matches;
       const id = Date.now();
-      if (writer && wide) setSide({ id: writer, open: true, auto: !sideRef.current.open || sideRef.current.auto });
-      terminalQuote.current = writer && asked.quote ? { id, writer, quote: asked.quote, wide } : null;
-      setTerminalTalk(null);
-      closePanels();
-      setTerminalOpen(true);
-      setTerminalRequest({ id, command: asked.command, runnerId: asked.runnerId });
+      void navigateRef.current({ kind: "surface", show: () => {
+        if (writer && wide) setSide({ id: writer, open: true, auto: !sideRef.current.open || sideRef.current.auto });
+        terminalQuote.current = writer && asked.quote ? { id, writer, quote: asked.quote, wide } : null;
+        setTerminalTalk(null);
+        showTerminal();
+        setTerminalRequest({ id, command: asked.command, runnerId: asked.runnerId });
+      } }, request);
     };
     window.addEventListener(SETUP_EVENT, onSetup);
     window.addEventListener(OPEN_TERMINAL_EVENT, onTerminal);
@@ -3423,114 +4075,70 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       window.removeEventListener(SETUP_EVENT, onSetup);
       window.removeEventListener(OPEN_TERMINAL_EVENT, onTerminal);
     };
-  }, [openSection, closePanels]);
+  }, [cancelPendingNavigation, commitForeground, openSection, showTerminal]);
 
   useEffect(() => {
     const onQuick = (event: Event) => {
       const detail = (event as CustomEvent<{ agentId?: string; sessionId?: string }>).detail ?? {};
-      closePanels();
-      setQuick({ agentId: detail.agentId, sessionId: detail.sessionId });
+      void navigate({ kind: "surface", show: () => setQuick({ agentId: detail.agentId, sessionId: detail.sessionId }) });
     };
     window.addEventListener(QUICK_CHAT_EVENT, onQuick);
     return () => window.removeEventListener(QUICK_CHAT_EVENT, onQuick);
-  }, [closePanels]);
+  }, [navigate]);
 
   useEffect(() => {
     if (dialog?.kind === "resident") recent.open(dialog.id);
   }, [dialog, recent.open]);
 
-  const linkState = useRef({ dialog, chatOpen });
-  linkState.current = { dialog, chatOpen };
   useEffect(() => {
-    const focusChannel = (id: string) => {
-      if (linkState.current.chatOpen) {
-        cancelPendingNavigation();
-        setChatChannelFocus({ id, nonce: Date.now() });
-      } else {
-        closePanels();
-        setChatChannel(id);
-        setChatOpen(true);
-      }
-    };
     const onOpenMessage = (event: Event) => {
       const link = (event as CustomEvent<LinkedMessage>).detail;
-      if (!link) return;
-      const { dialog: open, chatOpen: chatting } = linkState.current;
-      if (link.kind === "agent" && link.agent_id) {
-        const agentId = link.agent_id;
-        if (chatting || (open?.kind === "resident" && open.id === agentId)) {
-          cancelPendingNavigation();
-          if (chatting) setChatFocus({ id: agentId, nonce: Date.now() });
-        } else {
-          closePanels();
-          setDialog({ kind: "resident", id: agentId });
-        }
-      } else if (link.kind === "channel" && link.channel_id) {
-        focusChannel(link.channel_id);
-      } else return;
-      requestJump(link);
+      if (link) void navigate({ kind: "message", ref: link.ref });
     };
     const onOpenQuest = (event: Event) => {
-      const detail = (event as CustomEvent<{ taskId: string; agentId: string | null }>).detail;
+      const detail = (event as CustomEvent<{ taskId: string; agentId: string | null; loaded?: boolean }>).detail;
       if (!detail) return;
-      closePanels();
-      setHistory(detail.agentId ?? null);
-      setHistoryFocus({ taskId: detail.taskId });
+      void navigate({ kind: "quest", id: detail.taskId, agentId: detail.agentId, loaded: detail.loaded && atLeast(meRef.current, "write") });
     };
     const onOpenChannel = (event: Event) => {
-      const id = (event as CustomEvent<{ id: string }>).detail?.id;
-      if (id) focusChannel(id);
+      const detail = (event as CustomEvent<{ id: string; loaded?: boolean }>).detail;
+      if (detail?.id) void navigate({ kind: "channel", ...detail });
     };
-    const onTodoFocus = () => {
-      const id = sideFrom.current;
-      if (id) setSide({ id, open: true, auto: !sideRef.current.open || sideRef.current.auto });
-      closePanels();
-      setListsOpen(true);
+    const onTodoFocus = (event: Event) => {
+      const id = (event as CustomEvent<{ id?: string }>).detail?.id;
+      if (id) void navigate({ kind: "todo", id });
     };
     window.addEventListener("world:todo-focus", onTodoFocus);
     window.addEventListener("world:open-quest", onOpenQuest);
     window.addEventListener("world:open-channel", onOpenChannel);
     window.addEventListener("world:open-message", onOpenMessage);
-    const params = new URLSearchParams(window.location.search);
-    const quest = params.get("quest");
-    if (quest && /^[0-9a-f-]{36}$/i.test(quest)) {
-      params.delete("quest");
-      window.history.replaceState(null, "", `${window.location.pathname}${params.toString() ? `?${params.toString()}` : ""}${window.location.hash}`);
-      onOpenQuest(new CustomEvent("world:open-quest", { detail: { taskId: quest, agentId: null } }));
-    }
-    const linked = params.get("msg");
-    if (linked) {
-      params.delete("msg");
-      const rest = params.toString();
-      window.history.replaceState(null, "", `${window.location.pathname}${rest ? `?${rest}` : ""}${window.location.hash}`);
-      void resolveMessage(linked).then((found) => found && openMessage(found));
-    }
     return () => {
       window.removeEventListener("world:open-message", onOpenMessage);
       window.removeEventListener("world:open-quest", onOpenQuest);
       window.removeEventListener("world:todo-focus", onTodoFocus);
       window.removeEventListener("world:open-channel", onOpenChannel);
     };
-  }, [cancelPendingNavigation, closePanels]);
+  }, [navigate]);
 
   useEffect(() => {
     const onOpen = (event: Event) => {
       const detail = (event as CustomEvent<OpenWorkshopDetail>).detail;
       if (!detail) return;
-      closePanels();
-      setWorkbench(detail);
+      void navigateRef.current({ kind: "surface", show: () => setWorkbench(detail) });
     };
     window.addEventListener("world:open-workbench", onOpen);
     const params = new URLSearchParams(window.location.search);
     const linked = params.get("workbench");
     if (linked && /^[0-9a-f-]{36}$/i.test(linked)) {
-      params.delete("workbench");
-      const rest = params.toString();
-      window.history.replaceState(null, "", `${window.location.pathname}${rest ? `?${rest}` : ""}${window.location.hash}`);
-      setWorkbench(linked);
+      void navigateRef.current({ kind: "surface", show: () => {
+        params.delete("workbench");
+        const rest = params.toString();
+        window.history.replaceState(null, "", `${window.location.pathname}${rest ? `?${rest}` : ""}${window.location.hash}`);
+        setWorkbench(linked);
+      } });
     }
     return () => window.removeEventListener("world:open-workbench", onOpen);
-  }, [closePanels]);
+  }, []);
 
   useEffect(() => {
     if (!paletteOpen) return;
@@ -3539,19 +4147,22 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       event.preventDefault();
       event.stopPropagation();
       event.stopImmediatePropagation();
-      setPaletteOpen(false);
+      commitForeground(() => setPaletteOpen(false));
     };
     window.addEventListener("keydown", closePalette, true);
     return () => window.removeEventListener("keydown", closePalette, true);
-  }, [paletteOpen]);
+  }, [commitForeground, paletteOpen]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       const modifier = event.metaKey || event.ctrlKey;
       if (modifier && event.key.toLowerCase() === "k") {
         event.preventDefault();
-        setPaletteQuery("");
-        setPaletteOpen((value) => !value);
+        if (paletteOpen) commitForeground(() => setPaletteOpen(false));
+        else showAuxiliary(() => {
+          setPaletteQuery("");
+          setPaletteOpen(true);
+        });
         return;
       }
       if (!modifier || event.altKey) return;
@@ -3565,11 +4176,12 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       const detail = (event as CustomEvent<string | { command?: string }>).detail;
       const command = typeof detail === "string" ? detail : detail?.command;
       if (command === "palette") {
-        setPaletteQuery("");
-        setPaletteOpen(true);
+        showAuxiliary(() => {
+          setPaletteQuery("");
+          setPaletteOpen(true);
+        });
       } else if (command === "settings") {
-        setFocusSection(null);
-        setYouOpen(true);
+        openSettings();
       }
       else if (command === "next-tab" || command === "previous-tab") {
         if (!recent.ids.length) return;
@@ -3582,7 +4194,11 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
         const remaining = recent.ids.filter((id) => id !== dialog.id);
         recent.close(dialog.id);
         if (remaining.length) openAgent(remaining[Math.min(Math.max(index - 1, 0), remaining.length - 1)]);
-        else setDialog(null);
+        else {
+          const request = cancelPendingNavigation();
+          clearMessageFocus();
+          commitForeground(() => setDialog(null), request);
+        }
       }
     };
     window.addEventListener("keydown", onKey);
@@ -3591,7 +4207,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       window.removeEventListener("keydown", onKey);
       window.removeEventListener("world:desktop-command", onDesktopCommand);
     };
-  }, [dialog, openAgent, recent.ids, recent.close]);
+  }, [cancelPendingNavigation, clearMessageFocus, commitForeground, dialog, openAgent, openSettings, paletteOpen, recent.ids, recent.close, showAuxiliary]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -3600,7 +4216,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       if (e.metaKey || e.ctrlKey || e.altKey || !started) return;
       if (e.key === "?" && !paletteOpen && !workbench) {
         e.preventDefault();
-        setShortcutsOpen(true);
+        showAuxiliary(() => setShortcutsOpen(true));
         return;
       }
       if (overlay) return;
@@ -3611,48 +4227,48 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       }
       const k = e.key.toLowerCase();
       if (k === "q" && canRead) {
-        clearWorldLink();
-        setBoard("quests");
+        navigateSurface(() => setBoard("quests"));
       } else if (k === "c" && canRead) {
-        clearWorldLink();
-        setChatOpen(true);
+        navigateSurface(() => {
+          raiseLayer("chat");
+          setChatOpen(true);
+        });
       } else if (k === "h" && canWrite) {
-        clearWorldLink();
-        setHistory(null);
+        navigateSurface(() => setHistory(null));
       } else if (k === "k" && canWrite) {
-        clearWorldLink();
-        setQuick({});
+        navigateSurface(() => setQuick({}));
       } else if (k === "n") {
-        clearWorldLink();
-        openNotesRef.current();
+        if (notesOpen) commitForeground(() => setNotesOpen(false));
+        else showAuxiliary(() => setNotesOpen(true));
       } else if (k === "p" && canWrite) {
-        clearWorldLink();
         void summonRef.current();
       } else if (k === "l" && canWrite) {
-        clearWorldLink();
-        setListsOpen(true);
+        navigateSurface(() => setListsOpen(true));
       } else if (k === "r" && canRead) {
-        clearWorldLink();
-        setReports({ id: null });
+        void navigate({ kind: "report", id: null, loaded: true });
+      } else if (k === "b" && canRead) {
+        window.dispatchEvent(new CustomEvent(OPEN_WORKSPACE));
       } else if (k === "t" && canWrite && terminalFeature?.state !== "unavailable") {
-        clearWorldLink();
-        setTerminalOpen(true);
+        openTerminal();
       } else if (k === "o" && canWrite) {
-        clearWorldLink();
-        setFolderShop(true);
+        navigateSurface(() => setFolderShop(true));
       } else if (k === "y") {
-        clearWorldLink();
-        setFocusSection(null);
-        setYouOpen(true);
-      } else if (k === "m") setMapShown((o) => !o);
+        navigateSurface(() => {
+          setFocusSection(null);
+          setYouOpen(true);
+        });
+      } else if (k === "m") commitForeground(() => setMapShown((o) => !o));
       else return;
       e.preventDefault();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [overlay, started, canRead, canWrite, isAdmin, terminalFeature?.state, paletteOpen, workbench, clearWorldLink]);
+  }, [commitForeground, navigate, notesOpen, overlay, showAuxiliary, showTerminal, started, canRead, canWrite, isAdmin, terminalFeature?.state, paletteOpen, workbench]);
 
-  const openNotes = () => setNotesOpen((o) => !o);
+  const openNotes = () => {
+    if (notesOpen) commitForeground(() => setNotesOpen(false));
+    else showAuxiliary(() => setNotesOpen(true));
+  };
 
   useEffect(() => {
     if (!feed.length) return;
@@ -3661,88 +4277,92 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
   }, [feed]);
 
   const dialogAgent = dialog?.kind === "resident" ? allAgents.find((a) => a.id === dialog.id) ?? null : null;
-  const windowKey = creatingAgent
-    ? "create"
-    : youOpen
-      ? "you"
-      : folderShop
-        ? "workshop"
-        : changelogOpen
-          ? "changelog"
-          : reports
-            ? "reports"
-            : loka?.kind === "academy"
-              ? "academy"
-              : listsOpen
-              ? "lists"
-              : chatOpen
-                  ? "chat"
-                  : quick !== false
-                    ? "quick"
-                    : history !== false
-                      ? "history"
-                      : board
-                        ? "board"
-                        : loka && !dialogAgent
-                          ? `loka:${loka.kind}`
-                          : sheet && !dialogAgent
-                            ? "sheet"
-                            : dialogAgent
-                              ? `agent:${dialogAgent.id}`
-                              : dialog?.kind === "plot"
-                                ? "plot"
-                                : terminalOpen
-                                  ? "terminal"
-                                  : dialog?.kind ?? "none";
+  const lowerWindow = foregroundWindowLayer(windowLayers, { terminal: terminalWindowed, agent: Boolean(dialogAgent), chat: chatOpen });
+  const baseWindowKey = creatingAgent ? "create"
+    : youOpen ? "you"
+    : folderShop ? "workshop"
+    : changelogOpen ? "changelog"
+    : loka?.kind === "academy" ? "loka:academy"
+    : listsOpen ? "lists"
+    : quick !== false ? "quick"
+    : history !== false ? "history"
+    : board ? "board"
+    : loka ? `loka:${loka.kind}`
+    : sheet ? "sheet"
+    : dialog?.kind === "plot" ? "plot"
+    : lowerWindow === "agent" ? `agent:${dialogAgent?.id}`
+    : lowerWindow ?? "none";
+  const windowKey = reports ? "reports" : baseWindowKey;
+  const openSlug = baseWindowKey.startsWith("agent:") ? dialogAgent?.slug ?? null : null;
+  const previousSlug = useRef<string | null>(null);
+  useEffect(() => {
+    const previous = previousSlug.current;
+    previousSlug.current = openSlug;
+    if (!openSlug && !previous) return;
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("agent") === openSlug) return;
+    if (openSlug) params.set("agent", openSlug);
+    else params.delete("agent");
+    const rest = params.toString();
+    window.history.replaceState(null, "", `${window.location.pathname}${rest ? `?${rest}` : ""}${window.location.hash}`);
+  }, [openSlug]);
   const terminalFront = windowKey === "terminal";
   reportsVisible.current = windowKey === "reports";
   sideHostRef.current = !!reports || listsOpen || terminalFront || loka?.kind === "academy";
 
   const closeDialog = useCallback(() => {
-    setDialog(null);
+    const request = cancelPendingNavigation();
+    clearMessageFocus();
+    setAgentTabRequest(null);
+    commitForeground(() => setDialog(null), request);
     setInjected(null);
     canvasRef.current?.focus();
-  }, []);
+  }, [cancelPendingNavigation, clearMessageFocus, commitForeground]);
+  const closeReports = async () => {
+    const request = cancelPendingNavigation();
+    if (reportLeaveRequest.current && !(await reportLeaveRequest.current(request.current))) return;
+    commitForeground(() => setReports(null), request);
+  };
+  const closeLists = () => {
+    const request = cancelPendingNavigation();
+    commitForeground(() => {
+      setListsOpen(false);
+      setTodoFocus(null);
+      setFocusedList(undefined);
+      if (worldLink?.kind === "list") updateWorldLink("list", null);
+    }, request);
+  };
   const closeBoard = useCallback(() => {
-    setBoard(false);
-    if (worldLink?.kind === "team") updateWorldLink("team", null);
-    canvasRef.current?.focus();
-  }, [updateWorldLink, worldLink]);
+    const request = cancelPendingNavigation();
+    commitForeground(() => {
+      setBoard(false);
+      setFocusedTeam(null);
+      if (worldLink?.kind === "team") updateWorldLink("team", null);
+      canvasRef.current?.focus();
+    }, request);
+  }, [cancelPendingNavigation, commitForeground, updateWorldLink, worldLink]);
   const openCreateAgent = useCallback(() => {
-    setBoard(false);
-    setDialog(null);
-    setCreatingAgent(true);
-  }, []);
-  const storeAgent = useCallback((agent: WorldAgent) => {
-    setAgents((current) => {
-      const found = current.some((item) => item.id === agent.id);
-      return found ? current.map((item) => (item.id === agent.id ? agent : item)) : [...current, agent];
-    });
-  }, []);
-
+    void navigate({ kind: "surface", show: () => setCreatingAgent(true) });
+  }, [navigate]);
   const onboardingStarted = useRef(false);
   useEffect(() => {
     if (!started || !me?.onboarding || !canWrite || onboardingStarted.current) return;
     onboardingStarted.current = true;
+    const request = cancelPendingNavigation();
     void worldApi
       .startOnboarding()
       .then(async ({ pending, agent_id }) => {
         if (!pending || !agent_id) return;
-        await Promise.all([load(), reloadMe()]);
-        setBoard(false);
-        setDialog({ kind: "resident", id: agent_id });
+        const [list] = await Promise.all([load(), reloadMe()]);
+        const agent = list?.find((item) => item.id === agent_id);
+        if (agent && request.current()) void navigate({ kind: "agent", id: agent.id, agent }, request);
       })
       .catch(() => {
         onboardingStarted.current = false;
       });
-  }, [started, me?.onboarding, canWrite, load, reloadMe]);
+  }, [cancelPendingNavigation, started, me?.onboarding, canWrite, load, navigate, reloadMe]);
 
-  const summonAssistant = async () => {
-    const a = assistant ?? (await worldApi.ensureAssistant());
-    if (!assistant) await Promise.all([load(), reloadMe()]);
-    setBoard(false);
-    setDialog({ kind: "resident", id: a.id });
-  };
+  const summonAssistant = (request?: NavigationRequest) => navigate({ kind: "assistant" }, request);
 
   const talkTarget = (): WorldAgent | null => {
     const open = dialog?.kind === "resident" ? allAgents.find((a) => a.id === dialog.id) : null;
@@ -3758,8 +4378,13 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       return;
     }
     speech().warm("tts");
-    setDialog({ kind: "resident", id: target.id });
-    setInjected({ text, nonce: Date.now(), agentId: target.id });
+    const request = talkNavigation.current ?? cancelPendingNavigation();
+    talkNavigation.current = null;
+    commitForeground(() => {
+      raiseLayer("agent");
+      setDialog({ kind: "resident", id: target.id });
+      setInjected({ text, nonce: Date.now(), agentId: target.id });
+    }, request);
   });
   const voiceAgent = voiceAgentId ? agents.find((a) => a.id === voiceAgentId) ?? null : null;
   const minimiseCall = useCallback(() => callDispatch({ type: "minimise" }), []);
@@ -3788,8 +4413,36 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     }
     if (engineChoice() === "live") primeLiveAudio();
     callDispatch({ type: "start", agentId: target.id });
-    if (!inChat) setDialog({ kind: "resident", id: target.id });
+    if (!inChat) commitForeground(() => {
+      raiseLayer("agent");
+      setDialog({ kind: "resident", id: target.id });
+    });
   };
+  const callAboutRef = useRef<(about: string) => void>(() => {});
+  callAboutRef.current = (about) => {
+    if (!mainId) {
+      pushToast({ id: Date.now(), text: "Set up your main agent first, then you can call it about a canvas." });
+      return;
+    }
+    const name = agents.find((a) => a.id === mainId)?.name ?? "your main agent";
+    if (isCallOf(call, mainId, null)) {
+      callDispatch({ type: "restore" });
+      if (call.about !== about) pushToast({ id: Date.now(), text: `You are already on a call with ${name}. Hang up and call again from this canvas to share it.` });
+      return;
+    }
+    const live = engineChoice() === "live";
+    if (live) primeLiveAudio();
+    callDispatch({ type: "start", agentId: mainId, about });
+    if (!live) pushToast({ id: Date.now(), text: `${name} sees the canvas only on Live calls. Switch the call to Live to share it.` });
+  };
+  useEffect(() => {
+    const onCall = (e: Event) => {
+      const about = readAbout((e as CustomEvent<unknown>).detail);
+      if (about) callAboutRef.current(about);
+    };
+    window.addEventListener(CALL_ABOUT_EVENT, onCall);
+    return () => window.removeEventListener(CALL_ABOUT_EVENT, onCall);
+  }, []);
   const talkRef = useRef(talk);
   talkRef.current = talk;
   useEffect(() => {
@@ -3809,6 +4462,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       }
       if (e.key.toLowerCase() !== "v" || e.altKey || e.metaKey || e.ctrlKey || e.repeat || typing(e.target) || !started || !canWrite || otherMenu) return;
       e.preventDefault();
+      talkNavigation.current = cancelPendingNavigation();
       talkRef.current.start();
     };
     const up = (e: KeyboardEvent) => {
@@ -3854,13 +4508,16 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
 
   const renderAgentDialog = (
     agent: WorldAgent,
-    opts: { onClose: () => void; key: string; onOpenAgent: (id: string) => void; embedded?: boolean; compact?: boolean; attach?: { on: string; off: string; read: () => MessageQuote | null } },
+    opts: { foreground: ConversationForeground; surface: ConversationSurface; onClose: () => void; key: string; onOpenAgent: (id: string) => void; embedded?: boolean; compact?: boolean; attach?: { on: string; off: string; read: () => MessageQuote | null } },
   ) => (
     <AgentDialog
       key={opts.key}
       attach={opts.attach}
       embedded={opts.embedded}
       compact={opts.compact}
+      foreground={opts.foreground}
+      surface={opts.surface}
+      onClearMessageFocus={agentMessageFocus?.surface === opts.surface && agentMessageFocus.agentId === agent.id ? dismissMessageFocus : undefined}
       progress={progress[agent.id] ?? null}
       meId={me?.id ?? null}
       viewer={me ? { id: me.id, role: me.role } : null}
@@ -3870,24 +4527,34 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
         void load();
       }}
       agent={agent}
-      portrait={portraitUrl(residentFor(agent).look, 6)}
       asides={asides}
       onAside={(sid) => setAsides((prev) => new Set(prev).add(sid))}
       agents={agents}
       onOpenAgent={opts.onOpenAgent}
+      onNavigate={(select) => commitForeground(() => select())}
+      onBeginNavigation={cancelPendingNavigation}
+      onForked={(copy, request) => void navigate({ kind: "agent", id: copy.id, agent: copy }, request)}
       canInstall={isAdmin}
       onVoice={() => openVoice(agent.id, true)}
-      onCallSlot={agent.id === call.agentId && !call.quickId && !call.minimised && (!opts.compact || wide) ? onCallSlot : undefined}
+      onCallSlot={conversationIsForeground(opts.foreground, opts.surface) && agent.id === call.agentId && !call.quickId && !call.minimised && (!opts.compact || wide) ? onCallSlot : undefined}
       onAgentUpdated={(updated) => {
         storeAgent(updated);
         void load();
       }}
       onHistory={(focus) => {
-        closePanels();
-        setHistory(agent.id);
-        setHistoryFocus(focus ?? null);
+        if (focus?.taskId && !focus.sessionId) {
+          void navigate({ kind: "quest", id: focus.taskId, agentId: agent.id, loaded: canWrite });
+        } else {
+          navigateSurface(() => {
+            setHistory(agent.id);
+            setHistoryFocus(focus ?? null);
+          });
+        }
       }}
       injected={injected}
+      messageFocus={opts.surface === agentMessageFocus?.surface && agentMessageFocus.agentId === agent.id ? agentMessageFocus : undefined}
+      requestedTab={opts.surface === "agent" && agentTabRequest?.agentId === agent.id ? agentTabRequest : undefined}
+      onRequestedTabApplied={(nonce) => setAgentTabRequest((current) => current?.nonce === nonce ? null : current)}
       onVoiceSent={(id) => expectSpokenReply(`agent:${id}`)}
       access={agentAccess(agent)}
       onClose={opts.onClose}
@@ -3904,13 +4571,14 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       const rank = (x: WorldAgent) => (x.id === mainId ? 0 : x.status === "waiting" || x.status === "error" ? 1 : x.owner_user_id === me?.id ? 2 : 3);
       return rank(a) - rank(b) || a.name.localeCompare(b.name);
     });
+  chatAgentsRef.current = chatAgents;
   const restoreCall = () => {
     const id = call.agentId;
     if (!id) return;
     callDispatch({ type: "restore" });
     if (callSlot?.isConnected) return;
     if (call.quickId) {
-      if (quick === false) setQuick({ agentId: id, sessionId: call.quickId });
+      if (quick === false) commitForeground(() => setQuick({ agentId: id, sessionId: call.quickId ?? undefined }));
       return;
     }
     const shown = (sideAgent?.id === id && wide) || (dialog?.kind === "resident" && dialog.id === id && !reports && !listsOpen && !terminalFront);
@@ -3918,12 +4586,15 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     if (wide && (reports || listsOpen || terminalFront || loka?.kind === "academy") && side.open && chatAgents.some((a) => a.id === id)) setSide({ id, open: true, auto: side.auto });
     else openAgent(id);
   };
-  sideFrom.current = reports || listsOpen || terminalFront || loka?.kind === "academy" ? null : dialog?.kind === "resident" ? dialog.id : chatOpen && !chatChannel ? chatLast.agentId : null;
+  sideFrom.current = reports || listsOpen || terminalFront || loka?.kind === "academy" ? null : lowerWindow === "agent" ? dialogAgent?.id ?? null : lowerWindow === "chat" ? chatLast.agentId : null;
   const sideAgent = side.open ? chatAgents.find((a) => a.id === side.id) ?? chatAgents.find((a) => a.id === mainId) ?? chatAgents[0] ?? null : null;
   const sideToggle = chatAgents.length ? (
     <button
       type="button"
-      onClick={() => setSide({ id: sideAgent?.id ?? side.id, open: !side.open })}
+      onClick={() => {
+        cancelPendingNavigation();
+        showSideChat(sideAgent?.id ?? side.id, !side.open);
+      }}
       aria-pressed={side.open}
       aria-label={side.open ? "Hide agent chat" : "Talk to an agent here"}
       title={side.open ? "Hide agent chat" : "Talk to an agent while you read"}
@@ -3947,11 +4618,14 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     off: "Terminal not sent",
     read: () => terminalReader.current?.() ?? null,
   };
-  const withSide = (panel: React.ReactNode) => (
+  const conversationUncovered = !proOpen && !paletteOpen && !shortcutsOpen && !notesOpen;
+  const conversationTop = !conversationUncovered ? "covered" : workbench ? "workbench" : windowKey;
+  const conversationForeground: ConversationForeground = { documentVisible, top: conversationTop, wide };
+  const withSide = (panel: React.ReactNode, active = true) => (
     <div className="flex min-h-0 flex-1">
       <div className="flex min-h-0 min-w-0 flex-1">{panel}</div>
-      {sideAgent && <PaneResizer pane={sidePane} edge="left" label="Resize the agent chat" className="mx-1.5 hidden lg:block" />}
-      {sideAgent && (
+      {active && sideAgent && <PaneResizer pane={sidePane} edge="left" label="Resize the agent chat" className="mx-1.5 hidden lg:block" />}
+      {active && sideAgent && (
         <aside
           style={sidePane.style}
           aria-label={`Talk to ${sideAgent.name}`}
@@ -3970,11 +4644,17 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
               size="sm"
               ariaLabel="Agent to talk to"
               value={sideAgent.id}
-              onChange={(id) => setSide({ id, open: true, auto: side.auto })}
+              onChange={(id) => {
+                cancelPendingNavigation();
+                setSide({ id, open: true, auto: side.auto });
+              }}
               className="min-w-0 flex-1 font-semibold"
               options={chatAgents.map((a) => ({ value: a.id, label: a.name, hint: a.id === mainId ? "main" : undefined }))}
             />
-            <button type="button" onClick={() => setSide({ id: sideAgent.id, open: false })} aria-label="Hide agent chat" title="Hide agent chat" className={cn(CHUNKY, "bg-w-card p-1.5 hover:bg-w-paper")}>
+            <button type="button" onClick={() => {
+              cancelPendingNavigation();
+              showSideChat(sideAgent.id, false);
+            }} aria-label="Hide agent chat" title="Hide agent chat" className={cn(CHUNKY, "bg-w-card p-1.5 hover:bg-w-paper")}>
               <X size={14} weight="bold" />
             </button>
           </div>
@@ -3983,7 +4663,12 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
               key: `side:${sideAgent.id}`,
               embedded: true,
               compact: true,
-              onClose: () => setSide({ id: sideAgent.id, open: false }),
+              surface: "side",
+              foreground: { ...conversationForeground, sideMounted: active },
+              onClose: () => {
+                cancelPendingNavigation();
+                showSideChat(sideAgent.id, false);
+              },
               onOpenAgent: openAgent,
               attach: terminalFront ? terminalAttach : undefined,
             })}
@@ -4018,6 +4703,15 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
         state: (r.status !== "online" ? "offline" : agents.some((a) => a.runner_id === r.id && a.jobs?.length) ? "busy" : "online") as "busy" | "online" | "offline",
       })),
     [runners, agents],
+  );
+  const appRunner = useAppRunner();
+  const terminalDevices = useMemo(
+    () =>
+      deviceChoices(
+        runners.filter((r) => r.status === "online" && r.owner_user_id === me?.id).map((r) => ({ id: r.id, name: r.name })),
+        appRunner?.homeTerminal ? appRunner.id : null,
+      ),
+    [runners, me?.id, appRunner],
   );
   const activeTimers = items.filter((i) => i.kind === "timer" && i.status === "active" && i.owner_user_id === me?.id);
   const nextTimer = activeTimers.reduce<{ label: string; at: number } | null>((best, i) => {
@@ -4116,76 +4810,89 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       )
       .catch(() => {});
   };
-  const openWorkshopFor = (agentId: string | null) => {
-    if (workshopFeature?.state === "unavailable") {
-      setSheet({ kind: "setup", feature: "workshop", title: "Workshop" });
+  const openWorkshopFor = (agentId: string | null, navigation?: NavigationRequest) => {
+    commitForeground(() => {
+      if (workshopFeature?.state === "unavailable") {
+        setSheet({ kind: "setup", feature: "workshop", title: "Workshop" });
+        return;
+      }
+      if (!agentId) {
+        setWorkbench({});
+        return;
+      }
+      const agent = agentsRef.current.find((a) => a.id === agentId);
+      const sessions = [...new Set((agent?.jobs ?? []).filter((j) => j.kind !== "review" && j.session_id).map((j) => j.session_id as string))];
+      setWorkbench(sessions.length === 1 ? sessions[0] : { agentId });
+    }, navigation);
+  };
+  const openSurface = (surface: Surface, navigation: NavigationRequest) => {
+    if (surface === "inbox") {
+      if (!notesOpen) showAuxiliary(() => setNotesOpen(true), navigation);
       return;
     }
-    if (!agentId) {
-      setWorkbench({});
+    if (surface === "reports") {
+      void navigate({ kind: "report", id: null, loaded: true }, navigation);
       return;
     }
-    const agent = agentsRef.current.find((a) => a.id === agentId);
-    const sessions = [...new Set((agent?.jobs ?? []).filter((j) => j.kind !== "review" && j.session_id).map((j) => j.session_id as string))];
-    setWorkbench(sessions.length === 1 ? sessions[0] : { agentId });
+    commitForeground(() => {
+      if (surface === "timers") setListsOpen(true);
+      else if (surface === "schedules" || surface === "usage" || surface === "feeds") setSheet({ kind: "agents", surface });
+      else if (surface === "sessions") setHistory(null);
+      else if (surface === "workshop") openWorkshopFor(null, navigation);
+      else if (surface === "terminal") {
+        if (terminalFeature?.state === "unavailable") setSheet({ kind: "setup", feature: "terminal", title: "Terminal" });
+        else showTerminal();
+      } else if (surface === "devices") openDevices();
+    }, navigation);
   };
-  const openSurface = (surface: Surface) => {
-    if (surface === "timers") setListsOpen(true);
-    else if (surface === "schedules" || surface === "usage" || surface === "feeds") setSheet({ kind: "agents", surface });
-    else if (surface === "sessions") setHistory(null);
-    else if (surface === "reports") setReports({ id: null });
-    else if (surface === "workshop") openWorkshopFor(null);
-    else if (surface === "terminal") {
-      if (terminalFeature?.state === "unavailable") setSheet({ kind: "setup", feature: "terminal", title: "Terminal" });
-      else setTerminalOpen(true);
-    } else if (surface === "devices") openDevices();
-    else if (!notesOpen) openNotesRef.current();
-  };
-  const followOpens = (opens: Opens, name: string) => {
-    if (opens.kind === "channel") window.dispatchEvent(new CustomEvent("world:open-channel", { detail: { id: opens.ref } }));
-    else if (opens.kind === "quest") window.dispatchEvent(new CustomEvent("world:open-quest", { detail: { taskId: opens.ref, agentId: null } }));
-    else if (opens.kind === "list") openWorldLink("list", opens.ref);
+  const followOpens = (opens: Opens, name: string, navigation: NavigationRequest) => {
+    if (opens.kind === "channel") void navigate({ kind: "channel", id: opens.ref }, navigation);
+    else if (opens.kind === "quest") void navigate({ kind: "quest", id: opens.ref }, navigation);
+    else if (opens.kind === "list") void navigate({ kind: "list", id: opens.ref }, navigation);
     else if (opens.kind === "url") window.open(opens.ref, "_blank", "noopener,noreferrer");
-    else if (opens.kind === "surface") openSurface(opens.ref);
-    else if (opens.kind === "challenge") setLoka({ kind: "academy", challengeId: opens.ref });
+    else if (opens.kind === "surface" && opens.ref === "reports") void navigate({ kind: "report", id: null, loaded: true }, navigation);
+    else if (opens.kind === "surface") void navigate({ kind: "surface", show: (request) => openSurface(opens.ref, request) }, navigation);
+    else if (opens.kind === "challenge") void navigate({ kind: "academy", target: { challengeId: opens.ref } }, navigation);
     else void travel(opens.ref, name);
   };
-  const runAction = (a: PlaceAction) => {
+  const runAction = (a: PlaceAction, navigation: NavigationRequest) => {
     if (a.kind === "room") {
       setScene((s) => (s ? { ...s, room: a.room, at: undefined } : s));
       return;
     }
     if (a.kind === "academy") {
-      setLoka({ kind: "academy", challengeId: a.challengeId ?? null });
+      void navigate({ kind: "academy", target: { challengeId: a.challengeId ?? null } }, navigation);
       return;
     }
     if (a.kind === "npc") {
       const item = itemsRef.current.find((i) => i.id === a.id) ?? regionDetailRef.current?.items.find((i) => i.id === a.id);
-      if (item) setLoka({ kind: "npc", id: item.id, name: item.name, data: item.data });
+      if (item) commitForeground(() => setLoka({ kind: "npc", id: item.id, name: item.name, data: item.data }), navigation);
       return;
     }
-    if (a.kind === "surface") openSurface(a.surface);
-    else if (a.kind === "agent") setDialog({ kind: "resident", id: a.agentId });
-    else if (a.kind === "skills" || a.kind === "notes" || a.kind === "kit") setSheet({ kind: a.kind, agentId: a.agentId });
-    else if (a.kind === "notes-all") setSheet({ kind: "notes-all" });
-    else if (a.kind === "workbench") openWorkshopFor(a.agentId);
-    else if (a.kind === "history") setHistory(a.agentId);
-    else if (a.kind === "chat") setChatOpen(true);
-    else if (a.kind === "slack") openSection("world-slack");
+    if (a.kind === "surface" && a.surface === "reports") void navigate({ kind: "report", id: null, loaded: true }, navigation);
+    else if (a.kind === "surface") void navigate({ kind: "surface", show: (request) => openSurface(a.surface, request) }, navigation);
+    else if (a.kind === "agent") openAgent(a.agentId, navigation);
+    else if (a.kind === "skills" || a.kind === "notes" || a.kind === "kit") void navigate({ kind: "surface", show: () => setSheet({ kind: a.kind, agentId: a.agentId }) }, navigation);
+    else if (a.kind === "notes-all") void navigate({ kind: "surface", show: () => setSheet({ kind: "notes-all" }) }, navigation);
+    else if (a.kind === "workbench") void navigate({ kind: "surface", show: (request) => openWorkshopFor(a.agentId, request) }, navigation);
+    else if (a.kind === "history") void navigate({ kind: "surface", show: () => setHistory(a.agentId) }, navigation);
+    else if (a.kind === "chat") void navigate({ kind: "surface", show: () => { raiseLayer("chat"); setChatOpen(true); } }, navigation);
+    else if (a.kind === "slack") openSection("world-slack", undefined, navigation);
     else {
       const target = assistant ?? myAgents[0];
-      if (target) setDialog({ kind: "resident", id: target.id });
-      else setChatOpen(true);
+      if (target) openAgent(target.id, navigation);
+      else void navigate({ kind: "surface", show: () => { raiseLayer("chat"); setChatOpen(true); } }, navigation);
     }
   };
   interactRef.current = (t: Target) => {
+    const navigation = cancelPendingNavigation();
     if (t.kind === "board") {
-      setBoard("quests");
+      void navigate({ kind: "surface", show: () => setBoard("quests") }, navigation);
       return;
     }
     if (t.kind === "thing") {
       const action = roomActions.current[t.id];
-      if (action) runAction(action);
+      if (action) runAction(action, navigation);
       return;
     }
     if (t.kind === "place") {
@@ -4196,7 +4903,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
         return;
       }
       if (place.kind === "academy") {
-        setLoka({ kind: "academy" });
+        void navigate({ kind: "academy", target: {} }, navigation);
         return;
       }
       if (place.kind === "campus") {
@@ -4206,7 +4913,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       if (place.kind === "building") {
         const item = itemsRef.current.find((i) => i.id === place.ref) ?? regionDetailRef.current?.items.find((i) => i.id === place.ref);
         const opens = parseOpens(item?.data.opens);
-        if (item && opens) followOpens(opens, item.name);
+        if (item && opens) followOpens(opens, item.name, navigation);
         return;
       }
       if (!roomFor(t.id)) return;
@@ -4217,22 +4924,40 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
     }
     if (t.kind === "folk") {
       const item = itemsRef.current.find((i) => i.id === t.id) ?? regionDetailRef.current?.items.find((i) => i.id === t.id);
-      if (item) setLoka({ kind: "npc", id: item.id, name: item.name, data: item.data });
+      if (item) commitForeground(() => setLoka({ kind: "npc", id: item.id, name: item.name, data: item.data }), navigation);
       return;
     }
-    setDialog(t);
+    if (t.kind === "resident") openAgent(t.id, navigation);
+    else commitForeground(() => setDialog(t), navigation);
   };
 
   const fixRefusal = (fix: "budget" | "keys") => {
-    setLoka(null);
-    if (fix === "budget") setSheet({ kind: "agents", surface: "usage" });
+    if (fix === "budget") navigateSurface(() => {
+      setLoka(null);
+      setSheet({ kind: "agents", surface: "usage" });
+    });
     else openSection("world-environment");
   };
 
 
   return (
     <MotionConfig reducedMotion="user">
-    <div ref={rootRef} className="fixed inset-0 overflow-clip bg-[#17361f] text-w-text select-none">
+    <>
+    {terminalDocked && (
+      <div
+        style={dockBox(terminalPlace)}
+        className={cn(
+          "fixed flex bg-w-term-bg",
+          terminalPlace.dock === "bottom" && "border-t border-w-term-line",
+          terminalPlace.dock === "left" && "border-r border-w-term-line",
+          terminalPlace.dock === "right" && "border-l border-w-term-line",
+        )}
+      >
+        <DockResizer place={terminalPlace} onSize={(size) => setTerminalPlace((prev) => ({ ...prev, size }))} />
+        <TerminalSlot node={terminalNode} holder={terminalHolder} />
+      </div>
+    )}
+    <div ref={rootRef} style={terminalDocked ? stageInset(terminalPlace) : undefined} className="fixed inset-0 overflow-clip bg-[#17361f] text-w-text select-none">
       <canvas
         ref={canvasRef}
         tabIndex={0}
@@ -4249,7 +4974,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
           me={me}
           progress={record}
           onOpen={() => openSection("page:profile")}
-          onProgress={() => setLoka({ kind: "academy", tab: "progress" })}
+          onProgress={() => void navigate({ kind: "academy", target: { tab: "progress" } })}
         />
         <div className="pointer-events-auto flex min-w-0 flex-wrap items-center justify-end gap-2">
           {worldLink?.kind === "place" && linkedPlaceName && (
@@ -4289,15 +5014,17 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
           {!workbench && (
             <SearchChip
               onSearch={() => {
-                setPaletteQuery("");
-                setPaletteOpen(true);
+                showAuxiliary(() => {
+                  setPaletteQuery("");
+                  setPaletteOpen(true);
+                });
               }}
             />
           )}
           <div className={HUD_GROUP} role="group" aria-label="Sound and map">
-            <MusicButton grouped open={musicOpen} onToggle={() => setMusicOpen((v) => !v)} />
+            <MusicButton grouped open={musicOpen} onToggle={() => commitForeground(() => setMusicOpen((v) => !v))} />
             {canWrite && <SpeakerToggle grouped on={voiceReplies} onToggle={toggleVoiceReplies} />}
-            <MinimapChip grouped shown={Boolean(mapShown)} onToggle={() => setMapShown((o) => !o)} />
+            <MinimapChip grouped shown={Boolean(mapShown)} onToggle={() => commitForeground(() => setMapShown((o) => !o))} />
           </div>
           <BellButton unread={notes.unread} onClick={openNotes} />
         </div>
@@ -4307,23 +5034,14 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       <AnimatePresence>
       {notesOpen && (
         <Fragment key="notes">
-          <div className="absolute inset-0 z-[45]" onPointerDown={() => setNotesOpen(false)} />
+          <div className="absolute inset-0 z-[45]" onPointerDown={() => commitForeground(() => setNotesOpen(false))} />
           <motion.div {...POPOVER_MOTION} className="absolute right-3 top-16 z-50 flex max-h-[min(72vh,42rem)] w-[min(27rem,calc(100vw-1.5rem))] origin-top-right sm:right-4 sm:top-[4.25rem]">
             <NotificationsPanel
               notes={notes}
               agents={agents}
               onChanged={loadNotes}
-              onClose={() => setNotesOpen(false)}
-              onOpenAgent={(id) => {
-                setNotesOpen(false);
-                if (chatOpen && chatAgents.some((a) => a.id === id)) {
-                  setChatChannel(null);
-                  setChatFocus({ id, nonce: Date.now() });
-                } else {
-                  closePanels();
-                  setDialog({ kind: "resident", id });
-                }
-              }}
+              onClose={() => commitForeground(() => setNotesOpen(false))}
+              onOpenAgent={openAgent}
             />
           </motion.div>
         </Fragment>
@@ -4333,8 +5051,10 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
       {!workbench && (
         <TopSearch
           onSearch={() => {
-            setPaletteQuery("");
-            setPaletteOpen(true);
+            showAuxiliary(() => {
+              setPaletteQuery("");
+              setPaletteOpen(true);
+            });
           }}
         />
       )}
@@ -4343,16 +5063,17 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
         <div aria-hidden={overlay || undefined} className={cn("pointer-events-none absolute inset-x-0 bottom-3 z-20 flex justify-center px-3 sm:bottom-4", HUD_FADE, hudHide)}>
           <Hotbar
             slots={[
-              { key: "Q", label: "Quests", group: 0, icon: HOTBAR_ICONS.Quests, badge: agents.reduce((n, a) => n + (a.jobs?.length ?? 0), 0), onClick: () => { clearWorldLink(); setBoard("quests"); } },
-              { key: "C", label: "Chat", group: 0, icon: HOTBAR_ICONS.Chat, badge: chatUnread, onClick: () => { clearWorldLink(); setChatOpen(true); } },
+              { key: "Q", label: "Quests", group: 0, icon: HOTBAR_ICONS.Quests, badge: agents.reduce((n, a) => n + (a.jobs?.length ?? 0), 0), onClick: () => navigateSurface(() => setBoard("quests")) },
+              { key: "C", label: "Chat", group: 0, icon: HOTBAR_ICONS.Chat, badge: chatUnread, onClick: () => navigateSurface(() => { raiseLayer("chat"); setChatOpen(true); }) },
               ...(canWrite
-                ? [{ key: "L", label: "Lists", group: 0, icon: HOTBAR_ICONS.Lists, badge: items.filter((i) => i.kind === "timer" && i.status === "active").length, onClick: () => { clearWorldLink(); setListsOpen(true); } }]
+                ? [{ key: "L", label: "Lists", group: 0, icon: HOTBAR_ICONS.Lists, badge: items.filter((i) => i.kind === "timer" && i.status === "active").length, onClick: () => navigateSurface(() => setListsOpen(true)) }]
                 : []),
-              { key: "R", label: "Reports", group: 0, icon: HOTBAR_ICONS.Reports, onClick: () => { clearWorldLink(); setReports({ id: null }); } },
-              ...(canWrite ? [{ key: "P", label: assistant ? assistant.name : "Main agent", hint: assistant ? `${assistant.name}, your main agent` : "Summon your main agent", group: 1, icon: HOTBAR_ICONS.Main, image: assistant ? portraits[assistant.id] : undefined, tone: "gold" as const, onClick: () => { clearWorldLink(); void summonAssistant(); } }] : []),
-              ...(canWrite ? [{ key: "K", label: "Quick chat", hint: "A side chat with an agent's memory", group: 1, icon: HOTBAR_ICONS.Quick, onClick: () => { clearWorldLink(); setQuick({}); } }] : []),
-              ...(canWrite ? [{ key: "O", label: "Workshop", group: 2, icon: HOTBAR_ICONS.Workshop, onClick: () => { clearWorldLink(); setFolderShop(true); } }] : []),
-              ...(canWrite && terminalFeature?.state !== "unavailable" ? [{ key: "T", label: "Terminal", group: 2, icon: HOTBAR_ICONS.Terminal, onClick: () => { clearWorldLink(); setTerminalOpen(true); } }] : []),
+              { key: "R", label: "Reports", group: 0, icon: HOTBAR_ICONS.Reports, onClick: () => void navigate({ kind: "report", id: null, loaded: true }) },
+              { key: "B", label: "Workspace", hint: "A canvas with your chat and channels beside it", group: 0, icon: HOTBAR_ICONS.Workspace, onClick: () => window.dispatchEvent(new CustomEvent(OPEN_WORKSPACE)) },
+              ...(canWrite ? [{ key: "P", label: assistant ? assistant.name : "Main agent", hint: assistant ? `${assistant.name}, your main agent` : "Summon your main agent", group: 1, icon: HOTBAR_ICONS.Main, image: assistant ? assistantPortrait : undefined, tone: "gold" as const, onClick: () => void summonAssistant() }] : []),
+              ...(canWrite ? [{ key: "K", label: "Quick chat", hint: "A side chat with an agent's memory", group: 1, icon: HOTBAR_ICONS.Quick, onClick: () => navigateSurface(() => setQuick({})) }] : []),
+              ...(canWrite ? [{ key: "O", label: "Workshop", group: 2, icon: HOTBAR_ICONS.Workshop, onClick: () => navigateSurface(() => setFolderShop(true)) }] : []),
+              ...(canWrite && terminalFeature?.state !== "unavailable" ? [{ key: "T", label: "Terminal", group: 2, icon: HOTBAR_ICONS.Terminal, onClick: () => openTerminal() }] : []),
               ...(canWrite
                 ? [
                     {
@@ -4364,6 +5085,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
                       tone: talk.state === "listening" ? ("live" as const) : ("plain" as const),
                       onPress: () => {
                         talkPressedAt.current = Date.now();
+                        talkNavigation.current = cancelPendingNavigation();
                         talk.start();
                       },
                       onRelease: () => {
@@ -4385,6 +5107,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
 
       <Toasts toasts={toasts} dismiss={dismissToast} />
       <QuoteSelection />
+      <BrowserViews agents={allAgents} />
 
       <AnimatePresence>
         {!started && (
@@ -4527,8 +5250,10 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
             open={mapOpen}
             onToggle={() => setMapOpen((o) => !o)}
             onTravel={() => {
-              setMapOpen(false);
-              setLoka({ kind: "travel" });
+              commitForeground(() => {
+                setMapOpen(false);
+                setLoka({ kind: "travel" });
+              });
             }}
           />
           </div>
@@ -4545,8 +5270,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
             onAccept={() => {
               const challengeId = offer.challengeId;
               dismissOffer();
-              closePanels();
-              setLoka({ kind: "academy", challengeId });
+              void navigate({ kind: "academy", target: { challengeId } });
             }}
           />
         </div>
@@ -4587,126 +5311,28 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
             menu ? "items-stretch bg-w-scrim/55 backdrop-blur-[2px]" : "items-end bg-w-scrim/30",
           )}
           onPointerDown={(e) => {
-            if (e.target === e.currentTarget) {
-              if (board) closeBoard();
-              else if (quick !== false) setQuick(false);
-              else if (history !== false) setHistory(false);
-              else if (chatOpen) setChatOpen(false);
-              else if (listsOpen) setListsOpen(false);
-              else if (reports) setReports(null);
-              else if (changelogOpen) setChangelogOpen(false);
-              else if (folderShop) setFolderShop(false);
-              else if (youOpen) setYouOpen(false);
-              else if (creatingAgent) setCreatingAgent(false);
-              else if (loka) setLoka(null);
-              else if (sheet) setSheet(null);
-              else if (dialog || !terminalOpen) closeDialog();
-              else setTerminalOpen(false);
-            }
+            if (e.target !== e.currentTarget) return;
+            if (windowKey === "board") closeBoard();
+            else if (windowKey === "quick") commitForeground(() => setQuick(false));
+            else if (windowKey === "history") commitForeground(() => {
+              setHistory(false);
+              setHistoryFocus(null);
+            });
+            else if (windowKey === "chat") closeChat();
+            else if (windowKey === "lists") closeLists();
+            else if (windowKey === "reports") void closeReports();
+            else if (windowKey === "changelog") commitForeground(() => setChangelogOpen(false));
+            else if (windowKey === "workshop") commitForeground(() => setFolderShop(false));
+            else if (windowKey === "you") commitForeground(() => setYouOpen(false));
+            else if (windowKey === "create") commitForeground(() => setCreatingAgent(false));
+            else if (windowKey.startsWith("loka:")) commitForeground(() => setLoka(null));
+            else if (windowKey === "sheet") commitForeground(() => setSheet(null));
+            else if (terminalFront) commitForeground(() => setTerminalOpen(false));
+            else closeDialog();
           }}
         >
-          <AnimatePresence mode="popLayout" initial={false}>
-          <motion.div
-            key={windowKey}
-            {...MODAL_MOTION}
-            data-find-scope
-            className={cn("w-full origin-center", menu ? "mx-auto flex h-full flex-col" : "max-w-3xl 2xl:max-w-4xl")}
-          >
-            {creatingAgent ? (
-              <CreateAgentDialog
-                onCreated={(agent) => {
-                  storeAgent(agent);
-                  setCreatingAgent(false);
-                  setDialog({ kind: "resident", id: agent.id });
-                  void load();
-                }}
-                onClose={() => setCreatingAgent(false)}
-              />
-            ) : youOpen ? (
-              <YouPanel
-                key={focusSection?.at ?? 0}
-                me={me}
-                assistant={assistant}
-                voiceReplies={voiceReplies}
-                onToggleVoice={toggleVoiceReplies}
-                onRename={rename}
-                onStatus={setStatus}
-                onNewArt={setNewArt}
-                onOpenAssistant={() => {
-                  setYouOpen(false);
-                  void summonAssistant();
-                }}
-                onOpenPro={() => setProOpen(true)}
-                controlPlane={controlPlane}
-                focusSection={focusSection}
-                onClose={() => setYouOpen(false)}
-              />
-            ) : folderShop ? (
-              <FolderWorkshop
-                agents={agents}
-                meId={me?.id ?? null}
-                onClose={() => setFolderShop(false)}
-                onHistory={() => {
-                  setFolderShop(false);
-                  setHistory(null);
-                }}
-              />
-            ) : changelogOpen ? (
-              <ChangelogPanel onClose={() => setChangelogOpen(false)} />
-            ) : reports ? (
-              withSide(
-                <ReportsPanel
-                  agents={agents}
-                  meId={me?.id ?? null}
-                  selection={reports}
-                  onSelectionApplied={() => { closeCoveringPanels(); setNotesOpen(false); }}
-                  sideToggle={sideToggle}
-                  onClose={() => setReports(null)}
-                  onOpenAgent={(id) => {
-                    setReports(null);
-                    setDialog({ kind: "resident", id });
-                  }}
-                />,
-              )
-            ) : loka?.kind === "academy" ? (
-              withSide(
-                <AcademySheet
-                  key="academy"
-                  meId={me?.id ?? null}
-                  target={loka}
-                  initialTab={loka.tab}
-                  waitingOn={waitingOn}
-                  agents={agents}
-                  onOpenAgent={(id) => {
-                    setLoka(null);
-                    setDialog({ kind: "resident", id });
-                  }}
-                  onFix={fixRefusal}
-                  onClose={() => {
-                    setLoka(null);
-                    setWaitingOn(null);
-                    canvasRef.current?.focus();
-                  }}
-                />,
-              )
-            ) : listsOpen ? (
-              withSide(
-                <ListsPanel
-                  items={items}
-                  agents={agents}
-                  meId={me?.id ?? null}
-                  canWrite={canWrite}
-                  focusId={worldLink?.kind === "list" ? worldLink.id : null}
-                  onFocusChange={(id) => updateWorldLink("list", id)}
-                  sideToggle={sideToggle}
-                  onClose={() => {
-                    setListsOpen(false);
-                    if (worldLink?.kind === "list") updateWorldLink("list", null);
-                  }}
-                  onChanged={() => void loadItems()}
-                />,
-              )
-            ) : chatOpen ? (
+          {chatOpen && (
+            <div key="chat-layer" data-find-scope={windowKey === "chat" ? "" : undefined} inert={windowKey !== "chat"} className={cn("mx-auto h-full w-full flex-col", windowKey === "chat" ? "flex" : "hidden")}>
               <ChatPanel
                 meId={me?.id ?? null}
                 agents={agents}
@@ -4718,21 +5344,17 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
                     : chatAgent ?? (chatLast.agentId && chatAgents.some((a) => a.id === chatLast.agentId) ? chatLast.agentId : chatLast.channelId ? null : mainId)
                 }
                 onSelect={rememberChat}
+                onNavigate={(target, request) => void navigate(target, request)}
+                onBeginNavigation={cancelPendingNavigation}
                 talkable={chatAgents}
                 mainId={mainId}
                 renderAgent={(agent, nav) =>
-                  renderAgentDialog(agent, { key: `chat:${agent.id}`, embedded: true, onClose: nav.back, onOpenAgent: nav.open })
+                  renderAgentDialog(agent, { key: `chat:${agent.id}`, embedded: true, foreground: nav.foreground, surface: "chat", onClose: nav.back, onOpenAgent: nav.open })
                 }
-                onClose={() => {
-                  setChatOpen(false);
-                  setChatChannel(null);
-                  setChatAgent(null);
-                }}
-                onOpenAgent={(id) => {
-                  setChatOpen(false);
-                  setChatChannel(null);
-                  setDialog({ kind: "resident", id });
-                }}
+                foreground={conversationForeground}
+                onClose={closeChat}
+                onClearMessageFocus={dismissMessageFocus}
+                onOpenAgent={openAgent}
                 onUnreadChange={() => {
                   loadChatUnread();
                   loadNotes();
@@ -4741,6 +5363,106 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
                 focusAgent={chatFocus}
                 focusChannel={chatChannelFocus}
               />
+            </div>
+          )}
+          {dialogAgent && (
+            <div key="agent-layer" data-find-scope={lowerWindow === "agent" && windowKey.startsWith("agent:") ? "" : undefined} inert={!windowKey.startsWith("agent:")} className={cn("mx-auto h-full w-full flex-col", windowKey.startsWith("agent:") ? "flex" : "hidden")}>
+              {renderAgentDialog(dialogAgent, { onClose: closeDialog, key: targetKey(dialog), onOpenAgent: openAgent, foreground: conversationForeground, surface: "agent" })}
+            </div>
+          )}
+          <AnimatePresence mode="popLayout" initial={false}>
+          {baseWindowKey !== "chat" && !baseWindowKey.startsWith("agent:") && (
+          <motion.div
+            key={baseWindowKey}
+            {...MODAL_MOTION}
+            data-find-scope={!reports ? "" : undefined}
+            inert={reports ? true : undefined}
+            className={cn("w-full origin-center", menu ? "mx-auto flex h-full flex-col" : "max-w-3xl 2xl:max-w-4xl", reports && "hidden")}
+          >
+            {creatingAgent ? (
+              <CreateAgentDialog
+                onBeginNavigation={cancelPendingNavigation}
+                onCreated={(agent, request) => {
+                  storeAgent(agent);
+                  void load();
+                  if (request.current()) void navigate({ kind: "agent", id: agent.id, agent }, request);
+                }}
+                onClose={() => commitForeground(() => setCreatingAgent(false))}
+              />
+            ) : youOpen ? (
+              <YouPanel
+                key={focusSection?.at ?? 0}
+                me={me}
+                assistant={assistant}
+                voiceReplies={voiceReplies}
+                onToggleVoice={toggleVoiceReplies}
+                onRename={rename}
+                onStatus={setStatus}
+                onNewArt={setNewArt}
+                onBeforeBigWork={setBeforeBigWork}
+                onOpenAssistant={() => void summonAssistant()}
+                onOpenPro={() => showAuxiliary(() => setProOpen(true))}
+                controlPlane={controlPlane}
+                focusSection={focusSection}
+                onNavigate={(select) => commitForeground(() => select())}
+                onClose={() => commitForeground(() => setYouOpen(false))}
+              />
+            ) : folderShop ? (
+              <FolderWorkshop
+                agents={agents}
+                meId={me?.id ?? null}
+                onClose={() => commitForeground(() => setFolderShop(false))}
+                onHistory={() => navigateSurface(() => {
+                  setFolderShop(false);
+                  setHistory(null);
+                })}
+              />
+            ) : changelogOpen ? (
+              <ChangelogPanel onClose={() => commitForeground(() => setChangelogOpen(false))} />
+            ) : loka?.kind === "academy" ? (
+              withSide(
+                <AcademySheet
+                  key="academy"
+                  meId={me?.id ?? null}
+                  target={loka}
+                  initialTab={loka.tab}
+                  waitingOn={waitingOn}
+                  agents={agents}
+                  onOpenAgent={openAgent}
+                  onFix={fixRefusal}
+                  onNavigate={() => cancelPendingNavigation().request}
+                  navigationCurrent={navigationRequest.current}
+                  onClose={reports ? NOOP : () => {
+                    commitForeground(() => {
+                      setLoka(null);
+                      setWaitingOn(null);
+                      canvasRef.current?.focus();
+                    });
+                  }}
+                />,
+                !reports,
+              )
+            ) : listsOpen ? (
+              withSide(
+                <ListsPanel
+                  active={!reports}
+                  items={items}
+                  agents={agents}
+                  meId={me?.id ?? null}
+                  canWrite={canWrite}
+                  focusId={worldLink?.kind === "list" ? worldLink.id : null}
+                  initialFocus={focusedList}
+                  onFocusChange={(id) => updateWorldLink("list", id)}
+                  todoFocus={todoFocus}
+                  onNavigateList={(item, request) => item ? void navigate({ kind: "list", id: item.id, item }, request) : navigateSurface(() => setListsOpen(true), true)}
+                  onNavigateTodo={(todo) => void navigate({ kind: "todo", id: todo.id, todo })}
+                  onBeginNavigation={cancelPendingNavigation}
+                  sideToggle={sideToggle}
+                  onClose={reports ? NOOP : closeLists}
+                  onChanged={() => void loadItems()}
+                />,
+                !reports,
+              )
             ) : quick !== false ? (
               <QuickChatWindow
                 key={`${quick.agentId ?? ""}:${quick.sessionId ?? ""}`}
@@ -4749,11 +5471,10 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
                 meId={me?.id ?? null}
                 initialAgentId={quick.agentId ?? null}
                 initialSessionId={quick.sessionId ?? null}
-                onOpenAgent={(id) => {
-                  setQuick(false);
-                  setDialog({ kind: "resident", id });
-                }}
-                onClose={() => setQuick(false)}
+                onOpenAgent={openAgent}
+                onClose={reports ? NOOP : () => commitForeground(() => setQuick(false))}
+                onBeginNavigation={cancelPendingNavigation}
+                onNavigate={(show, request) => void navigate({ kind: "surface", show, preservePanels: true }, request)}
                 call={{ quickId: call.quickId, minimised: call.minimised }}
                 onCall={openQuickCall}
                 onHangUp={hangUpCall}
@@ -4763,20 +5484,22 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
               <QuestRoom
                 key={historyFocus.taskId}
                 taskId={historyFocus.taskId}
+                initial={historyFocus.page}
+                initialRequest={historyFocus.request}
                 agents={agents}
                 meId={me?.id ?? null}
-                onOpenAgent={(id) => {
-                  setHistory(false);
-                  setHistoryFocus(null);
-                  setDialog({ kind: "resident", id });
-                }}
+                onOpenAgent={openAgent}
                 onOpenSession={(sessionId, agentId) => {
-                  setHistory(agentId);
-                  setHistoryFocus({ sessionId });
+                  commitForeground(() => {
+                    setHistory(agentId);
+                    setHistoryFocus({ sessionId });
+                  });
                 }}
-                onClose={() => {
-                  setHistory(false);
-                  setHistoryFocus(null);
+                onClose={reports ? NOOP : () => {
+                  commitForeground(() => {
+                    setHistory(false);
+                    setHistoryFocus(null);
+                  });
                 }}
               />
             ) : history !== false ? (
@@ -4785,49 +5508,48 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
                 agents={agents}
                 initialAgentId={history}
                 focus={historyFocus}
-                onClose={() => {
-                  setHistory(false);
-                  setHistoryFocus(null);
+                onNavigate={(select) => commitForeground(() => select())}
+                onClose={reports ? NOOP : () => {
+                  commitForeground(() => {
+                    setHistory(false);
+                    setHistoryFocus(null);
+                  });
                 }}
               />
 
             ) : board ? (
               <Board
+                active={!reports}
                 view={board}
-                onViewChange={setBoard}
+                onViewChange={(view) => navigateSurface(() => setBoard(view))}
                 teamFocus={worldLink?.kind === "team" ? worldLink.id : null}
-                onTeamFocus={(id) => id ? updateWorldLink("team", id) : clearWorldLink()}
+                focusedTeam={focusedTeamRecord}
+                teams={worldTeams}
+                onTeamFocus={(id) => id ? void navigate({ kind: "team", id }) : navigateSurface(() => setBoard("teams"))}
                 agents={agents}
                 archived={archivedAgents}
                 viewer={me ? { id: me.id, role: me.role } : null}
-                portraits={portraits}
                 places={items.filter((i) => i.kind === "building" || i.kind === "decoration" || i.kind === "critter")}
                 onVisitPlace={(id) => {
-                  setBoard(false);
-                  const ok = engineRef.current?.walkToPlacement(id) ?? false;
-                  canvasRef.current?.focus();
-                  if (!ok) pushToast({ id: Date.now(), text: "That spot could not fit on the map yet." });
-                  return ok;
+                  navigateSurface(() => {
+                    const ok = engineRef.current?.walkToPlacement(id) ?? false;
+                    canvasRef.current?.focus();
+                    if (!ok) pushToast({ id: Date.now(), text: "That spot could not fit on the map yet." });
+                  });
                 }}
-                onClose={closeBoard}
+                onClose={reports ? NOOP : closeBoard}
                 canCreate={canWrite}
                 onCreate={openCreateAgent}
-                onOpen={(id) => {
-                  setBoard(false);
-                  setDialog({ kind: "resident", id });
-                }}
-                onOpenQuest={(task) => {
-                  setBoard(false);
-                  setHistory(task.assigned_agent_id);
-                  setHistoryFocus({ taskId: task.id });
-                }}
+                onOpen={openAgent}
+                onOpenQuest={(task) => void navigate({ kind: "quest", id: task.id, agentId: task.assigned_agent_id, loaded: canWrite })}
                 onVisit={(id) => {
-                  setBoard(false);
-                  engineRef.current?.walkTo({ kind: "resident", id });
-                  canvasRef.current?.focus();
+                  navigateSurface(() => {
+                    engineRef.current?.walkTo({ kind: "resident", id });
+                    canvasRef.current?.focus();
+                  });
                 }}
               />
-            ) : loka && !dialogAgent ? (
+            ) : loka ? (
               <div className="mx-auto flex max-h-full w-full max-w-3xl">
                 {loka.kind === "npc" ? (
                   <NpcTalkSheet
@@ -4837,9 +5559,11 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
                     agents={agents}
                     onFix={fixRefusal}
                     onSay={(text) => engineRef.current?.folkSay(loka.id, text)}
-                    onClose={() => {
-                      setLoka(null);
-                      canvasRef.current?.focus();
+                    onClose={reports ? NOOP : () => {
+                      commitForeground(() => {
+                        setLoka(null);
+                        canvasRef.current?.focus();
+                      });
                     }}
                   />
                 ) : (
@@ -4848,14 +5572,14 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
                     current={regionId}
                     visited={visited}
                     onTravel={(id) => {
-                      setLoka(null);
+                      commitForeground(() => setLoka(null));
                       void travel(id);
                     }}
-                    onClose={() => setLoka(null)}
+                    onClose={reports ? NOOP : () => commitForeground(() => setLoka(null))}
                   />
                 )}
               </div>
-            ) : sheet && !dialogAgent ? (
+            ) : sheet ? (
               <div className="mx-auto flex max-h-full w-full max-w-3xl">
                 <PlaceSheetView
                   sheet={sheet}
@@ -4863,26 +5587,80 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
                   meId={me?.id ?? null}
                   isAdmin={isAdmin}
                   canInstall={isAdmin}
-                  onSheet={setSheet}
-                  onClose={() => {
-                    setSheet(null);
-                    canvasRef.current?.focus();
+                  onSheet={(next) => commitForeground(() => setSheet(next))}
+                  onClose={reports ? NOOP : () => {
+                    commitForeground(() => {
+                      setSheet(null);
+                      canvasRef.current?.focus();
+                    });
                   }}
-                  onOpenAgent={(id) => {
-                    setSheet(null);
-                    setDialog({ kind: "resident", id });
-                  }}
+                  onOpenAgent={openAgent}
                   onAgentUpdated={storeAgent}
                 />
               </div>
-            ) : dialogAgent ? (
-              renderAgentDialog(dialogAgent, { onClose: closeDialog, key: targetKey(dialog), onOpenAgent: (id) => setDialog({ kind: "resident", id }) })
             ) : dialog?.kind === "plot" ? (
-              <PlotDialog hasAssistant={Boolean(assistant)} canCreate={canWrite} onCreate={openCreateAgent} onAsk={() => void summonAssistant()} onClose={closeDialog} />
-            ) : terminalOpen ? (
-              withSide(<TerminalSlot node={terminalNode} holder={terminalHolder} />)
+              <PlotDialog hasAssistant={Boolean(assistant)} canCreate={canWrite} onCreate={openCreateAgent} onAsk={() => void summonAssistant()} onClose={reports ? NOOP : closeDialog} />
+            ) : terminalFront ? (
+              withSide(<TerminalSlot node={terminalNode} holder={terminalHolder} />, !reports)
             ) : null}
           </motion.div>
+          )}
+          {reports && (
+            <motion.div
+              key="reports"
+              {...MODAL_MOTION}
+              data-find-scope
+              className="mx-auto flex h-full w-full origin-center flex-col"
+            >
+              {withSide(
+                <ReportsPanel
+                  agents={agents}
+                  meId={me?.id ?? null}
+                  selection={reports}
+                  workspace={{
+                    channelsOpen: workspaceLayout.channels,
+                    onToggleChannels: () => changeWorkspace({ channels: !workspaceLayout.channels }),
+                    channel: workspaceLayout.channel,
+                    onShowChannel: (id) => {
+                      changeWorkspace({ channels: true, channel: id });
+                      setWorkspaceFocus({ id, nonce: Date.now() });
+                    },
+                    channels: inWorkspace ? (
+                      <ChatPanel
+                        compact
+                        meId={me?.id ?? null}
+                        agents={agents}
+                        canPost={canWrite}
+                        initialChannel={workspaceLayout.channel}
+                        initialAgent={null}
+                        onSelect={(selection) => selection.channelId && changeWorkspace({ channel: selection.channelId })}
+                        talkable={chatAgents}
+                        mainId={mainId}
+                        renderAgent={(agent, nav) =>
+                          renderAgentDialog(agent, { key: `workspace:${agent.id}`, embedded: true, foreground: nav.foreground, surface: "chat", onClose: nav.back, onOpenAgent: nav.open })
+                        }
+                        foreground={{ ...conversationForeground, top: windowKey === "reports" ? "chat" : conversationForeground.top }}
+                        onClose={() => changeWorkspace({ channels: false })}
+                        onOpenAgent={openAgent}
+                        onUnreadChange={() => {
+                          loadChatUnread();
+                          loadNotes();
+                        }}
+                        agentUnread={notes.by_agent}
+                        focusChannel={workspaceFocus}
+                      />
+                    ) : null,
+                  }}
+                  leaveRequest={reportLeaveRequest}
+                  onNavigate={(selection, request) => void navigate({ kind: "report", ...selection }, request)}
+                  onBeginNavigation={cancelPendingNavigation}
+                  sideToggle={sideToggle}
+                  onClose={() => void closeReports()}
+                  onOpenAgent={openAgent}
+                />,
+              )}
+            </motion.div>
+          )}
           </AnimatePresence>
         </motion.div>
       )}
@@ -4894,13 +5672,22 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
         createPortal(
           <TerminalPanel
             meId={me?.id ?? null}
-            front={terminalFront}
+            front={terminalFront || terminalDocked}
+            place={terminalPlace}
+            onPlace={(next) => {
+              if (next.dock === "window" && terminalPlace.dock !== "window") navigateSurface(() => {
+                setTerminalPlace(next);
+                showTerminal();
+              });
+              else setTerminalPlace(next);
+            }}
+            command={terminalCommand}
             sideToggle={sideToggle}
             readerRef={terminalReader}
             request={terminalRequest}
             notice={terminalTalkNote}
             onTyped={onTerminalTyped}
-            onClose={() => setTerminalOpen(false)}
+            onClose={() => commitForeground(() => setTerminalOpen(false))}
           />,
           terminalNode,
         )}
@@ -4910,7 +5697,7 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
           key={`${voiceAgent.id}:${call.quickId ?? ""}`}
           agent={voiceAgent}
           quickId={call.quickId}
-          portrait={portraitUrl(residentFor(voiceAgent).look, 6)}
+          about={call.about}
           minimised={call.minimised}
           slot={callSlot}
           onMinimise={minimiseCall}
@@ -4933,20 +5720,19 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
               key: `workbench:${agent.id}`,
               embedded: true,
               attach,
+              surface: "workbench",
+              foreground: { ...conversationForeground, workbenchOpen: Boolean(workbench) },
               onClose: () => {},
-              onOpenAgent: (id) => {
-                setWorkbench(null);
-                setDialog({ kind: "resident", id });
-              },
+              onOpenAgent: openAgent,
             })
           }
-          onOpenAgent={(id) => {
-            setWorkbench(null);
-            setDialog({ kind: "resident", id });
-          }}
+          onOpenAgent={openAgent}
           onClose={() => {
-            setWorkbench(null);
-            canvasRef.current?.focus();
+            const request = workbenchCloseNavigation.current ?? undefined;
+            commitForeground(() => {
+              setWorkbench(null);
+              canvasRef.current?.focus();
+            }, request);
           }}
         />
       )}
@@ -4957,66 +5743,79 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
         canWorkshop={canWrite}
         onOpenWorkshop={() => {
           const target = dialog?.kind === "resident" ? dialog.id : focus?.kind === "resident" ? focus.id : scene?.placeId.startsWith("house:") ? scene.placeId.slice(6) : null;
-          closePanels();
-          setWorkbench(target ? { agentId: target } : {});
+          navigateSurface(() => setWorkbench(target ? { agentId: target } : {}));
         }}
         agents={agents}
         canRead={canRead}
         canWrite={canWrite}
         isAdmin={isAdmin}
-        onOpenChange={setPaletteOpen}
-        canOpenRecord={() => closeWorkbench.current?.() !== false}
-        onOpenAgent={openAgent}
-        onOpenQuests={() => { closePanels(); setBoard("quests"); }}
-        onOpenChat={() => { closePanels(); setChatOpen(true); }}
-        onOpenHistory={() => { closePanels(); setHistory(null); }}
-        onOpenFolderWorkshop={() => { closePanels(); setFolderShop(true); }}
-        onOpenAssistant={() => { closePanels(); void summonAssistant(); }}
-        onOpenYou={() => { closePanels(); setFocusSection(null); setYouOpen(true); }}
-        onOpenDevices={openDevices}
-        onOpenPro={() => { closePanels(); setProOpen(true); }}
-        onOpenLists={() => { closePanels(); setListsOpen(true); }}
-        onOpenTerminal={() => { closePanels(); setTerminalOpen(true); }}
-        onTerminalChat={() => {
-          closePanels();
-          setSide({ id: sideAgent?.id ?? side.id ?? mainId ?? null, open: true });
-          setTerminalOpen(true);
+        onOpenChange={(open, request) => {
+          if (open) showAuxiliary(() => setPaletteOpen(true), request);
+          else commitForeground(() => setPaletteOpen(false), request);
         }}
+        onBeginNavigation={cancelPendingNavigation}
+        onOpenAgent={openAgent}
+        onOpenQuests={() => navigateSurface(() => setBoard("quests"))}
+        onOpenChat={() => navigateSurface(() => { raiseLayer("chat"); setChatOpen(true); })}
+        onOpenHistory={() => navigateSurface(() => setHistory(null))}
+        onOpenFolderWorkshop={() => navigateSurface(() => setFolderShop(true))}
+        onOpenAssistant={summonAssistant}
+        onOpenYou={openSettings}
+        onOpenDevices={openDevices}
+        onOpenPro={() => showAuxiliary(() => setProOpen(true))}
+        onOpenLists={() => navigateSurface(() => setListsOpen(true), true)}
+        onOpenTerminal={() => openTerminal()}
+        onTerminalChat={() => navigateSurface(() => {
+          setSide({ id: sideAgent?.id ?? side.id ?? mainId ?? null, open: true });
+          setTerminalPlace((prev) => ({ ...prev, dock: "window" }));
+          showTerminal();
+        })}
+        onTerminal={(command) => runTerminalCommand(command)}
+        terminalDevices={terminalDevices}
         canTerminal={canWrite && terminalFeature?.state !== "unavailable"}
-        onOpenShortcuts={() => setShortcutsOpen(true)}
+        browserAgents={browserFeature?.state === "ready" ? agents.filter((a) => ownsAgent(a, me?.id)) : []}
+        onOpenShortcuts={(request) => showAuxiliary(() => setShortcutsOpen(true), request)}
         mainAgent={assistant}
-        onJump={(to) => {
-          if (to.kind === "rules") return openSection("world-rules", to.id);
-          if (to.kind === "device") return openSection("world-devices", to.id);
+        onJump={(to, request) => {
+          const navigation = request ?? cancelPendingNavigation();
+          if (to.kind === "rules") return openSection("world-rules", to.id, navigation);
+          if (to.kind === "device") return openSection("world-devices", to.id, navigation);
           if (to.kind === "you") {
-            try {
-              window.localStorage.setItem("world.you.page", to.page);
-            } catch {}
-            return openSection(to.focus ?? `page:${to.page}`);
+            return void navigate({ kind: "surface", show: (accepted) => {
+              try {
+                window.localStorage.setItem("world.you.page", to.page);
+              } catch {}
+              setYouOpen(true);
+              setFocusSection({ id: to.focus ?? `page:${to.page}`, at: accepted.request });
+            } }, navigation);
           }
-          if (to.kind === "map") return setMapShown((o) => !o);
-          if (to.kind === "music") return setMusicOpen(true);
-          if (to.kind === "notifications") return void (notesOpen || openNotesRef.current());
-          if (to.kind === "teams" && to.id) return openWorldLink("team", to.id);
-          if (to.kind === "list" || to.kind === "region" || to.kind === "place") return openWorldLink(to.kind, to.id);
-          closePanels();
-          if (to.kind === "schedules" || to.kind === "feeds") setSheet({ kind: "agents", surface: to.kind, agentId: to.agentId, focusId: to.id });
-          else if (to.kind === "kit") setSheet({ kind: "kit", agentId: to.agentId, focus: { id: to.id, kind: to.itemKind } });
-          else if (to.kind === "teams") setBoard("teams");
-          else if (to.kind === "surface") setSheet({ kind: "agents", surface: to.surface });
-          else if (to.kind === "travel") setLoka({ kind: "travel" });
-          else if (to.kind === "academy") {
-            setAcademyHost(true);
-            setLoka({ kind: "academy", tab: to.tab, challengeId: to.challengeId ?? null, courseId: to.courseId ?? null });
+          if (to.kind === "map") return void commitForeground(() => setMapShown((o) => !o), navigation);
+          if (to.kind === "music") return void commitForeground(() => setMusicOpen(true), navigation);
+          if (to.kind === "notifications") return void showAuxiliary(() => setNotesOpen(true), navigation);
+          if (to.kind === "academy") return void navigate({ kind: "academy", target: { tab: to.tab, challengeId: to.challengeId ?? null, courseId: to.courseId ?? null } }, navigation);
+          if (to.kind === "teams" && to.id) return void navigate({ kind: "team", id: to.id }, navigation);
+          if (to.kind === "list" || to.kind === "region" || to.kind === "place") return void navigate({ kind: to.kind, id: to.id }, navigation);
+          if ((to.kind === "schedules" || to.kind === "feeds" || to.kind === "kit") && !agentsRef.current.some((a) => a.id === to.agentId)) {
+            pushToast({ id: Date.now(), text: "That link is no longer available." });
+            return;
           }
-          else if (to.kind === "new-agent") setCreatingAgent(true);
+          navigateSurface(() => {
+            if (to.kind === "schedules" || to.kind === "feeds") setSheet({ kind: "agents", surface: to.kind, agentId: to.agentId, focusId: to.id });
+            else if (to.kind === "kit") setSheet({ kind: "kit", agentId: to.agentId, focus: { id: to.id, kind: to.itemKind } });
+            else if (to.kind === "teams") setBoard("teams");
+            else if (to.kind === "surface") setSheet({ kind: "agents", surface: to.surface });
+            else if (to.kind === "travel") setLoka({ kind: "travel" });
+            else if (to.kind === "new-agent") setCreatingAgent(true);
+          }, undefined, navigation);
         }}
       />
-      <AnimatePresence>{shortcutsOpen && <ShortcutSheet key="shortcuts" onClose={() => setShortcutsOpen(false)} />}</AnimatePresence>
+      <AnimatePresence>{shortcutsOpen && <ShortcutSheet key="shortcuts" onClose={() => commitForeground(() => setShortcutsOpen(false))} />}</AnimatePresence>
       <FindBar
         onNoScope={() => {
-          setPaletteQuery("");
-          setPaletteOpen(true);
+          showAuxiliary(() => {
+            setPaletteQuery("");
+            setPaletteOpen(true);
+          });
         }}
       />
       <AnimatePresence>
@@ -5026,16 +5825,17 @@ function LokaGame({ initialMe }: { initialMe: Me | null }) {
           {...SCRIM_MOTION}
           className={cn(SCRIM, "z-50 p-4")}
           onPointerDown={(e) => {
-            if (e.target === e.currentTarget) setProOpen(false);
+            if (e.target === e.currentTarget) commitForeground(() => setProOpen(false));
           }}
         >
           <motion.div {...MODAL_MOTION} className="flex w-full max-w-md justify-center">
-            <ProSheet onClose={() => setProOpen(false)} />
+            <ProSheet onClose={() => commitForeground(() => setProOpen(false))} />
           </motion.div>
         </motion.div>
       )}
       </AnimatePresence>
     </div>
+    </>
     </MotionConfig>
   );
 }

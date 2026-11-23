@@ -15,7 +15,7 @@ use loka_shared::world::{
     AgentMessage, AgentSchedule, AgentSession, AgentUpdate, HandleRename, McpServerEntry, RunEvent, SessionBrief, NewAgent, NewEvent, NewMessage, RenameHandleError, RetryRunError, Rewound, SessionRunView, SkillEntry, WorldRule, SessionRun, WorldAgent, WorldEvent,
 };
 use loka_shared::links::LinkedMessage;
-use loka_shared::quests::PlanAnswer;
+use loka_shared::quests::{ClarificationAnswer, ClarificationReply, PlanAnswer};
 use loka_shared::runners::{AgentMove, HandoffRunnerError};
 use loka_shared::milestones::{Milestone, MilestoneStore, NewMilestone};
 use serde::{Deserialize, Serialize};
@@ -510,9 +510,12 @@ pub async fn list_replies(
     Path((id, message_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Vec<AgentMessage>>, StatusCode> {
     let root = state.world.agent_thread_root(id, message_id, user.0).await.map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
+    if let Some(session) = state.world.quick_thread_session(id, root).await.map_err(internal)? {
+        crate::routes::quick::deliver_lost_replies(&state, session.id).await;
+    }
     let mut rows = state
         .world
-        .message_replies(id, root, user.0, loka_shared::replies::REPLY_LIMIT)
+        .message_replies_with_reply(id, root, user.0, loka_shared::replies::REPLY_LIMIT, (message_id != root).then_some(message_id))
         .await
         .map_err(internal)?;
     let owner = state.world.get_agent(id).await.map_err(internal)?.and_then(|agent| agent.owner_user_id);
@@ -522,6 +525,11 @@ pub async fn list_replies(
                 && m.meta.get("shell_share").is_none()
                 && m.meta.get("shell_command").is_none()
         });
+        for message in &mut rows {
+            if message.meta.get("clarify_request").is_some_and(Value::is_object) {
+                message.meta["clarify_request"] = Value::Bool(true);
+            }
+        }
     }
     Ok(Json(rows))
 }
@@ -550,6 +558,11 @@ pub async fn list_messages(
                 && m.meta.get("shell_share").is_none()
                 && m.meta.get("shell_command").is_none()
         });
+        for message in &mut rows {
+            if message.meta.get("clarify_request").is_some_and(Value::is_object) {
+                message.meta["clarify_request"] = Value::Bool(true);
+            }
+        }
     }
     Ok(Json(rows))
 }
@@ -863,36 +876,181 @@ pub async fn post_message(
     let files = inline_files(&state, viewer.org, &attachments).await?;
     let links = visible_links(&state, &viewer, text).await?;
     let options = body.options.map(|o| json!(o)).unwrap_or(Value::Null);
-    let question = match body.answers {
-        Some(ask) => sqlx::query_scalar::<_, String>(&format!(
-            "SELECT body FROM agent_messages m WHERE m.id = $1 AND m.agent_id = $2 AND {}",
-            loka_shared::guests::thread_filter("$2", "$3")
-        ))
-            .bind(ask)
-            .bind(id)
-            .bind(user.0)
-            .fetch_optional(state.world.pool())
-            .await
-            .map_err(|e| internal(e.into()))?
-            .map(|q| q.chars().take(600).collect::<String>()),
-        None => None,
-    };
     let author = state
         .world
         .user_display_name(user.0)
         .await
         .map_err(internal)?
         .unwrap_or_else(|| "someone".to_string());
+    let thread = match reply_to {
+        Some(root) => state.world.agent_thread_transcript(id, root, 12).await.map_err(internal)?,
+        None => String::new(),
+    };
+    if let Some(ask) = body.answers {
+        let mut tx = state.world.pool().begin().await.map_err(|e| internal(e.into()))?;
+        let card = sqlx::query_as::<_, (String, Option<Value>)>(&format!(
+            "SELECT body, meta->'clarify_request' FROM agent_messages m WHERE m.id = $1 AND m.agent_id = $2 AND {} FOR UPDATE",
+            loka_shared::guests::thread_filter("$2", "$3")
+        ))
+        .bind(ask)
+        .bind(id)
+        .bind(user.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| internal(e.into()))?;
+        if let Some((question, Some(origin @ Value::Object(_)))) = card {
+            let card_task = origin.get("task_id").and_then(Value::as_str).and_then(|task| task.parse().ok());
+            let answered_task = card_task.or(body.task_id);
+            let answered = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM agent_messages WHERE agent_id = $1 AND author_kind = 'user' AND author_user_id = $2 AND meta->>'answers' = $3)",
+            )
+            .bind(id)
+            .bind(user.0)
+            .bind(ask.to_string())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| internal(e.into()))?;
+            if answered {
+                return Err(StatusCode::CONFLICT);
+            }
+            let msg = state
+                .world
+                .insert_reply_with(
+                    &mut *tx,
+                    NewMessage {
+                        agent_id: id,
+                        author_kind: "user",
+                        author_user_id: Some(user.0),
+                        author_agent_id: None,
+                        body: text,
+                        session_id: None,
+                        run_id: None,
+                        meta: {
+                            let mut meta = json!({ "attachments": attachments, "options": options, "answers": ask });
+                            if body.spoken {
+                                meta["spoken"] = json!(true);
+                            }
+                            if let Some(task) = answered_task {
+                                meta["task_id"] = json!(task);
+                            }
+                            if let Some(quote) = &quote {
+                                meta["quote"] = quote.clone();
+                            }
+                            meta
+                        },
+                    },
+                    reply_to,
+                )
+                .await
+                .map_err(internal)?;
+            let event = NewEvent::new("message.created")
+                .agent(id)
+                .actor(Some(user.0))
+                .task(answered_task)
+                .payload(json!({
+                    "message_id": msg.id,
+                    "author": author,
+                    "author_kind": "user",
+                    "body": text,
+                    "attachments": attachments,
+                    "files": files,
+                    "links": links,
+                    "options": options,
+                    "answers": question.chars().take(1200).collect::<String>(),
+                    "clarify_origin": origin,
+                    "spoken": body.spoken,
+                    "quote": quote,
+                    "reply_to": reply_to,
+                    "thread": thread,
+                    "answer_card": ask,
+                }));
+            loka_shared::world::emit_in(&mut tx, &event, Some((id, "message"))).await.map_err(internal)?;
+            tx.commit().await.map_err(|e| internal(e.into()))?;
+            return Ok((StatusCode::CREATED, Json(msg)));
+        }
+    }
+    let question = match body.answers {
+        Some(ask) => sqlx::query_as::<_, (String, Option<Uuid>)>(&format!(
+            "SELECT body, NULLIF(meta->>'task_id', '')::uuid FROM agent_messages m WHERE m.id = $1 AND m.agent_id = $2 AND {}",
+            loka_shared::guests::thread_filter("$2", "$3")
+        ))
+        .bind(ask)
+        .bind(id)
+        .bind(user.0)
+        .fetch_optional(state.world.pool())
+        .await
+        .map_err(|e| internal(e.into()))?
+        .map(|(body, task)| (body.chars().take(1200).collect::<String>(), task)),
+        None => None,
+    };
+    let answered_task = body.task_id.or_else(|| question.as_ref().and_then(|(_, task)| *task));
     let setup_card = match text.is_empty() {
         true => None,
         false => crate::routes::setup_scan::card_kind(&state, id, body.answers).await?,
     };
-    let apps_card = match body.answers {
-        Some(card) if !text.is_empty() && setup_card.is_none() => state.world.is_apps_card(id, card).await.map_err(internal)?,
-        _ => false,
+    let quest_card = match body.answers {
+        Some(card) if !text.is_empty() && setup_card.is_none() => state.world.quest_card(id, card).await.map_err(internal)?,
+        _ => None,
     };
+    let apps_card = quest_card.is_some();
+    let clarification = match body.answers {
+        Some(ask) if !text.is_empty() && setup_card.is_none() && !apps_card => {
+            let mut meta = json!({ "attachments": attachments.clone(), "options": options.clone(), "answers": ask });
+            if body.spoken {
+                meta["spoken"] = json!(true);
+            }
+            if let Some(task) = answered_task {
+                meta["task_id"] = json!(task);
+            }
+            if let Some(quote) = &quote {
+                meta["quote"] = quote.clone();
+            }
+            let event_payload = json!({
+                "author": author,
+                "author_kind": "user",
+                "body": text,
+                "attachments": attachments.clone(),
+                "files": files.clone(),
+                "links": links.clone(),
+                "options": options.clone(),
+                "answers": question.as_ref().map(|(body, _)| body),
+                "spoken": body.spoken,
+                "quote": quote.clone(),
+                "reply_to": reply_to,
+                "thread": thread,
+                "answer_card": body.answers,
+            });
+            let (answer, message) = state
+                .world
+                .answer_clarification(
+                    id,
+                    ask,
+                    ClarificationReply {
+                        user_id: user.0,
+                        author: &author,
+                        text,
+                        meta,
+                        reply_to,
+                        event_payload,
+                    },
+                )
+                .await
+                .map_err(internal)?;
+            if let (ClarificationAnswer::Answered { .. }, Some(message)) = (&answer, message) {
+                return Ok((StatusCode::CREATED, Json(message)));
+            }
+            answer
+        }
+        _ => ClarificationAnswer::NotAClarification,
+    };
+    if clarification == ClarificationAnswer::Stale {
+        return Err(StatusCode::CONFLICT);
+    }
+    let clarification_answered = !matches!(clarification, ClarificationAnswer::NotAClarification);
     let plan = match body.answers {
-        Some(ask) if !text.is_empty() && setup_card.is_none() && !apps_card => Some(state.world.answer_plan(id, ask, text, &author).await.map_err(internal)?),
+        Some(ask) if !text.is_empty() && setup_card.is_none() && !apps_card && !clarification_answered => {
+            Some(state.world.answer_plan(id, ask, text, &author).await.map_err(internal)?)
+        }
         _ => None,
     };
     let plan_answered = matches!(plan, Some(PlanAnswer::Approved { .. } | PlanAnswer::Redirected { .. }));
@@ -915,7 +1073,7 @@ pub async fn post_message(
                 if body.spoken {
                     meta["spoken"] = json!(true);
                 }
-                if let Some(task) = body.task_id {
+                if let Some(task) = answered_task {
                     meta["task_id"] = json!(task);
                 }
                 if let Some(quote) = &quote {
@@ -933,7 +1091,7 @@ pub async fn post_message(
             NewEvent::new("message.created")
                 .agent(id)
                 .actor(Some(user.0))
-                .task(body.task_id)
+                .task(answered_task)
                 .payload(json!({
                     "message_id": msg.id,
                     "author": author,
@@ -944,24 +1102,22 @@ pub async fn post_message(
                     "links": links,
                     "options": options,
                     "onboarding": onboarding,
-                    "answers": question,
+                    "answers": question.as_ref().map(|(body, _)| body),
                     "spoken": body.spoken,
                     "quote": quote,
                     "reply_to": reply_to,
-                    "thread": match reply_to {
-                        Some(root) => state.world.agent_thread_transcript(id, root, 12).await.map_err(internal)?,
-                        None => String::new(),
-                    },
+                    "thread": thread,
+                    "answer_card": body.answers,
                 })),
-            (!onboarding && !plan_answered && setup_card.is_none() && !apps_card).then_some((id, "message")),
+            (!onboarding && !plan_answered && !clarification_answered && setup_card.is_none() && !apps_card).then_some((id, "message")),
         )
         .await
         .map_err(internal)?;
     if onboarding {
         crate::routes::onboarding::answer(&state, &user, id, text).await?;
     }
-    if let (true, Some(card)) = (apps_card, body.answers) {
-        state.world.answer_app_control(id, card, text, &author).await.map_err(internal)?;
+    if let (Some(kind), Some(card)) = (quest_card, body.answers) {
+        state.world.answer_quest_card(id, card, kind, text, &author).await.map_err(internal)?;
     }
     if let (Some(kind), Some(card)) = (setup_card, body.answers) {
         crate::routes::setup_scan::answer(&state, &user, id, card, kind, text).await?;
@@ -1325,6 +1481,14 @@ fn last_seen(after: Option<i64>, headers: &axum::http::HeaderMap) -> Option<i64>
     }
 }
 
+fn wire_event(event: &loka_shared::world::WorldEvent, replay_until: Option<i64>) -> Option<String> {
+    let mut value = serde_json::to_value(event).ok()?;
+    if replay_until.is_some_and(|head| event.seq <= head) {
+        value["replayed"] = json!(true);
+    }
+    serde_json::to_string(&value).ok()
+}
+
 pub async fn stream(
     State(state): State<AppState>,
     Extension(user): Extension<UserId>,
@@ -1335,9 +1499,13 @@ pub async fn stream(
     let viewer = user.0;
     let org = scope.org();
     let mut resync = None;
+    let mut replay_until = None;
     let mut cursor = match last_seen(q.after, &headers) {
         Some(after) => match state.world.replay_gap(org, after, loka_shared::world::REPLAY_MAX_EVENTS).await.map_err(internal)?.resume_from(after) {
-            loka_shared::world::Resume::Replay(from) => from,
+            loka_shared::world::Resume::Replay(from) => {
+                replay_until = state.world.recent_events(None, 1).await.map_err(internal)?.last().map(|e| e.seq);
+                from
+            }
             loka_shared::world::Resume::Resync(head) => {
                 resync = Some(head);
                 head
@@ -1353,8 +1521,10 @@ pub async fn stream(
             .unwrap_or(0),
     };
     let mut rx = state.world_tx.subscribe();
+    let mut signals = state.signal_tx.subscribe();
     let store = state.world.clone();
     let stream = async_stream::stream! {
+        let mut member_checked = tokio::time::Instant::now();
         let _open = crate::metrics::Open::new("world");
         if let Some(head) = resync {
             yield Ok::<Event, Infallible>(Event::default().event("resync").data(json!({ "head": head }).to_string()));
@@ -1364,7 +1534,10 @@ pub async fn stream(
                 Ok(events) if events.is_empty() => {}
                 Ok(events) => {
                     let current = match store.role_in_org(viewer, Some(org)).await {
-                        Ok(Some(role)) => Viewer { role: role.ladder(), org_role: Some(role), ..scope.clone() },
+                        Ok(Some(role)) => {
+                            member_checked = tokio::time::Instant::now();
+                            Viewer { role: role.ladder(), org_role: Some(role), ..scope.clone() }
+                        }
                         Ok(None) => break,
                         Err(e) => {
                             warn!(error = %e, "world stream membership check failed");
@@ -1401,7 +1574,7 @@ pub async fn stream(
                         if event.agent_id.is_some_and(|a| hidden.contains(&a)) || loka_shared::slack::hidden_from(&event, viewer) || loka_shared::loka::hidden_from(&event, viewer) || loka_shared::shell::hidden_from(&event, &owned) || loka_shared::event_scope::private_from(&event, viewer, &owned) || event.in_channel(&channels) {
                             continue;
                         }
-                        if let Ok(data) = serde_json::to_string(&event) {
+                        if let Some(data) = wire_event(&event, replay_until) {
                             yield Ok::<Event, Infallible>(
                                 Event::default().event("world").id(event.seq.to_string()).data(data),
                             );
@@ -1412,10 +1585,26 @@ pub async fn stream(
             }
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
             let closed = loop {
-                match tokio::time::timeout_at(deadline, rx.recv()).await {
-                    Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break true,
-                    Ok(Ok(wake)) if !wake.concerns(org) => continue,
-                    _ => break false,
+                let next = tokio::select! {
+                    woke = tokio::time::timeout_at(deadline, rx.recv()) => match woke {
+                        Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => Waited::Closed,
+                        Ok(Ok(wake)) if !wake.concerns(org) => continue,
+                        _ => Waited::Woke,
+                    },
+                    signal = signals.recv() => match signal {
+                        Ok(event) if loka_shared::signals::concerns(&event, org) => Waited::Signal(event),
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => Waited::Closed,
+                    },
+                };
+                match next {
+                    Waited::Closed => break true,
+                    Waited::Woke => break false,
+                    Waited::Signal(event) => match live_signal(&store, &event, viewer, org, &scope, &mut member_checked).await {
+                        Live::Send(data) => yield Ok::<Event, Infallible>(Event::default().event("world").data(data)),
+                        Live::Skip => {}
+                        Live::Gone => break true,
+                    },
                 }
             };
             if closed {
@@ -1431,6 +1620,62 @@ pub async fn stream(
         ],
         Sse::new(stream).keep_alive(KeepAlive::default()),
     ))
+}
+
+enum Waited {
+    Closed,
+    Woke,
+    Signal(std::sync::Arc<WorldEvent>),
+}
+
+enum Live {
+    Send(String),
+    Skip,
+    Gone,
+}
+
+const MEMBER_RECHECK: Duration = Duration::from_secs(10);
+
+async fn live_signal(
+    store: &loka_shared::world::WorldStore,
+    event: &WorldEvent,
+    viewer: Uuid,
+    org: Uuid,
+    scope: &Viewer,
+    member_checked: &mut tokio::time::Instant,
+) -> Live {
+    let scoped = loka_shared::signals::needs_scope(event);
+    let mut current = None;
+    if scoped || member_checked.elapsed() > MEMBER_RECHECK {
+        match store.role_in_org(viewer, Some(org)).await {
+            Ok(Some(role)) => {
+                *member_checked = tokio::time::Instant::now();
+                current = Some(Viewer { role: role.ladder(), org_role: Some(role), ..scope.clone() });
+            }
+            Ok(None) => return Live::Gone,
+            Err(_) => return Live::Skip,
+        }
+    }
+    if loka_shared::slack::hidden_from(event, viewer) || loka_shared::loka::hidden_from(event, viewer) {
+        return Live::Skip;
+    }
+    if let (true, Some(current)) = (scoped, current) {
+        let (Ok(hidden), Ok(channels), Ok(owned)) = (
+            store.hidden_agents(&current).await,
+            store.hidden_channels_among(Some(viewer), None, std::slice::from_ref(event)).await,
+            store.owned_agent_ids(viewer).await,
+        ) else {
+            return Live::Skip;
+        };
+        if event.agent_id.is_some_and(|a| hidden.contains(&a))
+            || loka_shared::shell::hidden_from(event, &owned)
+            || loka_shared::event_scope::private_from(event, viewer, &owned)
+            || event.in_channel(&channels)
+        {
+            return Live::Skip;
+        }
+    }
+    serde_json::to_string(event).map(Live::Send).unwrap_or(Live::Skip)
 }
 
 pub async fn list_rules(
@@ -2181,17 +2426,31 @@ pub async fn session_followup(
     Extension(user): Extension<UserId>,
     Path(id): Path<Uuid>,
     Json(body): Json<FollowUp>,
-) -> Result<(StatusCode, Json<SessionRun>), StatusCode> {
+) -> axum::response::Response {
     if body.text.trim().is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return StatusCode::BAD_REQUEST.into_response();
     }
-    let session = state.world.get_session(id).await.map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
-    let name = state.world.user_display_name(user.0).await.map_err(internal)?.unwrap_or_else(|| "someone".into());
-    let run = state.world.start_followup(&session, body.text.trim(), &name, body.interrupt).await.map_err(|e| {
-        warn!(error = %e, "follow-up refused");
-        StatusCode::CONFLICT
-    })?;
-    Ok((StatusCode::ACCEPTED, Json(run)))
+    let session = match state.world.get_session(id).await {
+        Ok(Some(session)) => session,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return internal(error).into_response(),
+    };
+    let name = match state.world.user_display_name(user.0).await {
+        Ok(name) => name.unwrap_or_else(|| "someone".into()),
+        Err(error) => return internal(error).into_response(),
+    };
+    match state.world.start_followup(&session, body.text.trim(), &name, body.interrupt).await {
+        Ok(run) => (StatusCode::ACCEPTED, Json(run)).into_response(),
+        Err(error) => refusal(error, "follow-up"),
+    }
+}
+
+fn refusal(error: anyhow::Error, what: &str) -> axum::response::Response {
+    if error.downcast_ref::<sqlx::Error>().is_some() {
+        return internal(error).into_response();
+    }
+    warn!(error = %error, "{what} refused");
+    (StatusCode::CONFLICT, Json(json!({ "error": error.to_string() }))).into_response()
 }
 
 #[derive(Deserialize)]
@@ -2206,7 +2465,7 @@ pub async fn session_review(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(body): Json<ReviewRequest>,
-) -> Result<(StatusCode, Json<SessionRun>), StatusCode> {
+) -> Result<axum::response::Response, StatusCode> {
     let session = state.world.get_session(id).await.map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
     let reviewer = match body.reviewer_agent_id {
         Some(r) => Some(load(&state, r).await?),
@@ -2225,15 +2484,14 @@ pub async fn session_review(
             return Err(StatusCode::BAD_REQUEST);
         }
     }
-    let run = state
+    match state
         .world
         .request_review(&session, reviewer.as_ref(), choice.as_ref(), body.focus.as_deref(), session.agent_id)
         .await
-        .map_err(|e| {
-            warn!(error = %e, "review refused");
-            StatusCode::CONFLICT
-        })?;
-    Ok((StatusCode::ACCEPTED, Json(run)))
+    {
+        Ok(run) => Ok((StatusCode::ACCEPTED, Json(run)).into_response()),
+        Err(error) => Ok(refusal(error, "review")),
+    }
 }
 
 #[derive(Deserialize)]
@@ -2403,7 +2661,7 @@ pub async fn channel_replies(
 ) -> Result<Json<Vec<loka_shared::channels::ChannelMessage>>, StatusCode> {
     visible_channel(&state, user.0, id).await?;
     let root = state.world.channel_thread_root(id, message_id).await.map_err(internal)?.ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(state.world.channel_thread(id, root, loka_shared::channels::THREAD_LIMIT).await.map_err(internal)?))
+    Ok(Json(state.world.channel_thread_with_reply(id, root, loka_shared::channels::THREAD_LIMIT, Some(message_id)).await.map_err(internal)?))
 }
 
 pub async fn channel_messages(
@@ -2581,6 +2839,7 @@ pub struct Me {
     status_emoji: Option<String>,
     status_text: Option<String>,
     mention_wakes_main: bool,
+    before_big_work: loka_shared::world::BeforeBigWork,
     new_art: bool,
     onboarding: bool,
     org: Option<MeOrg>,
@@ -2594,7 +2853,7 @@ pub struct MeOrg {
     role: loka_shared::orgs::OrgRole,
 }
 
-fn me_view((id, name, email, main_agent_id, status_emoji, status_text): loka_shared::world::MeRow, role: Role) -> Me {
+fn me_view((id, name, email, main_agent_id, status_emoji, status_text, before_big_work): loka_shared::world::MeRow, role: Role) -> Me {
     let base = name.clone().or_else(|| email.as_deref().and_then(|e| e.split('@').next()).map(String::from)).unwrap_or_default();
     let handle: String = base.chars().filter(|c| c.is_alphanumeric()).collect();
     let handle = if handle.is_empty() { "you".to_string() } else { handle };
@@ -2608,6 +2867,7 @@ fn me_view((id, name, email, main_agent_id, status_emoji, status_text): loka_sha
         status_emoji,
         status_text,
         mention_wakes_main: true,
+        before_big_work: loka_shared::world::BeforeBigWork::parse(&before_big_work).unwrap_or_default(),
         new_art: false,
         onboarding: false,
         org: None,
@@ -2647,6 +2907,7 @@ pub struct SetMe {
     main_agent_id: Option<Uuid>,
     status: Option<SetStatus>,
     mention_wakes_main: Option<bool>,
+    before_big_work: Option<loka_shared::world::BeforeBigWork>,
     new_art: Option<bool>,
 }
 
@@ -2689,6 +2950,9 @@ pub async fn set_me(
     }
     if let Some(on) = body.mention_wakes_main {
         state.world.set_mention_wakes_main(user.0, on).await.map_err(internal)?;
+    }
+    if let Some(value) = body.before_big_work {
+        state.world.set_before_big_work(user.0, value).await.map_err(internal)?;
     }
     if let Some(on) = body.new_art {
         state.world.set_new_art(user.0, on).await.map_err(internal)?;
@@ -2759,6 +3023,55 @@ pub struct RoomQuery {
     since: Option<DateTime<Utc>>,
 }
 
+#[derive(Deserialize, Default)]
+pub struct ResumeBody {
+    #[serde(default)]
+    text: Option<String>,
+}
+
+pub async fn quest_resume(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserId>,
+    Extension(viewer): Extension<Viewer>,
+    Path(task_id): Path<Uuid>,
+    body: Option<Json<ResumeBody>>,
+) -> axum::response::Response {
+    let task = match quest_task(&state, &viewer, task_id).await {
+        Ok(task) => task,
+        Err(status) => return status.into_response(),
+    };
+    let agent = match task.assigned_agent_id {
+        Some(id) => match state.world.get_agent(id).await {
+            Ok(agent) => agent,
+            Err(error) => return internal(error).into_response(),
+        },
+        None => None,
+    };
+    if !agent.as_ref().is_some_and(|agent| access::can_manage(&viewer, agent)) && viewer.role != Role::Admin {
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": "Only people who can manage this quest's agent can resume it." }))).into_response();
+    }
+    let name = match state.world.user_display_name(user.0).await {
+        Ok(name) => name.unwrap_or_else(|| "someone".into()),
+        Err(error) => return internal(error).into_response(),
+    };
+    let note = body.and_then(|Json(body)| body.text);
+    match state.world.request_resume(task.id, user.0, &name, note.as_deref()).await {
+        Ok(outcome) => {
+            if matches!(outcome, loka_shared::quests::ResumeOutcome::Resumed { .. }) {
+                if let Err(error) = state.db.update_status(task.id, "in_progress").await {
+                    warn!(task = %task.id, error = %error, "could not refresh the cached quest status after a resume");
+                }
+            }
+            (StatusCode::ACCEPTED, Json(outcome)).into_response()
+        }
+        Err(loka_shared::quests::ResumeRefusal::Refused(reason)) => {
+            warn!(task = %task.id, reason = %reason, "resume refused");
+            (StatusCode::CONFLICT, Json(json!({ "error": reason }))).into_response()
+        }
+        Err(loka_shared::quests::ResumeRefusal::Internal(error)) => internal(error).into_response(),
+    }
+}
+
 pub async fn quest_room(
     State(state): State<AppState>,
     Extension(user): Extension<UserId>,
@@ -2782,11 +3095,19 @@ pub async fn quest_room(
     let options = state.world.quest_options(task_id).await.map_err(internal)?;
     let parts = state.world.quest_parts(task_id).await.map_err(internal)?;
     let parent = state.world.quest_parent(task_id).await.map_err(internal)?;
+    let plan_waiting = state.world.plan_waiting(task_id).await.map_err(internal)?;
+    let manages = |agent_id: Uuid| viewer.role == Role::Admin || agents.iter().any(|agent| agent.id == agent_id && access::can_manage(&viewer, agent));
+    let resume = match task.assigned_agent_id {
+        Some(agent_id) if parts.is_empty() && manages(agent_id) => state.world.resume_preview(agent_id, task_id).await.ok().map(|plan| plan.view()),
+        _ => None,
+    };
     Ok(Json(json!({
         "task": {
+            "resume": resume,
             "parts": parts,
             "parent": parent,
             "plan_first": options.plan_first,
+            "plan_waiting": plan_waiting,
             "attempts": options.attempts,
             "attempt_variants": options.attempt_variants,
             "ci_feedback": options.ci_feedback,
@@ -3117,6 +3438,28 @@ mod disk_full_tests {
 mod stream_resume_tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn events_replayed_after_a_reconnect_say_so_and_live_ones_do_not() {
+        let event = |seq: i64| loka_shared::world::WorldEvent {
+            seq,
+            event_type: "report.updated".into(),
+            agent_id: None,
+            session_id: None,
+            run_id: None,
+            task_id: None,
+            actor_user_id: None,
+            payload: json!({ "report_id": "r" }),
+            created_at: chrono::Utc::now(),
+            org_id: None,
+        };
+        let read = |seq: i64, head: Option<i64>| serde_json::from_str::<Value>(&wire_event(&event(seq), head).unwrap()).unwrap();
+        assert_eq!(read(5, Some(9))["replayed"], json!(true));
+        assert_eq!(read(9, Some(9))["replayed"], json!(true));
+        assert!(read(10, Some(9)).get("replayed").is_none());
+        assert!(read(5, None).get("replayed").is_none());
+        assert_eq!(read(5, None)["type"], json!("report.updated"));
+    }
 
     #[test]
     fn the_newest_of_the_query_and_the_last_event_id_header_wins() {

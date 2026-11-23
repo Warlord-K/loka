@@ -3,10 +3,12 @@
 import { SOLO } from "@/lib/edition";
 import { AgentFace } from "./channel-ui";
 
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { terminalSummaries, watchTerminals, type Dock, type TerminalDevice, type TerminalSummary } from "@/lib/terminal-layout";
+import { keyProfile, shortcutKeycaps } from "@/lib/terminal-keys";
 import { Command } from "cmdk";
 import Glide from "./glide";
-import { AppleLogo, ArrowsClockwise, Crown, Lightning, ArrowCounterClockwise, Bell, BookOpenText, Buildings, CalendarDots, ChatCircleDots, CheckSquare, CircleHalf, ClockCounterClockwise, Code, Coins, Compass, Star, Student, Desktop, DeviceMobile, DownloadSimple, FileText, FlowArrow, Gavel, GearSix, GraduationCap, Hash, Hammer, House, IdentificationBadge, IdentificationCard, Key, Keyboard, ListChecks, MagnifyingGlass, MapTrifold, Microphone, Monitor, Moon, MusicNotes, Pause, PaperPlaneRight, Play, Plugs, Plus, PuzzlePiece, Rss, Scroll, ShareNetwork, SignOut, SkipForward, SlackLogo, Smiley, SpeakerHigh, SpeakerSlash, Square, Sun, Sword, TerminalWindow, TextAa, Timer, Trophy, UploadSimple, User, UserCircle, UserSwitch, UsersThree, X } from "@phosphor-icons/react";
+import { AppleLogo, ArrowsClockwise, Crown, ArrowCounterClockwise, Bell, BookOpenText, Buildings, CalendarDots, ChatCircleDots, CheckSquare, CircleHalf, ClockCounterClockwise, Code, Coins, Compass, CornersOut, Star, Desktop, DeviceMobile, DownloadSimple, FileText, FlowArrow, Gavel, GearSix, GraduationCap, Hash, Hammer, House, IdentificationBadge, IdentificationCard, Key, Keyboard, Lightning, ListChecks, MagnifyingGlass, MapTrifold, Microphone, Monitor, Moon, MusicNotes, Pause, PaperPlaneRight, Play, Plugs, Plus, PuzzlePiece, Rss, Scroll, ShareNetwork, SidebarSimple, SignOut, SkipForward, SlackLogo, Smiley, SpeakerHigh, SpeakerSlash, Square, SquareHalfBottom, SquareSplitHorizontal, SquareSplitVertical, SquaresFour, Student, Sun, Sword, TerminalWindow, TextAa, Timer, Trophy, UploadSimple, User, UserCircle, UserSwitch, UsersThree, X } from "@phosphor-icons/react";
 import { openQuickChat } from "./quick-chat";
 import { cn } from "@/lib/utils";
 import { worldApi, type SearchResults, type WorldAgent } from "@/lib/world";
@@ -22,8 +24,13 @@ import { stepTextScale } from "@/lib/text-scale";
 import { Keys, hintKeys, isMac } from "./keycap";
 import { useThemeMode } from "./theme";
 import { useSoundPrefs } from "./sounds";
+import { latestOnly } from "@/lib/latest";
 import { setMusicOn, skipMusic, toggleMusicPause, useMusic } from "./music";
+import { watchBrowser } from "@/lib/browser-view";
 import { MeaningIcon } from "@/lib/meaning-icons";
+import type { NavigationRequest } from "@/lib/exact-world-navigation";
+import { questNeedsYou } from "@/lib/quest-status";
+import { OPEN_WORKSPACE } from "@/lib/workspace-layout";
 
 function words(text: string): string[] {
   return text.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
@@ -75,34 +82,6 @@ export function paletteScore(value: string, search: string, keywords?: string[])
     return subsequence(primary.replace(/\s+/g, ""), query.replace(/\s+/g, "")) ? 0.2 : 0;
   }
   return everyPrefix ? 0.6 : 0;
-}
-
-const AGENT_TAB = "world:agent-tab";
-let pendingTab: string | null = null;
-
-export function takeAgentTab(agentId: string): "work" | null {
-  if (pendingTab !== agentId) return null;
-  pendingTab = null;
-  return "work";
-}
-
-export function useAgentTabRequests(agentId: string, onTab: (tab: "work") => void) {
-  const latest = useRef(onTab);
-  latest.current = onTab;
-  useEffect(() => {
-    const onRequest = (e: Event) => {
-      if ((e as CustomEvent<string>).detail !== agentId) return;
-      const tab = takeAgentTab(agentId);
-      if (tab) latest.current(tab);
-    };
-    window.addEventListener(AGENT_TAB, onRequest);
-    return () => window.removeEventListener(AGENT_TAB, onRequest);
-  }, [agentId]);
-}
-
-function requestQuestTab(agentId: string) {
-  pendingTab = agentId;
-  window.dispatchEvent(new CustomEvent(AGENT_TAB, { detail: agentId }));
 }
 
 const RECENT_KEY = "world.palette.recent";
@@ -160,12 +139,14 @@ function shortDate(iso: string | null): string {
 }
 
 function useGlobalSearch(open: boolean, search: string) {
-  const [results, setResults] = useState<SearchResults | null>(null);
+  const [found, setFound] = useState<{ query: string; results: SearchResults } | null>(null);
   const [pending, setPending] = useState(false);
+  const requests = useRef(latestOnly()).current;
   const query = search.trim();
   useEffect(() => {
+    const current = requests.begin();
     if (!open || query.length < 2) {
-      setResults(null);
+      setFound(null);
       setPending(false);
       return;
     }
@@ -174,20 +155,21 @@ function useGlobalSearch(open: boolean, search: string) {
     const timer = window.setTimeout(() => {
       worldApi
         .search(query, controller.signal)
-        .then((found) => {
-          setResults(found);
+        .then((results) => {
+          if (!current()) return;
+          setFound({ query, results });
           setPending(false);
         })
         .catch(() => {
-          if (!controller.signal.aborted) setPending(false);
+          if (!controller.signal.aborted && current()) setPending(false);
         });
     }, 220);
     return () => {
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [open, query]);
-  return { results, pending };
+  }, [open, query, requests]);
+  return { results: found?.query === query ? found.results : null, pending };
 }
 
 function cronLabel(cron: string | null, next: string | null): string {
@@ -216,9 +198,13 @@ function HitGroup({ heading, children }: { heading: string; children: ReactNode 
   );
 }
 
-type ActionGroup = "Go to" | "Create" | "Settings" | "Preferences" | "Account" | "Help";
+type ActionGroup = "Go to" | "Create" | "Terminal" | "Settings" | "Preferences" | "Account" | "Help";
 
-const ACTION_GROUPS: ActionGroup[] = ["Go to", "Create", "Settings", "Preferences", "Account", "Help"];
+const ACTION_GROUPS: ActionGroup[] = ["Go to", "Create", "Terminal", "Settings", "Preferences", "Account", "Help"];
+
+export type TerminalPaletteCommand = { action: "new_tab" | "split_right" | "split_down"; device?: string } | { focus: string } | { dock: Dock };
+
+const NO_TERMINALS = (): TerminalSummary[] => [];
 
 interface PaletteAction {
   id: string;
@@ -226,7 +212,7 @@ interface PaletteAction {
   hint: string;
   icon: typeof Scroll;
   available: boolean;
-  run: () => void;
+  run: (request?: NavigationRequest) => void;
   group?: ActionGroup;
   keywords?: string;
   core?: boolean;
@@ -241,7 +227,7 @@ export function DesktopCommandPalette({
   canWorkshop,
   onOpenWorkshop,
   onOpenChange,
-  canOpenRecord,
+  onBeginNavigation,
   onOpenAgent,
   onOpenQuests,
   onOpenChat,
@@ -254,14 +240,17 @@ export function DesktopCommandPalette({
   onOpenLists,
   onOpenTerminal,
   onTerminalChat,
+  onTerminal,
+  terminalDevices = [],
   canTerminal,
+  browserAgents,
   onOpenShortcuts,
   mainAgent,
   onJump,
   initialSearch = "",
 }: {
   mainAgent: WorldAgent | null;
-  onJump: (jump: PaletteJump) => void;
+  onJump: (jump: PaletteJump, request?: NavigationRequest) => void;
   initialSearch?: string;
   open: boolean;
   agents: WorldAgent[];
@@ -270,23 +259,27 @@ export function DesktopCommandPalette({
   isAdmin: boolean;
   canWorkshop: boolean;
   onOpenWorkshop: () => void;
-  onOpenChange: (open: boolean) => void;
-  canOpenRecord: () => boolean;
-  onOpenAgent: (id: string) => void;
+  onOpenChange: (open: boolean, request?: NavigationRequest) => void;
+  onBeginNavigation: () => NavigationRequest;
+  onOpenAgent: (id: string, request?: NavigationRequest, tab?: "work") => void;
   onOpenQuests: () => void;
   onOpenChat: () => void;
   onOpenHistory: () => void;
   onOpenFolderWorkshop: () => void;
-  onOpenAssistant: () => void;
+  onOpenAssistant: (request?: NavigationRequest) => void;
   onOpenYou: () => void;
   onOpenDevices: () => void;
   onOpenPro: () => void;
   onOpenLists: () => void;
   onOpenTerminal: () => void;
   onTerminalChat: () => void;
+  onTerminal: (command: TerminalPaletteCommand) => void;
+  terminalDevices?: TerminalDevice[];
   canTerminal: boolean;
-  onOpenShortcuts: () => void;
+  browserAgents: WorldAgent[];
+  onOpenShortcuts: (request?: NavigationRequest) => void;
 }) {
+  const terminals = useSyncExternalStore(watchTerminals, terminalSummaries, NO_TERMINALS);
   const previousFocus = useRef<HTMLElement | null>(null);
   const [questControls, setQuestControls] = useState(0);
   const [search, setSearch] = useState("");
@@ -336,23 +329,59 @@ export function DesktopCommandPalette({
     if (open) setRecent(loadRecent());
   }, [open]);
   const mod = isMac() ? "⌘" : "Ctrl";
-  const go = (to: PaletteJump) => () => onJump(to);
+  const go = (to: PaletteJump) => (request?: NavigationRequest) => onJump(to, request);
   const you = (page: string, focus?: string) => go({ kind: "you", page, focus });
   const openTab = (href: string) => () => window.open(href, "_blank", "noopener,noreferrer");
-  const newQuest = () => {
+  const newQuest = (request?: NavigationRequest) => {
     if (!mainAgent) return onOpenQuests();
-    requestQuestTab(mainAgent.id);
-    onOpenAgent(mainAgent.id);
+    onOpenAgent(mainAgent.id, request, "work");
   };
   const suggestSetup = () => {
-    void fetch("/api/world/setup-scan", { method: "POST" }).finally(onOpenAssistant);
+    const request = onBeginNavigation();
+    const openAssistant = () => {
+      if (request.current()) onOpenAssistant(request);
+    };
+    void fetch("/api/world/setup-scan", { method: "POST" }).then(openAssistant, openAssistant);
   };
+  const terminalKeys = keyProfile(isDesktopApp());
+  const terminalActions: PaletteAction[] = [
+    { id: "terminal-new", label: "New terminal", hint: shortcutKeycaps("new_tab", terminalKeys), icon: TerminalWindow, available: canTerminal, run: () => onTerminal({ action: "new_tab" }), group: "Terminal", keywords: "shell tab console open another" },
+    { id: "terminal-split-right", label: "Split terminal right", hint: shortcutKeycaps("split_right", terminalKeys), icon: SquareSplitHorizontal, available: canTerminal, run: () => onTerminal({ action: "split_right" }), group: "Terminal", keywords: "shell pane side by side" },
+    { id: "terminal-split-down", label: "Split terminal down", hint: shortcutKeycaps("split_down", terminalKeys), icon: SquareSplitVertical, available: canTerminal, run: () => onTerminal({ action: "split_down" }), group: "Terminal", keywords: "shell pane stacked below" },
+    { id: "terminal-dock-bottom", label: "Dock the terminal to the bottom", hint: "", icon: SquareHalfBottom, available: canTerminal, run: () => onTerminal({ dock: "bottom" }), group: "Terminal", keywords: "shell panel drawer place" },
+    { id: "terminal-dock-left", label: "Dock the terminal to the left", hint: "", icon: SidebarSimple, available: canTerminal, run: () => onTerminal({ dock: "left" }), group: "Terminal", keywords: "shell side panel place" },
+    { id: "terminal-dock-right", label: "Dock the terminal to the right", hint: "", icon: SidebarSimple, available: canTerminal, run: () => onTerminal({ dock: "right" }), group: "Terminal", keywords: "shell side panel place" },
+    { id: "terminal-dock-window", label: "Open the terminal as a window", hint: "", icon: CornersOut, available: canTerminal, run: () => onTerminal({ dock: "window" }), group: "Terminal", keywords: "shell full undock maximise" },
+    ...(terminalDevices.length > 1
+      ? terminalDevices.map((d) => ({
+          id: `terminal-new-on-${d.id}`,
+          label: `New terminal on ${d.name}`,
+          hint: "",
+          icon: TerminalWindow,
+          available: canTerminal,
+          run: () => onTerminal({ action: "new_tab", device: d.id }),
+          group: "Terminal" as const,
+          keywords: `shell tab console device runner machine open ${d.name}`,
+        }))
+      : []),
+    ...terminals.map((t) => ({
+      id: `terminal-tab-${t.id}`,
+      label: `Jump to terminal ${t.label}`,
+      hint: "",
+      icon: TerminalWindow,
+      available: canTerminal,
+      run: () => onTerminal({ focus: t.id }),
+      group: "Terminal" as const,
+      keywords: `shell tab switch go ${t.label}`,
+    })),
+  ];
   const actions: PaletteAction[] = [
     { id: "quest-status", label: "Change quest status", hint: "S", icon: CircleHalf, available: canWrite && questControls > 0, run: questCommand("status"), core: true },
     { id: "quest-assign", label: "Assign quest to", hint: "A", icon: UserSwitch, available: canWrite && questControls > 0, run: questCommand("assignee"), core: true },
     { id: "quests", label: "Open quests", hint: "Q", icon: Scroll, available: canRead, run: onOpenQuests, keywords: "board tasks work", core: true },
     { id: "lists", label: "Open your lists (to-dos, lists, timers)", hint: "L", icon: CheckSquare, available: canWrite, run: onOpenLists, keywords: "todos reminders checklist", core: true },
     { id: "reports", label: "Open reports", hint: "R", icon: FileText, available: canRead, run: () => openReport(), keywords: "library wiki notes docs", core: true },
+    { id: "workspace", label: "Open workspace (a canvas with your chat and channels)", hint: "B", icon: SquaresFour, available: canRead, run: () => window.dispatchEvent(new CustomEvent(OPEN_WORKSPACE)), keywords: "canvas board live cursors agents team channels call", core: true },
     { id: "chat", label: "Open chat", hint: "C", icon: ChatCircleDots, available: canRead, run: onOpenChat, keywords: "channels messages dm post office", core: true },
     { id: "quick", label: "Quick chat with an agent", hint: "K", icon: Lightning, available: canWrite, run: () => openQuickChat(), keywords: "aside side question ask memory throwaway research", core: true },
     { id: "history", label: "Open session history", hint: "H", icon: ClockCounterClockwise, available: canWrite, run: onOpenHistory, keywords: "sessions runs rewind library", core: true },
@@ -378,6 +407,7 @@ export function DesktopCommandPalette({
     { id: "new-agent", label: "New agent", hint: "", icon: Plus, available: canWrite, run: go({ kind: "new-agent" }), group: "Create", keywords: "create add hire resident" },
     { id: "set-profile", label: "Profile settings", hint: "", icon: UserCircle, available: true, run: you("profile"), group: "Settings", keywords: "name handle email status" },
     { id: "set-main-agent", label: "Main agent settings", hint: "", icon: Star, available: canWrite, run: you("main-agent"), group: "Settings", keywords: "assistant crown" },
+    { id: "set-before-big-work", label: "Before big work", hint: "", icon: FlowArrow, available: canWrite, run: you("main-agent"), group: "Settings", keywords: "ask clarify unclear just build always show plan" },
     { id: "set-rules", label: "Rules", hint: "", icon: Scroll, available: true, run: you("rules", "world-rules"), group: "Settings", keywords: "instructions talking working" },
     { id: "set-setup", label: "Setup status", hint: "", icon: ListChecks, available: canWrite, run: you("setup"), group: "Settings", keywords: "ready readiness checklist" },
     { id: "set-keys", label: "Keys and environment", hint: "", icon: Key, available: canWrite, run: you("keys", "world-environment"), group: "Settings", keywords: "api provider secrets openai anthropic values" },
@@ -402,18 +432,22 @@ export function DesktopCommandPalette({
     { id: "changelog", label: "What's new", hint: "", icon: MeaningIcon.whatsNew, available: true, run: openChangelog, group: "Help", keywords: "changelog updates release notes" },
     { id: "shortcuts", label: "Keyboard shortcuts", hint: "?", icon: Keyboard, available: true, run: onOpenShortcuts, group: "Help", keywords: "keys hotkeys" },
     { id: "docs", label: "Read the docs", hint: "", icon: BookOpenText, available: true, run: openTab("/docs"), group: "Help", keywords: "help guide documentation manual" },
+    ...terminalActions,
   ];
+  for (const agent of browserAgents) {
+    actions.push({ id: `watch-browser:${agent.id}`, label: `Watch ${agent.name}'s browser`, hint: "", icon: MeaningIcon.watchBrowser, available: true, run: () => watchBrowser({ agentId: agent.id }), keywords: `browser live view screen sign in captcha take control ${agent.slug}` });
+  }
   const shown = actions.filter((action) => action.available);
-  const select = (run: () => void, value?: string) => {
+  const select = (run: (request: NavigationRequest) => void, value?: string, navigation?: NavigationRequest) => {
+    const request = navigation ?? onBeginNavigation();
     if (value) rememberRecent(value);
     setSearch("");
-    onOpenChange(false);
-    run();
+    onOpenChange(false, request);
+    run(request);
   };
-  const selectRecord = (run: () => void, value?: string) => select(() => {
-    if (!canOpenRecord()) return;
+  const selectRecord = (run: (request: NavigationRequest) => void, value?: string) => select((request) => {
     if (value) rememberRecent(value);
-    run();
+    run(request);
   });
   const tellTarget = canWrite && mainAgent ? mainAgent : null;
   const tellText = search.trim();
@@ -422,28 +456,28 @@ export function DesktopCommandPalette({
   useEffect(() => setTellError(null), [search, open]);
   const tell = async () => {
     if (!tellTarget || !tellText || sending) return;
+    const request = onBeginNavigation();
     setSending(true);
     setTellError(null);
     try {
       await worldApi.send(tellTarget.id, tellText);
-      select(() => onOpenAgent(tellTarget.id));
+      if (request.current()) select(() => onOpenAgent(tellTarget.id, request), undefined, request);
     } catch {
-      setTellError(`Could not send that to ${tellTarget.name}. Try again.`);
+      if (request.current()) setTellError(`Could not send that to ${tellTarget.name}. Try again.`);
     } finally {
       setSending(false);
     }
   };
   const agentName = (id: string | null) => (id ? agents.find((a) => a.id === id)?.name ?? null : null);
   const jump = (to: PaletteJump) => () => {
-    const run = () => onJump(to);
+    const run = (request: NavigationRequest) => onJump(to, request);
     if (to.kind === "teams" || to.kind === "list" || to.kind === "region" || to.kind === "place") select(run);
     else selectRecord(run);
   };
   const academyHits = (results?.places ?? []).filter((p) => p.kind === "challenge" || p.kind === "adventure");
   const mapPlaces = (results?.places ?? []).filter((p) => p.kind === "building" || p.kind === "npc");
-  const giveQuest = (agentId: string) => {
-    requestQuestTab(agentId);
-    onOpenAgent(agentId);
+  const giveQuest = (agentId: string, request: NavigationRequest) => {
+    onOpenAgent(agentId, request, "work");
   };
   const query = search.trim().toLowerCase();
   const terms = useMemo(() => words(query), [query]);
@@ -533,7 +567,7 @@ export function DesktopCommandPalette({
           {giveTargets.length > 0 && (
             <Command.Group heading="Give a quest" className={GROUP}>
               {giveTargets.map((agent) => (
-                <Command.Item key={agent.id} value={`give:${agent.id}`} onSelect={() => select(() => giveQuest(agent.id))} className={ITEM}>
+                <Command.Item key={agent.id} value={`give:${agent.id}`} onSelect={() => select((request) => giveQuest(agent.id, request))} className={ITEM}>
                   <Sword size={17} weight="duotone" className="text-w-link" />
                   <span className="min-w-0 flex-1 truncate">Give {agent.name} a quest</span>
                   <AgentFace agent={agent} size={18} />
@@ -614,6 +648,7 @@ export function DesktopCommandPalette({
                       >
                         <StatusIcon status={quest.status} />
                         <span className="min-w-0 flex-1 truncate">{quest.title}</span>
+                        {questNeedsYou(quest) && <span className="shrink-0 text-w-xs font-semibold text-w-warn">Needs you</span>}
                         {agent && <span className="flex shrink-0 items-center gap-1.5 text-w-xs text-w-muted"><AgentFace agent={agent} size={16} />{agent.name}</span>}
                       </Command.Item>
                     );
@@ -848,6 +883,11 @@ export function DesktopCommandPalette({
           <Command.Group heading="Create" className={GROUP}>
             {shown.filter((action) => action.group === "Create" && !recent.includes(`action:${action.id}`)).map(actionItem)}
           </Command.Group>
+          {terminals.length > 0 && (
+            <Command.Group heading="Terminals" className={GROUP}>
+              {shown.filter((action) => action.id.startsWith("terminal-tab-") && !recent.includes(`action:${action.id}`)).map(actionItem)}
+            </Command.Group>
+          )}
           <Command.Separator className="my-2 border-t-2 border-dashed border-w-line" />
           <Command.Group heading="Conversations" className={GROUP}>
             {agents.filter((agent) => !recent.includes(`agent:${agent.id}`)).map(agentItem)}

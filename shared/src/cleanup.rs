@@ -18,12 +18,13 @@ pub enum CleanupKind {
     Chats,
     Quests,
     Activity,
-    Workspaces,
+    QuestFolders,
+    Caches,
 }
 
 impl CleanupKind {
-    pub const ALL: [CleanupKind; 5] =
-        [CleanupKind::RunLogs, CleanupKind::Chats, CleanupKind::Quests, CleanupKind::Activity, CleanupKind::Workspaces];
+    pub const ALL: [CleanupKind; 6] =
+        [CleanupKind::RunLogs, CleanupKind::Chats, CleanupKind::Quests, CleanupKind::Activity, CleanupKind::QuestFolders, CleanupKind::Caches];
 
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim() {
@@ -31,7 +32,8 @@ impl CleanupKind {
             "chats" | "messages" => Some(Self::Chats),
             "quests" => Some(Self::Quests),
             "activity" | "events" => Some(Self::Activity),
-            "workspaces" | "workspace" | "disk" => Some(Self::Workspaces),
+            "quest_folders" | "quest_folder" | "folders" | "workspaces" | "workspace" | "disk" => Some(Self::QuestFolders),
+            "caches" | "cache" | "build_caches" | "builds" => Some(Self::Caches),
             _ => None,
         }
     }
@@ -42,7 +44,8 @@ impl CleanupKind {
             Self::Chats => "chats",
             Self::Quests => "quests",
             Self::Activity => "activity",
-            Self::Workspaces => "workspaces",
+            Self::QuestFolders => "quest_folders",
+            Self::Caches => "caches",
         }
     }
 
@@ -52,7 +55,8 @@ impl CleanupKind {
             Self::Chats => "chat messages with your agents",
             Self::Quests => "finished, failed and cancelled quests with their sessions, runs and logs (lifetime cost stays)",
             Self::Activity => "activity feed events, including cleared bell items",
-            Self::Workspaces => "workspaces and temp folders of closed quests on your devices (worktrees, build output, test databases and scratch files), plus the node_modules, .next and cargo target folders of idle open quests (branches, commits and pull requests stay)",
+            Self::QuestFolders => "folders and temp folders of closed quests on your devices (worktrees, test databases and scratch files; branches, commits and pull requests stay)",
+            Self::Caches => "rebuildable build caches on your devices: the cargo target, node_modules and .next folders of every quest that is not building right now, plus the shared dependency caches (source, branches, commits and unsaved work are never touched; the next build is just slower)",
         }
     }
 }
@@ -100,7 +104,8 @@ pub struct WorkspaceUse {
     pub temp_bytes: i64,
     pub reclaimable_temp_bytes: i64,
     pub build_bytes: i64,
-    pub reclaimable_build_bytes: i64,
+    pub seed_bytes: i64,
+    pub reclaimable_cache_bytes: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -208,9 +213,8 @@ impl WorldStore {
                 .unwrap_or_default();
             let ids: Vec<Uuid> = largest.iter().map(|(id, _, _, _)| *id).collect();
             let closed: Vec<Uuid> = store.closed_tasks(runner_id, &ids, true).await?.into_iter().map(|task| task.id).collect();
-            let idle: Vec<Uuid> = store.idle_tasks(runner_id, &ids).await?;
-            let idle_build: i64 = largest.iter().filter(|(id, _, _, _)| idle.contains(id) && !closed.contains(id)).map(|(_, _, _, build)| *build).sum();
             let build_bytes = view["build_bytes"].as_i64().unwrap_or(0);
+            let seed_bytes = view["seed_bytes"].as_i64().unwrap_or(0);
             let reclaimed: Vec<&(Uuid, i64, i64, i64)> = largest.iter().filter(|(id, _, _, _)| closed.contains(id)).collect();
             let reclaimable: Vec<i64> = reclaimed.iter().map(|(_, bytes, _, _)| *bytes).collect();
             found.push(WorkspaceUse {
@@ -227,57 +231,65 @@ impl WorldStore {
                 temp_bytes: view["temp_bytes"].as_i64().unwrap_or(0),
                 reclaimable_temp_bytes: reclaimed.iter().map(|(_, _, temp, _)| *temp).sum(),
                 build_bytes,
-                reclaimable_build_bytes: idle_build,
+                seed_bytes,
+                reclaimable_cache_bytes: build_bytes + seed_bytes,
             });
         }
         Ok(found)
     }
 
-    async fn clean_workspaces(&self, request: CleanupRequest, apply: bool) -> Result<CleanupResult> {
-        if request.agent.is_some() {
-            bail!("workspaces are cleaned for all of your agents at once");
-        }
-        let usage = self.workspace_use(request.owner).await?;
-        let rows: i64 = usage.iter().map(|u| u.reclaimable_tasks).sum();
-        let bytes: i64 = usage.iter().map(|u| u.reclaimable_bytes + u.reclaimable_build_bytes).sum();
-        let runners: Vec<Uuid> = usage.iter().filter(|u| u.reclaimable_tasks > 0 || u.reclaimable_build_bytes > 0).map(|u| u.runner_id).collect();
+    async fn queue_device_cleanup(&self, request: CleanupRequest, kind: CleanupKind, runners: &[Uuid], rows: i64, bytes: i64, apply: bool) -> Result<CleanupResult> {
+        let column = match kind {
+            CleanupKind::Caches => "clean_caches_at",
+            _ => "clean_workspaces_at",
+        };
         let applied = apply && !runners.is_empty();
         if applied {
             let mut tx = self.pool().begin().await?;
-            sqlx::query("UPDATE world_runners SET clean_workspaces_at = NOW() WHERE id = ANY($1)")
-                .bind(&runners)
+            sqlx::query(&format!("UPDATE world_runners SET {column} = NOW() WHERE id = ANY($1)"))
+                .bind(runners)
                 .execute(&mut *tx)
                 .await?;
             sqlx::query(
                 "INSERT INTO world_cleanups (user_id, org_id, agent_id, by_agent_id, kind, older_than, rows_removed, bytes_freed)
-                 VALUES ($1, $2, NULL, $3, 'workspaces', 0, $4, $5)",
+                 VALUES ($1, $2, NULL, $3, $4, 0, $5, $6)",
             )
             .bind(request.owner)
             .bind(request.org)
             .bind(request.by_agent)
+            .bind(kind.key())
             .bind(rows)
             .bind(bytes)
             .execute(&mut *tx)
             .await?;
-            for runner in &runners {
+            for runner in runners {
                 sqlx::query("SELECT pg_notify($1, $2)").bind(CHANNEL_RUNNER_JOBS).bind(runner.to_string()).execute(&mut *tx).await?;
             }
             tx.commit().await?;
         }
-        Ok(CleanupResult {
-            kind: CleanupKind::Workspaces,
-            older_than_days: 0,
-            agent_id: None,
-            rows,
-            bytes,
-            applied,
-            what: CleanupKind::Workspaces.describe(),
-        })
+        Ok(CleanupResult { kind, older_than_days: 0, agent_id: None, rows, bytes, applied, what: kind.describe() })
+    }
+
+    async fn clean_devices(&self, request: CleanupRequest, apply: bool) -> Result<CleanupResult> {
+        if request.agent.is_some() {
+            bail!("{} are cleaned for all of your agents at once", request.kind.key());
+        }
+        let usage = self.workspace_use(request.owner).await?;
+        if request.kind == CleanupKind::Caches {
+            let cleared: Vec<&WorkspaceUse> = usage.iter().filter(|u| u.reclaimable_cache_bytes > 0).collect();
+            let runners: Vec<Uuid> = cleared.iter().map(|u| u.runner_id).collect();
+            let bytes = cleared.iter().map(|u| u.reclaimable_cache_bytes).sum();
+            return self.queue_device_cleanup(request, CleanupKind::Caches, &runners, runners.len() as i64, bytes, apply).await;
+        }
+        let rows: i64 = usage.iter().map(|u| u.reclaimable_tasks).sum();
+        let bytes: i64 = usage.iter().map(|u| u.reclaimable_bytes).sum();
+        let runners: Vec<Uuid> = usage.iter().filter(|u| u.reclaimable_tasks > 0).map(|u| u.runner_id).collect();
+        self.queue_device_cleanup(request, CleanupKind::QuestFolders, &runners, rows, bytes, apply).await
     }
 
     pub async fn clean_up(&self, request: CleanupRequest, apply: bool) -> Result<CleanupResult> {
-        if request.kind == CleanupKind::Workspaces {
-            return self.clean_workspaces(request, apply).await;
+        if matches!(request.kind, CleanupKind::QuestFolders | CleanupKind::Caches) {
+            return self.clean_devices(request, apply).await;
         }
         if !(MIN_DAYS..=MAX_DAYS).contains(&request.older_than_days) {
             bail!("older_than_days must be between {MIN_DAYS} and {MAX_DAYS}");
@@ -300,7 +312,7 @@ impl WorldStore {
             CleanupKind::Chats => chats(&mut tx, &request, apply).await?,
             CleanupKind::Quests => quests(&mut tx, &request, apply).await?,
             CleanupKind::Activity => activity(&mut tx, &request, apply).await?,
-            CleanupKind::Workspaces => unreachable!("workspaces are handled before the transaction"),
+            CleanupKind::QuestFolders | CleanupKind::Caches => unreachable!("device cleanups are handled before the transaction"),
         };
         if apply && rows > 0 {
             sqlx::query(
@@ -497,6 +509,16 @@ async fn activity(tx: &mut Transaction<'_, Postgres>, r: &CleanupRequest, apply:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quest_folder_cleanups_keep_their_old_name_as_an_alias() {
+        for name in ["quest_folders", "workspaces", "workspace", "disk"] {
+            assert_eq!(CleanupKind::parse(name), Some(CleanupKind::QuestFolders), "{name}");
+        }
+        assert_eq!(CleanupKind::QuestFolders.key(), "quest_folders");
+        assert_eq!(serde_json::to_value(CleanupKind::QuestFolders).unwrap(), serde_json::json!("quest_folders"));
+        assert!(CleanupKind::ALL.iter().all(|kind| CleanupKind::parse(kind.key()) == Some(*kind)));
+    }
 
     #[tokio::test]
     async fn cleanups_preview_then_remove_only_old_data_and_keep_totals() -> Result<()> {

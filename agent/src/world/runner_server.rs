@@ -14,7 +14,7 @@ use loka_shared::{
         RunnerJob, RunnerPublish, RunnerSkill, RunnerStore, RunnerUsage, RunnerWorkspace,
     },
     world::{
-        resume_prompt, AgentSession, InboxItem, NewEvent, NewMessage, NewRun, NewSession, ReviewerChoice, SessionRun,
+        AgentSession, FollowupAdvance, InboxItem, NewEvent, NewMessage, NewRun, NewSession, ReviewerChoice, SessionRun,
         TaskResume, WorldAgent, WorldStore,
     },
 };
@@ -23,9 +23,17 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 use crate::prompts::{self, Action, Report};
-use loka_shared::run_causes::Cause;
+use crate::quests::{finish_error, finish_step, followup_step, incomplete_report, salvages, Finish, FollowupStep, Started};
+use loka_shared::run_causes::{Cause, Required};
+
+pub const LOST_REPLY_GRACE_SECS: i64 = 20;
 
 const TURN_BATCH: i64 = 20;
+
+fn quick_answer(output: &str) -> String {
+    let text = prompts::plain_dashes(&prompts::split_actions(output).0);
+    if text.trim().is_empty() { "Done.".to_string() } else { text }
+}
 
 #[derive(Clone)]
 pub struct RunnerCoordinator {
@@ -35,6 +43,12 @@ pub struct RunnerCoordinator {
     owner_name: String,
     reviews_enabled: bool,
     max_review_rounds: i32,
+}
+
+struct AttentionCard {
+    choices: Vec<String>,
+    drafts: Vec<prompts::Draft>,
+    clarify_request: Option<Value>,
 }
 
 impl RunnerCoordinator {
@@ -152,7 +166,7 @@ impl RunnerCoordinator {
                 }
                 Ok(None) => self.store.finish_inbox(&reset_ids, "done", None).await,
                 Err(error) => {
-                    self.store.requeue_inbox(&reset_ids, &error.to_string()).await?;
+                    self.store.requeue_inbox(&reset_ids, &loka_shared::cli_errors::chain(&error)).await?;
                     Err(error)
                 }
             };
@@ -177,7 +191,7 @@ impl RunnerCoordinator {
                     }
                 }
                 Err(error) => {
-                    self.store.requeue_inbox(&compact_ids, &error.to_string()).await?;
+                    self.store.requeue_inbox(&compact_ids, &loka_shared::cli_errors::chain(&error)).await?;
                     self.store.repend_inbox(&rest_ids).await?;
                     return Err(error);
                 }
@@ -197,7 +211,7 @@ impl RunnerCoordinator {
                 Ok(())
             }
             Err(error) => {
-                self.store.requeue_inbox(&ids, &error.to_string()).await?;
+                self.store.requeue_inbox(&ids, &loka_shared::cli_errors::chain(&error)).await?;
                 Err(error)
             }
         }
@@ -236,6 +250,7 @@ impl RunnerCoordinator {
                 fork_from: None,
                 prompt: prompts::RESET_PROMPT,
                 timeout_secs: 600,
+                request: None,
             })
             .await?;
         Ok(Some(run))
@@ -257,6 +272,7 @@ impl RunnerCoordinator {
                 fork_from: None,
                 prompt: prompts::COMPACT_PROMPT,
                 timeout_secs: 600,
+                request: None,
             })
             .await?;
         Ok(Some(run))
@@ -351,6 +367,7 @@ impl RunnerCoordinator {
         let teams = self.store.teams_of_agent(agent.id).await.unwrap_or_default();
         let rules_text = [
             prompts::rules(&rules, "talk", &self.owner_name),
+            prompts::before_big_work(self.store.agent_before_big_work(agent).await?).to_string(),
             prompts::teams(&teams, agent.id, "talk"),
             skills_index,
         ]
@@ -378,13 +395,16 @@ impl RunnerCoordinator {
             main.summary.as_deref(),
             main.cli_session_id.is_none(),
         );
-        if main.cli_session_id.is_some() && main.rules_hash.as_deref() != Some(rules_hash.as_str())
-        {
-            let instructions = [system.as_str(), rules_text.as_str()]
-                .into_iter()
-                .filter(|text| !text.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n\n");
+        if main.rules_hash.as_deref() != Some(rules_hash.as_str()) {
+            let instructions = if main.cli_session_id.is_none() {
+                rules_text.clone()
+            } else {
+                [system.as_str(), rules_text.as_str()]
+                    .into_iter()
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            };
             prompt = format!("[instructions updated]\n{instructions}\n\n{prompt}");
         }
         let run = self
@@ -398,6 +418,7 @@ impl RunnerCoordinator {
                 fork_from: None,
                 prompt: &prompt,
                 timeout_secs: 600,
+                request: None,
             })
             .await?;
         self.runners.set_run_rules_hash(run.id, &rules_hash).await?;
@@ -657,6 +678,7 @@ impl RunnerCoordinator {
             keys_version,
             metered: self.store.metered(agent.id).await?,
             setup_scan,
+            task_id: claimed.task_id,
         })
     }
 
@@ -678,19 +700,24 @@ impl RunnerCoordinator {
         let expected = session
             .working_dir
             .as_deref()
-            .ok_or_else(|| anyhow!("session has no workspace"))?;
+            .ok_or_else(|| anyhow!("session has no quest folder"))?;
         if expected != completion.workspace_key {
             bail!("completion workspace does not match the leased session")
         }
         let environment = self.store.secrets_for_agent(agent.id).await?;
-        let output = redact(&completion.output, environment.values());
+        let redactor = loka_shared::redaction::Redactor::new(environment.values());
+        let output = redactor.redact(&completion.output);
         let error = completion
             .error
             .as_deref()
-            .map(|value| redact(value, environment.values()));
-        if completion.exit_code != 0 || error.is_some() {
+            .map(|value| redactor.redact(value));
+        if error.is_some() || completion.exit_code != 0 && output.trim().is_empty() {
             let message = error
                 .unwrap_or_else(|| format!("runner process exited with {}", completion.exit_code));
+            if self.runners.requeue_for_space(lease, &message).await? {
+                tracing::info!(run = %lease.run_id, kind = %lease.kind, "Run refused for lack of disk space goes back to the queue to wait for room");
+                return Ok(());
+            }
             if lease.kind == "turn"
                 && !completion.retryable
                 && session.rewind.as_ref().is_some_and(|r| r.get("fresh").is_none())
@@ -724,37 +751,17 @@ impl RunnerCoordinator {
                 .await?;
             return Ok(());
         }
-        let accounted = if lease.kind == "publish" {
-            Accounted {
-                baseline: session.usage_baseline.clone(),
-                cost_usd: 0.0,
-                input_tokens: 0,
-                cached_input_tokens: 0,
-                output_tokens: 0,
-            }
-        } else {
-            self.account(&session, completion)
-        };
         let compaction = self.is_compaction(lease.run_id, &lease.kind).await?;
         let reset = self.is_reset(lease.run_id, &lease.kind).await?;
         let context_tokens = match completion.usage.context_tokens {
-            _ if lease.kind == "publish" => session.context_tokens,
-            _ if compaction => 0,
-            measured => loka_shared::context::used(measured, completion.usage.input_tokens, completion.usage.cached_input_tokens),
+            _ if lease.kind == "publish" => None,
+            _ if compaction => Some(0),
+            measured => Some(loka_shared::context::used(measured, completion.usage.input_tokens, completion.usage.cached_input_tokens)),
         };
+        let reported = loka_shared::run_recording::accounts_spend(&lease.kind).then(|| reported(completion));
         let applied = self
             .runners
-            .apply_success(
-                lease,
-                &output,
-                completion.session_id.as_deref(),
-                &accounted.baseline,
-                context_tokens,
-                accounted.cost_usd,
-                accounted.input_tokens,
-                accounted.cached_input_tokens,
-                accounted.output_tokens,
-            )
+            .apply_success(lease, &output, completion.session_id.as_deref(), reported.as_ref(), context_tokens)
             .await?;
         if applied == ApplyCompletion::Stopped {
             bail!("runner lease stopped before completion was applied")
@@ -767,15 +774,9 @@ impl RunnerCoordinator {
         {
             bail!("runner lease stopped during completion")
         }
-        self.emit_run_event_once(
-            "run.completed",
-            lease.run_id,
-            &session,
-            agent.id,
-            json!({ "cost_usd": accounted.cost_usd }),
-            false,
-        )
-        .await?;
+        if !prompts::contract_open(&lease.kind, &session, &output) {
+            self.store.announce_completed(lease.run_id).await?;
+        }
         if lease.kind == "turn" {
             self.store
                 .set_run_checkpoint(lease.run_id, completion.checkpoint.as_deref())
@@ -784,50 +785,65 @@ impl RunnerCoordinator {
                 self.store.clear_session_rewind(session.id).await?;
             }
         }
-        match lease.kind.as_str() {
-            "turn" if reset => self.after_reset(&agent, &session, lease.run_id, lease.runner_id).await?,
-            "turn" if compaction => self.after_compaction(&agent, &session, lease.run_id, lease.runner_id).await?,
-            "turn" => {
-                let replied = self.after_turn(&agent, &session, lease.run_id, &output).await;
-                self.stop_typing(&agent, lease.run_id).await;
-                replied?;
-                let _ = self.store.announce_context(agent.id).await;
-                if !self.compact_if_large(&agent, &session, lease.run_id, completion).await? {
-                    if let Err(e) = self.store.auto_context_cleanup(agent.id, lease.run_id).await {
-                        tracing::warn!(agent = %agent.slug, error = %e, "Automatic context cleanup check failed");
+        let settled = async {
+            match lease.kind.as_str() {
+                "turn" if reset => self.after_reset(&agent, &session, lease.run_id, lease.runner_id).await?,
+                "turn" if compaction => self.after_compaction(&agent, &session, lease.run_id, lease.runner_id).await?,
+                "turn" => {
+                    let replied = self.after_turn(&agent, &session, lease.run_id, &output).await;
+                    self.stop_typing(&agent, lease.run_id).await;
+                    replied?;
+                    let _ = self.store.announce_context(agent.id).await;
+                    if !self.compact_if_large(&agent, &session, lease.run_id, completion).await? {
+                        if let Err(e) = self.store.auto_context_cleanup(agent.id, lease.run_id).await {
+                            tracing::warn!(agent = %agent.slug, error = %e, "Automatic context cleanup check failed");
+                        }
                     }
                 }
+                "task" => {
+                    self.after_task(&agent, &session, lease.run_id, &output, completion.work_summary.as_deref())
+                        .await?
+                }
+                "followup" => {
+                    self.after_followup(
+                        &agent,
+                        &session,
+                        lease.run_id,
+                        &output,
+                        completion.work_summary.as_deref(),
+                        loka_shared::runners::PrSync::from_report(completion.publish_pr_state.as_deref()),
+                    )
+                        .await?
+                }
+                "aside" => self.after_aside(&agent, &session, &output).await?,
+                "quick" => self.after_quick(&agent, &session, lease.run_id, &output).await?,
+                "direct" => {
+                    self.store
+                        .set_session_status(session.id, "active", Some(&tail(&prompts::plain_dashes(&output), 2000)))
+                        .await?;
+                }
+                "review" => {
+                    self.after_review(&agent, &session, lease.run_id, &output)
+                        .await?
+                }
+                "publish" => self.after_publish(&agent, &session, completion).await?,
+                other => bail!("unsupported runner job kind {other}"),
             }
-            "task" => {
-                self.after_task(&agent, &session, lease.run_id, &output, completion.work_summary.as_deref())
-                    .await?
-            }
-            "followup" => {
-                self.after_followup(
-                    &agent,
-                    &session,
-                    lease.run_id,
-                    &output,
-                    completion.work_summary.as_deref(),
-                    loka_shared::runners::PrSync::from_report(completion.publish_pr_state.as_deref()),
-                )
-                    .await?
-            }
-            "aside" => self.after_aside(&agent, &session, &output).await?,
-            "quick" => self.after_quick(&agent, &session, lease.run_id, &output).await?,
-            "direct" => {
-                self.store
-                    .set_session_status(session.id, "active", Some(&tail(&prompts::plain_dashes(&output), 2000)))
-                    .await?;
-            }
-            "review" => {
-                self.after_review(&agent, &session, lease.run_id, &output)
-                    .await?
-            }
-            "publish" => self.after_publish(&agent, &session, completion).await?,
-            other => bail!("unsupported runner job kind {other}"),
+            Ok::<(), anyhow::Error>(())
         }
-        Ok(())
+        .await;
+        let announced = self.store.announce_completed(lease.run_id).await;
+        settled.and(announced.map(|_| ()))
+    }
+
+    pub async fn keep_late_spend(&self, runner_id: Uuid, lease_id: Uuid, completion: &RunnerCompletion) -> Result<bool> {
+        let Some(lease) = self.runners.late_lease(runner_id, lease_id).await? else {
+            return Ok(false);
+        };
+        if !loka_shared::run_recording::accounts_spend(&lease.kind) {
+            return Ok(false);
+        }
+        self.runners.keep_late_spend(&lease, &reported(completion)).await
     }
 
     pub async fn redact_completion(
@@ -836,12 +852,10 @@ impl RunnerCoordinator {
         completion: &RunnerCompletion,
     ) -> Result<RunnerCompletion> {
         let environment = self.store.secrets_for_agent(lease.agent_id).await?;
+        let redactor = loka_shared::redaction::Redactor::new(environment.values());
         let mut completion = completion.clone();
-        completion.output = redact(&completion.output, environment.values());
-        completion.error = completion
-            .error
-            .as_deref()
-            .map(|value| redact(value, environment.values()));
+        completion.output = redactor.redact(&completion.output);
+        completion.error = completion.error.as_deref().map(|value| redactor.redact(value));
         Ok(completion)
     }
 
@@ -872,12 +886,48 @@ impl RunnerCoordinator {
         Ok(server.jsonrpc(message).await)
     }
 
+    pub async fn ingest_events(&self, lease: &LeaseContext, events: Vec<RunnerEvent>) -> Result<()> {
+        let (usage, shown): (Vec<_>, Vec<_>) = events
+            .into_iter()
+            .partition(|event| event.kind == loka_shared::runners::USAGE_EVENT);
+        if !usage.is_empty() {
+            if let Err(error) = self.record_live_usage(lease, &usage).await {
+                tracing::warn!(error = %format!("{error:#}"), run = %lease.run_id, "Could not record live usage");
+            }
+        }
+        let events = self.redact_events(lease, &shown).await?;
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.runners.record_events(lease, &events).await?;
+        let Some(text) = events
+            .iter()
+            .rev()
+            .find_map(|event| loka_shared::progress::from_event(&event.kind, event.tool.as_deref(), &event.text))
+        else {
+            return Ok(());
+        };
+        match lease.kind.as_str() {
+            "turn" => {
+                let _ = self.store.emit_progress(lease.agent_id, lease.run_id, "turn", &text).await;
+            }
+            kind if !loka_shared::run_recording::shows_activity(kind) => {}
+            _ => {
+                if let Some(run) = self.store.get_run(lease.run_id).await? {
+                    let _ = self.store.set_run_activity(&run, &text).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn redact_events(
         &self,
         lease: &LeaseContext,
         events: &[RunnerEvent],
     ) -> Result<Vec<RunnerEvent>> {
         let environment = self.store.secrets_for_agent(lease.agent_id).await?;
+        let redactor = loka_shared::redaction::Redactor::new(environment.values());
         events
             .iter()
             .map(|event| {
@@ -889,8 +939,8 @@ impl RunnerCoordinator {
                     tool: event
                         .tool
                         .as_ref()
-                        .map(|tool| redact(tool, environment.values())),
-                    text: redact(&event.text, environment.values()),
+                        .map(|tool| redactor.redact(tool)),
+                    text: redactor.redact(&event.text),
                 })
             })
             .collect()
@@ -944,6 +994,7 @@ impl RunnerCoordinator {
                 fork_from: None,
                 prompt: prompts::COMPACT_PROMPT,
                 timeout_secs: 600,
+                request: None,
             })
             .await?;
         Ok(true)
@@ -984,6 +1035,7 @@ impl RunnerCoordinator {
                 .await?;
         }
         let items = self.run_inbox_items(run_id).await?;
+        let tasks = self.referenced_tasks(&items).await;
         let thread = self.store.reply_thread(agent, &items).await?;
         let root = loka_shared::replies::reply_root(&items);
         let (text, actions) = prompts::split_actions(output);
@@ -1011,14 +1063,18 @@ impl RunnerCoordinator {
                             continue;
                         }
                         crate::quests::seed_milestones(&self.store, agent.id, task_id, &milestones).await;
-                        if let Err(error) = self
+                        match self
                             .start_task(agent, main, task_id, brief.as_deref(), review.unwrap_or(false) || choice.is_some(), choice.as_ref())
                             .await
                         {
-                            problems.push(format!("Could not start task {task_id}: {error}"));
-                        } else if let Some(minutes) = time_limit_minutes {
-                            if let Err(error) = self.store.set_task_time_limit(task_id, Some(minutes)).await {
-                                problems.push(format!("Could not set the time limit on task {task_id}: {error}"));
+                            Err(error) => problems.push(format!("Could not start task {task_id}: {error}")),
+                            Ok(outcome) => {
+                                tracing::info!(agent = %agent.slug, task = %task_id, resumed = outcome.resumed, session = %outcome.session_id, run = %outcome.run_id, "Start queued a run");
+                                if let Some(minutes) = time_limit_minutes {
+                                    if let Err(error) = self.store.set_task_time_limit(task_id, Some(minutes)).await {
+                                        problems.push(format!("Could not set the time limit on task {task_id}: {error}"));
+                                    }
+                                }
                             }
                         }
                     }
@@ -1029,24 +1085,50 @@ impl RunnerCoordinator {
                         .await?;
                 }
                 Action::Escalate { text } if !text.trim().is_empty() => {
-                    self.attention(agent, main, run_id, &text, Vec::new(), Vec::new())
+                    self.attention(
+                        agent,
+                        main,
+                        run_id,
+                        &text,
+                        AttentionCard { choices: Vec::new(), drafts: Vec::new(), clarify_request: None },
+                    )
                         .await?;
                     replied = true;
                 }
-                Action::Ask { text, choices } if !text.trim().is_empty() => {
+                Action::Ask { text, choices, clarify_request, clarify_source } if !text.trim().is_empty() => {
                     let choices = choices
                         .into_iter()
                         .map(|choice| prompts::plain_dashes(choice.trim()))
                         .filter(|choice| !choice.is_empty())
                         .take(4)
                         .collect();
-                    self.attention(agent, main, run_id, &text, choices, Vec::new()).await?;
+                    self.attention(
+                        agent,
+                        main,
+                        run_id,
+                        &text,
+                        AttentionCard {
+                            choices,
+                            drafts: Vec::new(),
+                            clarify_request: clarify_request
+                                .then(|| prompts::clarification_origin(&items, &tasks, clarify_source.as_deref()))
+                                .flatten(),
+                        },
+                    )
+                    .await?;
                     replied = true;
                 }
                 Action::Drafts { text, items } if !text.trim().is_empty() => {
                     let drafts = prompts::clean_drafts(&items);
                     let body = if drafts.is_empty() { text } else { prompts::drafts_body(&text, &drafts) };
-                    self.attention(agent, main, run_id, &body, Vec::new(), drafts).await?;
+                    self.attention(
+                        agent,
+                        main,
+                        run_id,
+                        &body,
+                        AttentionCard { choices: Vec::new(), drafts, clarify_request: None },
+                    )
+                    .await?;
                     replied = true;
                 }
                 _ => {}
@@ -1072,14 +1154,16 @@ impl RunnerCoordinator {
             else {
                 continue;
             };
+            let resume = item.payload.get("resume").and_then(Value::as_bool) == Some(true);
             if started.contains(&task_id)
-                || replied
+                || (replied && !resume)
                 || self.store.quest_has_parts(task_id).await.unwrap_or(false)
                 || crate::quests::assigned_elsewhere(&self.store, task_id, agent.id).await
             {
                 continue;
             }
-            let brief = (!text.trim().is_empty()).then_some(text.as_str());
+            let note = item.payload.get("brief").and_then(Value::as_str).filter(|note| !note.trim().is_empty());
+            let brief = note.or((!text.trim().is_empty()).then_some(text.as_str()));
             if let Err(error) = self.start_task(agent, main, task_id, brief, false, None).await {
                 problems.push(format!("Could not start task {task_id}: {error}"));
             }
@@ -1107,7 +1191,7 @@ impl RunnerCoordinator {
         brief: Option<&str>,
         review: bool,
         reviewer: Option<&ReviewerChoice>,
-    ) -> Result<()> {
+    ) -> Result<Started> {
         let task = self
             .db
             .get_task(task_id)
@@ -1116,34 +1200,17 @@ impl RunnerCoordinator {
         if task.assigned_agent_id != Some(agent.id) {
             bail!("task is not assigned to this agent")
         }
-        match self
+        let resume = self
             .store
-            .resume_task_session(agent.id, task.id, &resume_prompt(&agent.name, brief))
-            .await?
-        {
-            TaskResume::Busy(session_id) => bail!(
-                "it is already being worked on in session {session_id}; use message_session to steer that session instead of starting it again"
-            ),
-            TaskResume::AwaitingPlan(session_id) => bail!("session {session_id} has a plan that {}", loka_shared::quests::PLAN_WAITING),
-            TaskResume::Resumed { session_id, run_id } => {
-                self.db.update_status(task.id, "in_progress").await?;
-                self.store
-                    .emit(
-                        NewEvent::new("task.started")
-                            .agent(agent.id)
-                            .session(session_id)
-                            .run(run_id)
-                            .task(Some(task.id))
-                            .payload(json!({ "task_id": task.id, "title": task.title, "repo": task.repo, "resumed": true })),
-                        None,
-                    )
-                    .await?;
-                self.store
-                    .post_quest_started(agent.id, task.id, session_id, &task.title, brief.filter(|b| !b.trim().is_empty()))
-                    .await?;
-                return Ok(());
-            }
-            TaskResume::Fresh => {}
+            .resume_task_session(agent.id, task.id, &agent.name, brief)
+            .await?;
+        if let Some(problem) = resume.problem() {
+            bail!(problem)
+        }
+        if let TaskResume::Resumed { session_id, run_id } = resume {
+            self.db.update_status(task.id, "in_progress").await?;
+            self.store.announce_resumed(agent.id, task.id, session_id, run_id, brief).await?;
+            return Ok(Started { resumed: true, session_id, run_id });
         }
         let suffix = task
             .repo
@@ -1171,7 +1238,7 @@ impl RunnerCoordinator {
                     .session(session.id)
                     .run(run.id)
                     .task(Some(task.id))
-                    .payload(crate::quests::started_payload(&task, &options, opened.len())),
+                    .payload(crate::quests::started_payload(&task, &options, opened.len(), run.id)),
                 None,
             )
             .await?;
@@ -1179,7 +1246,7 @@ impl RunnerCoordinator {
         self.store
             .post_quest_started(agent.id, task.id, session.id, &task.title, brief.filter(|b| !b.trim().is_empty()))
             .await?;
-        Ok(())
+        Ok(Started { resumed: false, session_id: session.id, run_id: run.id })
     }
 
     async fn after_task(
@@ -1190,9 +1257,9 @@ impl RunnerCoordinator {
         output: &str,
         work: Option<&str>,
     ) -> Result<()> {
-        if session.planning() {
-            let run = self.store.get_run(run_id).await?.ok_or_else(|| anyhow!("completed task run disappeared"))?;
-            return crate::quests::plan_step(&self.store, agent, session, &run, output).await;
+        let run = self.store.get_run(run_id).await?.ok_or_else(|| anyhow!("completed task run disappeared"))?;
+        if crate::quests::prework_step(&self.store, agent, session, &run, output).await? {
+            return Ok(());
         }
         let parsed = prompts::parse_report(output);
         let missing = parsed.as_ref().and_then(|report| report.status.as_deref()).is_none();
@@ -1226,30 +1293,21 @@ impl RunnerCoordinator {
         if session.racing() {
             return self.attempt_done(agent, &session, run_id, incomplete_report(&report).is_none()).await;
         }
-        if let Some(error) = incomplete_report(&report) {
-            return self
-                .finalize_task(agent, &session, None, Some(error), None, None)
-                .await;
+        let has_repo = self.quest_has_repo(&session).await?;
+        match finish_step(&report, self.reviews_enabled && session.wants_review(), None) {
+            Finish::Fail(_) if salvages(&report, has_repo) => self.queue_publish(agent, &session, run_id).await,
+            Finish::Fail(error) => self.finalize_task(agent, &session, None, Some(error), None, None).await,
+            Finish::Review => self.queue_review(agent, &session, run_id).await,
+            Finish::Publish if has_repo => self.queue_publish(agent, &session, run_id).await,
+            Finish::Publish => self.finalize_task(agent, &session, None, None, None, None).await,
         }
-        if self.reviews_enabled && session.wants_review() {
-            self.queue_review(agent, &session, run_id).await
-        } else {
-            let has_repo = match session.task_id {
-                Some(task_id) => self
-                    .db
-                    .get_task(task_id)
-                    .await?
-                    .and_then(|task| task.repo)
-                    .is_some(),
-                None => false,
-            };
-            if has_repo {
-                self.queue_publish(agent, &session, run_id).await
-            } else {
-                self.finalize_task(agent, &session, None, None, None, None)
-                    .await
-            }
-        }
+    }
+
+    async fn quest_has_repo(&self, session: &AgentSession) -> Result<bool> {
+        Ok(match session.task_id {
+            Some(task_id) => self.db.get_task(task_id).await?.and_then(|task| task.repo).is_some(),
+            None => false,
+        })
     }
 
     async fn missing_report(
@@ -1262,9 +1320,11 @@ impl RunnerCoordinator {
     ) -> Result<bool> {
         let diagnosis = self.store.record_run_end(run_id, kind, None, output, false).await?;
         if diagnosis.cause == Cause::NeverStarted {
-            return Ok(self.store.auto_retry(run_id, &diagnosis).await?.is_some());
+            let retried = self.store.auto_retry(run_id, &diagnosis).await?.is_some();
+            self.store.announce_completed(run_id).await?;
+            return Ok(retried);
         }
-        if self.store.nudge_for_report(session.id).await?.is_some() {
+        if self.store.settle_missing(run_id, session.id, Required::Report, output).await?.handled() {
             return Ok(true);
         }
         let report = Report::synthesized(output, work);
@@ -1421,6 +1481,7 @@ impl RunnerCoordinator {
                 fork_from: None,
                 prompt: &prompt,
                 timeout_secs: task_timeout(),
+                request: None,
             })
             .await?;
         self.store
@@ -1436,9 +1497,8 @@ impl RunnerCoordinator {
         run_id: Uuid,
         output: &str,
     ) -> Result<()> {
-        if prompts::needs_verdict(output)
-            && loka_shared::quests::compare_candidates(review).is_none()
-            && self.store.nudge_for_verdict(review.id).await?.is_some()
+        if prompts::contract_open("review", review, output)
+            && self.store.settle_missing(run_id, review.id, Required::Verdict, output).await?.handled()
         {
             return Ok(());
         }
@@ -1473,7 +1533,7 @@ impl RunnerCoordinator {
             return Ok(());
         }
         let verdict = prompts::readable_verdict(output);
-        let verdict_value = review_value(output, true);
+        let verdict_value = review_value(output);
         if manual {
             let requester = review
                 .asked_by
@@ -1541,7 +1601,7 @@ impl RunnerCoordinator {
             let workspace = task_session
                 .working_dir
                 .clone()
-                .ok_or_else(|| anyhow!("task has no workspace"))?;
+                .ok_or_else(|| anyhow!("task has no quest folder"))?;
             let prompt = with_rules(
                 prompts::task(&task, &workspace, Some(&findings)),
                 &self.work_rules(agent).await?,
@@ -1556,6 +1616,7 @@ impl RunnerCoordinator {
                     fork_from: None,
                     prompt: &prompt,
                     timeout_secs: task_timeout(),
+                    request: Some(loka_shared::run_request::RunRequest::fix(&findings)),
                 })
                 .await?;
             self.store
@@ -1568,9 +1629,6 @@ impl RunnerCoordinator {
                 )
                 .await?;
             return Ok(());
-        }
-        if verdict.is_none() && self.store.review_runs_since_work(task_session.id).await? < 2 {
-            return self.queue_review(agent, &task_session, run_id).await;
         }
         let task = match task_session.task_id {
             Some(task_id) => self.db.get_task(task_id).await?,
@@ -1617,13 +1675,14 @@ impl RunnerCoordinator {
                 fork_from: None,
                 prompt: "Publish the reviewed workspace using the structured publish instructions.",
                 timeout_secs: task_timeout(),
+                request: None,
             })
             .await?;
         self.store
             .set_session_status(task_session.id, "active", None)
             .await?;
         self.store
-            .set_run_activity(&run, "Publishing reviewed work")
+            .set_run_activity(&run, "Publishing the work")
             .await?;
         Ok(())
     }
@@ -1682,8 +1741,10 @@ impl RunnerCoordinator {
                     .store
                     .latest_review_output(session.id)
                     .await?
-                    .map(|output| review_value(&output, true));
-                self.finalize_task(agent, session, verdict, None, pr_url, pr_number)
+                    .map(|output| review_value(&output));
+                let report = prompts::stored_report(session.summary.as_deref()).unwrap_or_default();
+                let error = finish_error(&report, verdict.as_ref());
+                self.finalize_task(agent, session, verdict, error, pr_url, pr_number)
                     .await
             }
         }
@@ -1791,9 +1852,9 @@ impl RunnerCoordinator {
         work: Option<&str>,
         pr_sync: loka_shared::runners::PrSync,
     ) -> Result<()> {
-        if session.role == "task" && session.planning() {
-            let run = self.store.get_run(run_id).await?.ok_or_else(|| anyhow!("completed follow-up disappeared"))?;
-            return crate::quests::plan_step(&self.store, agent, session, &run, output).await;
+        let run = self.store.get_run(run_id).await?.ok_or_else(|| anyhow!("completed follow-up disappeared"))?;
+        if crate::quests::prework_step(&self.store, agent, session, &run, output).await? {
+            return Ok(());
         }
         if let Some(report) = prompts::parse_report(output) {
             self.store
@@ -1817,12 +1878,10 @@ impl RunnerCoordinator {
             true,
         )
         .await?;
-        if session.role == "task" && matches!(session.status.as_str(), "active" | "completed") {
-            let was_completed = session.status == "completed";
-            let advance = was_completed || self.store.complete_followup(session.id).await?;
-            if !advance {
+        if session.role == "task" {
+            let FollowupAdvance::Advance { was_completed } = self.store.complete_followup(session.id).await? else {
                 return Ok(());
-            }
+            };
             let session = self
                 .store
                 .get_session(session.id)
@@ -1839,22 +1898,28 @@ impl RunnerCoordinator {
             } else {
                 false
             };
+            let has_repo = self.quest_has_repo(&session).await?;
+            let verdict = crate::quests::review_on_record(&self.store, session.id, run_id, pr_sync)
+                .await?
+                .map(|output| review_value(&output));
             let step = followup_step(
                 was_completed,
                 &report,
                 self.reviews_enabled,
                 session.wants_review(),
                 nudge_available,
+                has_repo,
+                pr_sync,
+                verdict.as_ref(),
             );
-            let step = match step {
-                FollowupStep::Review if !pr_sync.needs_review() && !session.racing() => FollowupStep::Settle,
-                step => step,
-            };
             if session.racing() && !matches!(step, FollowupStep::Nudge | FollowupStep::Leave) {
-                return self.attempt_done(agent, &session, run_id, !matches!(step, FollowupStep::Fail(_))).await;
+                return self.attempt_done(agent, &session, run_id, !matches!(step, FollowupStep::Fail(_) | FollowupStep::Salvage)).await;
             }
             match step {
                 FollowupStep::Nudge | FollowupStep::Leave => {}
+                FollowupStep::Salvage => {
+                    self.queue_publish(agent, &session, run_id).await?;
+                }
                 FollowupStep::Fail(error) => {
                     self.finalize_task(agent, &session, None, Some(error), None, None)
                         .await?;
@@ -1870,19 +1935,10 @@ impl RunnerCoordinator {
                             }
                         }
                     }
-                    let has_repo = match session.task_id {
-                        Some(task_id) => self
-                            .db
-                            .get_task(task_id)
-                            .await?
-                            .and_then(|task| task.repo)
-                            .is_some(),
-                        None => false,
-                    };
                     if has_repo {
                         self.queue_publish(agent, &session, run_id).await?;
                     } else {
-                        self.finalize_task(agent, &session, None, None, None, None)
+                        self.finalize_task(agent, &session, verdict, None, None, None)
                             .await?;
                     }
                 }
@@ -1892,10 +1948,29 @@ impl RunnerCoordinator {
     }
 
     async fn after_quick(&self, agent: &WorldAgent, session: &AgentSession, run_id: Uuid, output: &str) -> Result<()> {
-        let text = prompts::plain_dashes(&prompts::split_actions(output).0);
-        let text = if text.trim().is_empty() { "Done.".to_string() } else { text };
-        self.store.record_quick_reply(agent, session, run_id, &text, false).await?;
+        self.store.record_quick_reply(agent, session, run_id, &quick_answer(output), false).await?;
         Ok(())
+    }
+
+    pub async fn deliver_lost_quick_replies(&self, session: Option<Uuid>) -> Result<usize> {
+        let mut delivered = 0;
+        for run in self.store.quick_runs_without_reply(session, LOST_REPLY_GRACE_SECS).await? {
+            let (Some(agent), Some(session)) = (self.store.get_agent(run.agent_id).await?, self.store.get_session(run.session_id).await?) else {
+                continue;
+            };
+            let ended_well = run.status == "completed";
+            let text = if ended_well {
+                quick_answer(run.output.as_deref().unwrap_or_default())
+            } else {
+                let reason = run.error.as_deref().filter(|e| !e.trim().is_empty()).unwrap_or("the run ended before it could reply");
+                format!("I could not answer that: {reason}")
+            };
+            if self.store.record_quick_reply(&agent, &session, run.id, &text, !ended_well).await?.is_some() {
+                tracing::warn!(run = %run.id, status = %run.status, "delivered a quick chat reply that never became a message");
+                delivered += 1;
+            }
+        }
+        Ok(delivered)
     }
 
     async fn quick_rules(&self, agent: &WorldAgent) -> Result<String> {
@@ -2474,9 +2549,10 @@ impl RunnerCoordinator {
         main: &AgentSession,
         run_id: Uuid,
         text: &str,
-        choices: Vec<String>,
-        drafts: Vec<prompts::Draft>,
+        card: AttentionCard,
     ) -> Result<()> {
+        let AttentionCard { choices, drafts, clarify_request } = card;
+        let clarification = clarify_request.is_some();
         let text = self.store.expand_message_links(&prompts::plain_dashes(text), agent.id).await;
         let exists = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(
@@ -2503,7 +2579,7 @@ impl RunnerCoordinator {
                 session_id: Some(main.id),
                 run_id: Some(run_id),
                 meta: if drafts.is_empty() {
-                    json!({ "kind": "ask", "choices": choices })
+                    json!({ "kind": "ask", "choices": choices, "clarify_request": clarify_request })
                 } else {
                     json!({ "kind": "ask", "choices": [], "drafts": drafts })
                 },
@@ -2535,7 +2611,8 @@ impl RunnerCoordinator {
                         "text": text,
                         "agent": agent.name,
                         "message_id": message.id,
-                        "choices": choices
+                        "choices": choices,
+                        "clarification": clarification
                     })),
                 None,
             )
@@ -2764,10 +2841,6 @@ impl RunnerCoordinator {
         })
     }
 
-    fn account(&self, session: &AgentSession, completion: &RunnerCompletion) -> Accounted {
-        account_usage(session, completion.cost_usd, completion.usage)
-    }
-
     pub async fn record_live_usage(&self, lease: &LeaseContext, events: &[RunnerEvent]) -> Result<loka_shared::withdraw::StoppedWork> {
         let Some(usage) = events
             .iter()
@@ -2781,7 +2854,12 @@ impl RunnerCoordinator {
         let Some(session) = self.store.get_session(lease.session_id).await? else {
             return Ok(Default::default());
         };
-        let spent = account_usage(&session, 0.0, usage);
+        let spent = loka_shared::run_recording::account(
+            &session.backend,
+            &session.model,
+            &session.usage_baseline,
+            &loka_shared::run_recording::Reported { cost_usd: 0.0, usage },
+        );
         let stopped = self
             .store
             .record_live_usage(lease.run_id, spent.cost_usd, spent.input_tokens, spent.cached_input_tokens, spent.output_tokens)
@@ -2793,43 +2871,8 @@ impl RunnerCoordinator {
     }
 }
 
-fn account_usage(session: &AgentSession, reported_cost: f64, reported: RunnerUsage) -> Accounted {
-    let previous_f64 = |key: &str| {
-        session
-            .usage_baseline
-            .get(key)
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0)
-    };
-    let mut baseline = session.usage_baseline.clone();
-    if !baseline.is_object() {
-        baseline = json!({});
-    }
-    let usage = if session.backend == "codex" {
-        reported.record(&mut baseline);
-        reported.since(&session.usage_baseline)
-    } else {
-        reported
-    };
-    let RunnerUsage { input_tokens, cached_input_tokens, output_tokens, .. } = usage;
-    let cost_usd = if loka_shared::backends::cost_per_run(&session.backend) && reported_cost > 0.0 {
-        reported_cost
-    } else if reported_cost > 0.0 {
-        let previous = previous_f64("cost_usd");
-        if let Some(object) = baseline.as_object_mut() {
-            object.insert("cost_usd".into(), json!(reported_cost));
-        }
-        loka_shared::pricing::session_cost_delta(reported_cost, previous, &session.model, input_tokens, cached_input_tokens, output_tokens)
-    } else {
-        loka_shared::pricing::cost(&session.model, input_tokens, cached_input_tokens, output_tokens)
-    };
-    Accounted {
-        baseline,
-        cost_usd,
-        input_tokens: input_tokens as i64,
-        cached_input_tokens: cached_input_tokens as i64,
-        output_tokens: output_tokens as i64,
-    }
+fn reported(completion: &RunnerCompletion) -> loka_shared::run_recording::Reported {
+    loka_shared::run_recording::Reported { cost_usd: completion.cost_usd, usage: completion.usage }
 }
 
 #[derive(Default)]
@@ -2860,14 +2903,6 @@ impl TurnOptions {
             fast: value.get("fast").and_then(Value::as_bool).unwrap_or(false),
         }
     }
-}
-
-struct Accounted {
-    baseline: Value,
-    cost_usd: f64,
-    input_tokens: i64,
-    cached_input_tokens: i64,
-    output_tokens: i64,
 }
 
 fn workspace_for(
@@ -2936,16 +2971,6 @@ fn resolve_text(text: &str, environment: &BTreeMap<String, String>) -> Result<St
     Ok(output)
 }
 
-fn redact<'a>(text: &str, values: impl Iterator<Item = &'a String>) -> String {
-    let mut values = values.filter(|value| !value.is_empty()).collect::<Vec<_>>();
-    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-    values.dedup();
-    values.into_iter().fold(text.replace('\0', ""), |text, value| {
-        text.replace(value, "[REDACTED]")
-    })
-}
-
-
 fn image_extension(mime: &str) -> &'static str {
     match mime {
         "image/jpeg" => "jpg",
@@ -2981,53 +3006,6 @@ fn next_fire(
 
 fn task_timeout() -> i32 {
     env_i32("WORLD_TASK_TIMEOUT_SECS", 3600)
-}
-
-fn incomplete_report(report: &Report) -> Option<String> {
-    if report.status.as_deref() == Some("done") {
-        return None;
-    }
-    if report.synthesized {
-        return Some(prompts::SYNTHESIZED_ERROR.to_string());
-    }
-    Some(match report.summary.as_deref() {
-        Some(summary) => format!(
-            "Task reported {}: {summary}",
-            report.status.as_deref().unwrap_or("no status")
-        ),
-        None => "Task did not provide a valid completion report".to_string(),
-    })
-}
-
-enum FollowupStep {
-    Nudge,
-    Fail(String),
-    Leave,
-    Review,
-    Settle,
-}
-
-fn followup_step(
-    was_completed: bool,
-    report: &Report,
-    reviews_enabled: bool,
-    wants_review: bool,
-    nudge_available: bool,
-) -> FollowupStep {
-    if let Some(error) = incomplete_report(report) {
-        if was_completed {
-            return FollowupStep::Leave;
-        }
-        if report.status.is_none() && nudge_available {
-            return FollowupStep::Nudge;
-        }
-        return FollowupStep::Fail(error);
-    }
-    if reviews_enabled && wants_review {
-        FollowupStep::Review
-    } else {
-        FollowupStep::Settle
-    }
 }
 
 fn with_rules(prompt: String, rules: &str) -> String {
@@ -3068,7 +3046,7 @@ fn direct_system(agent: &WorldAgent, owner: &str, folder: Option<&str>, rules: &
         .unwrap_or_default();
     let folder = folder.filter(|f| !f.trim().is_empty()).unwrap_or("this folder");
     format!(
-        "You are {name}, a resident of the Loka. {persona}{addendum}\n\nRight now you are pairing live with {owner} in their own copy of {folder} on their Mac, like a coding assistant in their editor. This is not a quest: there is no worktree, no review and no report block. Answer questions directly and make the edits they ask for in place. Keep replies short and to the point. Do not create branches, commit, push or open pull requests unless they ask you to. When they or their rules allow force-pushing, rebasing or rewriting history, do it (prefer --force-with-lease); that is the approval. The files are theirs and may have uncommitted work, so never discard or reset changes you did not make.{rules}",
+        "You are {name}, a resident of the Loka. {persona}{addendum}\n\nRight now you are pairing live with {owner} in their own copy of {folder} on their Mac, like a coding assistant in their editor. This is not a quest: there is no worktree, no review and no report block. Answer questions directly and make the edits they ask for in place. Keep replies short and to the point. Do not create branches, commit, push or open pull requests unless they ask you to. When they or their rules allow force-pushing, rebasing or rewriting history, do it (prefer --force-with-lease); that is the approval. The files are theirs and may have uncommitted work, so never discard or reset changes you did not make. TMPDIR is a folder private to this chat: keep scratch files there, and start any test server (PGlite, Postgres) on a free port you pick with its data inside it, never reusing a server you find already running.{rules}",
         name = agent.name,
         rules = if rules.is_empty() { String::new() } else { format!("\n\n{rules}") }
     )
@@ -3079,14 +3057,13 @@ fn tail(text: &str, max: usize) -> String {
     text.chars().skip(length.saturating_sub(max)).collect()
 }
 
-fn review_value(output: &str, final_attempt: bool) -> Value {
+fn review_value(output: &str) -> Value {
     match prompts::readable_verdict(output) {
         Some(verdict) => json!({ "verdict": verdict.verdict, "findings": verdict.findings, "summary": tail(output, 800) }),
         None if prompts::parse_verdict(output).is_some_and(|v| v.verdict == "pick") => {
             json!({ "verdict": "pick", "summary": tail(output, 800) })
         }
-        None if final_attempt => json!({ "verdict": prompts::NO_VERDICT, "summary": tail(output, 800), "note": prompts::UNREADABLE_VERDICT_NOTE }),
-        None => json!({ "verdict": prompts::NO_VERDICT, "summary": tail(output, 800) }),
+        None => prompts::no_verdict(tail(output, 800)),
     }
 }
 
@@ -3104,7 +3081,8 @@ pub async fn parent_quest_pr(db: &Database, task: &AgentTask) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{followup_step, incomplete_report, may_attach_reported_pr, review_value, FollowupStep};
+    use super::{followup_step, incomplete_report, may_attach_reported_pr, prompts, review_value, FollowupStep};
+    use loka_shared::runners::PrSync;
 
     #[tokio::test]
     async fn a_reset_whose_notes_turn_is_too_long_still_resets_and_keeps_the_notes() -> anyhow::Result<()> {
@@ -3198,6 +3176,86 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn the_first_turn_of_a_forked_or_new_agent_runs_on_the_runner_and_the_local_worker() -> anyhow::Result<()> {
+        use loka_shared::runners::{CreateRunner, RunnerStore};
+        use uuid::Uuid;
+        let Some(harness) = harness().await? else {
+            eprintln!("SKIPPED: set STEER_TEST_DATABASE_URL to a migrated database");
+            return Ok(());
+        };
+        let pool = &harness.pool;
+        let tag = Uuid::new_v4().simple().to_string();
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email, name, world_role) VALUES ($1, 'Ana', 'write') RETURNING id")
+            .bind(format!("first-turn-{tag}@example.test"))
+            .fetch_one(pool)
+            .await?;
+        let source: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id) VALUES ($1, 'Source', 'claude', 'sonnet', $2) RETURNING id",
+        )
+        .bind(format!("source-{tag}"))
+        .bind(owner)
+        .fetch_one(pool)
+        .await?;
+        sqlx::query("INSERT INTO agent_messages (agent_id, author_kind, author_user_id, body) VALUES ($1, 'user', $2, 'remember the launch plan')")
+            .bind(source)
+            .bind(owner)
+            .execute(pool)
+            .await?;
+        let fork = harness.store.fork_agent(source, owner, &format!("fork-{tag}"), "Fork", "Ana").await?.expect("fork").agent_id;
+        let fresh: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id) VALUES ($1, 'Fresh', 'claude', 'sonnet', $2) RETURNING id",
+        )
+        .bind(format!("fresh-{tag}"))
+        .bind(owner)
+        .fetch_one(pool)
+        .await?;
+        let message = |agent: Uuid| {
+            sqlx::query("INSERT INTO agent_inbox (agent_id, kind, payload) VALUES ($1, 'message', $2)")
+                .bind(agent)
+                .bind(serde_json::json!({ "body": "hello", "author_kind": "user", "from_owner": true }))
+                .execute(pool)
+        };
+
+        for agent in [fork, fresh] {
+            message(agent).await?;
+            let mut taken = Vec::new();
+            while let Some(claimed) = harness.store.claim_agent_inbox("local-worker").await? {
+                taken.push(claimed);
+                if claimed == agent {
+                    break;
+                }
+            }
+            assert_eq!(taken.last(), Some(&agent), "the local worker takes the first message of an agent that has no device");
+            for claimed in taken {
+                harness.store.release_agent_inbox(claimed, "local-worker").await?;
+            }
+            sqlx::query("UPDATE agent_inbox SET status = 'done' WHERE agent_id = $1").bind(agent).execute(pool).await?;
+        }
+
+        let runners = RunnerStore::new(pool.clone());
+        let runner = runners.register(owner, &CreateRunner { name: "First turn Mac".into(), platform: "macos".into() }).await?.runner.id;
+        runners.heartbeat(runner, &serde_json::json!({ "backends": { "claude": true } })).await?;
+        for (agent, handoff) in [(fork, true), (fresh, false)] {
+            message(agent).await?;
+            runners.adopt_stranded(runner, Some(agent)).await?;
+            harness.coordinator.prepare_turn(runner).await?;
+            let claim = runners
+                .claim_kinds(runner, &format!("mcp-{}", Uuid::new_v4()), &["turn".to_string()])
+                .await?
+                .expect("the runner claims the first turn");
+            assert_eq!(claim.agent_id, agent);
+            let job = harness.coordinator.build_job(claim, format!("mcp-{}", Uuid::new_v4())).await?;
+            assert_eq!(job.prompt.contains("[memory handoff]"), handoff, "only a fork starts from a remembered past");
+            if handoff {
+                assert!(job.prompt.contains("remember the launch plan"), "the fork's first turn carries what its source knew");
+            }
+            assert!(job.prompt.contains("hello"), "the message itself reaches the CLI");
+        }
+        sqlx::query("DELETE FROM agent_profiles WHERE id = ANY($1)").bind(vec![source, fork, fresh]).execute(pool).await?;
+        Ok(())
+    }
+
     struct Harness {
         pool: sqlx::PgPool,
         store: loka_shared::world::WorldStore,
@@ -3276,20 +3334,57 @@ mod tests {
             .await?)
     }
 
+    async fn approved_earlier(harness: &Harness, quest: &MergedQuest) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, prompt, created_at)
+             VALUES ($1, $2, $3, 'task', 'completed', 'work', NOW() - INTERVAL '3 minutes')",
+        )
+        .bind(quest.task_session)
+        .bind(quest.agent.id)
+        .bind(quest.task)
+        .execute(&harness.pool)
+        .await?;
+        let review: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_sessions (agent_id, role, backend, model, parent_session_id, task_id, status)
+             VALUES ($1, 'review', 'claude', 'sonnet', $2, $3, 'completed') RETURNING id",
+        )
+        .bind(quest.agent.id)
+        .bind(quest.task_session)
+        .bind(quest.task)
+        .fetch_one(&harness.pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, prompt, output, created_at)
+             VALUES ($1, $2, $3, 'review', 'completed', 'review', $4, NOW() - INTERVAL '2 minutes')",
+        )
+        .bind(review)
+        .bind(quest.agent.id)
+        .bind(quest.task)
+        .bind("Looks right.\n<!-- verdict {\"verdict\": \"approve\", \"summary\": \"ok\"} verdict -->")
+        .execute(&harness.pool)
+        .await?;
+        Ok(())
+    }
+
     #[tokio::test]
-    async fn a_followup_that_merged_or_changed_nothing_queues_no_review() -> anyhow::Result<()> {
+    async fn a_followup_reviews_only_work_that_has_no_review_on_record() -> anyhow::Result<()> {
         use loka_shared::runners::PrSync;
         use uuid::Uuid;
         let Some(harness) = harness().await? else {
             return Ok(());
         };
         let output = "Merged it.\n<!-- report {\"status\": \"done\", \"summary\": \"merged\"} report -->";
-        for (sync, reviews, status) in [
-            (PrSync::Merged, 0, "done"),
-            (PrSync::Unchanged, 0, "review"),
-            (PrSync::Changed, 1, "in_progress"),
+        for (sync, reviewed, reviews, status) in [
+            (PrSync::Merged, false, 0, "done"),
+            (PrSync::Unchanged, true, 1, "done"),
+            (PrSync::Unchanged, false, 1, "in_progress"),
+            (PrSync::Changed, true, 2, "in_progress"),
+            (PrSync::Changed, false, 1, "in_progress"),
         ] {
             let quest = merged_quest(&harness, false).await?;
+            if reviewed {
+                approved_earlier(&harness, &quest).await?;
+            }
             let run: Uuid = sqlx::query_scalar(
                 "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, prompt) VALUES ($1, $2, $3, 'followup', 'completed', 'merge it') RETURNING id",
             )
@@ -3300,12 +3395,18 @@ mod tests {
             .await?;
             let session = harness.store.get_session(quest.task_session).await?.expect("task session");
             harness.coordinator.after_followup(&quest.agent, &session, run, output, None, sync).await?;
-            assert_eq!(review_sessions(&harness, &quest).await?, reviews, "{sync:?}");
-            let now = quest_status(&harness, &quest).await?;
-            if sync == PrSync::Unchanged {
-                assert_ne!(now, "failed", "{sync:?}");
+            assert_eq!(review_sessions(&harness, &quest).await?, reviews, "{sync:?} reviewed={reviewed}");
+            assert_eq!(quest_status(&harness, &quest).await?, status, "{sync:?} reviewed={reviewed}");
+            let finished: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT payload->>'verdict', payload->>'error' FROM world_events WHERE task_id = $1 AND type = 'task.finished'",
+            )
+            .bind(quest.task)
+            .fetch_optional(&harness.pool)
+            .await?;
+            if sync == PrSync::Unchanged && reviewed {
+                assert_eq!(finished, Some((Some("approve".into()), None)), "unchanged reviewed work finishes with its verdict");
             } else {
-                assert_eq!(now, status, "{sync:?}");
+                assert_eq!(finished, None, "{sync:?} reviewed={reviewed}: nothing finishes before its review");
             }
             if sync == PrSync::Merged {
                 let merged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_events WHERE task_id = $1 AND type = 'task.merged'")
@@ -3314,6 +3415,304 @@ mod tests {
                     .await?;
                 assert_eq!(merged, 1);
             }
+        }
+
+        let quest = merged_quest(&harness, false).await?;
+        approved_earlier(&harness, &quest).await?;
+        for answer in ["Nothing left.", "Still nothing."] {
+            let run: Uuid = sqlx::query_scalar(
+                "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, prompt) VALUES ($1, $2, $3, 'followup', 'completed', $4) RETURNING id",
+            )
+            .bind(quest.task_session)
+            .bind(quest.agent.id)
+            .bind(quest.task)
+            .bind(answer)
+            .fetch_one(&harness.pool)
+            .await?;
+            let session = harness.store.get_session(quest.task_session).await?.expect("task session");
+            harness.coordinator.after_followup(&quest.agent, &session, run, output, None, PrSync::Unchanged).await?;
+        }
+        assert_eq!(review_sessions(&harness, &quest).await?, 1, "follow-ups that change nothing keep the earlier review");
+        assert_eq!(quest_status(&harness, &quest).await?, "done");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_followup_that_changed_nothing_publishes_reviewed_work_and_reviews_the_rest() -> anyhow::Result<()> {
+        use loka_shared::runners::PrSync;
+        let Some(harness) = harness().await? else {
+            return Ok(());
+        };
+        for reviewed in [false, true] {
+            let quest = unpublished_quest(&harness, "claude").await?;
+            sqlx::query("UPDATE agent_sessions SET review = TRUE, status = 'completed' WHERE id = $1")
+                .bind(quest.task_session)
+                .execute(&harness.pool)
+                .await?;
+            sqlx::query("UPDATE agent_tasks SET status = 'review' WHERE id = $1").bind(quest.task).execute(&harness.pool).await?;
+            if reviewed {
+                approved_earlier(&harness, &quest).await?;
+            }
+            let followup = harness.store.start_followup(&task_session(&harness, &quest).await?, "Anything left?", "Abhi", false).await?;
+            finish_run(&harness, followup.id).await?;
+            harness
+                .coordinator
+                .after_followup(&quest.agent, &task_session(&harness, &quest).await?, followup.id, done_report("claude"), None, PrSync::Unchanged)
+                .await?;
+            let publishes = quest_runs(&harness, &quest, "publish").await?;
+            if !reviewed {
+                assert!(publishes.is_empty(), "work that was never reviewed is never published unreviewed");
+                assert_eq!(review_sessions(&harness, &quest).await?, 1, "it gets its review instead");
+                assert_ne!(quest_status(&harness, &quest).await?, "failed");
+                continue;
+            }
+            assert_eq!(publishes.len(), 1, "reviewed work that a follow-up left alone publishes");
+            assert_eq!(review_sessions(&harness, &quest).await?, 1, "without a second review");
+            finish_run(&harness, publishes[0].0).await?;
+            let completion: loka_shared::runners::RunnerCompletion = serde_json::from_value(serde_json::json!({
+                "output": "Nothing to publish",
+                "session_id": null,
+                "exit_code": 0,
+                "error": null,
+                "workspace_key": "tasks/x",
+                "pr_url": null,
+                "pr_number": null,
+                "publish_pr_state": null,
+            }))?;
+            harness.coordinator.after_publish(&quest.agent, &task_session(&harness, &quest).await?, &completion).await?;
+            let finished: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+                "SELECT payload->>'status', payload->>'verdict', payload->>'error' FROM world_events WHERE task_id = $1 AND type = 'task.finished'",
+            )
+            .bind(quest.task)
+            .fetch_one(&harness.pool)
+            .await?;
+            assert_eq!(finished, (Some("done".into()), Some("approve".into()), None), "the quest finishes with the earlier verdict");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_first_run_with_review_on_is_reviewed_before_anything_publishes() -> anyhow::Result<()> {
+        let Some(harness) = harness().await? else {
+            return Ok(());
+        };
+        let quest = unpublished_quest(&harness, "claude").await?;
+        sqlx::query("UPDATE agent_sessions SET review = TRUE WHERE id = $1").bind(quest.task_session).execute(&harness.pool).await?;
+        let run = completed_run(&harness, &quest, "task").await?;
+        harness.coordinator.after_task(&quest.agent, &task_session(&harness, &quest).await?, run, done_report("claude"), None).await?;
+        assert_eq!(review_sessions(&harness, &quest).await?, 1);
+        assert!(quest_runs(&harness, &quest, "publish").await?.is_empty());
+        assert_eq!(quest_status(&harness, &quest).await?, "in_progress");
+        Ok(())
+    }
+
+    async fn quest_runs(harness: &Harness, quest: &MergedQuest, kind: &str) -> anyhow::Result<Vec<(uuid::Uuid, String)>> {
+        Ok(sqlx::query_as("SELECT id, prompt FROM session_runs WHERE task_id = $1 AND kind = $2 ORDER BY created_at, id")
+            .bind(quest.task)
+            .bind(kind)
+            .fetch_all(&harness.pool)
+            .await?)
+    }
+
+    async fn finish_run(harness: &Harness, run: uuid::Uuid) -> anyhow::Result<()> {
+        sqlx::query("UPDATE session_runs SET status = 'completed', started_at = NOW(), finished_at = NOW() WHERE id = $1")
+            .bind(run)
+            .execute(&harness.pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_report_that_never_comes_saves_the_work_and_the_quest_stays_failed() -> anyhow::Result<()> {
+        use loka_shared::runners::{PrSync, RunnerCompletion};
+        use uuid::Uuid;
+        let Some(harness) = harness().await? else {
+            return Ok(());
+        };
+        let quest = merged_quest(&harness, false).await?;
+        sqlx::query("UPDATE agent_tasks SET repo = 'acme/app', pr_url = NULL, pr_number = NULL WHERE id = $1")
+            .bind(quest.task)
+            .execute(&harness.pool)
+            .await?;
+        let task_run: Uuid = sqlx::query_scalar(
+            "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, prompt) VALUES ($1, $2, $3, 'task', 'completed', 'do it') RETURNING id",
+        )
+        .bind(quest.task_session)
+        .bind(quest.agent.id)
+        .bind(quest.task)
+        .fetch_one(&harness.pool)
+        .await?;
+        let work = Some("Commits ahead of main:\nabc fix");
+        let coordinator = &harness.coordinator;
+        let session = |harness: &Harness| {
+            let store = harness.store.clone();
+            let id = quest.task_session;
+            async move { store.get_session(id).await.map(|session| session.expect("task session")) }
+        };
+
+        coordinator.after_task(&quest.agent, &session(&harness).await?, task_run, "All done. No commit or push performed.", work).await?;
+        let reminders = quest_runs(&harness, &quest, "followup").await?;
+        assert_eq!(reminders.len(), 1, "the first miss gets its reminder");
+        assert_eq!(reminders[0].1, loka_shared::world::REPORT_NUDGE);
+
+        finish_run(&harness, reminders[0].0).await?;
+        coordinator.after_followup(&quest.agent, &session(&harness).await?, reminders[0].0, "Still done.", work, PrSync::Changed).await?;
+        let reminders = quest_runs(&harness, &quest, "followup").await?;
+        assert_eq!(reminders.len(), 2, "a reminder that still has no report gets one more");
+        assert_eq!(reminders[1].1, loka_shared::world::REPORT_NUDGE_LAST);
+        assert!(quest_runs(&harness, &quest, "publish").await?.is_empty(), "nothing is published while a reminder is still pending");
+
+        finish_run(&harness, reminders[1].0).await?;
+        coordinator.after_followup(&quest.agent, &session(&harness).await?, reminders[1].0, "Done, really.", work, PrSync::Changed).await?;
+        assert_eq!(quest_runs(&harness, &quest, "followup").await?.len(), 2, "two reminders end the chase");
+        assert_eq!(quest_runs(&harness, &quest, "publish").await?.len(), 1, "the work is published without a report");
+        assert_eq!(quest_status(&harness, &quest).await?, "in_progress", "the quest settles only when the publish run reports back");
+        assert_eq!(review_sessions(&harness, &quest).await?, 0, "unreported work is never reviewed");
+        let stored = prompts::stored_report(session(&harness).await?.summary.as_deref()).expect("a stored report");
+        assert!(stored.synthesized);
+        assert_eq!(stored.status.as_deref(), Some("blocked"));
+
+        let published = RunnerCompletion {
+            output: String::new(),
+            session_id: None,
+            cost_usd: 0.0,
+            exit_code: 0,
+            usage: Default::default(),
+            error: None,
+            workspace_key: "key".into(),
+            pr_url: Some("https://github.com/acme/app/pull/9".into()),
+            pr_number: Some(9),
+            publish_pr_state: None,
+            checkpoint: None,
+            steered: Vec::new(),
+            retryable: false,
+            work_summary: None,
+        };
+        coordinator.after_publish(&quest.agent, &session(&harness).await?, &published).await?;
+        let (status, error, pr): (String, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT status, error_message, pr_url FROM agent_tasks WHERE id = $1").bind(quest.task).fetch_one(&harness.pool).await?;
+        assert_eq!(status, "failed", "a quest without its report never counts as done");
+        assert_eq!(error.as_deref(), Some(prompts::SYNTHESIZED_ERROR));
+        assert_eq!(pr.as_deref(), Some("https://github.com/acme/app/pull/9"), "the saved work is attached to the quest");
+        let finished: Vec<(Option<String>, bool)> = sqlx::query_as(
+            "SELECT payload->>'pr_url', COALESCE((payload#>>'{report,synthesized}')::boolean, false) FROM world_events WHERE task_id = $1 AND type = 'task.finished'",
+        )
+        .bind(quest.task)
+        .fetch_all(&harness.pool)
+        .await?;
+        assert_eq!(finished, [(Some("https://github.com/acme/app/pull/9".to_string()), true)]);
+
+        coordinator.after_followup(&quest.agent, &session(&harness).await?, reminders[1].0, "Done, really.", work, PrSync::Changed).await?;
+        coordinator.after_publish(&quest.agent, &session(&harness).await?, &published).await?;
+        assert_eq!(quest_runs(&harness, &quest, "publish").await?.len(), 1, "a stale re-finish never publishes again");
+        let finished: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_events WHERE task_id = $1 AND type = 'task.finished'")
+            .bind(quest.task)
+            .fetch_one(&harness.pool)
+            .await?;
+        assert_eq!(finished, 1, "a stale re-finish never announces the quest twice");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_report_that_never_comes_on_a_quest_without_a_repo_just_fails_it() -> anyhow::Result<()> {
+        use loka_shared::runners::PrSync;
+        use uuid::Uuid;
+        let Some(harness) = harness().await? else {
+            return Ok(());
+        };
+        let quest = merged_quest(&harness, false).await?;
+        sqlx::query("UPDATE agent_tasks SET pr_url = NULL, pr_number = NULL WHERE id = $1").bind(quest.task).execute(&harness.pool).await?;
+        let mut nudge = Uuid::nil();
+        for (kind, prompt) in [("task", "do it"), ("followup", loka_shared::world::REPORT_NUDGE), ("followup", loka_shared::world::REPORT_NUDGE_LAST)] {
+            nudge = sqlx::query_scalar(
+                "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, prompt) VALUES ($1, $2, $3, $4, 'completed', $5) RETURNING id",
+            )
+            .bind(quest.task_session)
+            .bind(quest.agent.id)
+            .bind(quest.task)
+            .bind(kind)
+            .bind(prompt)
+            .fetch_one(&harness.pool)
+            .await?;
+        }
+        let session = harness.store.get_session(quest.task_session).await?.expect("task session");
+        harness.coordinator.after_followup(&quest.agent, &session, nudge, "Done.", None, PrSync::Changed).await?;
+        assert_eq!(quest_runs(&harness, &quest, "publish").await?.len(), 0);
+        assert_eq!(quest_status(&harness, &quest).await?, "failed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_run_refused_for_lack_of_disk_waits_instead_of_failing_its_quest() -> anyhow::Result<()> {
+        use loka_shared::runners::{BeginCompletion, CreateRunner, RunnerStore, WORK_RUN_KINDS};
+        use uuid::Uuid;
+        let Some(harness) = harness().await? else {
+            return Ok(());
+        };
+        let runners = RunnerStore::new(harness.pool.clone());
+        for (kind, role) in [("task", "task"), ("followup", "task"), ("publish", "task"), ("review", "review")] {
+            assert!(WORK_RUN_KINDS.contains(&kind));
+            let quest = merged_quest(&harness, false).await?;
+            let owner = quest.agent.owner_user_id.expect("owner");
+            sqlx::query("UPDATE users SET world_role = 'write' WHERE id = $1").bind(owner).execute(&harness.pool).await?;
+            let runner = runners.register(owner, &CreateRunner { name: "Full Mac".into(), platform: "macos".into() }).await?.runner.id;
+            sqlx::query("UPDATE agent_profiles SET runner_id = $2 WHERE id = $1").bind(quest.agent.id).bind(runner).execute(&harness.pool).await?;
+            sqlx::query("UPDATE agent_sessions SET runner_id = $2 WHERE agent_id = $1").bind(quest.agent.id).bind(runner).execute(&harness.pool).await?;
+            let session = if role == "review" {
+                sqlx::query_scalar(
+                    "INSERT INTO agent_sessions (agent_id, role, backend, model, parent_session_id, task_id, status, working_dir, cli_session_id, runner_id)
+                     VALUES ($1, 'review', 'claude', 'sonnet', $2, $3, 'active', $4, 'cli-review', $5) RETURNING id",
+                )
+                .bind(quest.agent.id)
+                .bind(quest.task_session)
+                .bind(quest.task)
+                .bind(format!("tasks/{}/app", quest.task))
+                .bind(runner)
+                .fetch_one(&harness.pool)
+                .await?
+            } else {
+                quest.task_session
+            };
+            let run: Uuid = sqlx::query_scalar(
+                "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, prompt) VALUES ($1, $2, $3, $4, 'queued', 'go') RETURNING id",
+            )
+            .bind(session)
+            .bind(quest.agent.id)
+            .bind(quest.task)
+            .bind(kind)
+            .fetch_one(&harness.pool)
+            .await?;
+            let claim = runners
+                .claim_kinds(runner, &format!("mcp-{}", Uuid::new_v4()), &WORK_RUN_KINDS.map(String::from))
+                .await?
+                .expect("claimed");
+            assert_eq!(claim.run_id, run);
+            let refused: loka_shared::runners::RunnerCompletion = serde_json::from_value(serde_json::json!({
+                "output": "",
+                "session_id": null,
+                "cost_usd": 0.0,
+                "exit_code": 1,
+                "usage": {},
+                "error": "No space left on device: this device has only 1.0 GB free, so Loka did not start this run.",
+                "workspace_key": format!("tasks/{}/app", quest.task),
+            }))?;
+            let hash = vec![7u8; 32];
+            assert_eq!(runners.begin_completion(runner, claim.lease_id, &hash, &refused).await?, BeginCompletion::Begun);
+            let lease = runners.lease_for_completion(runner, claim.lease_id).await?.expect("lease");
+            harness.coordinator.complete(&lease, &refused).await?;
+            assert!(runners.finish_completion(runner, claim.lease_id).await?, "{kind}");
+
+            let (status, waiting): (String, Option<String>) =
+                sqlx::query_as("SELECT status, waiting_for FROM session_runs WHERE id = $1").bind(run).fetch_one(&harness.pool).await?;
+            assert_eq!((status.as_str(), waiting.as_deref()), ("queued", Some("disk")), "{kind} waits");
+            assert_eq!(quest_status(&harness, &quest).await?, "in_progress", "{kind} does not fail the quest");
+            let failed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_events WHERE task_id = $1 AND type IN ('run.failed', 'task.finished')")
+                .bind(quest.task)
+                .fetch_one(&harness.pool)
+                .await?;
+            assert_eq!(failed, 0, "{kind} announces no failure");
+            let session_status: String = sqlx::query_scalar("SELECT status FROM agent_sessions WHERE id = $1").bind(session).fetch_one(&harness.pool).await?;
+            assert_eq!(session_status, "active", "{kind}");
         }
         Ok(())
     }
@@ -3423,20 +3822,20 @@ mod tests {
     fn review_off_empty_or_null_report_does_not_open_review() {
         for report in [empty_report(), null_report()] {
             assert!(matches!(
-                followup_step(false, &report, true, false, true),
+                followup_step(false, &report, true, false, true, false, PrSync::Changed, None),
                 FollowupStep::Nudge
             ));
             assert!(matches!(
-                followup_step(false, &report, true, true, true),
+                followup_step(false, &report, true, true, true, false, PrSync::Changed, None),
                 FollowupStep::Nudge
             ));
-            let step = followup_step(false, &report, true, false, false);
+            let step = followup_step(false, &report, true, false, false, false, PrSync::Changed, None);
             let FollowupStep::Fail(error) = step else {
                 panic!("empty report was not failed");
             };
             assert_eq!(error, "Task did not provide a valid completion report");
             assert!(matches!(
-                followup_step(true, &report, true, false, true),
+                followup_step(true, &report, true, false, true, false, PrSync::Changed, None),
                 FollowupStep::Leave
             ));
         }
@@ -3446,11 +3845,11 @@ mod tests {
         };
         assert!(incomplete_report(&done).is_none());
         assert!(matches!(
-            followup_step(false, &done, true, false, false),
+            followup_step(false, &done, true, false, false, false, PrSync::Changed, None),
             FollowupStep::Settle
         ));
         assert!(matches!(
-            followup_step(false, &done, true, true, false),
+            followup_step(false, &done, true, true, false, false, PrSync::Changed, None),
             FollowupStep::Review
         ));
     }
@@ -3462,19 +3861,316 @@ mod tests {
         let stored = serde_json::to_string(&report).unwrap();
         let report = crate::prompts::stored_report(Some(&stored)).unwrap();
         assert!(incomplete_report(&report).is_none());
-        assert!(matches!(followup_step(false, &report, true, false, true), FollowupStep::Settle));
-        assert!(matches!(followup_step(true, &report, true, true, false), FollowupStep::Review));
+        assert!(matches!(followup_step(false, &report, true, false, true, false, PrSync::Changed, None), FollowupStep::Settle));
+        assert!(matches!(followup_step(true, &report, true, true, false, false, PrSync::Changed, None), FollowupStep::Review));
     }
 
     #[test]
-    fn unreadable_review_is_noted_not_failed() {
-        let changes = review_value("<!-- verdict {\"verdict\":\"changes\",\"findings\":[{\"issue\":\"x\"}]} verdict -->", true);
+    fn a_report_that_never_came_still_saves_the_work() {
+        let last_words = Report::synthesized("No commit or push performed.", Some("Commits ahead of main:\nabc fix"));
+        assert!(super::salvages(&last_words, true));
+        assert!(!super::salvages(&last_words, false), "a quest without a repo has nothing to publish");
+        let blocked = Report { status: Some("blocked".to_string()), summary: Some("needs a key".to_string()), ..Report::default() };
+        assert!(!super::salvages(&blocked, true), "a report the agent wrote itself is never published for it");
+        assert!(!super::salvages(&Report::default(), true));
+        assert!(matches!(followup_step(false, &last_words, true, true, false, true, PrSync::Changed, None), FollowupStep::Salvage), "never reviewed, never claimed done");
+        assert!(matches!(followup_step(false, &last_words, true, false, false, true, PrSync::Changed, None), FollowupStep::Salvage));
+        assert!(matches!(followup_step(false, &last_words, true, false, true, true, PrSync::Changed, None), FollowupStep::Salvage), "the nudge was spent when the report is synthesized");
+        assert!(matches!(followup_step(false, &last_words, true, false, false, false, PrSync::Changed, None), FollowupStep::Fail(_)));
+        assert!(matches!(followup_step(true, &last_words, true, false, false, true, PrSync::Changed, None), FollowupStep::Leave));
+        assert_eq!(incomplete_report(&last_words).as_deref(), Some(crate::prompts::SYNTHESIZED_ERROR));
+    }
+
+    #[test]
+    fn a_missing_verdict_carries_its_cause_in_plain_words() {
+        let changes = review_value("<!-- verdict {\"verdict\":\"changes\",\"findings\":[{\"issue\":\"x\"}]} verdict -->");
         assert_eq!(changes["verdict"], "changes");
         assert_eq!(changes["findings"].as_array().map(Vec::len), Some(1));
         assert!(changes.get("note").is_none());
-        let unreadable = review_value("I looked and it seems fine", true);
+        assert!(changes.get("cause").is_none());
+        let unreadable = review_value("Waiting on the test run.");
         assert_eq!(unreadable["verdict"], crate::prompts::NO_VERDICT);
         assert_eq!(unreadable["note"], crate::prompts::UNREADABLE_VERDICT_NOTE);
-        assert!(review_value("I looked and it seems fine", false).get("note").is_none());
+        assert_eq!((unreadable["cause"].as_str(), unreadable["reason"].as_str()), (Some("no_verdict"), Some(loka_shared::run_causes::MISSED_VERDICT)));
+    }
+
+    #[tokio::test]
+    async fn a_quick_run_that_ended_without_a_message_gets_its_reply_delivered_once() -> anyhow::Result<()> {
+        use super::RunnerCoordinator;
+        use loka_shared::{db::Database, quick::Opening, world::{AsideChoice, WorldStore}};
+        use uuid::Uuid;
+        let Ok(url) = std::env::var("QUICK_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let db = Database::connect(&url).await?;
+        let pool = db.pool().clone();
+        let store = WorldStore::new(pool.clone());
+        let coordinator = RunnerCoordinator::new(db, store.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email, name, world_role) VALUES ($1, 'Sam', 'write') RETURNING id")
+            .bind(format!("lostq-{tag}@example.test"))
+            .fetch_one(&pool)
+            .await?;
+        let agent_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id) VALUES ($1, 'Quill', 'claude', 'haiku', $2) RETURNING id",
+        )
+        .bind(format!("lostq-{tag}"))
+        .bind(owner)
+        .fetch_one(&pool)
+        .await?;
+        sqlx::query("INSERT INTO agent_sessions (agent_id, role, backend, model, cli_session_id, status) VALUES ($1, 'main', 'claude', 'haiku', 'main-cli', 'active')")
+            .bind(agent_id)
+            .execute(&pool)
+            .await?;
+        let agent = store.get_agent(agent_id).await?.expect("agent");
+        let choice = AsideChoice::default();
+        let open = || store.open_quick(Opening { agent_id, user_id: owner, asker: "Sam", text: "hi", choice: &choice, thread_root: None });
+        let end = |run: Uuid, status: &'static str, output: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query("UPDATE session_runs SET status = $2, output = $3, error = CASE WHEN $2 = 'completed' THEN NULL ELSE 'The device went offline' END, finished_at = NOW() - INTERVAL '2 minutes' WHERE id = $1")
+                    .bind(run)
+                    .bind(status)
+                    .bind(output)
+                    .execute(&pool)
+                    .await
+            }
+        };
+
+        let answered = open().await?;
+        store.post_quick_message(&agent, &answered, Some(owner), "what now?", None, serde_json::json!({})).await?;
+        let run = store.queue_quick(&answered, "what now?").await?;
+        end(run.id, "completed", "Take the short route \u{2014} it is faster.\n<!-- actions []  actions -->").await?;
+        assert_eq!(coordinator.deliver_lost_quick_replies(Some(answered.id)).await?, 1);
+        assert_eq!(coordinator.deliver_lost_quick_replies(None).await?, 0, "a reply is delivered once, by the read or the sweep");
+        let rows = store.quick_messages(answered.id, 10).await?;
+        let reply = rows.last().expect("reply");
+        assert_eq!((reply.author_kind.as_str(), reply.body.as_str(), reply.run_id), ("agent", "Take the short route - it is faster.", Some(run.id)));
+        assert!(!store.session_busy(answered.id).await?);
+
+        let broken = open().await?;
+        store.post_quick_message(&agent, &broken, Some(owner), "and now?", None, serde_json::json!({})).await?;
+        let run = store.queue_quick(&broken, "and now?").await?;
+        end(run.id, "failed", "").await?;
+        assert_eq!(coordinator.deliver_lost_quick_replies(Some(broken.id)).await?, 1);
+        let note = store.quick_messages(broken.id, 10).await?.pop().expect("note");
+        assert_eq!(note.body, "I could not answer that: The device went offline");
+        assert_eq!(note.meta["failed"], true, "a failure is marked so clients can say so");
+
+        let empty = open().await?;
+        let run = store.queue_quick(&empty, "ok").await?;
+        end(run.id, "completed", "").await?;
+        assert_eq!(coordinator.deliver_lost_quick_replies(Some(empty.id)).await?, 1);
+        assert_eq!(store.quick_messages(empty.id, 10).await?.pop().expect("done").body, "Done.");
+        Ok(())
+    }
+
+    async fn unpublished_quest(harness: &Harness, cli: &str) -> anyhow::Result<MergedQuest> {
+        let quest = merged_quest(harness, false).await?;
+        sqlx::query("UPDATE agent_tasks SET repo = 'acme/ghar-mail', pr_url = NULL, pr_number = NULL WHERE id = $1")
+            .bind(quest.task)
+            .execute(&harness.pool)
+            .await?;
+        sqlx::query("UPDATE agent_sessions SET backend = $2, review = FALSE WHERE id = $1")
+            .bind(quest.task_session)
+            .bind(cli)
+            .execute(&harness.pool)
+            .await?;
+        Ok(quest)
+    }
+
+    async fn completed_run(harness: &Harness, quest: &MergedQuest, kind: &str) -> anyhow::Result<uuid::Uuid> {
+        Ok(sqlx::query_scalar(
+            "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, prompt, started_at, finished_at)
+             VALUES ($1, $2, $3, $4, 'completed', 'work', NOW(), NOW()) RETURNING id",
+        )
+        .bind(quest.task_session)
+        .bind(quest.agent.id)
+        .bind(quest.task)
+        .bind(kind)
+        .fetch_one(&harness.pool)
+        .await?)
+    }
+
+    async fn task_session(harness: &Harness, quest: &MergedQuest) -> anyhow::Result<loka_shared::world::AgentSession> {
+        Ok(harness.store.get_session(quest.task_session).await?.expect("task session"))
+    }
+
+    async fn session_status(harness: &Harness, quest: &MergedQuest) -> anyhow::Result<String> {
+        Ok(task_session(harness, quest).await?.status)
+    }
+
+    fn done_report(cli: &str) -> &'static str {
+        match cli {
+            "codex" => "Ready for Loka to publish.\n<!-- report\n{\"status\":\"done\",\"summary\":\"Ready to publish\",\"pr_title\":\"fix: mail\"}\n-->",
+            "cursor" => "<!-- report {\"status\": \"done\", \"summary\": \"Ready to publish\"} report -->",
+            "omp" => "Done.\n\n<!-- report\n{\"status\": \"done\", \"summary\": \"Ready to publish\"}\nreport -->\n",
+            _ => "Done.\n<!-- report\n{\"status\": \"done\", \"summary\": \"Ready to publish\", \"pr_title\": \"fix: mail\"}\nreport -->",
+        }
+    }
+
+    const WAITING_ON_PUBLISH: &str =
+        "<!-- report {\"status\": \"blocked\", \"summary\": \"The commit is ready, waiting for Loka to push it and open the PR\"} report -->";
+
+    async fn block_first_run(harness: &Harness, quest: &MergedQuest) -> anyhow::Result<()> {
+        let run = completed_run(harness, quest, "task").await?;
+        harness.coordinator.after_task(&quest.agent, &task_session(harness, quest).await?, run, WAITING_ON_PUBLISH, None).await?;
+        assert_eq!(quest_status(harness, quest).await?, "failed");
+        assert_eq!(session_status(harness, quest).await?, "failed");
+        Ok(())
+    }
+
+    async fn answer_followup(harness: &Harness, quest: &MergedQuest, run: uuid::Uuid, output: &str) -> anyhow::Result<()> {
+        finish_run(harness, run).await?;
+        harness
+            .coordinator
+            .after_followup(&quest.agent, &task_session(harness, quest).await?, run, output, None, loka_shared::runners::PrSync::Changed)
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_done_report_publishes_from_every_starting_state() -> anyhow::Result<()> {
+        use loka_shared::world::{TaskResume, FOLLOWUP_ASK, REOPENED_ASK};
+        let Some(harness) = harness().await? else {
+            return Ok(());
+        };
+        for cli in ["claude", "codex", "cursor", "omp", "opencode"] {
+            let first = unpublished_quest(&harness, cli).await?;
+            let run = completed_run(&harness, &first, "task").await?;
+            harness.coordinator.after_task(&first.agent, &task_session(&harness, &first).await?, run, done_report(cli), None).await?;
+            assert_eq!(quest_runs(&harness, &first, "publish").await?.len(), 1, "{cli}: a first run that reports done publishes");
+
+            let blocked = unpublished_quest(&harness, cli).await?;
+            block_first_run(&harness, &blocked).await?;
+            assert!(quest_runs(&harness, &blocked, "publish").await?.is_empty(), "{cli}: a blocked report publishes nothing");
+            let followup = harness.store.start_followup(&task_session(&harness, &blocked).await?, "Report done so Loka publishes.", "Abhi", false).await?;
+            assert!(followup.prompt.ends_with(REOPENED_ASK), "{cli}: the follow-up says the quest is open again");
+            assert_eq!(session_status(&harness, &blocked).await?, "active", "{cli}");
+            let (status, error): (String, Option<String>) =
+                sqlx::query_as("SELECT status, error_message FROM agent_tasks WHERE id = $1").bind(blocked.task).fetch_one(&harness.pool).await?;
+            assert_eq!((status.as_str(), error), ("in_progress", None), "{cli}: the quest is back in progress");
+            answer_followup(&harness, &blocked, followup.id, done_report(cli)).await?;
+            assert_eq!(quest_runs(&harness, &blocked, "publish").await?.len(), 1, "{cli}: a done follow-up on a blocked quest publishes");
+
+            let failed = unpublished_quest(&harness, cli).await?;
+            let run = completed_run(&harness, &failed, "task").await?;
+            harness.coordinator.fail_run(run, "task", &task_session(&harness, &failed).await?, &failed.agent, "Timed out after 3600 seconds", true).await?;
+            assert_eq!(quest_status(&harness, &failed).await?, "failed");
+            let followup = harness.store.start_followup(&task_session(&harness, &failed).await?, "Finish it and report done.", "Abhi", false).await?;
+            answer_followup(&harness, &failed, followup.id, done_report(cli)).await?;
+            assert_eq!(quest_runs(&harness, &failed, "publish").await?.len(), 1, "{cli}: a done follow-up on a failed quest publishes");
+
+            let resumed = unpublished_quest(&harness, cli).await?;
+            block_first_run(&harness, &resumed).await?;
+            let TaskResume::Resumed { run_id, .. } = harness.store.resume_task_session(resumed.agent.id, resumed.task, "Fea", Some("Pick it up")).await? else {
+                panic!("{cli}: the quest resumes in its own session");
+            };
+            assert_eq!(quest_status(&harness, &resumed).await?, "in_progress", "{cli}: a resumed quest is back in progress");
+            answer_followup(&harness, &resumed, run_id, done_report(cli)).await?;
+            assert_eq!(quest_runs(&harness, &resumed, "publish").await?.len(), 1, "{cli}: a resumed quest that reports done publishes");
+
+            let feedback = unpublished_quest(&harness, cli).await?;
+            block_first_run(&harness, &feedback).await?;
+            let merge: uuid::Uuid = sqlx::query_scalar("SELECT id FROM task_milestones WHERE task_id = $1 AND kind = 'merge'")
+                .bind(feedback.task)
+                .fetch_one(&harness.pool)
+                .await?;
+            let run_id = loka_shared::milestones::MilestoneStore::new(harness.pool.clone())
+                .reopen_for_feedback(feedback.task, merge, "Address the review comment.")
+                .await?
+                .expect("PR feedback reopens the quest session");
+            assert_eq!(quest_status(&harness, &feedback).await?, "in_progress", "{cli}: PR feedback puts a failed quest back in progress");
+            answer_followup(&harness, &feedback, run_id, done_report(cli)).await?;
+            assert_eq!(quest_runs(&harness, &feedback, "publish").await?.len(), 1, "{cli}: a done answer to PR feedback publishes");
+
+            let in_review = unpublished_quest(&harness, cli).await?;
+            sqlx::query("UPDATE agent_tasks SET status = 'review' WHERE id = $1").bind(in_review.task).execute(&harness.pool).await?;
+            sqlx::query("UPDATE agent_sessions SET status = 'completed' WHERE id = $1").bind(in_review.task_session).execute(&harness.pool).await?;
+            let followup = harness.store.start_followup(&task_session(&harness, &in_review).await?, "Fix the comment.", "Abhi", false).await?;
+            assert!(followup.prompt.ends_with(FOLLOWUP_ASK), "{cli}: a finished quest is not reopened");
+            assert_eq!(quest_status(&harness, &in_review).await?, "review");
+            answer_followup(&harness, &in_review, followup.id, done_report(cli)).await?;
+            assert_eq!(quest_runs(&harness, &in_review, "publish").await?.len(), 1, "{cli}: a done follow-up on a quest in review publishes");
+
+            let done = unpublished_quest(&harness, cli).await?;
+            sqlx::query("UPDATE agent_tasks SET status = 'done' WHERE id = $1").bind(done.task).execute(&harness.pool).await?;
+            sqlx::query("UPDATE agent_sessions SET status = 'completed' WHERE id = $1").bind(done.task_session).execute(&harness.pool).await?;
+            let first = harness.store.start_followup(&task_session(&harness, &done).await?, "One more tweak.", "Abhi", false).await?;
+            let second = harness.store.start_followup(&task_session(&harness, &done).await?, "And the docs.", "Abhi", false).await?;
+            answer_followup(&harness, &done, first.id, done_report(cli)).await?;
+            assert!(quest_runs(&harness, &done, "publish").await?.is_empty(), "{cli}: a follow-up still waiting holds the publish");
+            answer_followup(&harness, &done, second.id, done_report(cli)).await?;
+            assert_eq!(quest_runs(&harness, &done, "publish").await?.len(), 1, "{cli}: a done follow-up on a done quest publishes");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_reopened_quest_that_stays_blocked_says_so_and_a_cancelled_one_stays_closed() -> anyhow::Result<()> {
+        use loka_shared::world::FOLLOWUP_ASK;
+        let Some(harness) = harness().await? else {
+            return Ok(());
+        };
+        let quest = unpublished_quest(&harness, "codex").await?;
+        block_first_run(&harness, &quest).await?;
+        let followup = harness.store.start_followup(&task_session(&harness, &quest).await?, "Try again.", "Abhi", false).await?;
+        let still = "<!-- report {\"status\": \"blocked\", \"summary\": \"The staging database is down\"} report -->";
+        answer_followup(&harness, &quest, followup.id, still).await?;
+        assert_eq!(quest_status(&harness, &quest).await?, "failed");
+        assert_eq!(session_status(&harness, &quest).await?, "failed");
+        assert!(quest_runs(&harness, &quest, "publish").await?.is_empty());
+        let finished: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT payload#>>'{report,summary}' FROM world_events WHERE task_id = $1 AND type = 'task.finished' ORDER BY seq",
+        )
+        .bind(quest.task)
+        .fetch_all(&harness.pool)
+        .await?;
+        assert_eq!(finished.last().cloned().flatten().as_deref(), Some("The staging database is down"), "the new reason reaches the main session");
+        assert_eq!(finished.len(), 2);
+
+        let same = unpublished_quest(&harness, "codex").await?;
+        block_first_run(&harness, &same).await?;
+        let followup = harness.store.start_followup(&task_session(&harness, &same).await?, "Report done so Loka publishes.", "Abhi", false).await?;
+        answer_followup(&harness, &same, followup.id, WAITING_ON_PUBLISH).await?;
+        let (status, error): (String, Option<String>) =
+            sqlx::query_as("SELECT status, error_message FROM agent_tasks WHERE id = $1").bind(same.task).fetch_one(&harness.pool).await?;
+        assert_eq!(status, "failed", "the same blocked report fails the reopened quest again");
+        assert!(error.is_some(), "and says why");
+        let finished: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_events WHERE task_id = $1 AND type = 'task.finished'")
+            .bind(same.task)
+            .fetch_one(&harness.pool)
+            .await?;
+        assert_eq!(finished, 2, "the main session hears about the repeated block");
+
+        let timed_out = unpublished_quest(&harness, "claude").await?;
+        let run = completed_run(&harness, &timed_out, "task").await?;
+        harness.coordinator.fail_run(run, "task", &task_session(&harness, &timed_out).await?, &timed_out.agent, "Timed out after 3600 seconds", true).await?;
+        let followup = harness.store.start_followup(&task_session(&harness, &timed_out).await?, "Keep going.", "Abhi", false).await?;
+        assert_eq!(quest_status(&harness, &timed_out).await?, "in_progress");
+        harness
+            .coordinator
+            .fail_run(followup.id, "followup", &task_session(&harness, &timed_out).await?, &timed_out.agent, "Timed out after 3600 seconds", true)
+            .await?;
+        let (status, error): (String, Option<String>) =
+            sqlx::query_as("SELECT status, error_message FROM agent_tasks WHERE id = $1").bind(timed_out.task).fetch_one(&harness.pool).await?;
+        assert_eq!(status, "failed", "a second timeout fails the reopened quest again");
+        assert!(error.is_some_and(|error| error.contains("Timed out")));
+
+        let done = unpublished_quest(&harness, "claude").await?;
+        block_first_run(&harness, &done).await?;
+        sqlx::query("UPDATE agent_tasks SET status = 'done', error_message = NULL WHERE id = $1").bind(done.task).execute(&harness.pool).await?;
+        let followup = harness.store.start_followup(&task_session(&harness, &done).await?, "One more tweak.", "Abhi", false).await?;
+        assert!(followup.prompt.ends_with(FOLLOWUP_ASK), "a quest that is not failed is never told it ended unfinished");
+        assert_eq!(session_status(&harness, &done).await?, "active", "its follow-up still advances");
+        assert_eq!(quest_status(&harness, &done).await?, "done");
+
+        let cancelled = unpublished_quest(&harness, "claude").await?;
+        block_first_run(&harness, &cancelled).await?;
+        sqlx::query("UPDATE agent_tasks SET status = 'cancelled' WHERE id = $1").bind(cancelled.task).execute(&harness.pool).await?;
+        let followup = harness.store.start_followup(&task_session(&harness, &cancelled).await?, "What did you change?", "Abhi", false).await?;
+        assert!(followup.prompt.ends_with(FOLLOWUP_ASK));
+        assert_eq!(session_status(&harness, &cancelled).await?, "failed", "a cancelled quest is never reopened");
+        assert_eq!(quest_status(&harness, &cancelled).await?, "cancelled");
+        Ok(())
     }
 }

@@ -224,6 +224,39 @@ pub async fn change_canvas(
         .ok_or((StatusCode::NOT_FOUND, String::new()))
 }
 
+const PRESENCE_GAP: std::time::Duration = std::time::Duration::from_millis(100);
+
+fn presence_allowed(seen: &mut std::collections::HashMap<(Uuid, Uuid), std::time::Instant>, key: (Uuid, Uuid), now: std::time::Instant, leaving: bool) -> bool {
+    if seen.len() > 10_000 {
+        seen.retain(|_, at| now.duration_since(*at) < std::time::Duration::from_secs(60));
+    }
+    if !leaving && seen.get(&key).is_some_and(|at| now.duration_since(*at) < PRESENCE_GAP) {
+        return false;
+    }
+    seen.insert(key, now);
+    true
+}
+
+pub async fn presence(
+    State(state): State<AppState>,
+    Extension(user): Extension<UserId>,
+    Extension(role): Extension<Role>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<canvas::Presence>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(Uuid, Uuid), std::time::Instant>>> = std::sync::OnceLock::new();
+    let body = body.checked().map_err(invalid)?;
+    let report = readable(&state, user.0, role, id).await.map_err(status)?;
+    if report.kind != "canvas" {
+        return Err((StatusCode::BAD_REQUEST, "only canvases show who is looking".into()));
+    }
+    let allowed = presence_allowed(&mut SEEN.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner()), (user.0, id), std::time::Instant::now(), body.leaving);
+    if allowed {
+        state.world.canvas_presence(&report, user.0, body).await.map_err(|e| status(internal(e)))?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn add_mark(
     State(state): State<AppState>,
     Extension(user): Extension<UserId>,
@@ -273,6 +306,19 @@ pub async fn delete_mark(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn presence_is_throttled_per_viewer_and_canvas_but_leaving_always_goes_out() {
+        let mut seen = std::collections::HashMap::new();
+        let (me, other, board) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let t0 = std::time::Instant::now();
+        assert!(super::presence_allowed(&mut seen, (me, board), t0, false));
+        assert!(!super::presence_allowed(&mut seen, (me, board), t0 + std::time::Duration::from_millis(40), false));
+        assert!(super::presence_allowed(&mut seen, (other, board), t0 + std::time::Duration::from_millis(40), false));
+        assert!(super::presence_allowed(&mut seen, (me, board), t0 + std::time::Duration::from_millis(60), true));
+        assert!(super::presence_allowed(&mut seen, (me, board), t0 + std::time::Duration::from_millis(200), false));
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -285,6 +331,7 @@ mod tests {
             world: loka_shared::world::WorldStore::new(pool.clone()),
             runners: loka_shared::runners::RunnerStore::new(pool),
             world_tx: tokio::sync::broadcast::channel(8).0,
+            signal_tx: tokio::sync::broadcast::channel(8).0,
             runner_tx: crate::runner_wakes::RunnerWakes::default(),
             term: crate::terminal::TermHub::new(),
         })

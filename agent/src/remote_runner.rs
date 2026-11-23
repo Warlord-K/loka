@@ -21,9 +21,10 @@ use tokio::sync::{mpsc, Notify, Semaphore};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::cli::{self, CliOptions, JobUid, StreamEvent};
+use crate::cli::{self, CliOptions, JobUid, Redactor, StreamEvent};
 use crate::world::warm::{self, Pool};
 
+mod build_cache;
 mod github_feed;
 mod health;
 mod media;
@@ -42,8 +43,7 @@ const IDLE_WAIT: Duration = Duration::from_secs(45);
 const STREAM_SILENCE: Duration = Duration::from_secs(45);
 const WORKSPACE_CLEANUP_INTERVAL: Duration = Duration::from_secs(600);
 const FATAL_DRAIN: Duration = Duration::from_secs(30);
-const TRANSCRIPT_GONE: &str = "[memory handoff] The saved transcript of your earlier work in this session was cleaned up, so this is a fresh start. Rebuild what you need from the workspace (git status, git log, git diff, any open PR) and the message below, then continue.";
-const MAX_EVENT_TEXT: usize = 4_000;
+const TRANSCRIPT_GONE: &str = "[memory handoff] The saved transcript of your earlier work in this session was cleaned up, so this is a fresh start. Rebuild what you need from the quest folder (git status, git log, git diff, any open PR) and the message below, then continue.";
 const FOLDERS_FILE: &str = "folders.json";
 const SHELL_CANCEL_CHECK: Duration = Duration::from_secs(2);
 const CHAT_KINDS: [&str; 4] = ["turn", "aside", "direct", "quick"];
@@ -57,6 +57,7 @@ struct McpLease {
     token: String,
     pids: SpawnedPids,
     roots: Vec<PathBuf>,
+    delivery: crate::world::tool_catalog::Delivery,
 }
 
 fn same_process(pid: u32, started: Option<u64>) -> bool {
@@ -72,8 +73,8 @@ static MCP_LEASES: Mutex<BTreeMap<Uuid, McpLease>> = Mutex::new(BTreeMap::new())
 struct OpenMcpLease(Uuid);
 
 impl OpenMcpLease {
-    fn new(job: &RunnerJob, pids: SpawnedPids, roots: Vec<PathBuf>) -> Self {
-        MCP_LEASES.lock().unwrap().insert(job.lease_id, McpLease { token: job.mcp_token.clone(), pids, roots });
+    fn new(job: &RunnerJob, pids: SpawnedPids, roots: Vec<PathBuf>, delivery: crate::world::tool_catalog::Delivery) -> Self {
+        MCP_LEASES.lock().unwrap().insert(job.lease_id, McpLease { token: job.mcp_token.clone(), pids, roots, delivery });
         Self(job.lease_id)
     }
 }
@@ -82,6 +83,52 @@ impl Drop for OpenMcpLease {
     fn drop(&mut self) {
         MCP_LEASES.lock().unwrap().remove(&self.0);
     }
+}
+
+struct BrowserRun {
+    grant: crate::browser::Grant,
+    pids: SpawnedPids,
+}
+
+static BROWSER_RUNS: Mutex<BTreeMap<Uuid, BrowserRun>> = Mutex::new(BTreeMap::new());
+
+struct OpenBrowserRun(Uuid);
+
+impl OpenBrowserRun {
+    fn new(lease_id: Uuid, grant: crate::browser::Grant, pids: SpawnedPids) -> Self {
+        BROWSER_RUNS.lock().unwrap().insert(lease_id, BrowserRun { grant, pids });
+        Self(lease_id)
+    }
+}
+
+impl Drop for OpenBrowserRun {
+    fn drop(&mut self) {
+        BROWSER_RUNS.lock().unwrap().remove(&self.0);
+    }
+}
+
+fn browser_grant(job: &RunnerJob, offered: bool) -> Option<crate::browser::Grant> {
+    (offered && crate::browser::wanted(&job.kind)).then(|| crate::browser::Grant::for_run(job.agent_id, job.run_id, &job.kind, job.task_id))
+}
+
+fn spawned_by(pids: &Mutex<Vec<(u32, Option<u64>)>>, pid: u32) -> bool {
+    pids.lock().unwrap().iter().any(|(spawned, started)| *spawned == pid && same_process(*spawned, *started))
+}
+
+fn by_ancestry<T>(pid: u32, mut find: impl FnMut(u32) -> Option<T>) -> Option<T> {
+    let mut current = pid;
+    for _ in 0..64 {
+        if let Some(found) = find(current) {
+            return Some(found);
+        }
+        current = cli::parent_pid(current).filter(|parent| *parent > 1)?;
+    }
+    None
+}
+
+fn browser_grant_for_process(pid: u32) -> Option<crate::browser::Grant> {
+    let runs = BROWSER_RUNS.lock().unwrap();
+    by_ancestry(pid, |current| runs.values().find(|run| spawned_by(&run.pids, current)).map(|run| run.grant))
 }
 
 #[derive(Clone)]
@@ -105,7 +152,15 @@ struct ClosedTasks {
     #[serde(default)]
     entries: Vec<loka_shared::runners::ClosedTask>,
     #[serde(default)]
-    idle: Vec<Uuid>,
+    closed_sessions: Vec<Uuid>,
+    #[serde(default)]
+    quests: Vec<PrefixMatch>,
+}
+
+#[derive(Deserialize)]
+struct PrefixMatch {
+    prefix: String,
+    id: Uuid,
 }
 
 #[derive(Debug)]
@@ -138,12 +193,12 @@ enum CompletionState {
     Blocked(StatusCode),
 }
 
-struct ExecutionOutcome {
-    result: crate::cli::CliResult,
-    pr_url: Option<String>,
-    pr_number: Option<i64>,
-    publish_pr_state: Option<String>,
-    work_summary: Option<String>,
+pub(crate) struct ExecutionOutcome {
+    pub(crate) result: crate::cli::CliResult,
+    pub(crate) pr_url: Option<String>,
+    pub(crate) pr_number: Option<i64>,
+    pub(crate) publish_pr_state: Option<String>,
+    pub(crate) work_summary: Option<String>,
 }
 
 
@@ -278,12 +333,20 @@ impl RunnerApi {
             .collect())
     }
 
-    async fn idle_tasks(&self, tasks: &[Uuid]) -> Result<Vec<Uuid>> {
-        let response = send_json(|| self.authorized(self.client.post(self.runner_url("/workspaces"))), &json!({ "tasks": tasks, "idle": true }))
+    async fn quests_by_prefix(&self, prefixes: &[String]) -> Result<Vec<(String, Uuid)>> {
+        let response = send_json(|| self.authorized(self.client.post(self.runner_url("/workspaces"))), &json!({ "prefixes": prefixes }))
             .await
-            .context("runner idle quests request failed")?;
-        ensure_success(response.status(), "runner idle quests")?;
-        Ok(response.json::<ClosedTasks>().await?.idle)
+            .context("runner quest prefix request failed")?;
+        ensure_success(response.status(), "runner quest prefixes")?;
+        Ok(response.json::<ClosedTasks>().await?.quests.into_iter().map(|found| (found.prefix, found.id)).collect())
+    }
+
+    async fn closed_sessions(&self, sessions: &[Uuid]) -> Result<Vec<Uuid>> {
+        let response = send_json(|| self.authorized(self.client.post(self.runner_url("/workspaces"))), &json!({ "sessions": sessions }))
+            .await
+            .context("runner closed sessions request failed")?;
+        ensure_success(response.status(), "runner closed sessions")?;
+        Ok(response.json::<ClosedTasks>().await?.closed_sessions)
     }
 
     async fn disk_low(&self, notice: &loka_shared::runners::DiskNotice) -> Result<()> {
@@ -587,6 +650,7 @@ pub async fn run() -> Result<()> {
     }
     prepare_root(&root).await?;
     close_leftover_browser_tabs(&root).await;
+    spawn_browser_keep_alive(root.clone());
     let storage = RunnerStorage::from_env(&root, runner_id).await?;
     for name in [
         "WORLD_RUNNER_TOKEN",
@@ -633,6 +697,9 @@ pub async fn run() -> Result<()> {
     };
     let outbox = Outbox::open(&root, Arc::new(api.clone()))?;
     listen_for_mcp(api.clone(), &root).await?;
+    if let Err(error) = listen_for_browser(&root) {
+        warn!(error = %format!("{error:#}"), "The agent browser is off on this runner, its socket could not open");
+    }
     if crate::mcp_hub::enabled() {
         crate::mcp_hub::start(cli::socket_path(&root.join(MCP_HUB_SOCKET))?).await?;
     }
@@ -677,18 +744,18 @@ async fn wake_stream(api: RunnerApi, wake: Arc<Notify>, nudge: Arc<Notify>) {
     }
 }
 
-const LOW_DISK_BYTES: f64 = 5.0 * 1024.0 * 1024.0 * 1024.0;
-
-fn disk_space(path: &Path) -> Option<(f64, f64)> {
-    use std::os::unix::ffi::OsStrExt;
-    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(path.as_ptr(), &mut stats) } != 0 {
-        return None;
+fn claimable_kinds(chat_open: bool, work_open: bool) -> Vec<String> {
+    let mut kinds = Vec::new();
+    if chat_open {
+        kinds.extend(CHAT_KINDS.map(String::from));
     }
-    let block = stats.f_frsize as f64;
-    Some((stats.f_bavail as f64 * block, stats.f_blocks as f64 * block))
+    if work_open {
+        kinds.extend(WORK_KINDS.map(String::from));
+    }
+    kinds
 }
+
+use loka_shared::run_recording::{disk_space, LOW_DISK_BYTES};
 
 fn watch_disk(root: PathBuf) {
     tokio::spawn(async move {
@@ -760,7 +827,8 @@ async fn runner_loop(
     let chat = Arc::new(Semaphore::new(budget.chat_slots));
     let work = Arc::new(Semaphore::new(budget.work_slots));
     let shells = Arc::new(Semaphore::new(2));
-    let terminals = Arc::new(Semaphore::new(5));
+    let terminals = Arc::new(Semaphore::new(loka_shared::terminal::max_per_device().max(1) as usize));
+    let views = Arc::new(Semaphore::new(loka_shared::terminal::max_views_per_device().max(1) as usize));
     let mut claims = Claims { poll: true, shell: true, terminal: true };
     let warm = Pool::new(budget.warm_sessions);
     tokio::spawn(warm.clone().reap_loop());
@@ -776,23 +844,28 @@ async fn runner_loop(
     let rescan = Arc::new(Notify::new());
     workspaces::spawn_usage(root.clone(), rescan.clone());
     let mut clean_requested = false;
+    let mut caches_requested = false;
     let mut beat_at: Option<Instant> = None;
+    let mut reported_low = false;
     let mut poll_outage = Outage::new("poll");
     loop {
         if let Ok(error) = fatal_rx.try_recv() {
-            return stop_after_fatal(&api, &warm, &running, &outbox, &freed, error).await;
+            return stop_after_fatal(&api, &root, &warm, &running, &outbox, &freed, error).await;
         }
         if stop_rx.try_recv().is_ok() {
-            return stop_after_sigterm(&api, &warm, &running, &outbox, &freed).await;
+            return stop_after_sigterm(&api, &root, &warm, &running, &outbox, &freed).await;
         }
         let cleanup_due = cleaned_at.elapsed() >= WORKSPACE_CLEANUP_INTERVAL
             || (cleaned_at.elapsed() >= workspaces::LOW_DISK_RECHECK && workspaces::low_disk(&root));
-        if clean_requested || cleanup_due {
+        if clean_requested || caches_requested || cleanup_due {
             cleaned_at = Instant::now();
-            let mode = workspaces::mode_for(&root, clean_requested);
+            let modes = workspaces::modes_for(&root, clean_requested, caches_requested);
             clean_requested = false;
-            if let Err(error) = workspaces::sweep(&api, &root, mode, &rescan).await {
-                warn!(error = %format!("{error:#}"), "Failed to remove closed task workspaces");
+            caches_requested = false;
+            for mode in modes {
+                if let Err(error) = workspaces::sweep(&api, &root, mode, &rescan).await {
+                    warn!(error = %format!("{error:#}"), "Failed to remove closed task workspaces");
+                }
             }
         }
         let mut uids = JobUid::free();
@@ -802,25 +875,26 @@ async fn runner_loop(
             take
         };
         let shell = want(claims.shell && shells.available_permits() > 0);
-        let terminal = want(claims.terminal && terminals.available_permits() > 0);
-        let mut kinds = Vec::new();
-        if want(chat.available_permits() > 0 || work.available_permits() > 0) {
-            if chat.available_permits() > 0 {
-                kinds.extend(CHAT_KINDS.map(String::from));
-            }
-            if work.available_permits() > 0 {
-                kinds.extend(WORK_KINDS.map(String::from));
-            }
-        }
-        let beat = beat_at.is_none_or(|at| at.elapsed() >= HEARTBEAT_INTERVAL);
+        let room = loka_shared::terminal::TerminalRoom {
+            shells: claims.terminal && terminals.available_permits() > 0,
+            views: claims.terminal && views.available_permits() > 0,
+        };
+        let terminal_room = want(room.any());
+        let disk_low = !loka_shared::run_recording::has_room(&root);
+        let work_open = work.available_permits() > 0 && !disk_low;
+        let chat_open = chat.available_permits() > 0;
+        let kinds = if want(chat_open || work_open) { claimable_kinds(chat_open, work_open) } else { Vec::new() };
+        let beat = beat_at.is_none_or(|at| at.elapsed() >= HEARTBEAT_INTERVAL) || disk_low != reported_low;
         let poll = RunnerPoll {
             heartbeat: beat.then(|| RunnerHeartbeat {
                 capabilities: capabilities(),
                 leases: held_leases(&running, &outbox),
+                disk_low,
             }),
             kinds,
             shell,
-            terminal,
+            terminal: terminal_room && room.shells,
+            views: terminal_room && room.views,
         };
         if poll_outage.failures > 0 && !outbox.finishing().is_empty() {
             outbox.flush(OUTBOX_FLUSH).await;
@@ -850,6 +924,7 @@ async fn runner_loop(
                 poll_outage.recovered();
                 if beat {
                     beat_at = Some(Instant::now());
+                    reported_low = disk_low;
                 }
                 if let Some(on) = polled.github_feed {
                     github_switch.store(if on { github_feed::ON } else { github_feed::OFF }, Ordering::Relaxed);
@@ -861,6 +936,7 @@ async fn runner_loop(
                     crate::apps::set_allowed(on);
                 }
                 clean_requested |= polled.clean_workspaces == Some(true);
+                caches_requested |= polled.clean_caches == Some(true);
                 polled
             }
             Err(error) => {
@@ -879,7 +955,7 @@ async fn runner_loop(
                 let _permit = permit;
                 let finished = match uid {
                     Ok(uid) => JobUid::scope(uid, execute_shell(&api, &root, job)).await,
-                    Err(error) => api.shell_finish(job.id, &failed_shell(format!("{error:#}"))).await,
+                    Err(error) => api.shell_finish(job.id, &failed_shell(loka_shared::cli_errors::chain(&error))).await,
                 };
                 if let Err(error) = finished {
                     warn!(error = %format!("{error:#}"), "Shell command job failed");
@@ -888,7 +964,8 @@ async fn runner_loop(
         }
 
         if let Some(job) = polled.terminal {
-            let permit = terminals.clone().acquire_owned().await?;
+            let slots = if job.kind == loka_shared::terminal::BROWSER { &views } else { &terminals };
+            let permit = slots.clone().acquire_owned().await?;
             let uid = JobUid::take().await.context("job uid setup failed");
             let (api, root) = (api.clone(), root.clone());
             tokio::spawn(async move {
@@ -928,10 +1005,13 @@ async fn runner_loop(
                 loka_shared::telemetry::add("runner_jobs_running", &[("kind", &job_kind)], 1.0);
                 let started = Instant::now();
                 let finished = match uid {
-                    Ok(uid) => JobUid::scope(uid, execute_job(&api, &root, job, storage.as_deref(), &warm, &nudge, lane.sink(), stages.clone())).await,
+                    Ok(uid) => {
+                        let session = own_temp_session(&job);
+                        JobUid::scope(uid, cli::scope_session_temp(session, execute_job(&api, &root, job, storage.as_deref(), &warm, &nudge, lane.sink(), stages.clone()))).await
+                    }
                     Err(error) => {
                         warn!(error = %format!("{error:#}"), "Job uid setup failed");
-                        Ok(failed_completion(workspace_key.clone(), format!("{error:#}")))
+                        Ok(failed_completion(workspace_key.clone(), loka_shared::cli_errors::chain(&error)))
                     }
                 };
                 let execute_ms = started.elapsed().as_millis();
@@ -944,7 +1024,7 @@ async fn runner_loop(
                 match finished {
                     Ok(completion) => lane.complete(completion).await,
                     Err(error) => {
-                        let failure = failed_completion(workspace_key, format!("{error:#}"));
+                        let failure = failed_completion(workspace_key, loka_shared::cli_errors::chain(&error));
                         let _ = fatal.send(error);
                         let _ = tokio::time::timeout(FATAL_DRAIN, lane.complete(failure)).await;
                     }
@@ -975,16 +1055,16 @@ async fn runner_loop(
             reconnect_delay().await;
             continue;
         }
-        let idle = if poll.kinds.is_empty() { HEARTBEAT_INTERVAL } else { IDLE_WAIT };
+        let idle = if poll.kinds.is_empty() || disk_low { HEARTBEAT_INTERVAL } else { IDLE_WAIT };
         tokio::select! {
             _ = wake.notified() => {}
             _ = freed.notified() => {}
             _ = tokio::time::sleep(idle) => {}
             Some(error) = fatal_rx.recv() => {
-                return stop_after_fatal(&api, &warm, &running, &outbox, &freed, error).await;
+                return stop_after_fatal(&api, &root, &warm, &running, &outbox, &freed, error).await;
             }
             Some(()) = stop_rx.recv() => {
-                return stop_after_sigterm(&api, &warm, &running, &outbox, &freed).await;
+                return stop_after_sigterm(&api, &root, &warm, &running, &outbox, &freed).await;
             }
         }
     }
@@ -1043,7 +1123,7 @@ async fn execute_shell(api: &RunnerApi, root: &Path, job: ShellJob) -> Result<()
     let mut process = match crate::shell::spawn(&workspace, &job.command) {
         Ok(process) => process,
         Err(error) => {
-            api.shell_finish(job.id, &failed_shell(format!("{error:#}"))).await?;
+            api.shell_finish(job.id, &failed_shell(loka_shared::cli_errors::chain(&error))).await?;
             return Ok(());
         }
     };
@@ -1117,6 +1197,7 @@ async fn execute_shell(api: &RunnerApi, root: &Path, job: ShellJob) -> Result<()
 
 async fn stop_after_fatal(
     api: &RunnerApi,
+    root: &Path,
     warm: &Pool,
     running: &Mutex<BTreeMap<Uuid, String>>,
     outbox: &Outbox,
@@ -1124,13 +1205,15 @@ async fn stop_after_fatal(
     error: anyhow::Error,
 ) -> Result<()> {
     warn!(error = %format!("{error:#}"), "Runner job failed fatally, letting other jobs finish before restarting");
-    let reason = format!("runner restarted after another job failed: {error:#}");
+    let reason = format!("runner restarted after another job failed: {}", loka_shared::cli_errors::chain(&error));
     wind_down(api, warm, running, outbox, freed, FATAL_DRAIN, reason).await;
+    close_leftover_browser_tabs(root).await;
     Err(error)
 }
 
 async fn stop_after_sigterm(
     api: &RunnerApi,
+    root: &Path,
     warm: &Pool,
     running: &Mutex<BTreeMap<Uuid, String>>,
     outbox: &Outbox,
@@ -1138,11 +1221,13 @@ async fn stop_after_sigterm(
 ) -> Result<()> {
     if pausing_for_update() {
         wind_down(api, warm, running, outbox, freed, UPDATE_DRAIN, loka_shared::run_causes::UPDATE_PAUSE.to_string()).await;
+        close_leftover_browser_tabs(root).await;
         return Ok(());
     }
     let drain = Duration::from_secs(cli::env_secs("WORLD_RUNNER_DRAIN_SECS", FATAL_DRAIN.as_secs()));
     info!(drain_secs = drain.as_secs(), "Runner received SIGTERM, letting running jobs finish before stopping");
     wind_down(api, warm, running, outbox, freed, drain, "runner stopped before the job finished".to_string()).await;
+    close_leftover_browser_tabs(root).await;
     Ok(())
 }
 
@@ -1222,6 +1307,10 @@ fn held_leases(running: &Mutex<BTreeMap<Uuid, String>>, outbox: &Outbox) -> Vec<
 }
 
 
+fn own_temp_session(job: &RunnerJob) -> Option<Uuid> {
+    matches!(job.kind.as_str(), "direct" | "quick").then_some(job.session_id)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_job(
     api: &RunnerApi,
@@ -1264,7 +1353,13 @@ async fn execute_job(
         if WORK_KINDS.contains(&job_ref.kind.as_str()) {
             workspaces::guard(api, root).await?;
         }
-        execute_job_inner(root, job_ref, storage, warm, job_state).await
+        let _active = workspaces::activate(root, job_ref.lease_id, &job_ref.workspace.key);
+        let outcome = execute_job_inner(root, job_ref, storage, warm, job_state).await;
+        if let ("task" | "followup" | "review", Some(repo)) = (job_ref.kind.as_str(), job_ref.workspace.repo.clone()) {
+            let (root, tree) = (root.to_path_buf(), root.join("workspaces").join(&job_ref.workspace.key));
+            tokio::spawn(async move { build_cache::keep_seed(&root, &repo, &tree).await });
+        }
+        outcome
     });
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1371,7 +1466,7 @@ async fn execute_job(
             "runner stopped with uncheckpointed Claude session state: {}",
             result
                 .err()
-                .map(|error| format!("{error:#}"))
+                .map(|error| loka_shared::cli_errors::chain(&error))
                 .unwrap_or_default()
         ));
     }
@@ -1379,55 +1474,78 @@ async fn execute_job(
     Ok(match result {
         Ok(outcome) => {
             let session_id = select_session_id(
-                outcome.result.session_id.or(started_session_id),
+                outcome.result.session_id.clone().or(started_session_id),
                 job.cli_session_id.as_deref(),
                 job.resume,
                 job.fork || job.rewind_to.is_some(),
             );
-            RunnerCompletion {
-                output: outcome.result.output,
-                session_id,
-                cost_usd: outcome.result.cost_usd,
-                exit_code: outcome.result.exit_code,
-                usage: RunnerUsage {
-                    input_tokens: outcome.result.usage.input_tokens,
-                    cached_input_tokens: outcome.result.usage.cached_input_tokens,
-                    output_tokens: outcome.result.usage.output_tokens,
-                    context_tokens: outcome.result.usage.context_tokens,
-                },
-                error: None,
-                workspace_key,
-                pr_url: outcome.pr_url,
-                pr_number: outcome.pr_number,
-                publish_pr_state: outcome.publish_pr_state,
-                checkpoint: outcome.result.checkpoint,
-                steered: delivered.lock().unwrap().clone(),
-                retryable: false,
-                work_summary: outcome.work_summary,
-            }
+            success_completion(outcome, session_id, workspace_key, delivered.lock().unwrap().clone())
         }
-        Err(error) => RunnerCompletion {
-            output: String::new(),
-            session_id: select_session_id(
+        Err(error) => errored_completion(
+            &error,
+            select_session_id(
                 started_session_id,
                 job.cli_session_id.as_deref(),
                 job.resume,
                 job.fork || job.rewind_to.is_some(),
             ),
-            cost_usd: 0.0,
-            exit_code: 1,
-            usage: RunnerUsage::default(),
-            error: Some(format!("{error:#}")),
             workspace_key,
-            pr_url: None,
-            pr_number: None,
-            publish_pr_state: None,
-            checkpoint: None,
-            steered: Vec::new(),
-            retryable: pausing_for_update(),
-            work_summary: None,
-        },
+            pausing_for_update(),
+        ),
     })
+}
+
+pub(crate) fn errored_completion(
+    error: &anyhow::Error,
+    session_id: Option<String>,
+    workspace_key: String,
+    retryable: bool,
+) -> RunnerCompletion {
+    RunnerCompletion {
+        output: String::new(),
+        session_id,
+        cost_usd: 0.0,
+        exit_code: 1,
+        usage: RunnerUsage::default(),
+        error: Some(loka_shared::cli_errors::chain(error)),
+        workspace_key,
+        pr_url: None,
+        pr_number: None,
+        publish_pr_state: None,
+        checkpoint: None,
+        steered: Vec::new(),
+        retryable,
+        work_summary: None,
+    }
+}
+
+pub(crate) fn success_completion(
+    outcome: ExecutionOutcome,
+    session_id: Option<String>,
+    workspace_key: String,
+    steered: Vec<Uuid>,
+) -> RunnerCompletion {
+    RunnerCompletion {
+        output: outcome.result.output,
+        session_id,
+        cost_usd: outcome.result.cost_usd,
+        exit_code: outcome.result.exit_code,
+        usage: RunnerUsage {
+            input_tokens: outcome.result.usage.input_tokens,
+            cached_input_tokens: outcome.result.usage.cached_input_tokens,
+            output_tokens: outcome.result.usage.output_tokens,
+            context_tokens: outcome.result.usage.context_tokens,
+        },
+        error: None,
+        workspace_key,
+        pr_url: outcome.pr_url,
+        pr_number: outcome.pr_number,
+        publish_pr_state: outcome.publish_pr_state,
+        checkpoint: outcome.result.checkpoint,
+        steered,
+        retryable: false,
+        work_summary: outcome.work_summary,
+    }
 }
 
 async fn close_leftover_browser_tabs(root: &Path) {
@@ -1436,6 +1554,19 @@ async fn close_leftover_browser_tabs(root: &Path) {
     if tokio::time::timeout(BROWSER_CLOSE_LIMIT, sweep).await.is_err() {
         warn!("Closing browser tabs left open by earlier runs took too long, so it was skipped");
     }
+}
+
+fn spawn_browser_keep_alive(root: PathBuf) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(crate::browser::KEEP_ALIVE_EVERY);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let root = root.clone();
+            let _ = tokio::task::spawn_blocking(move || crate::browser::keep_alive(&root)).await;
+        }
+    });
 }
 
 async fn close_run_browser_tabs(root: &Path, job: &RunnerJob) {
@@ -1512,6 +1643,9 @@ async fn execute_job_inner(
     } else {
         prepare_workspace(&work_root, &job.workspace).await?
     };
+    if let ("task" | "followup" | "review", Some(repo)) = (job.kind.as_str(), job.workspace.repo.as_deref()) {
+        build_cache::seed_quest(&work_root, repo, &workspace).await;
+    }
     if !loka_shared::backends::is_agent_cli(&job.cli) {
         bail!("local runners support Claude, Codex, Cursor, OpenCode and omp jobs");
     }
@@ -1528,13 +1662,13 @@ async fn execute_job_inner(
             return Err(vault_refs::failure(name, "vault references are read only on their owner's own Mac."));
         }
         let resolved = vault_refs::Resolver::new(vault_refs::find_op()).resolve(&job.vault_refs).await?;
-        vault_values.extend(redactable(resolved.values()));
+        vault_values.extend(resolved.values().cloned());
         granted.extend(resolved);
     }
     let mut skills = materialize_skills(&work_root, job).await?;
-    let browser = storage.is_none() && crate::browser::wanted(&job.kind) && crate::browser::available();
-    if browser {
-        skills.push(materialize_browser(root, job).await?);
+    let browser = browser_grant(job, storage.is_none() && browser_ready());
+    if let Some(grant) = browser {
+        skills.push(materialize_browser(root, job, grant).await?);
     }
     let apps_launcher = (storage.is_none() && crate::apps::wanted(&job.kind) && crate::apps::allowed())
         .then(|| crate::apps::launcher(job.agent_id))
@@ -1609,6 +1743,7 @@ async fn execute_job_inner(
         environment.entry(name.clone()).or_insert_with(|| value.clone());
     }
     add_gate_environment(&mut environment, root, job, browser, screen_launcher, apps_launcher);
+    let browser_run = browser.map(|grant| OpenBrowserRun::new(job.lease_id, grant, pids.clone()));
     if std::env::var_os("COMPOSE_PROJECT_NAME").is_none() {
         environment
             .entry("COMPOSE_PROJECT_NAME".into())
@@ -1620,7 +1755,8 @@ async fn execute_job_inner(
         media::prune(&dir);
         media_roots.push(dir);
     }
-    let mcp_lease = exposes_world_tools(job).then(|| OpenMcpLease::new(job, pids.clone(), media_roots));
+    let delivery = crate::world::kit::tool_delivery(&job.cli, &job.model, &environment).await;
+    let mcp_lease = exposes_world_tools(job).then(|| OpenMcpLease::new(job, pids.clone(), media_roots, delivery));
     let mut hub_registration = None;
     let mut hub_values = Vec::new();
     let mcp_config_json = if job.kind == "aside" && !job.world_tools {
@@ -1637,6 +1773,7 @@ async fn execute_job_inner(
                         cwd: &workspace,
                         pids: pids.clone(),
                         passthrough: &["world"],
+                        tools: delivery,
                     },
                     &servers,
                 )
@@ -1662,12 +1799,11 @@ async fn execute_job_inner(
     });
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let upload = events.clone();
-    let mut secrets = redaction_values(job);
-    secrets.extend(hub_values);
-    secrets.extend(redactable(provided.values()));
-    secrets.extend(vault_values);
-    secrets.sort_by_key(|value| std::cmp::Reverse(value.len()));
-    secrets.dedup();
+    let mut secret_values = redaction_values(job);
+    secret_values.extend(hub_values);
+    secret_values.extend(provided.values().cloned());
+    secret_values.extend(vault_values);
+    let secrets = Redactor::new(secret_values);
     let event_secrets = secrets.clone();
     let observed_session_id = started_session_id.clone();
     let drain_task = tokio::spawn(async move {
@@ -1744,6 +1880,7 @@ async fn execute_job_inner(
     let outcome = (&mut cli).await;
     drop(cli);
     drop(mcp_lease);
+    drop(browser_run);
     if let Some(watch) = keys_watch {
         watch.abort();
     }
@@ -1762,15 +1899,15 @@ async fn execute_job_inner(
         stages.lock().unwrap().checkpoint_ms = Some(checkpoint_started.elapsed().as_millis());
     }
     checkpointed.store(true, Ordering::Release);
-    let mut result = outcome.map_err(|error| anyhow!(redact(&format!("{error:#}"), &secrets)))?;
-    result.output = redact(&result.output, &secrets);
+    let mut result = outcome.map_err(|error| anyhow!(secrets.redact(&loka_shared::cli_errors::chain(&error))))?;
+    result.output = secrets.redact(&result.output);
     let work_summary = match (job.kind.as_str(), job.workspace.base_branch.as_deref()) {
         ("task" | "followup", Some(base)) if job.workspace.repo.is_some() && crate::world::prompts::parse_report(&result.output).is_none() => {
             crate::git::workspace::work_summary(&workspace, base).await
         }
         _ => None,
     }
-    .map(|summary| redact(&summary, &secrets));
+    .map(|summary| secrets.redact(&summary));
     let publish_pr_state = match job.kind.as_str() {
         "followup" if job.workspace.repo.is_some() && crate::world::prompts::parse_report(&result.output).is_some() => {
             crate::git::github::pr_sync(&workspace, claimed_at).await.report().map(str::to_string)
@@ -1962,7 +2099,7 @@ const LIVE_USAGE_EVERY: Duration = Duration::from_secs(5);
 async fn drain_events(
     mut receiver: mpsc::UnboundedReceiver<StreamEvent>,
     sender: EventSink,
-    secrets: Vec<String>,
+    secrets: Redactor,
     started_session_id: Arc<Mutex<Option<String>>>,
     pids: SpawnedPids,
 ) {
@@ -2003,8 +2140,8 @@ fn select_session_id(
     })
 }
 
-fn map_event(event: StreamEvent, secrets: &[String]) -> Option<RunnerEvent> {
-    let (kind, tool, text) = match event {
+pub(crate) fn map_event(event: StreamEvent, secrets: &Redactor) -> Option<RunnerEvent> {
+    let (kind, tool, text) = match event.redacted_clip(secrets, loka_shared::run_recording::EVENT_MAX_CHARS) {
         StreamEvent::Spawned { .. } | StreamEvent::Usage(_) => return None,
         StreamEvent::SessionStarted { session_id } => (
             "text".to_string(),
@@ -2022,23 +2159,17 @@ fn map_event(event: StreamEvent, secrets: &[String]) -> Option<RunnerEvent> {
     Some(RunnerEvent {
         kind,
         tool,
-        text: redact(&truncate(&text, MAX_EVENT_TEXT), secrets),
+        text,
     })
 }
 
-fn redactable<'a>(values: impl IntoIterator<Item = &'a String> + 'a) -> impl Iterator<Item = String> + 'a {
-    values.into_iter().filter(|value| value.len() >= 4).cloned()
-}
-
 fn redaction_values(job: &RunnerJob) -> Vec<String> {
-    let mut values = redactable(job.environment.values()).collect::<Vec<_>>();
-    values.extend(redactable(job.provider_keys.values()));
+    let mut values = job.environment.values().cloned().collect::<Vec<_>>();
+    values.extend(job.provider_keys.values().cloned());
     values.push(job.mcp_token.clone());
-    values.extend(redactable(&job.omp_secrets));
+    values.extend(job.omp_secrets.iter().cloned());
     collect_json_strings(&job.mcp_servers, &mut values);
     values.extend(cli::host_secrets().iter().cloned());
-    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-    values.dedup();
     values
 }
 
@@ -2076,12 +2207,6 @@ fn collect_json_secrets(value: &Value, sensitive: bool, values: &mut Vec<String>
     }
 }
 
-pub(crate) fn redact(text: &str, values: &[String]) -> String {
-    values.iter().fold(text.to_string(), |text, value| {
-        text.replace(value, "[REDACTED]")
-    })
-}
-
 async fn listen_for_mcp(api: RunnerApi, root: &Path) -> Result<()> {
     let path = cli::socket_path(&root.join(MCP_SOCKET))?;
     let _ = tokio::fs::remove_file(&path).await;
@@ -2112,7 +2237,7 @@ const MAX_MCP_REQUEST_BYTES: u64 = 4 * 1024 * 1024;
 
 async fn relay_mcp(api: &RunnerApi, stream: tokio::net::UnixStream) -> Result<()> {
     let pid = stream.peer_cred()?.pid().context("runner MCP peer has no pid")?;
-    let (lease_id, token, roots) = lease_for_process(pid as u32)
+    let (lease_id, token, roots, delivery) = lease_for_process(pid as u32)
         .await
         .context("runner MCP peer is not part of a running job")?;
     let (reader, mut writer) = stream.into_split();
@@ -2122,6 +2247,8 @@ async fn relay_mcp(api: &RunnerApi, stream: tokio::net::UnixStream) -> Result<()
         bail!("runner MCP request is larger than {MAX_MCP_REQUEST_BYTES} bytes");
     }
     let mut request: Value = serde_json::from_str(&line)?;
+    delivery.stamp(&mut request);
+    crate::world::tool_catalog::unwrap_use_tool(&mut request);
     if media::wants_upload(&request) {
         let reply = match media::save_upload(api, lease_id, &token, &roots, &request).await {
             Ok(text) => media::answer(&request, text),
@@ -2173,18 +2300,130 @@ fn offline_reply(request: &Value) -> Option<Value> {
     Some(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": OFFLINE_TOOL_NOTE } }))
 }
 
-async fn lease_for_process(pid: u32) -> Option<(Uuid, String, Vec<PathBuf>)> {
+async fn lease_for_process(pid: u32) -> Option<(Uuid, String, Vec<PathBuf>, crate::world::tool_catalog::Delivery)> {
     let leases = MCP_LEASES.lock().unwrap();
-    let mut current = pid;
-    for _ in 0..64 {
-        if let Some((lease_id, lease)) =
-            leases.iter().find(|(_, lease)| lease.pids.lock().unwrap().iter().any(|(pid, started)| *pid == current && same_process(*pid, *started)))
-        {
-            return Some((*lease_id, lease.token.clone(), lease.roots.clone()));
-        }
-        current = cli::parent_pid(current).filter(|parent| *parent > 1)?;
+    by_ancestry(pid, |current| {
+        leases
+            .iter()
+            .find(|(_, lease)| spawned_by(&lease.pids, current))
+            .map(|(lease_id, lease)| (*lease_id, lease.token.clone(), lease.roots.clone(), lease.delivery))
+    })
+}
+
+struct BrowserListener {
+    path: PathBuf,
+    identity: (u64, u64),
+    accepting: tokio::task::JoinHandle<()>,
+}
+
+impl BrowserListener {
+    fn bind(path: PathBuf, root: PathBuf) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let _ = std::fs::remove_file(&path);
+        let bound = std::os::unix::net::UnixListener::bind(&path).with_context(|| format!("could not open the runner browser socket {}", path.display()))?;
+        bound.set_nonblocking(true)?;
+        cli::share_with_jobs(&path, 0o666)?;
+        let meta = std::fs::symlink_metadata(&path)?;
+        let listener = tokio::net::UnixListener::from_std(bound)?;
+        let served = root;
+        let accepting = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let root = served.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = answer_browser(stream, root).await {
+                                warn!(error = %format!("{error:#}"), "Runner browser request refused");
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        warn!(error = %format!("{error:#}"), "Runner browser socket accept failed");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        });
+        Ok(Self { path, identity: (meta.dev(), meta.ino()), accepting })
     }
-    None
+
+    fn listening(&self) -> bool {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        !self.accepting.is_finished()
+            && std::fs::symlink_metadata(&self.path).is_ok_and(|meta| meta.file_type().is_socket() && (meta.dev(), meta.ino()) == self.identity)
+    }
+}
+
+impl Drop for BrowserListener {
+    fn drop(&mut self) {
+        self.accepting.abort();
+    }
+}
+
+struct BrowserSocket {
+    path: Option<(PathBuf, PathBuf)>,
+    listener: Option<BrowserListener>,
+    failing: bool,
+}
+
+static BROWSER_SOCKET_STATE: Mutex<BrowserSocket> = Mutex::new(BrowserSocket { path: None, listener: None, failing: false });
+
+fn browser_socket_ready() -> bool {
+    let mut state = BROWSER_SOCKET_STATE.lock().unwrap();
+    socket_ready(&mut state)
+}
+
+fn socket_ready(state: &mut BrowserSocket) -> bool {
+    if state.listener.as_ref().is_some_and(BrowserListener::listening) {
+        return true;
+    }
+    let Some((path, root)) = state.path.clone() else { return false };
+    if tokio::runtime::Handle::try_current().is_err() {
+        return false;
+    }
+    state.listener = None;
+    match BrowserListener::bind(path, root) {
+        Ok(listener) => {
+            info!("The runner browser socket was gone, it is open again");
+            state.listener = Some(listener);
+            state.failing = false;
+            true
+        }
+        Err(error) => {
+            if !std::mem::replace(&mut state.failing, true) {
+                warn!(error = %format!("{error:#}"), "The agent browser is off on this runner, its socket could not open");
+            }
+            false
+        }
+    }
+}
+
+fn browser_ready() -> bool {
+    crate::browser::available() && browser_socket_ready()
+}
+
+fn listen_for_browser(root: &Path) -> Result<()> {
+    let path = crate::browser::socket_for(root)?;
+    let mut state = BROWSER_SOCKET_STATE.lock().unwrap();
+    state.path = Some((path.clone(), root.to_path_buf()));
+    let listener = BrowserListener::bind(path, root.to_path_buf());
+    state.failing = listener.is_err();
+    state.listener = Some(listener?);
+    Ok(())
+}
+
+async fn answer_browser(mut stream: tokio::net::UnixStream, root: PathBuf) -> Result<()> {
+    let pid = stream.peer_cred()?.pid().context("runner browser peer has no pid")?;
+    let grant = browser_grant_for_process(pid as u32).context("runner browser peer is not part of a run that was given the browser")?;
+    let mut asked = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), (&mut stream).take(crate::browser::REQUEST_LIMIT).read_to_end(&mut asked))
+        .await
+        .context("runner browser peer asked nothing")??;
+    let args = crate::browser::read_request(&asked).context("runner browser peer sent an unknown request")?;
+    let reply: crate::browser::Reply = tokio::task::spawn_blocking(move || crate::browser::serve(&root, grant, &args).into()).await?;
+    stream.write_all(&serde_json::to_vec(&reply)?).await?;
+    stream.shutdown().await?;
+    Ok(())
 }
 
 fn runner_mcp_servers(job: &RunnerJob, root: &Path) -> Result<serde_json::Map<String, Value>> {
@@ -2451,7 +2690,7 @@ async fn repository_path(root: &Path, repo: &str) -> Result<PathBuf> {
     }
     ensure_git_repo(&path).await?;
     let token = std::env::var("GITHUB_TOKEN").unwrap_or_default();
-    if let Err(e) = crate::git::workspace::ensure_repo_identity(&path, &token).await {
+    if let Err(e) = crate::git::workspace::ensure_repo_identity(&path, &token, &crate::git::workspace::GitHost::INHERITED).await {
         warn!(repo, error = %e, "Failed to set repo git identity");
     }
     if let Err(e) = crate::git::workspace::ensure_commit_hygiene(&path).await {
@@ -2522,13 +2761,13 @@ async fn materialize_skills(root: &Path, job: &RunnerJob) -> Result<Vec<PathBuf>
     Ok(paths)
 }
 
-async fn materialize_browser(root: &Path, job: &RunnerJob) -> Result<PathBuf> {
+async fn materialize_browser(root: &Path, job: &RunnerJob, grant: crate::browser::Grant) -> Result<PathBuf> {
     let profiles = secure_create_dir(root, Path::new("browser"), false).await?;
-    secure_create_dir(&profiles, Path::new(&job.agent_id.to_string()), false).await?;
+    secure_create_dir(&profiles, Path::new(&crate::browser::Place::of(root, grant.agent_id).profile_name()), false).await?;
     let dir = secure_create_dir(&root.join("skills"), Path::new(&job.session_id.to_string()), false).await?;
     let path = dir.join("browser.md");
-    let launcher = crate::browser::launcher(job.agent_id, job.run_id, &job.kind).ok_or_else(|| anyhow::anyhow!("the browser launcher path is not usable"))?;
-    tokio::fs::write(&path, crate::browser::skill(&launcher)).await?;
+    let launcher = crate::browser::launcher(grant.agent_id, grant.run_id).ok_or_else(|| anyhow::anyhow!("the browser launcher path is not usable"))?;
+    tokio::fs::write(&path, crate::browser::skill(&launcher, grant.reach)).await?;
     Ok(path)
 }
 
@@ -2618,15 +2857,15 @@ fn add_gate_environment(
     environment: &mut BTreeMap<String, String>,
     root: &Path,
     job: &RunnerJob,
-    browser: bool,
+    browser: Option<crate::browser::Grant>,
     screen_launcher: Option<String>,
     apps_launcher: Option<String>,
 ) {
-    if browser || screen_launcher.is_some() || apps_launcher.is_some() {
+    if browser.is_some() || screen_launcher.is_some() || apps_launcher.is_some() {
         environment.insert(crate::browser::ROOT_ENV.to_string(), root.display().to_string());
     }
-    if browser {
-        for (name, value) in crate::browser::environment(root, job.agent_id, job.run_id, &job.kind) {
+    if let Some((grant, socket)) = browser.zip(crate::browser::socket_for(root).ok()) {
+        for (name, value) in crate::browser::environment(root, grant, &socket) {
             environment.insert(name, value);
         }
     }
@@ -2791,7 +3030,8 @@ fn capabilities() -> Value {
             "opencode": loka_shared::backends::opencode_enabled() && crate::model_catalog::command_exists("opencode"),
             "omp": crate::model_catalog::command_exists("omp")
         },
-        "browser": crate::browser::available(),
+        "browser": browser_ready(),
+        "browser_view": crate::browser::shows_live_view(),
         "screen": crate::screen::installed(),
         "apps": crate::apps::installed(),
         "versions": { "claude": crate::claude::detect::version(), "runner": env!("WORLD_BUILD") },
@@ -2911,10 +3151,6 @@ fn ensure_success(status: StatusCode, operation: &str) -> Result<()> {
     }
 }
 
-fn truncate(value: &str, max_chars: usize) -> String {
-    value.chars().take(max_chars).collect()
-}
-
 async fn reconnect_delay() {
     let jitter = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2927,6 +3163,17 @@ async fn reconnect_delay() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_full_disk_claims_chat_but_no_work_until_there_is_room() {
+        let work: Vec<String> = WORK_KINDS.map(String::from).to_vec();
+        let low = claimable_kinds(true, false);
+        assert!(!low.is_empty() && low.iter().all(|kind| !work.contains(kind)), "chat turns still run: {low:?}");
+        let room = claimable_kinds(true, true);
+        assert!(work.iter().all(|kind| room.contains(kind)), "every work kind is claimed again once there is room: {room:?}");
+        assert!(claimable_kinds(false, false).is_empty());
+        assert_eq!(claimable_kinds(false, true), work, "a busy chat lane does not hold back work");
+    }
 
     #[test]
     fn a_recorded_pr_is_kept_when_nothing_is_ahead() {
@@ -3037,14 +3284,14 @@ mod tests {
         let lease_id = Uuid::new_v4();
         let me = std::process::id();
         let pids = Arc::new(Mutex::new(vec![(me, cli::process_start(me))]));
-        MCP_LEASES.lock().unwrap().insert(lease_id, McpLease { token: "lease-token".into(), pids, roots: vec![PathBuf::from("/work")] });
-        assert_eq!(lease_for_process(pid).await, Some((lease_id, "lease-token".to_string(), vec![PathBuf::from("/work")])));
+        MCP_LEASES.lock().unwrap().insert(lease_id, McpLease { token: "lease-token".into(), pids, roots: vec![PathBuf::from("/work")], delivery: crate::world::tool_catalog::Delivery::Index });
+        assert_eq!(lease_for_process(pid).await, Some((lease_id, "lease-token".to_string(), vec![PathBuf::from("/work")], crate::world::tool_catalog::Delivery::Index)));
         assert_eq!(lease_for_process(1).await, None);
         drop(OpenMcpLease(lease_id));
         assert_eq!(lease_for_process(pid).await, None);
         let reused = Uuid::new_v4();
         let stale = Arc::new(Mutex::new(vec![(me, cli::process_start(me).map(|start| start + 1))]));
-        MCP_LEASES.lock().unwrap().insert(reused, McpLease { token: "old-token".into(), pids: stale.clone(), roots: Vec::new() });
+        MCP_LEASES.lock().unwrap().insert(reused, McpLease { token: "old-token".into(), pids: stale.clone(), roots: Vec::new(), delivery: Default::default() });
         assert_eq!(lease_for_process(pid).await, None, "a recycled pid never inherits an exited job's lease");
         assert!(live_pids(&stale).is_empty());
         drop(OpenMcpLease(reused));
@@ -3107,9 +3354,8 @@ mod tests {
         });
         let mut secrets = Vec::new();
         collect_json_strings(&definition, &mut secrets);
-        let text = redact(
+        let text = Redactor::new(secrets).redact(
             "environment-secret header-secret https://example.test/mcp?token=url-secret",
-            &secrets,
         );
         assert_eq!(text, "[REDACTED] [REDACTED] [REDACTED]");
     }
@@ -3120,9 +3366,9 @@ mod tests {
             ("PIN".to_string(), "42".to_string()),
             ("API_KEY".to_string(), "vault-secret".to_string()),
         ]);
-        let values = redactable(resolved.values()).collect::<Vec<_>>();
-        assert_eq!(values, vec!["vault-secret".to_string()]);
-        assert_eq!(redact("build 42 vault-secret", &values), "build 42 [REDACTED]");
+        let redactor = Redactor::new(resolved.values());
+        assert_eq!(redactor.values(), ["vault-secret".to_string()]);
+        assert_eq!(redactor.redact("build 42 vault-secret"), "build 42 [REDACTED]");
     }
 
     #[test]
@@ -3168,6 +3414,17 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn only_folder_and_quick_jobs_get_a_session_temp_folder() {
+        for kind in ["direct", "quick"] {
+            let job = quest_job(kind);
+            assert_eq!(own_temp_session(&job), Some(job.session_id), "{kind}");
+        }
+        for kind in ["task", "followup", "review", "publish", "turn", "aside"] {
+            assert_eq!(own_temp_session(&quest_job(kind)), None, "{kind}");
+        }
+    }
+
     #[tokio::test]
     async fn attached_files_land_on_disk_and_are_listed_in_the_prompt_note() {
         let root = std::env::temp_dir().join(format!("loka-files-test-{}", Uuid::new_v4().simple()));
@@ -3208,20 +3465,141 @@ mod tests {
             assert!(crate::browser::wanted(kind) && crate::screen::wanted(kind), "{kind} must get the browser and screen");
             let job = quest_job(kind);
             let mut screen_only = BTreeMap::from([(crate::browser::ROOT_ENV.to_string(), "/spoofed".to_string())]);
-            add_gate_environment(&mut screen_only, root, &job, false, Some("/x/loka-agent screen a".into()), None);
+            add_gate_environment(&mut screen_only, root, &job, None, Some("/x/loka-agent screen a".into()), None);
             assert_eq!(screen_only[crate::browser::ROOT_ENV], "/runner");
             assert_eq!(screen_only[crate::screen::LAUNCHER_ENV], "/x/loka-agent screen a");
             let mut browser_only = BTreeMap::new();
-            add_gate_environment(&mut browser_only, root, &job, true, None, None);
+            add_gate_environment(&mut browser_only, root, &job, browser_grant(&job, true), None, None);
             assert_eq!(browser_only[crate::browser::ROOT_ENV], "/runner");
+            assert_eq!(browser_only[crate::browser::SOCKET_ENV], "/runner/leases/browser.sock");
             let mut apps_only = BTreeMap::new();
-            add_gate_environment(&mut apps_only, root, &job, false, None, Some("/x/loka-agent apps a".into()));
+            add_gate_environment(&mut apps_only, root, &job, None, None, Some("/x/loka-agent apps a".into()));
             assert_eq!(apps_only[crate::browser::ROOT_ENV], "/runner");
             assert_eq!(apps_only[crate::apps::LEASE_ENV], job.lease_id.to_string());
         }
         let mut none = BTreeMap::new();
-        add_gate_environment(&mut none, root, &quest_job("task"), false, None, None);
+        add_gate_environment(&mut none, root, &quest_job("task"), None, None, None);
         assert!(none.is_empty());
         assert!(!crate::screen::wanted("turn") && !crate::browser::wanted("turn"));
+    }
+
+    fn private_page(job: &RunnerJob, spoof: &str) -> Vec<String> {
+        let mut args = vec![job.agent_id.to_string()];
+        args.extend((!spoof.is_empty()).then(|| spoof.to_string()));
+        args.extend([job.run_id.to_string(), "open".into(), "http://192.168.1.9/".into()]);
+        args
+    }
+
+    fn refused_for(reach: crate::browser::Reach) -> std::result::Result<crate::browser::Answer, crate::browser::Refusal> {
+        Err(crate::browser::check_url("http://192.168.1.9/", reach).unwrap_err())
+    }
+
+    #[tokio::test]
+    async fn the_browser_socket_the_runner_listens_on_is_the_one_jobs_are_given() {
+        let base = std::env::temp_dir().join(format!("loka-browser-sock-{}", Uuid::new_v4().simple()));
+        let root = base.join("Library").join("Application Support").join("dev.ygpt.loka").join("runner");
+        std::fs::create_dir_all(root.join("leases")).unwrap();
+        let moved = crate::browser::socket_for(&root).unwrap();
+        let clean_up = || {
+            let _ = std::fs::remove_file(&moved);
+            let _ = std::fs::remove_dir(moved.parent().unwrap());
+            std::fs::remove_dir_all(&base).unwrap();
+        };
+        if let Err(error) = listen_for_browser(&root) {
+            let denied = error.chain().filter_map(|cause| cause.downcast_ref::<std::io::Error>()).any(|io| io.kind() == std::io::ErrorKind::PermissionDenied);
+            clean_up();
+            assert!(denied, "{error:#}");
+            return;
+        }
+        let job = quest_job("review");
+        let grant = browser_grant(&job, true).unwrap();
+        let mut environment = BTreeMap::new();
+        add_gate_environment(&mut environment, &root, &job, Some(grant), None, None);
+        let socket = PathBuf::from(&environment[crate::browser::SOCKET_ENV]);
+        assert!(!socket.to_string_lossy().contains(' ') && socket.as_os_str().len() <= 104, "{}", socket.display());
+        assert_eq!(socket, moved);
+        assert!(browser_socket_ready(), "the listener the runner opened is the one it reports");
+        let me = std::process::id();
+        let run = OpenBrowserRun::new(job.lease_id, grant, Arc::new(Mutex::new(vec![(me, cli::process_start(me))])));
+        let other_job = quest_job("task");
+        let other_grant = browser_grant(&other_job, true).unwrap();
+        let other = tokio::process::Command::new("sleep").arg("30").kill_on_drop(true).spawn().unwrap();
+        let other_pid = other.id().unwrap();
+        let other_run = OpenBrowserRun::new(other_job.lease_id, other_grant, Arc::new(Mutex::new(vec![(other_pid, cli::process_start(other_pid))])));
+        assert_eq!(browser_grant_for_process(other_pid), Some(other_grant), "the other job keeps its own grant");
+        let ask = |socket: PathBuf, trusted: fn(u32, u32) -> bool, job: &RunnerJob| {
+            let args = private_page(job, "");
+            tokio::task::spawn_blocking(move || {
+                let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+                crate::browser::request(&mut stream, &args, |pid| trusted(pid, me))
+            })
+        };
+        let received = ask(socket.clone(), |pid, me| pid == me, &job).await.unwrap();
+        assert_eq!(grant.reach, crate::browser::Reach::Public, "a review stays on the public web");
+        assert_eq!(received, refused_for(grant.reach), "a job asking while another holds a grant is served with its own grant, over the real socket");
+        assert_ne!(received, refused_for(other_grant.reach));
+        assert!(ask(socket.clone(), |pid, me| pid == me, &other_job).await.unwrap().is_err_and(|refusal| refusal.to_string().contains("use the exact launcher")), "another job's launcher words are refused");
+        assert!(ask(socket.clone(), |pid, me| pid != me, &job).await.unwrap().is_err(), "the peer pid of the real socket is checked");
+
+        std::fs::remove_file(&moved).unwrap();
+        assert!(!BROWSER_SOCKET_STATE.lock().unwrap().listener.as_ref().unwrap().listening(), "a removed socket is a dead listener");
+        assert!(browser_socket_ready(), "the readiness check opens it again before anything is offered");
+        assert_eq!(ask(socket, |pid, me| pid == me, &job).await.unwrap(), refused_for(grant.reach), "and jobs reach the reopened socket");
+        drop(other_run);
+        drop(run);
+        BROWSER_SOCKET_STATE.lock().unwrap().listener = None;
+        clean_up();
+    }
+
+    #[tokio::test]
+    async fn the_runner_decides_the_browser_reach_of_every_run_kind() {
+        use crate::browser::Reach;
+        let expected = [
+            ("task", Some(Reach::Loopback)),
+            ("followup", Some(Reach::Loopback)),
+            ("review", Some(Reach::Public)),
+            ("quick", Some(Reach::Public)),
+            ("aside", None),
+            ("direct", None),
+            ("turn", None),
+            ("publish", None),
+        ];
+        let me = std::process::id();
+        for (kind, reach) in expected {
+            let job = quest_job(kind);
+            assert_eq!(browser_grant(&job, false), None, "{kind} on a cloud runner or a Mac without the browser");
+            let grant = browser_grant(&job, true);
+            assert_eq!(grant.map(|grant| grant.reach), reach, "{kind} on the owner's device");
+            let mut environment = BTreeMap::from([(crate::browser::SOCKET_ENV.to_string(), "/spoofed.sock".to_string())]);
+            add_gate_environment(&mut environment, Path::new("/runner"), &job, grant, None, None);
+            if let Some(launcher) = environment.get(crate::browser::LAUNCHER_ENV) {
+                assert!(launcher.ends_with(&format!(" browser {} {}", job.agent_id, job.run_id)), "no mode word in {launcher}");
+            }
+            let Some(grant) = grant else {
+                assert_eq!(environment[crate::browser::SOCKET_ENV], "/spoofed.sock", "{kind} gets no runner socket");
+                continue;
+            };
+            assert_eq!(environment[crate::browser::SOCKET_ENV], "/runner/leases/browser.sock");
+            let child = tokio::process::Command::new("sleep").arg("5").kill_on_drop(true).spawn().unwrap();
+            let gate_pid = child.id().unwrap();
+            assert_eq!(browser_grant_for_process(gate_pid), None, "{kind}: nothing is granted before the run starts");
+            let run = OpenBrowserRun::new(job.lease_id, grant, Arc::new(Mutex::new(vec![(me, cli::process_start(me))])));
+            assert_eq!(browser_grant_for_process(gate_pid), Some(grant), "{kind}: a process the run spawned gets its grant");
+            assert_eq!(browser_grant_for_process(1), None);
+            for spoof in ["web", "quest", "local"] {
+                let (runner_end, mut gate_end) = std::os::unix::net::UnixStream::pair().unwrap();
+                runner_end.set_nonblocking(true).unwrap();
+                let answered = tokio::spawn(answer_browser(tokio::net::UnixStream::from_std(runner_end).unwrap(), std::env::temp_dir()));
+                let args = private_page(&job, spoof);
+                let received = tokio::task::spawn_blocking(move || crate::browser::request(&mut gate_end, &args, |pid| pid == me)).await.unwrap();
+                answered.await.unwrap().unwrap();
+                assert_eq!(received, refused_for(reach.unwrap()), "{kind}: asking for {spoof} never changes the reach the runner serves");
+            }
+            drop(run);
+            assert_eq!(browser_grant_for_process(gate_pid), None, "{kind}: the grant ends with the run");
+            let (runner_end, _gate_end) = std::os::unix::net::UnixStream::pair().unwrap();
+            runner_end.set_nonblocking(true).unwrap();
+            assert!(answer_browser(tokio::net::UnixStream::from_std(runner_end).unwrap(), std::env::temp_dir()).await.is_err());
+        }
     }
 }

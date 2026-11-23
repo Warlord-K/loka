@@ -183,7 +183,7 @@ pub enum Hook {
 }
 
 impl Hook {
-    fn variable(self) -> &'static str {
+    pub(crate) fn variable(self) -> &'static str {
         match self {
             Hook::ClaudeShell => "CLAUDE_CODE_SHELL",
             Hook::Shell => "SHELL",

@@ -2,10 +2,19 @@ import type { Metadata, Viewport } from "next";
 import { headers } from "next/headers";
 import { GeistSans } from "geist/font/sans";
 import { GeistMono } from "geist/font/mono";
+import { JetBrains_Mono } from "next/font/google";
 import { Providers } from "./providers";
 import { THEME_SCRIPT } from "@/lib/theme";
 import { TEXT_SCALE_SCRIPT } from "@/lib/text-scale";
 import "./globals.css";
+
+const terminalMono = JetBrains_Mono({
+  subsets: ["latin"],
+  weight: ["400", "700"],
+  variable: "--font-term",
+  display: "swap",
+  preload: false,
+});
 
 export const metadata: Metadata = {
   title: { default: "Loka", template: "%s · Loka" },
@@ -36,7 +45,7 @@ export const viewport: Viewport = {
 export default async function RootLayout({ children }: { children: React.ReactNode }) {
   const nonce = (await headers()).get("x-nonce") ?? undefined;
   return (
-    <html lang="en" className={`dark overscroll-none ${GeistSans.variable} ${GeistMono.variable}`} suppressHydrationWarning>
+    <html lang="en" className={`dark overscroll-none ${GeistSans.variable} ${GeistMono.variable} ${terminalMono.variable}`} suppressHydrationWarning>
       <head>
         <script nonce={nonce} dangerouslySetInnerHTML={{ __html: THEME_SCRIPT + TEXT_SCALE_SCRIPT }} />
       </head>

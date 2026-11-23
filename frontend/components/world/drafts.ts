@@ -34,6 +34,13 @@ export function useDraft(key: string): [string, (next: string | ((cur: string) =
   useEffect(() => {
     if (state.key !== key) setState({ key, value: readDraft(key) });
   }, [key, state.key]);
+  useEffect(() => {
+    const update = (event: Event) => {
+      if ((event as CustomEvent<string>).detail === key) setState({ key, value: readDraft(key) });
+    };
+    window.addEventListener(EVENT, update);
+    return () => window.removeEventListener(EVENT, update);
+  }, [key]);
   const set = useCallback(
     (next: string | ((cur: string) => string)) => {
       const resolved = typeof next === "function" ? next(readDraft(key)) : next;

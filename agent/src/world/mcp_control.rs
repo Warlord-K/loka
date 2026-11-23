@@ -79,7 +79,8 @@ impl Server {
             }), &["folder", "prompt"]));
         }
         if self.caller.is_main && self.caller.owner_user_id.is_some() {
-            tools.push(tool("owner_prefs", &format!("Read your person's Loka settings, or change them {OWNER_ONLY}: whether an @mention of them in a channel wakes you (mention_wakes_main), their status (emoji and text, or clear_status), and which Slack source feeds passive mentions (desktop, app or both). With no changes it only reads them."), json!({
+            tools.push(tool("owner_prefs", &format!("Read your person's Loka settings, or change them {OWNER_ONLY}: how to begin big work (before_big_work: ask_when_unclear, just_build or always_show_plan), whether an @mention of them in a channel wakes you (mention_wakes_main), their status (emoji and text, or clear_status), and which Slack source feeds passive mentions (desktop, app or both). With no changes it only reads them."), json!({
+                "before_big_work": { "type": "string", "enum": ["ask_when_unclear", "just_build", "always_show_plan"] },
                 "mention_wakes_main": { "type": "boolean" },
                 "status_emoji": s("One emoji, optional"),
                 "status_text": s("Short status, up to 100 characters, optional"),
@@ -124,10 +125,10 @@ impl Server {
             }), &["agent", "key"]));
         }
         if self.caller.is_main && self.caller.owner_user_id.is_some() {
-            tools.push(tool("storage", "See how much space your person's agents take in Loka (chats, run history, run step logs, activity), per agent, with when each was last active and past cleanups, plus the disk their devices spend on quest workspaces and quest temp folders (total, how much of it is temp build output, free space, and how much belongs to closed quests or idle open quests' build folders). Read only. Use it when they ask what is using space or want to tidy up, then suggest a clean_up.", json!({}), &[]));
-            tools.push(tool("clean_up", &format!("Permanently delete old data of your person's agents to free space. Kinds: run_logs (step logs, prompts and raw output of finished runs; cost and run list stay), chats (chat messages older than the cutoff), quests (closed quests with their sessions, runs and logs; lifetime cost stays), activity (old activity feed events and cleared bell items), workspaces (checkouts, build output, private temp folders and scratch files of closed quests on your person's devices, oldest first, plus the node_modules, .next and cargo target folders of idle open quests; branches, commits and pull requests stay, older_than_days and agent do not apply). Without confirm it only previews what would go and how much space it frees: always preview first, tell your person exactly what will be deleted, and that it cannot be undone. Pass confirm true {OWNER_ONLY}, after they agreed to that exact cleanup."), json!({
-                "kind": s("run_logs, chats, quests, activity or workspaces"),
-                "older_than_days": { "type": "integer", "description": "Only data older than this many days, 7 to 3650 (not used for workspaces)" },
+            tools.push(tool("storage", "See how much space your person's agents take in Loka (chats, run history, run step logs, activity), per agent, with when each was last active and past cleanups, plus the disk their devices spend on quest folders and quest temp folders (total, how much of it is temp build output, free space, and how much belongs to closed quests) and, separately, on rebuildable build caches (cargo targets, node_modules, .next and the shared dependency caches). Read only. Use it when they ask what is using space or want to tidy up, then suggest a clean_up.", json!({}), &[]));
+            tools.push(tool("clean_up", &format!("Permanently delete old data of your person's agents to free space. Kinds: run_logs (step logs, prompts and raw output of finished runs; cost and run list stay), chats (chat messages older than the cutoff), quests (closed quests with their sessions, runs and logs; lifetime cost stays), activity (old activity feed events and cleared bell items), quest_folders (the quest folders, meaning checkouts, private temp folders and scratch files of closed quests on your person's devices, oldest first; branches, commits and pull requests stay, older_than_days and agent do not apply), caches (rebuildable build caches on the devices: cargo target, node_modules and .next folders of every quest that is not building right now plus the shared dependency caches; source and unsaved work are never touched, the next build is only slower, older_than_days and agent do not apply). Loka already clears build output and closed quests by itself when a device runs low, so use this only when your person asks to tidy up, never to make room for a waiting run. Without confirm it only previews what would go and how much space it frees: always preview first, tell your person exactly what will be deleted, and that it cannot be undone. Pass confirm true {OWNER_ONLY}, after they agreed to that exact cleanup."), json!({
+                "kind": s("run_logs, chats, quests, activity, quest_folders or caches"),
+                "older_than_days": { "type": "integer", "description": "Only data older than this many days, 7 to 3650 (not used for quest_folders and caches)" },
                 "agent": s("Agent name or slug, optional, defaults to all of your person's agents"),
                 "confirm": { "type": "boolean", "description": "Really delete, default false (preview)" }
             }), &["kind"]));
@@ -295,13 +296,16 @@ impl Server {
                 if runs.is_empty() {
                     return Ok(format!("No matching runs for {}.", agent.name));
                 }
-                Ok(format!("Runs of {}:\n{}", agent.name, runs.iter().map(run_line).collect::<Vec<_>>().join("\n")))
+                let ids: Vec<Uuid> = runs.iter().map(|run| run.id).collect();
+                let waiting = self.store.disk_waiting(loka_shared::world::DiskWaitKey::Run, &ids).await?;
+                Ok(format!("Runs of {}:\n{}", agent.name, runs.iter().map(|run| run_line(run, waiting.contains(&run.id))).collect::<Vec<_>>().join("\n")))
             }
             "run_log" => {
                 let (run, agent) = self.owner_run(need("run")?).await?;
                 self.require_run_control(&agent)?;
                 let steps = args.get("steps").and_then(Value::as_i64).unwrap_or(15).clamp(1, 40);
-                let mut out = vec![format!("{} of {}", run_line(&run), agent.name)];
+                let waiting = self.store.disk_waiting(loka_shared::world::DiskWaitKey::Run, &[run.id]).await?.contains(&run.id);
+                let mut out = vec![format!("{} of {}", run_line(&run, waiting), agent.name)];
                 out.push(format!(
                     "Tokens: {} in ({} cached), {} out. Time limit {} min.{}",
                     run.input_tokens,
@@ -475,11 +479,22 @@ impl Server {
                 Ok(if on { "Academy offers are on.".into() } else { "Academy offers are off; open offers were withdrawn.".into() })
             }
             "owner_prefs" => {
+                if !self.caller.is_main {
+                    bail!("only the main agent can read or change owner preferences");
+                }
                 let owner = self.owner()?;
                 let wakes = args.get("mention_wakes_main").and_then(Value::as_bool);
                 let clear = flag("clear_status");
                 let (emoji, text, source) = (arg("status_emoji"), arg("status_text"), arg("slack_source"));
-                let changing = wakes.is_some() || clear || emoji.is_some() || text.is_some() || source.is_some();
+                let before = match args.get("before_big_work") {
+                    None => None,
+                    Some(Value::String(value)) => Some(
+                        loka_shared::world::BeforeBigWork::parse(value.trim())
+                            .ok_or_else(|| anyhow!("before_big_work must be ask_when_unclear, just_build or always_show_plan"))?,
+                    ),
+                    Some(_) => bail!("before_big_work must be ask_when_unclear, just_build or always_show_plan"),
+                };
+                let changing = wakes.is_some() || clear || emoji.is_some() || text.is_some() || source.is_some() || before.is_some();
                 if changing {
                     self.require_owner_asked().await?;
                     if emoji.is_some_and(|e| e.chars().count() > 16) || text.is_some_and(|t| t.chars().count() > 100) {
@@ -494,20 +509,24 @@ impl Server {
                     if let Some(on) = wakes {
                         self.store.set_mention_wakes_main(owner, on).await?;
                     }
+                    if let Some(value) = before {
+                        self.store.set_before_big_work(owner, value).await?;
+                    }
                     if clear {
                         self.store.set_user_status(owner, None, None).await?;
                     } else if emoji.is_some() || text.is_some() {
                         self.store.set_user_status(owner, emoji, text).await?;
                     }
                 }
-                let (_, _, _, _, status_emoji, status_text) = self.store.me(owner).await?.ok_or_else(|| anyhow!("your person is gone"))?;
+                let (_, _, _, _, status_emoji, status_text, _) = self.store.me(owner).await?.ok_or_else(|| anyhow!("your person is gone"))?;
                 let status = match (status_emoji, status_text) {
                     (None, None) => "none".to_string(),
                     (e, t) => format!("{} {}", e.unwrap_or_default(), t.unwrap_or_default()).trim().to_string(),
                 };
                 Ok(format!(
-                    "{}mention_wakes_main: {}. Status: {status}. Slack source: {}.",
+                    "{}before_big_work: {}. mention_wakes_main: {}. Status: {status}. Slack source: {}.",
                     if changing { "Saved. " } else { "" },
+                    self.store.before_big_work(owner).await?,
                     self.store.mention_wakes_main(owner).await?,
                     self.store.slack_source(owner).await?
                 ))
@@ -714,7 +733,7 @@ impl Server {
                     }
                     for w in &report.workspaces {
                         lines.push(format!(
-                            "- Quest workspaces and temp folders on {}{}: {} in {} folders ({} of it quest temp: build output and test databases), {} of it from closed quests that a cleanup would remove; build output (cargo targets, node_modules, .next) {} in all, {} of it from idle open quests that a cleanup would also clear{}",
+                            "- Quest folders and temp folders on {}{}: {} in {} folders ({} of it quest temp: build output and test databases), {} of it from closed quests that a quest_folders cleanup would remove | rebuildable build caches: {} of build output (cargo targets, node_modules, .next) and {} of shared dependency caches, all of it cleared by a caches cleanup{}",
                             w.name,
                             if w.online { "" } else { " (offline)" },
                             size(w.bytes),
@@ -722,9 +741,9 @@ impl Server {
                             size(w.temp_bytes),
                             size(w.reclaimable_bytes),
                             size(w.build_bytes),
-                            size(w.reclaimable_build_bytes),
+                            size(w.seed_bytes),
                             match (w.free_gb, w.low) {
-                                (Some(free), true) => format!(" | only {free} GB of disk free, closed quest folders are cleared automatically below 5 GB and new quest runs are refused until there is room"),
+                                (Some(free), true) => format!(" | only {free} GB of disk free, closed quest folders are cleared automatically below 5 GB and quest runs wait and start by themselves once there is room"),
                                 (Some(free), false) => format!(" | {free} GB of disk free"),
                                 _ => String::new(),
                             }
@@ -738,10 +757,10 @@ impl Server {
                 }
                 let kind = arg("kind")
                     .and_then(loka_shared::cleanup::CleanupKind::parse)
-                    .ok_or_else(|| anyhow!("kind must be run_logs, chats, quests, activity or workspaces"))?;
+                    .ok_or_else(|| anyhow!("kind must be run_logs, chats, quests, activity, quest_folders or caches"))?;
                 let days = match args.get("older_than_days").and_then(Value::as_i64) {
                     Some(days) => days as i32,
-                    None if kind == loka_shared::cleanup::CleanupKind::Workspaces => 0,
+                    None if matches!(kind, loka_shared::cleanup::CleanupKind::QuestFolders | loka_shared::cleanup::CleanupKind::Caches) => 0,
                     None => bail!("older_than_days is required"),
                 };
                 let agent = match arg("agent") {
@@ -766,15 +785,29 @@ impl Server {
                         apply,
                     )
                     .await?;
-                if result.kind == loka_shared::cleanup::CleanupKind::Workspaces {
+                if result.kind == loka_shared::cleanup::CleanupKind::QuestFolders {
                     return Ok(if result.rows == 0 && result.bytes == 0 {
-                        "Nothing to clean: no closed quest workspaces, temp folders or idle build folders on your person's devices (open quests keep their checkouts, and a quest's folders stay an hour after its last run).".to_string()
+                        "Nothing to clean: no closed quest folders or temp folders on your person's devices (open quests keep their checkouts, and a quest's folders stay an hour after its last run).".to_string()
                     } else if result.applied {
-                        format!("Asked the devices to remove the workspaces and temp folders of {} closed quests, the node_modules, .next and cargo target folders of idle open quests, about {} in all. They do it within a minute; branches, commits and pull requests stay, and builds rerun from scratch. This cannot be undone.", result.rows, size(result.bytes))
+                        format!("Asked the devices to remove the folders and temp folders of {} closed quests, about {}. They do it within a minute; branches, commits and pull requests stay. This cannot be undone.", result.rows, size(result.bytes))
                     } else {
                         format!(
-                            "Preview: workspaces and temp folders of {} closed quests plus the build folders (cargo target, node_modules, .next) of idle open quests, about {}, on your person's devices. Nothing removed yet. Tell your person that open quests keep their checkouts, that the next build will be slower, and that this is permanent for those folders; call again with confirm true only after they agree.",
+                            "Preview: folders and temp folders of {} closed quests, about {}, on your person's devices. Nothing removed yet. Tell your person that open quests keep their checkouts and that this is permanent for those folders; call again with confirm true only after they agree.",
                             result.rows,
+                            size(result.bytes)
+                        )
+                    });
+                }
+                if result.kind == loka_shared::cleanup::CleanupKind::Caches {
+                    return Ok(if result.rows == 0 && result.bytes == 0 {
+                        "Nothing to clean: no rebuildable build caches on your person's devices.".to_string()
+                    } else if result.applied {
+                        format!("Asked {} device{} to clear rebuildable build caches, about {} at most (builds that are running right now keep theirs). They do it within a minute; source, branches and unsaved work are never touched, and the next build is only slower.", result.rows, if result.rows == 1 { "" } else { "s" }, size(result.bytes))
+                    } else {
+                        format!(
+                            "Preview: rebuildable build caches (cargo targets, node_modules, .next and shared dependency caches) on {} device{}, about {} at most. Nothing removed yet. This never touches source, branches or unsaved work and the next build is only slower; call again with confirm true after your person agrees.",
+                            result.rows,
+                            if result.rows == 1 { "" } else { "s" },
                             size(result.bytes)
                         )
                     });
@@ -904,7 +937,7 @@ fn duration_label(run: &SessionRun) -> String {
     if end.is_some() { text } else { format!("{text} so far") }
 }
 
-fn run_line(run: &SessionRun) -> String {
+fn run_line(run: &SessionRun, waiting_for_disk: bool) -> String {
     let cause = match (run.status.as_str(), run.error.as_deref()) {
         ("failed" | "timed_out" | "cancelled", Some(e)) if !e.trim().is_empty() => {
             let described = loka_shared::cli_errors::describe(e);
@@ -913,11 +946,12 @@ fn run_line(run: &SessionRun) -> String {
         }
         _ => String::new(),
     };
+    let status = if waiting_for_disk { format!("{}, {}", run.status, loka_shared::world::WAITING_FOR_DISK_NOTE) } else { run.status.clone() };
     format!(
         "- {} {} [{}] {} {} ${:.2}{}{}",
         &run.id.to_string()[..8],
         run.kind,
-        run.status,
+        status,
         run.created_at.format("%b %d %H:%M"),
         duration_label(run),
         run.cost_usd,
@@ -978,15 +1012,16 @@ mod tests {
             created_at: now,
             started_at: Some(now - Duration::seconds(125)),
             finished_at: Some(now),
+            request: None,
         }
     }
 
     #[test]
     fn run_lines_show_cost_duration_and_failure_cause() {
-        let ok = run_line(&run("completed", None));
+        let ok = run_line(&run("completed", None), false);
         assert!(ok.contains("[completed]") && ok.contains("2m05s") && ok.contains("$1.23"), "{ok}");
         assert!(!ok.contains("::"));
-        let failed = run_line(&run("failed", Some("You've hit your usage limit")));
+        let failed = run_line(&run("failed", Some("You've hit your usage limit")), false);
         assert!(failed.contains(":: "), "{failed}");
         assert!(!failed.contains(loka_shared::cli_errors::FRIENDLY_MARK.trim()), "{failed}");
     }

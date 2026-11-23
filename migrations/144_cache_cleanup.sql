@@ -1,0 +1,1 @@
+ALTER TABLE world_runners ADD COLUMN IF NOT EXISTS clean_caches_at TIMESTAMPTZ;

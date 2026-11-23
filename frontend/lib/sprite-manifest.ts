@@ -37,6 +37,7 @@ export interface AccessoryView {
   size: Point;
   pivot: Point;
   behind: boolean;
+  mirror: boolean;
 }
 
 export type AccessoryCut = Partial<Record<View, AccessoryView>>;
@@ -45,6 +46,7 @@ export interface AccessorySpec {
   slot: string;
   basis: "head" | "body";
   atlas: string | null;
+  sideFaces: "left" | "right" | null;
   sizes: Record<number, AccessoryCut>;
   swaps: Record<string, Swap>;
 }
@@ -80,6 +82,7 @@ export const VIEW_W = 320;
 export const VIEW_H = 192;
 export const MIN_CSS = 2;
 export const MAX_DPR = 2;
+export const ART_GROWTH = 1.25;
 
 type Raw = Record<string, unknown>;
 
@@ -224,7 +227,7 @@ function accessoryCut(value: unknown, path: string): AccessoryCut {
     const v = record(raw[view], `${path}.${view}`);
     const [x, y, w, h] = rect(v.rect, `${path}.${view}.rect`);
     if (v.layer !== undefined && v.layer !== "over" && v.layer !== "under") fail(`${path}.${view}.layer`, `"over" or "under"`);
-    out[view] = { at: [x, y], size: [w, h], pivot: offset(v.pivot, `${path}.${view}.pivot`), behind: v.layer === "under" };
+    out[view] = { at: [x, y], size: [w, h], pivot: offset(v.pivot, `${path}.${view}.pivot`), behind: v.layer === "under", mirror: false };
   }
   if (!out.front) fail(`${path}.front`, "a front view");
   return out;
@@ -250,19 +253,24 @@ function accessory(value: unknown, path: string): AccessorySpec {
     const cut: AccessoryCut = {};
     for (const view of VIEWS) {
       if (raw[view] === undefined) continue;
-      cut[view] = { at: point(raw[view], `${path}.views.${view}`), size, pivot, behind: behind.includes(view) };
+      cut[view] = { at: point(raw[view], `${path}.views.${view}`), size, pivot, behind: behind.includes(view), mirror: false };
     }
     if (!cut.front) fail(`${path}.views.front`, "two whole numbers");
     sizes[0] = cut;
   }
-  return { slot: a.slot.trim(), basis, atlas: sheet(a.atlas, `${path}.atlas`), sizes, swaps: swaps(a.swaps, `${path}.swaps`) };
+  const faces = a.sideFaces ?? null;
+  if (faces !== null && faces !== "left" && faces !== "right") fail(`${path}.sideFaces`, `"left" or "right"`);
+  return { slot: a.slot.trim(), basis, atlas: sheet(a.atlas, `${path}.atlas`), sideFaces: faces, sizes, swaps: swaps(a.swaps, `${path}.swaps`) };
 }
 
 export function accessoryView(spec: AccessorySpec, body: BodySpec, view: View): AccessoryView | null {
   const wanted = body.classes ? (spec.basis === "body" ? body.classes.body : body.classes.head) : 0;
   const keys = Object.keys(spec.sizes).map(Number).sort((a, b) => Math.abs(a - wanted) - Math.abs(b - wanted) || b - a);
   const cut = spec.sizes[keys[0]];
-  return cut?.[view] ?? (view === "back" ? null : cut?.front ?? null);
+  const own = cut?.[view];
+  if (!own) return null;
+  if (view !== "side" || !spec.sideFaces || spec.sideFaces === body.sideFaces) return own;
+  return { ...own, pivot: [mirrored(own.pivot[0], own.size[0]), own.pivot[1]], mirror: true };
 }
 
 function thing(value: unknown, path: string): ThingSpec {
@@ -322,10 +330,15 @@ export function parseManifest(raw: unknown): SpriteManifest {
   };
 }
 
-export function snapScale(cssWidth: number, cssHeight: number, dpr: number): number {
+export function classicScale(cssWidth: number, cssHeight: number, dpr: number): number {
   const css = Math.max(MIN_CSS, Math.floor(Math.min(cssWidth / VIEW_W, cssHeight / VIEW_H)));
-  const device = Math.round(css * Math.min(Math.max(dpr || 1, 1), MAX_DPR));
-  return Math.max(SNAP, Math.round(device / SNAP) * SNAP);
+  return Math.max(1, Math.round(css * Math.min(Math.max(dpr || 1, 1), MAX_DPR)));
+}
+
+export function snapScale(cssWidth: number, cssHeight: number, dpr: number): number {
+  const step = Math.min(Math.max(dpr || 1, 1), MAX_DPR) >= MAX_DPR ? SNAP / 2 : SNAP;
+  const wanted = classicScale(cssWidth, cssHeight, dpr) / ART_GROWTH;
+  return Math.max(SNAP, Math.round(wanted / step) * step);
 }
 
 export function withArtOnly(manifest: SpriteManifest, look: LokaLook, canonical: (species: string) => string, innate: (body: string) => string[] = () => []): LokaLook {
@@ -368,6 +381,11 @@ export function walkFrame(cycle: number, count: number): number {
   return ((Math.floor(cycle * count) % count) + count) % count;
 }
 
-export function placed(anchor: Point, density: number, x: number, y: number): Point {
-  return [Math.round(x * density - anchor[0]) / density, Math.round(y * density - anchor[1]) / density];
+export function spriteGrid(density: number, scale: number): number {
+  return scale % density === 0 ? density : scale;
+}
+
+export function placed(anchor: Point, density: number, x: number, y: number, scale = density): Point {
+  const grid = spriteGrid(density, scale);
+  return [Math.round((x - anchor[0] / density) * grid) / grid, Math.round((y - anchor[1] / density) * grid) / grid];
 }

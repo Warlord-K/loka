@@ -3,6 +3,8 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { Alarm, ArrowLeft, ArrowsOutLineHorizontal, CaretDown, Check, CheckSquare, CheckSquareOffset, Copy, DotsSixVertical, LinkSimple, Notepad, PaintBucket, Plus, Robot, Square, Trash } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
+import { guardedDetailLoader, type NavigationRequest } from "@/lib/exact-world-navigation";
+import { navigationDetails } from "@/lib/navigation-details";
 import { useNow } from "@/lib/clock";
 import { checklistMarkdown, useCopy } from "@/lib/copy";
 import { matchesQuery, worldApi, type WorldAgent, type WorldItem } from "@/lib/world";
@@ -306,7 +308,7 @@ function StickyNote({
   );
 }
 
-function NewListForm({ onCancel, onCreated }: { onCancel: () => void; onCreated: (item: WorldItem) => void }) {
+function NewListForm({ onCancel, onCreated, onBeginNavigation, onChanged }: { onCancel: () => void; onCreated: (item: WorldItem, request?: NavigationRequest) => void; onBeginNavigation?: () => NavigationRequest; onChanged: () => void }) {
   const [title, setTitle] = useState("");
   const [items, setItems] = useState("");
   const [busy, setBusy] = useState(false);
@@ -321,15 +323,23 @@ function NewListForm({ onCancel, onCreated }: { onCancel: () => void; onCreated:
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (!title.trim() || busy) return;
+    const request = onBeginNavigation?.();
     setBusy(true);
     setError(null);
     try {
       const item = await worldApi.createList(title, items.split("\n"));
-      if (live.current) onCreated(item);
+      onChanged();
+      if (!live.current) return;
+      if (request && !request.current()) {
+        setBusy(false);
+        return;
+      }
+      onCreated(item, request);
     } catch {
       if (!live.current) return;
-      setError("Could not make the list.");
       setBusy(false);
+      if (request && !request.current()) return;
+      setError("Could not make the list.");
     }
   };
   return (
@@ -350,50 +360,81 @@ function NewListForm({ onCancel, onCreated }: { onCancel: () => void; onCreated:
 }
 
 export function ListsPanel({
+  active = true,
   items: allItems,
   agents,
   meId,
   canWrite,
   sideToggle,
   focusId,
+  initialFocus,
   onFocusChange,
+  todoFocus,
+  onNavigateList,
+  onNavigateTodo,
+  onBeginNavigation,
   onClose,
   onChanged,
 }: {
+  active?: boolean;
   items: WorldItem[];
   agents: WorldAgent[];
   meId: string | null;
   canWrite: boolean;
   sideToggle?: ReactNode;
   focusId?: string | null;
+  initialFocus?: WorldItem;
   onFocusChange?: (id: string | null) => void;
+  todoFocus?: { todo: import("@/lib/world").Todo; nonce: number } | null;
+  onNavigateList?: (item: WorldItem | null, request?: NavigationRequest) => void;
+  onNavigateTodo?: (todo: import("@/lib/world").Todo) => void;
+  onBeginNavigation?: () => NavigationRequest;
   onClose: () => void;
   onChanged: () => void;
 }) {
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && !escapeTaken(e) && onClose();
+    const onKey = (e: KeyboardEvent) => active && e.key === "Escape" && !escapeTaken(e) && onClose();
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [active, onClose]);
   const [filter, setFilter] = useState("");
   const [creating, setCreating] = useState(false);
-  const [focused, setFocused] = useState<WorldItem | null | undefined>(undefined);
+  const [focused, setFocused] = useState<WorldItem | null | undefined>(initialFocus);
   const focusIdRef = useRef(focusId);
   focusIdRef.current = focusId;
+  const detailLoader = useRef(guardedDetailLoader()).current;
   const [linkCopied, copyLink] = useCopy();
+  const appliedFocus = useRef<{ item: WorldItem; items: WorldItem[] } | undefined>(undefined);
   useEffect(() => {
     if (!focusId) {
+      detailLoader.invalidate();
       setFocused(undefined);
       return;
     }
     const local = allItems.find((item) => item.id === focusId);
-    setFocused(local);
-    let live = true;
-    void worldApi.item(focusId).then((item) => live && setFocused(item)).catch(() => live && setFocused(null));
+    if (initialFocus?.id === focusId) {
+      const applied = appliedFocus.current;
+      if (applied?.item !== initialFocus || applied.items === allItems) {
+        appliedFocus.current = { item: initialFocus, items: allItems };
+        setFocused(local && ownsItem(local, meId) ? local : initialFocus);
+        return;
+      }
+      if (local && ownsItem(local, meId)) {
+        setFocused(local);
+        return;
+      }
+    }
+    setFocused(local && ownsItem(local, meId) ? local : undefined);
+    const intent = detailLoader.begin(() => focusIdRef.current === focusId);
+    void navigationDetails.item(intent, focusId).then((item) => {
+      if (item && intent.current()) setFocused(item);
+    }).catch(() => {
+      if (intent.current()) setFocused(null);
+    });
     return () => {
-      live = false;
+      if (intent.current()) detailLoader.invalidate();
     };
-  }, [focusId, allItems]);
+  }, [focusId, allItems, initialFocus, meId, detailLoader]);
   const everyone = useEveryone();
   const mineOnly = allItems.filter((i) => ownsItem(i, meId));
   const items = everyone ? allItems : mineOnly;
@@ -411,14 +452,13 @@ export function ListsPanel({
   const reminders = groupTimers(timers.filter(isAgentTimer));
   const [timersOpen, setTimersOpen] = useState(true);
   const [view, setView] = useState<"todos" | "lists">("todos");
+  const todoNonce = useRef(0);
   useEffect(() => {
-    const showTodos = () => {
-      setView("todos");
-      setCreating(false);
-    };
-    window.addEventListener("world:todo-focus", showTodos);
-    return () => window.removeEventListener("world:todo-focus", showTodos);
-  }, []);
+    if (!todoFocus || todoFocus.nonce === todoNonce.current) return;
+    todoNonce.current = todoFocus.nonce;
+    setView("todos");
+    setCreating(false);
+  }, [todoFocus]);
   const shown = creating || focusId ? "lists" : view;
 
   const toggle = async (list: WorldItem, index: number) => {
@@ -484,7 +524,7 @@ export function ListsPanel({
         actions={
           <>
             {focusId && (
-              <button type="button" onClick={() => { setView("lists"); onFocusChange?.(null); }} className={BTN_SECONDARY}>
+              <button type="button" onClick={() => { setView("lists"); (onNavigateList ?? onFocusChange)?.(null); }} className={BTN_SECONDARY}>
                 <ArrowLeft size={14} weight="bold" />
                 All lists
               </button>
@@ -499,6 +539,7 @@ export function ListsPanel({
               <button
                 type="button"
                 onClick={() => {
+                  onBeginNavigation?.();
                   setCreating(true);
                   setView("lists");
                 }}
@@ -531,6 +572,7 @@ export function ListsPanel({
               onClick={() => {
                 setCreating(false);
                 setView(id);
+                onNavigateList?.(null);
               }}
               className={cn(
                 TAB,
@@ -551,12 +593,15 @@ export function ListsPanel({
         </div>}
         {creating && !focusId ? (
           <NewListForm
-            onCancel={() => setCreating(false)}
-            onCreated={(item) => {
+            onCancel={() => { onBeginNavigation?.(); setCreating(false); }}
+            onBeginNavigation={onBeginNavigation}
+            onChanged={onChanged}
+            onCreated={(item, request) => {
+              if (request && !request.current()) return;
               setCreating(false);
               setFocused(item);
-              onChanged();
-              onFocusChange?.(item.id);
+              if (onNavigateList) onNavigateList(item, request);
+              else onFocusChange?.(item.id);
             }}
           />
         ) : focusId ? (
@@ -597,7 +642,7 @@ export function ListsPanel({
           )
         ) : shown === "todos" ? (
           <div className="flex min-h-[24rem] min-w-0 flex-1 flex-col @4xl:min-h-0">
-            <TodoBoard agents={agents} filter={filter} />
+            <TodoBoard active={active} agents={agents} filter={filter} focus={todoFocus} onNavigate={onNavigateTodo} />
           </div>
         ) : (
           <div className="min-h-0 flex-1 @4xl:overflow-y-auto">

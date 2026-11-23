@@ -419,11 +419,16 @@ pub fn open_for_owner(settings: &mut Value) {
     }
 }
 
-pub(crate) fn allow_write(settings: &mut Value, dir: &Path) {
+pub(crate) fn allow_private_dir(settings: &mut Value, dir: &Path) {
+    let paths: Vec<Value> = crate::cli::private_temp_grants(dir).into_iter().map(|path| Value::String(path.display().to_string())).collect();
     if let Some(write) = settings["sandbox"]["filesystem"]["allowWrite"].as_array_mut() {
-        write.push(Value::String(dir.display().to_string()));
-        if let Some(real) = std::fs::canonicalize(dir).ok().filter(|real| real != dir) {
-            write.push(Value::String(real.display().to_string()));
+        write.extend(paths.iter().cloned());
+    }
+    let network = &mut settings["sandbox"]["network"];
+    if network.is_object() {
+        match network["allowUnixSockets"].as_array_mut() {
+            Some(sockets) => sockets.extend(paths),
+            None => network["allowUnixSockets"] = Value::Array(paths),
         }
     }
 }

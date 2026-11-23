@@ -390,6 +390,7 @@ impl MilestoneStore {
             .bind(session_id)
             .execute(&mut *tx)
             .await?;
+        crate::world::reopen_quest(&mut tx, Some(task_id)).await?;
         let run_id = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, prompt, timeout_secs, activity)
              VALUES ($1, $2, $3, 'followup', 'queued', $4, 3600, $5)

@@ -251,12 +251,14 @@ function isTyping(el: EventTarget | null): boolean {
 type PickerState = { kind: "status" | "assignee"; ids: string[]; anchor: DOMRect } | null;
 
 export function useQuestControls({
+  active = true,
   tasks,
   setTasks,
   agents,
   viewer,
   order,
 }: {
+  active?: boolean;
   tasks: TaskBrief[];
   setTasks: (update: (prev: TaskBrief[]) => TaskBrief[]) => void;
   agents: WorldAgent[];
@@ -320,6 +322,7 @@ export function useQuestControls({
 
   const open = useCallback(
     (kind: "status" | "assignee", id: string | null, el?: Element | null) => {
+      if (!active) return;
       const ids = targetsFor(id).filter((x) => {
         const t = tasksRef.current.find((q) => q.id === x);
         return t && editable(t);
@@ -330,7 +333,7 @@ export function useQuestControls({
       const anchor = node?.getBoundingClientRect() ?? new DOMRect(window.innerWidth / 2 - 128, window.innerHeight / 3, 0, 0);
       setPicker({ kind, ids, anchor });
     },
-    [targetsFor, editable],
+    [active, targetsFor, editable],
   );
 
   const toggle = useCallback(
@@ -353,6 +356,7 @@ export function useQuestControls({
   const clear = useCallback(() => setSelected(new Set()), []);
 
   useEffect(() => {
+    if (!active) return;
     const onKey = (e: KeyboardEvent) => {
       if (picker || isTyping(e.target) || e.metaKey || e.ctrlKey || e.altKey) return;
       const k = e.key.toLowerCase();
@@ -382,14 +386,15 @@ export function useQuestControls({
       window.removeEventListener("keydown", onKey, true);
       window.removeEventListener("world:quest-command", onCommand);
     };
-  }, [picker, selected, open, toggle, clear]);
+  }, [active, picker, selected, open, toggle, clear]);
 
   useEffect(() => {
+    if (!active) return;
     window.dispatchEvent(new CustomEvent("world:quest-controls", { detail: true }));
     return () => {
       window.dispatchEvent(new CustomEvent("world:quest-controls", { detail: false }));
     };
-  }, []);
+  }, [active]);
 
   const pickerTasks = picker ? tasks.filter((t) => picker.ids.includes(t.id)) : [];
   const single = pickerTasks.length === 1 ? pickerTasks[0] : null;
@@ -442,7 +447,7 @@ export function useQuestControls({
 
   const overlay = (
     <>
-      {picker && (
+      {active && picker && (
         <Picker
           key={`${picker.kind}:${picker.ids.join(",")}`}
           title={picker.kind === "status" ? (picker.ids.length > 1 ? `Status for ${picker.ids.length} quests` : "Change status") : picker.ids.length > 1 ? `Assign ${picker.ids.length} quests` : "Assign to"}
@@ -457,7 +462,7 @@ export function useQuestControls({
           onClose={() => setPicker(null)}
         />
       )}
-      {notice && (
+      {active && notice && (
         <div role="status" className="pointer-events-none fixed inset-x-0 bottom-24 z-[94] flex justify-center px-3">
           <p className="pointer-events-auto rounded-lg border-2 border-w-ink bg-w-lemon px-3 py-1.5 text-w-sm shadow-[0_3px_0_rgb(var(--w-ink))]">{notice}</p>
         </div>

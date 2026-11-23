@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { ArrowSquareOut, Books, Buildings, CheckSquare, FileText, FlowArrow, Hash, ListChecks, MapTrifold, Square, Student, Timer, UserCircle, UsersThree } from "@phosphor-icons/react";
 import { latestOnly } from "@/lib/latest";
 import { cn, safeDecode } from "@/lib/utils";
@@ -9,7 +9,7 @@ import { AgentFace } from "./channel-ui";
 import { MessageLink, messageRefFromHref, openWorldLink, worldRefFromHref } from "./message-links";
 import { SetupCard } from "./setup-hint";
 import { SlackMark } from "./panels";
-import { StatusIcon, statusLabel } from "./quest-ui";
+import { StatusIcon } from "./quest-ui";
 import { countdown, focusTodo, isTimerTodo } from "./todos-ui";
 import { canvasItemKind, canvasItemLabel, openReport, REPORTS_STALE, reportsApi, type CanvasItem, type ReportBrief } from "@/lib/reports";
 import { ATTEMPT_ID, ATTEMPT_ID_SOURCE, checkOf, openPractice, practiceApi, subjectLabel, type AttemptCard } from "@/lib/practice";
@@ -17,6 +17,10 @@ import { teamsApi, type Team } from "@/lib/teams";
 import type { WorldItem } from "@/lib/world";
 import { openAcademy, type AdventureCard, type ChallengeDetail, type RegionDetail } from "@/lib/loka";
 import { lokaApi } from "./loka-client";
+import { EMBED_DRAG, embedDragData } from "@/lib/canvas-embeds";
+import { QUEST_STAGE_LABEL, questStage } from "@/lib/quest-status";
+import { useLiveQuests } from "./live-quests";
+import { Shimmer } from "./shimmer";
 
 const REF_SOURCE = "ch\\d{1,18}|[0-9a-fA-F][0-9a-fA-F-]{5,35}";
 const ID_SOURCE = "[0-9a-fA-F][0-9a-fA-F-]{5,35}";
@@ -141,7 +145,6 @@ function cached<T>(load: () => Promise<T>, ttl: number, stale?: string): Cached<
 }
 
 const todosOnce = cached<Todo[]>(() => worldApi.todos(), 15_000, "world:todos-stale");
-const questsOnce = cached<TaskBrief[]>(() => worldApi.tasks(), 15_000);
 const channelsOnce = cached<ChannelSummary[]>(() => worldApi.channels(), 60_000);
 const agentsOnce = cached<WorldAgent[]>(() => worldApi.agents(), 60_000);
 const slackCache = new Map<string, Promise<SlackDetail | null>>();
@@ -197,6 +200,7 @@ function Shell({
   onClick,
   href,
   muted,
+  drag,
 }: {
   card: boolean;
   icon: ReactNode;
@@ -206,6 +210,7 @@ function Shell({
   onClick?: () => void;
   href?: string;
   muted?: boolean;
+  drag?: string;
 }) {
   const inner = card ? (
     <>
@@ -233,6 +238,15 @@ function Shell({
     <button
       type="button"
       className={cls}
+      draggable={!!drag}
+      onDragStart={
+        drag
+          ? (e) => {
+              e.dataTransfer.effectAllowed = "copy";
+              e.dataTransfer.setData(EMBED_DRAG, drag);
+            }
+          : undefined
+      }
       onClick={(e) => {
         e.stopPropagation();
         onClick?.();
@@ -249,8 +263,31 @@ function Missing({ label }: { label: string }) {
 
 function TodoEmbed({ refId, label, card }: { refId: string; label?: string; card: boolean }) {
   const todos = useLoaded(todosOnce, "todos");
-  if (!todos) return <Shell card={card} icon={<Square size={12} weight="bold" />} label={label || "to-do"} />;
-  const todo = todos.find((t) => matchesId(t.id, refId));
+  const listed = todos?.find((todo) => matchesId(todo.id, refId));
+  const [exact, setExact] = useState<{ id: string; todo: Todo | null } | null>(null);
+  const exactRequests = useRef(latestOnly()).current;
+  useEffect(() => {
+    if (!todos || listed || !EXACT_ID.test(refId)) {
+      exactRequests.begin();
+      return;
+    }
+    let live = true;
+    const load = () => {
+      const current = exactRequests.begin();
+      void worldApi.todo(refId)
+        .then((todo) => live && current() && setExact({ id: refId, todo }))
+        .catch(() => live && current() && setExact({ id: refId, todo: null }));
+    };
+    load();
+    window.addEventListener("world:todos-stale", load);
+    return () => {
+      live = false;
+      window.removeEventListener("world:todos-stale", load);
+    };
+  }, [exactRequests, listed, refId, todos]);
+  const pendingExact = Boolean(todos && !listed && EXACT_ID.test(refId) && exact?.id !== refId);
+  if (!todos || pendingExact) return <Shell card={card} icon={<Square size={12} weight="bold" />} label={label || "to-do"} />;
+  const todo = listed ?? (exact?.id === refId ? exact.todo : null);
   if (!todo) return <Missing label={label || "a to-do you cannot open"} />;
   const timer = isTimerTodo(todo);
   const closed = todo.status !== "open";
@@ -271,8 +308,22 @@ function TodoEmbed({ refId, label, card }: { refId: string; label?: string; card
   );
 }
 
+function QuestBadge({ quest }: { quest: TaskBrief }) {
+  const stage = questStage(quest);
+  const text = QUEST_STAGE_LABEL[stage];
+  return (
+    <span className="flex min-w-0 items-center gap-1">
+      <span>Quest ·</span>
+      <span className={cn("shrink-0", stage === "needs_you" ? "text-w-alert" : stage === "stuck" ? "text-w-danger" : undefined)}>
+        {stage === "working" ? <Shimmer>{text}</Shimmer> : text}
+      </span>
+      {quest.repo && <span className="min-w-0 truncate">· {quest.repo}</span>}
+    </span>
+  );
+}
+
 function QuestEmbed({ refId, label, card }: { refId: string; label?: string; card: boolean }) {
-  const quests = useLoaded(questsOnce, "quests");
+  const quests = useLiveQuests();
   if (!quests) return <Shell card={card} icon={<StatusIcon status="todo" size={12} />} label={label || "quest"} />;
   const quest = quests.find((q) => matchesId(q.id, refId));
   if (!quest) return <Missing label={label || "a quest you cannot open"} />;
@@ -281,8 +332,9 @@ function QuestEmbed({ refId, label, card }: { refId: string; label?: string; car
       card={card}
       icon={<StatusIcon status={quest.status} size={12} />}
       label={label || quest.title}
-      byline={["Quest", statusLabel(quest.status), quest.repo].filter(Boolean).join(" · ")}
+      byline={<QuestBadge quest={quest} />}
       body={quest.title}
+      drag={embedDragData({ kind: "quest", target: quest.id }, quest.title)}
       onClick={() =>
         window.dispatchEvent(new CustomEvent("world:open-quest", { detail: { taskId: quest.id, agentId: quest.assigned_agent_id } }))
       }

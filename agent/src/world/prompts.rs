@@ -4,7 +4,7 @@ use loka_shared::outside::{defused, one_line};
 use loka_shared::powers;
 use loka_shared::quests::QuestChoice;
 use loka_shared::teams::TeamContext;
-use loka_shared::world::{InboxItem, ReviewerChoice, WorldAgent, WorldRule};
+use loka_shared::world::{BeforeBigWork, InboxItem, ReviewerChoice, WorldAgent, WorldRule};
 use serde::Deserialize;
 use serde_json::Value;
 use std::borrow::Cow;
@@ -87,6 +87,58 @@ pub fn turn(items: &[InboxItem], tasks: &[AgentTask]) -> String {
         }
     }
     out.join("\n\n")
+}
+
+pub fn clarification_origin(items: &[InboxItem], tasks: &[AgentTask], source: Option<&str>) -> Option<Value> {
+    let mut requests = Vec::new();
+    for item in items {
+        if item.kind == "message" && item.payload.get("from_owner").and_then(Value::as_bool) == Some(true) {
+            let Some(body) = item.payload.get("body").and_then(Value::as_str).map(str::trim).filter(|body| !body.is_empty()) else {
+                continue;
+            };
+            let reference = match item.payload.get("message_id") {
+                Some(Value::Number(id)) => Some(format!("msg:ch{id}")),
+                Some(Value::String(id)) if !id.is_empty() => Some(format!("msg:{}", link_ref(id))),
+                _ => None,
+            };
+            requests.push((
+                reference,
+                serde_json::json!({
+                    "request": truncate_chars(body, 2000),
+                    "message_id": item.payload.get("message_id"),
+                    "task_id": item.payload.get("task_id"),
+                }),
+            ));
+        }
+        if item.kind == "task.assigned" {
+            let Some(task_id) = item.payload.get("task_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(task) = tasks.iter().find(|task| task.id.to_string() == task_id) else {
+                continue;
+            };
+            let description = task
+                .description
+                .as_deref()
+                .or_else(|| item.payload.get("brief").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|description| !description.is_empty());
+            let request = description.map(|description| format!("{}\n\n{description}", task.title)).unwrap_or_else(|| task.title.clone());
+            requests.push((
+                Some(format!("quest:{}", task.id)),
+                serde_json::json!({
+                    "request": truncate_chars(&request, 2000),
+                    "task_id": task.id,
+                    "title": task.title,
+                }),
+            ));
+        }
+    }
+    match source.map(str::trim).filter(|source| !source.is_empty()) {
+        Some(source) => requests.into_iter().find_map(|(reference, request)| (reference.as_deref() == Some(source)).then_some(request)),
+        None if requests.len() == 1 => requests.pop().map(|(_, request)| request),
+        None => None,
+    }
 }
 
 fn is_slack(item: &InboxItem) -> bool {
@@ -321,13 +373,16 @@ fn failure_hint(failure: &str, task_id: &str) -> &'static str {
     let quest = !task_id.is_empty();
     match failure {
         "usage_limit" | "rate_limited" | "overloaded" | "network" if quest => {
-            "\nThis was a temporary provider problem, not a fault in the work. If you are reading this, your own CLI is answering again, so pick the quest back up with start_task on the same task_id (it resumes the same session and workspace). Mention it to your person only if it fails again."
+            "\nThis was a temporary provider problem, not a fault in the work. If you are reading this, your own CLI is answering again, so pick the quest back up with start_task on the same task_id (it resumes the same session and quest folder). Mention it to your person only if it fails again."
         }
         "auth" | "missing_scope" | "billing" => {
             "\nThis needs your person: the CLI's sign-in, key or billing must be fixed on their side. Tell them briefly what to fix; do not retry until they say it is done."
         }
+        "disk_full" if quest => {
+            "\nThe device ran out of disk space while this ran. Loka frees space on that device by itself (build output of quests that are not running, closed quest folders) and holds new runs until there is room, then starts them on its own. Resume the quest once now with start_task on the same task_id: its run waits for room and starts by itself, so do not wait for your person. If it fails for disk space again after that resume, do not resume it again: tell your person in one line that this quest needs more room than the device can free. Never ask them to delete Loka's own folders or clear caches by hand. Only if setup_status still shows disk space as needing setup, put setup:disk alone on its own line; that card and the bell tell them what, if anything, is left for them to do."
+        }
         "disk_full" => {
-            "\nThe device ran out of disk space. Tell your person briefly that the device needs free space (closed quest workspaces can be cleared under Settings > Storage); do not retry until they say there is room."
+            "\nThe device ran out of disk space while this ran. Loka frees space on that device by itself and starts new runs once there is room, so never ask your person to delete Loka's own folders or clear caches by hand. Only if setup_status still shows disk space as needing setup, put setup:disk alone on its own line; that card and the bell tell them what, if anything, is left for them to do."
         }
         "context_too_long" if quest => {
             "\nThe quest session ran out of context. Start the quest again with a short brief that lists what is already done instead of resuming it."
@@ -366,8 +421,9 @@ fn cause_note(p: &Value) -> String {
             "\nThis was a problem outside the work and the Loka already retried it once. Do not hand it to another agent. Tell your person what is broken, then resume it with start_task on task_id {task_id}; the session and worktree are kept."
         ),
         "no_report" => format!(
-            "\nIt did real work but never wrote the report block, so the Loka saved its last message as the report (report: synthesized). Resume the same quest with start_task on task_id {task_id} and a one-line brief such as \"finish up and end with the report block\". Do not hand it to another agent."
+            "\nIt did real work but never wrote the report block, so the Loka saved its last message as the report (report: synthesized) and published its work as a pull request when it changed anything, so nothing is lost. Tell your person in one line, and resume the same quest with start_task on task_id {task_id} and a one-line brief such as \"finish up and end with the report block\" only if the work is not finished. Do not hand it to another agent."
         ),
+        "no_verdict" => "\nThe review never gave a verdict, even after Loka asked it once to finish. The work itself is kept. Tell your person in one line that this review did not finish, and ask for another review only if they want one.".to_string(),
         "timed_out" => format!(
             "\nIt ran out of time; the work so far is kept. Resume it with start_task on task_id {task_id}, and raise its time limit if it needs longer."
         ),
@@ -470,18 +526,26 @@ fn render_event(item: &InboxItem, tasks: &[AgentTask]) -> String {
             p.get("asked_by").and_then(|a| a.get("question")).and_then(Value::as_str).unwrap_or(""),
             s("answer")
         ),
+        "task.assigned" if p.get("resume").and_then(Value::as_bool) == Some(true) => format!(
+            "[event] task.resume: your person asked to resume this quest and its earlier session cannot continue, so a fresh session on the same branch and worktree has to take it over.\nsource: quest:{}\ntask_id: {}\ntitle: {}\nResume it now with a start_task action on this task_id in this reply: Loka hands the last report to the new session. Do not do the work in chat.{}",
+            s("task_id"),
+            s("task_id"),
+            s("title"),
+            p.get("brief").and_then(Value::as_str).filter(|b| !b.trim().is_empty()).map(|b| format!("\nTheir note for the session: {b}")).unwrap_or_default()
+        ),
         "task.assigned" => {
             let task_id = s("task_id");
             let team = team_note(p);
             match tasks.iter().find(|t| t.id.to_string() == task_id) {
                 Some(t) => format!(
-                    "[event] task.assigned\ntask_id: {}\ntitle: {}\nrepo: {}\ndescription:\n{}{team}",
+                    "[event] task.assigned\nsource: quest:{}\ntask_id: {}\ntitle: {}\nrepo: {}\ndescription:\n{}{team}",
+                    t.id,
                     t.id,
                     t.title,
                     t.repo.as_deref().unwrap_or("(none)"),
                     t.description.as_deref().unwrap_or("(none)")
                 ),
-                None => format!("[event] task.assigned\ntask_id: {task_id}\n(task details unavailable){team}"),
+                None => format!("[event] task.assigned\nsource: quest:{task_id}\ntask_id: {task_id}\n(task details unavailable){team}"),
             }
         }
         "task.ci_stuck" => format!(
@@ -576,7 +640,7 @@ fn render_event(item: &InboxItem, tasks: &[AgentTask]) -> String {
             item.kind,
             or(&s("task_id"), "(none)"),
             s("error"),
-            if p.get("cause").is_some_and(|c| c.is_string()) && !matches!(s("failure").as_str(), "auth" | "missing_scope" | "billing" | "context_too_long") {
+            if p.get("cause").is_some_and(|c| c.is_string()) && !matches!(s("failure").as_str(), "auth" | "missing_scope" | "billing" | "context_too_long" | "disk_full") {
                 ""
             } else {
                 failure_hint(&s("failure"), &s("task_id"))
@@ -704,7 +768,11 @@ fn render_event(item: &InboxItem, tasks: &[AgentTask]) -> String {
             p.get("review").and_then(|r| r.get("summary")).and_then(Value::as_str).unwrap_or("(none)")
         ),
         "review.finished" => format!(
-            "[event] review.finished: the review you asked for is done{}.\ntask_id: {}\nverdict:\n{}",
+            "[event] review.finished: the review you asked for {}{}.\ntask_id: {}\nverdict:\n{}",
+            match p.pointer("/review/cause").and_then(Value::as_str) {
+                Some(_) => "ended without a verdict, even after Loka asked it once to finish, so ask for another review if you still want one",
+                None => "is done",
+            },
             p.get("reviewer").and_then(Value::as_str).map(|r| format!(" (reviewer: {r})")).unwrap_or_default(),
             or(&s("task_id"), "(none)"),
             pretty(p.get("review"))
@@ -758,11 +826,11 @@ pub fn quick_task(task: &AgentTask, working_dir: &str) -> String {
     task_from(QUICK_TASK, task, working_dir, None)
 }
 
-const NO_REPO_LINE: &str = "No repository is set on this quest, so this workspace is an empty folder, not a git checkout: nothing in it is committed, pushed or opened as a pull request for you. If the work changes a GitHub repository, clone it into this folder (`git clone https://github.com/owner/name`), work on a new branch there, push it with `git push --no-track origin HEAD`, open the pull request with `gh pr create` and put its link in the report's \"pr_url\", and list \"set the repo on the quest\" in followups. If the work is not code, carry on in this folder.";
+const NO_REPO_LINE: &str = "No repository is set on this quest, so this quest folder is an empty folder, not a git checkout: nothing in it is committed, pushed or opened as a pull request for you. If the work changes a GitHub repository, clone it into this folder (`git clone https://github.com/owner/name`), work on a new branch there, push it with `git push --no-track origin HEAD`, open the pull request with `gh pr create` and put its link in the report's \"pr_url\", and list \"set the repo on the quest\" in followups. If the work is not code, carry on in this folder.";
 
 fn repo_line(repo: Option<&str>) -> String {
     match repo {
-        Some(repo) => format!("Repository: {repo} (branch already checked out in the workspace)"),
+        Some(repo) => format!("Repository: {repo} (branch already checked out in the quest folder)"),
         None => NO_REPO_LINE.to_string(),
     }
 }
@@ -784,7 +852,7 @@ pub fn review(task: &AgentTask, base_branch: &str) -> String {
         Some(_) => format!(
             "Review the change with: git status, git diff origin/{base_branch}...HEAD, git diff (uncommitted), and by reading the surrounding code."
         ),
-        None => "There is no repository. Review the files the task produced in this workspace: list them, read them, and run them if that is cheap.".to_string(),
+        None => "There is no repository. Review the files the task produced in this quest folder: list them, read them, and run them if that is cheap.".to_string(),
     };
     REVIEW
         .replace("{title}", &task.title)
@@ -812,6 +880,14 @@ pub fn rules(rules: &[WorldRule], scope: &str, owner: &str) -> String {
         blocks.push(format!("{intro}\n{}", approved.iter().map(|a| format!("- {a}")).collect::<Vec<_>>().join("\n")));
     }
     blocks.join("\n\n")
+}
+
+pub fn before_big_work(mode: BeforeBigWork) -> &'static str {
+    match mode {
+        BeforeBigWork::AskWhenUnclear => "Before big work: ask when unclear. Start small, clear requests immediately. For non-trivial work, first check whether missing facts could materially change what gets built. If so, ask 1 to 3 specific questions together, with choices when practical, using an ask action with clarify_request true. Name its msg: or quest: ref in clarify_source when this turn has several requests. Make the question self-contained. Once answered, continue the original request and never ask it again. Never ask permission between steps.",
+        BeforeBigWork::JustBuild => "Before big work: just build. Start from the person's words, rules and existing systems, make reasonable reversible assumptions, and state them in the result. Ask only for a fact without which useful progress is impossible, using clarify_request true and the request's clarify_source when needed. Never pause for permission between steps.",
+        BeforeBigWork::AlwaysShowPlan => "Before big work: always show a plan. Start small, clear requests immediately. For new non-trivial quests, set plan_first true so the existing plan card appears before changes begin. Do not alter an existing quest's approved, skipped or racing options. Ask only for missing facts that materially change the plan, using clarify_request true and the request's clarify_source when needed. Explicit instructions and required approvals win. After approval, keep moving.",
+    }
 }
 
 pub fn teams(teams: &[TeamContext], agent_id: Uuid, scope: &str) -> String {
@@ -946,6 +1022,10 @@ pub enum Action {
         text: String,
         #[serde(default)]
         choices: Vec<String>,
+        #[serde(default)]
+        clarify_request: bool,
+        #[serde(default)]
+        clarify_source: Option<String>,
     },
     Drafts {
         text: String,
@@ -1098,7 +1178,7 @@ impl Report {
             last
         };
         let mut summary = format!(
-            "It ended without the report block, so the Loka wrote this from its last message (report: synthesized).\n\nLast message:\n{}",
+            "It ended without the report block, so the Loka saved its work and wrote this from its last message (report: synthesized). Check the work before merging.\n\nLast message:\n{}",
             if last.is_empty() { "(empty)".to_string() } else { last }
         );
         if let Some(work) = work.map(str::trim).filter(|work| !work.is_empty()) {
@@ -1175,7 +1255,7 @@ fn lenient_milestones<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Resu
 
 pub const SYNTHESIZED_SUMMARY_MAX: usize = 1_500;
 
-pub const SYNTHESIZED_ERROR: &str = "It ended without the report block even after reminders. The work is kept in its worktree and its last message is saved as the report.";
+pub const SYNTHESIZED_ERROR: &str = "It ended without the report block even after two reminders. Its work is saved as a pull request when it changed anything, and its last message is saved as the report.";
 
 pub fn executor_checks(output: Option<&str>) -> String {
     let checks = output.and_then(parse_report).map(|r| r.checks).unwrap_or_default();
@@ -1261,6 +1341,30 @@ fn truncate_chars(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Clarification {
+    pub text: String,
+    #[serde(default)]
+    pub choices: Vec<String>,
+}
+
+pub fn parse_clarification(output: &str) -> Option<Clarification> {
+    let (_, block) = extract_block(output, "clarify")?;
+    let mut request = serde_json::from_str::<Clarification>(&block).ok()?;
+    request.text = plain_dashes(&truncate_chars(request.text.trim(), 2000));
+    if request.text.is_empty() {
+        return None;
+    }
+    request.choices = request
+        .choices
+        .into_iter()
+        .map(|choice| plain_dashes(&truncate_chars(choice.trim(), 120)))
+        .filter(|choice| !choice.is_empty())
+        .take(4)
+        .collect();
+    Some(request)
+}
+
 pub fn plan_text(output: &str) -> String {
     let Some((before, block)) = extract_block(output, "plan") else {
         return plain_dashes(&tail_chars(output.trim(), 4000));
@@ -1296,6 +1400,12 @@ pub fn plan_text(output: &str) -> String {
         return plain_dashes(&tail_chars(before.trim(), 4000));
     }
     plain_dashes(&out.join("\n\n"))
+}
+
+pub fn has_plan(output: &str) -> bool {
+    extract_block(output, "plan")
+        .and_then(|(_, block)| serde_json::from_str::<Value>(&block).ok())
+        .is_some_and(|value| value.is_object())
 }
 
 pub struct AttemptBrief {
@@ -1407,7 +1517,7 @@ fn comment_pair_report(output: &str) -> Option<Report> {
     report_from_fields(value)
 }
 
-const REPORT_KEYS: &[&str] = &[
+pub(crate) const REPORT_KEYS: &[&str] = &[
     "status",
     "summary",
     "decisions",
@@ -1537,7 +1647,17 @@ pub fn parse_verdict(output: &str) -> Option<Verdict> {
 pub const NO_VERDICT: &str = "no verdict";
 
 pub const UNREADABLE_VERDICT_NOTE: &str =
-    "Review ended without a verdict, even after the reviewer was asked for one. The work went ahead without it, so ask for another review if you want one";
+    "Review ended without a verdict, even after the reviewer was asked once to finish and give one. The work went ahead without it, so ask for another review if you want one";
+
+pub fn no_verdict(summary: String) -> Value {
+    serde_json::json!({
+        "verdict": NO_VERDICT,
+        "summary": summary,
+        "note": UNREADABLE_VERDICT_NOTE,
+        "cause": loka_shared::run_causes::Cause::NoVerdict.as_str(),
+        "reason": loka_shared::run_causes::MISSED_VERDICT,
+    })
+}
 
 pub fn failed_nudge_output(error: &str) -> String {
     format!("The reviewer was asked for a verdict again, but that follow-up failed: {error}")
@@ -1549,6 +1669,22 @@ pub fn is_verdict_nudge(prompt: &str) -> bool {
 
 pub fn failed_nudge_settles(prompt: &str, error: &str) -> bool {
     is_verdict_nudge(prompt) && !loka_shared::cli_errors::describe(error).starts_with("Stopped by")
+}
+
+pub fn contract_open(kind: &str, session: &loka_shared::world::AgentSession, output: &str) -> bool {
+    let reported = || parse_report(output).is_some_and(|report| report.status.is_some());
+    match kind {
+        "task" => !session.planning() && !reported(),
+        "followup" => {
+            session.role == "task"
+                && session.status == "active"
+                && !session.planning()
+                && !reported()
+                && stored_report(session.summary.as_deref()).and_then(|report| report.status).is_none()
+        }
+        "review" => needs_verdict(output) && loka_shared::quests::compare_candidates(session).is_none(),
+        _ => false,
+    }
 }
 
 pub fn needs_verdict(output: &str) -> bool {
@@ -1802,7 +1938,7 @@ fn onboarding_finished(p: &Value) -> String {
     let goal = s("goal");
     if !goal.is_empty() {
         return format!(
-            "[event] onboarding.finished: {} just went through first-time setup with you in the app. The app showed a scripted welcome in your name that asked which CLI, model, name and persona to use. {picked}{device}\nThen they told you about their work and what they want done, in their own words:\n> {}\nThe app told them you are putting together a proposed setup they approve, and that they can watch it come together. This is your first real turn with them: call features onboarding, then in this same reply install the playbooks, create and start your setup quest with milestones, and reply with one friendly line, the numbered plan and the quest card. Do not ask anything first and do not repeat the setup questions.",
+            "[event] onboarding.finished: {} just finished first-time setup. The app asked which CLI, model, name and persona to use. {picked}{device}\nThen they described what they want:\n> {}\nThey expect a proposed setup they can approve. Follow features onboarding in this reply. If material facts are missing, apply their Before big work setting first; otherwise install the playbooks and create the setup quest with milestones and the right plan_first choice. Reply with one friendly line, the numbered plan and quest card. Do not repeat answered setup questions.",
             sender(p),
             goal.replace('\n', "\n> "),
         );
@@ -1878,10 +2014,29 @@ fn pretty(value: Option<&Value>) -> String {
 
 
 fn answered_quote(p: &Value) -> String {
+    let origin = p.get("clarify_origin");
+    let request = origin
+        .and_then(|origin| origin.get("request"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|request| !request.is_empty());
     match p.get("answers").and_then(Value::as_str).map(str::trim).filter(|q| !q.is_empty()) {
         Some(question) => {
+            let request = request
+                .map(|text| format!("Original request:\n{}\n\n", text.lines().map(|line| format!("> {line}")).collect::<Vec<_>>().join("\n")))
+                .unwrap_or_default();
+            let task = origin
+                .and_then(|origin| origin.get("task_id"))
+                .and_then(Value::as_str)
+                .map(|id| format!("Continue the existing quest:{id}; do not create a duplicate.\n"))
+                .unwrap_or_default();
+            let source = origin
+                .map(msg_tag)
+                .filter(|reference| !reference.is_empty())
+                .map(|reference| format!("Original message {}; use read_thread if more context is needed.\n", reference.trim()))
+                .unwrap_or_default();
             let quoted: Vec<String> = question.lines().map(|l| format!("> {l}")).collect();
-            format!("(replying to your question)\n{}\n", quoted.join("\n"))
+            format!("(replying to your question)\n{request}{task}{source}Question:\n{}\n", quoted.join("\n"))
         }
         None => String::new(),
     }
@@ -1891,6 +2046,46 @@ fn answered_quote(p: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn clarification_blocks_are_bounded_and_readable() {
+        let parsed = parse_clarification(
+            "Need this first.\n<!-- clarify\n{\"text\":\"1. Which account?\",\"choices\":[\"Personal\",\"Team\",\"\",\"One\",\"Ignored\"]}\nclarify -->",
+        )
+        .unwrap();
+        assert_eq!(parsed.text, "1. Which account?");
+        assert_eq!(parsed.choices, ["Personal", "Team", "One", "Ignored"]);
+        assert!(parse_clarification("<!-- clarify {\"text\":\"\"} clarify -->").is_none());
+        assert!(parse_clarification("<!-- clarify nope clarify -->").is_none());
+    }
+
+    #[test]
+    fn clarification_origin_selects_the_verified_request() {
+        let items = [
+            inbox(
+                1,
+                "message",
+                json!({ "body": "First request", "from_owner": true, "message_id": "11111111-0000-0000-0000-000000000000" }),
+            ),
+            inbox(
+                2,
+                "message",
+                json!({ "body": "Second request", "from_owner": true, "message_id": "22222222-0000-0000-0000-000000000000", "task_id": "aaaaaaaa-0000-0000-0000-000000000000" }),
+            ),
+        ];
+        assert!(clarification_origin(&items, &[], None).is_none());
+        let origin = clarification_origin(&items, &[], Some("msg:22222222")).unwrap();
+        assert_eq!(origin["request"], "Second request");
+        assert!(clarification_origin(&items, &[], Some("msg:33333333")).is_none());
+        let rendered = answered_quote(&json!({
+            "answers": "Which environment?",
+            "clarify_origin": origin,
+        }));
+        assert!(rendered.contains("Original request:\n> Second request"));
+        assert!(rendered.contains("quest:aaaaaaaa-0000-0000-0000-000000000000"));
+        assert!(rendered.contains("Original message (msg:22222222); use read_thread"));
+        assert!(rendered.contains("Question:\n> Which environment?"));
+    }
 
     #[test]
     fn attachments_split_into_images_and_files() {
@@ -1925,7 +2120,7 @@ mod tests {
 
     #[test]
     fn quests_without_a_repo_are_told_their_folder_is_not_a_checkout() {
-        assert_eq!(repo_line(Some("acme/app")), "Repository: acme/app (branch already checked out in the workspace)");
+        assert_eq!(repo_line(Some("acme/app")), "Repository: acme/app (branch already checked out in the quest folder)");
         let none = repo_line(None);
         assert!(none.contains("empty folder, not a git checkout") && none.contains("git clone") && none.contains("git push --no-track origin HEAD") && none.contains("pr_url"));
         assert!(!none.contains('\u{2014}'));
@@ -1942,6 +2137,14 @@ mod tests {
             assert!(template.contains("never add `--delete-branch`"));
             assert!(!template.contains('\u{2014}'));
         }
+    }
+
+    #[test]
+    fn a_resume_request_tells_the_agent_to_start_the_quest_again() {
+        let resume = render_item(&inbox(1, "task.assigned", serde_json::json!({ "task_id": "t9", "title": "Fix it", "resume": true, "brief": "check the lock" })), &[]);
+        assert!(resume.contains("task.resume") && resume.contains("start_task action on this task_id") && resume.contains("check the lock"), "{resume}");
+        let plain = render_item(&inbox(2, "task.assigned", serde_json::json!({ "task_id": "t9", "title": "Fix it" })), &[]);
+        assert!(plain.starts_with("[event] task.assigned") && !plain.contains("task.resume"));
     }
 
     #[test]
@@ -1977,6 +2180,24 @@ mod tests {
     }
 
     #[test]
+    fn a_full_disk_resumes_the_quest_and_never_sends_the_person_to_clean_up_by_hand() {
+        let quest = render_item(&inbox(1, "run.failed", serde_json::json!({
+            "task_id": "t1", "error": "No space left on device (os error 28)", "failure": "disk_full", "cause": "cli_error",
+            "reason": "The disk is full.", "stage": "run", "turns": 12, "duration_secs": 400, "auto_retried": false
+        })), &[]);
+        let turn = render_item(&inbox(2, "run.failed", serde_json::json!({ "error": "No space left on device", "failure": "disk_full" })), &[]);
+        assert!(quest.contains("Resume the quest once now with start_task") && quest.contains("starts by itself") && quest.contains("do not resume it again"), "{quest}");
+        assert!(!turn.contains("start_task"), "{turn}");
+        for text in [quest, turn] {
+            assert!(text.contains("frees space on that device by itself") && text.contains("setup_status") && text.contains("setup:disk"), "{text}");
+            for by_hand in ["Settings > Storage", "do not retry", "until they say"] {
+                assert!(!text.contains(by_hand), "{by_hand}: {text}");
+            }
+            assert!(!text.contains('\u{2014}'));
+        }
+    }
+
+    #[test]
     fn a_cancelled_review_tells_the_agent_the_quest_is_back_in_review() {
         let cancelled = render_item(&inbox(1, "review.finished", serde_json::json!({
             "task_id": "t9", "cancelled": true,
@@ -1987,6 +2208,21 @@ mod tests {
         assert!(!cancelled.contains('\u{2014}'));
         let finished = render_item(&inbox(2, "review.finished", serde_json::json!({ "task_id": "t9", "review": { "verdict": "approve" } })), &[]);
         assert!(finished.contains("the review you asked for is done"));
+    }
+
+    #[test]
+    fn a_review_that_missed_its_verdict_says_so_to_whoever_asked() {
+        let missed = render_item(&inbox(1, "review.finished", serde_json::json!({ "task_id": "t9", "review": no_verdict("Waiting on the test run.".into()) })), &[]);
+        assert!(missed.contains("ended without a verdict") && !missed.contains("is done"), "{missed}");
+        assert!(missed.contains(loka_shared::run_causes::MISSED_VERDICT));
+        let failed = render_item(&inbox(2, "run.failed", serde_json::json!({
+            "task_id": "t9", "error": loka_shared::run_causes::MISSED_VERDICT, "cause": "no_verdict",
+            "reason": loka_shared::run_causes::MISSED_VERDICT, "stage": "review", "run_kind": "review"
+        })), &[]);
+        assert!(failed.contains("what happened: no_verdict at the review stage") && failed.contains("did not finish"), "{failed}");
+        for text in [missed, failed] {
+            assert!(!text.contains('\u{2014}'));
+        }
     }
 
     #[test]
@@ -2405,9 +2641,11 @@ mod tests {
     #[test]
     fn both_quest_templates_tell_agents_to_keep_build_output_off_the_shared_disk() {
         assert!(REVIEW.contains("CARGO_TARGET_DIR") && REVIEW.contains("do not clone the repository"));
+        assert!(REVIEW.contains("free port") && REVIEW.contains("never reuse a server"));
         for prompt in [TASK, QUICK_TASK] {
             assert!(prompt.contains("CARGO_TARGET_DIR") && prompt.contains("TMPDIR") && prompt.contains("/tmp"), "{prompt}");
             assert!(prompt.contains("private to this quest"));
+            assert!(prompt.contains("free port") && prompt.contains("never reuse a server"), "{prompt}");
             assert!(!prompt.contains('\u{2014}'));
         }
     }
@@ -2546,6 +2784,13 @@ mod tests {
         let example = parse_report(loka_shared::world::REPORT_NUDGE).unwrap();
         assert_eq!(example.status.as_deref(), Some("done"));
         assert!(loka_shared::world::REPORT_NUDGE.starts_with("[report missing]"));
+        let last = parse_report(loka_shared::world::REPORT_NUDGE_LAST).unwrap();
+        assert_eq!(last.status.as_deref(), Some("blocked"), "the last reminder never suggests done by default");
+        for reminder in [loka_shared::world::REPORT_NUDGE, loka_shared::world::REPORT_NUDGE_LAST] {
+            assert!(reminder.starts_with(loka_shared::world::REPORT_NUDGE_MARK));
+            assert!(!reminder.contains('\u{2014}'));
+        }
+        assert!(loka_shared::world::REPORT_NUDGE_LAST.contains("only the report block"));
     }
 
     #[test]
@@ -2738,5 +2983,67 @@ mod tests {
         assert!(!failed_nudge_settles("Review the work", "run timed out"));
         assert!(!is_verdict_nudge("Review the work"));
         assert!(nudge.contains("<!-- verdict") && nudge.ends_with("verdict -->"));
+    }
+
+    #[test]
+    fn a_run_announces_its_end_at_once_unless_its_contract_can_still_fail_it() {
+        let session = |role: &str, status: &str, extra: serde_json::Value| -> loka_shared::world::AgentSession {
+            let mut row = serde_json::json!({
+                "id": Uuid::nil(), "agent_id": Uuid::nil(), "role": role, "backend": "claude", "model": "opus",
+                "cli_session_id": "c1", "parent_session_id": null, "task_id": null, "working_dir": null,
+                "status": status, "usage_baseline": {}, "context_tokens": 0, "review_rounds": 0, "summary": null,
+                "rules_hash": null, "asked_by": null,
+                "created_at": chrono::Utc::now(), "updated_at": chrono::Utc::now()
+            });
+            if let (Some(row), serde_json::Value::Object(extra)) = (row.as_object_mut(), extra) {
+                row.extend(extra);
+            }
+            serde_json::from_value(row).unwrap()
+        };
+        let report = "Done.\n<!-- report\n{\"status\": \"done\", \"summary\": \"ok\"}\nreport -->";
+        let verdict = "<!-- verdict {\"verdict\":\"approve\",\"summary\":\"ok\"} verdict -->";
+        let pick = "<!-- verdict {\"verdict\":\"pick\",\"winner\":1} verdict -->";
+        let waiting = "Waiting on the test run.";
+        let task = session("task", "active", serde_json::json!({}));
+        let planning = session("task", "active", serde_json::json!({ "plan_state": "planning" }));
+        let reported = session("task", "active", serde_json::json!({ "summary": "{\"status\": \"done\", \"summary\": \"ok\"}" }));
+        let finished = session("task", "completed", serde_json::json!({}));
+        let review = session("review", "active", serde_json::json!({}));
+        let compare = session("review", "active", serde_json::json!({ "asked_by": { "compare": [Uuid::nil()] } }));
+        let main = session("main", "active", serde_json::json!({}));
+        let cases = [
+            ("task", &task, report, false),
+            ("task", &task, waiting, true),
+            ("task", &task, "<!-- report\n{\"summary\": \"no status\"}\nreport -->", true),
+            ("task", &planning, waiting, false),
+            ("followup", &task, report, false),
+            ("followup", &task, waiting, true),
+            ("followup", &reported, waiting, false),
+            ("followup", &planning, waiting, false),
+            ("followup", &finished, waiting, false),
+            ("followup", &review, waiting, false),
+            ("review", &review, verdict, false),
+            ("review", &review, pick, false),
+            ("review", &review, waiting, true),
+            ("review", &review, report, true),
+            ("review", &compare, waiting, false),
+            ("publish", &task, waiting, false),
+            ("turn", &main, waiting, false),
+            ("aside", &main, waiting, false),
+            ("quick", &main, waiting, false),
+            ("direct", &main, waiting, false),
+        ];
+        for (kind, session, output, open) in cases {
+            assert_eq!(contract_open(kind, session, output), open, "{kind} {} {}: {output}", session.role, session.status);
+        }
+    }
+
+    #[test]
+    fn both_nudges_say_to_wait_for_background_commands_before_the_block() {
+        for (nudge, block) in [(loka_shared::world::VERDICT_NUDGE, "<!-- verdict"), (loka_shared::world::REPORT_NUDGE, "<!-- report")] {
+            let wait = nudge.find("wait for it to finish").expect("tells the agent to wait for background commands");
+            assert!(nudge.contains("in the background") && wait < nudge.find(block).unwrap(), "{nudge}");
+            assert!(!nudge.contains("do not wait") && !nudge.contains('\u{2014}'), "{nudge}");
+        }
     }
 }

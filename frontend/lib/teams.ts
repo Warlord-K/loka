@@ -53,6 +53,12 @@ export interface TeamDraft {
 
 export const TEAMS_CHANGED = "world:teams-changed";
 
+export class TeamRequestError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}
+
 async function send<T>(url: string, method: string, body?: unknown): Promise<T> {
   const res = await fetch(url, {
     method,
@@ -62,7 +68,7 @@ async function send<T>(url: string, method: string, body?: unknown): Promise<T> 
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(text || `Request failed (${res.status})`);
+    throw new TeamRequestError(text || `Request failed (${res.status})`, res.status);
   }
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;

@@ -60,7 +60,7 @@ async fn refresh() {
             Ok(Ok(_)) => debug!(backend, "CLI reported no models"),
             Ok(Err(error)) => warn!(
                 backend,
-                error = %crate::remote_runner::redact(&format!("{error:#}"), crate::cli::host_secrets()),
+                error = %crate::cli::host_redactor().redact(&format!("{error:#}")),
                 "Model discovery failed"
             ),
             Err(_) => debug!(backend, "Model discovery timed out"),
@@ -109,7 +109,7 @@ fn command(bin: impl AsRef<std::ffi::OsStr>) -> Result<Command> {
 
 async fn output(mut cmd: Command) -> Result<String> {
     let mut child = cmd.spawn()?;
-    let stderr = crate::cli::stderr_tail(child.stderr.take());
+    let stderr = crate::cli::stderr_tail(child.stderr.take(), crate::cli::host_redactor());
     let out = child.wait_with_output().await?;
     anyhow::ensure!(out.status.success(), "exited with {}: {}", out.status, stderr.lock().unwrap().trim());
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
@@ -120,7 +120,7 @@ async fn converse(mut cmd: Command, requests: &[Value], done: impl Fn(&Value) ->
     let state = crate::cli::own_cli_state().await;
     let mut child: Child = cmd.spawn()?;
     drop(state);
-    let stderr = crate::cli::stderr_tail(child.stderr.take());
+    let stderr = crate::cli::stderr_tail(child.stderr.take(), crate::cli::host_redactor());
     let mut stdin = child.stdin.take().context("stdin")?;
     for request in requests {
         stdin.write_all(format!("{request}\n").as_bytes()).await?;

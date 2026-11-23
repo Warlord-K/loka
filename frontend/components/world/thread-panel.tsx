@@ -20,6 +20,11 @@ import { QuotedBlock, QuotePreview, quoteProps, useQuote, type MessageQuote } fr
 import { takeEscape } from "@/lib/escape";
 import { RunCommandContext, type RunCommand } from "./run-command";
 import { notSent, sendFailure } from "@/lib/send-failure";
+import { scrollWithin } from "@/lib/scroll";
+import { startRechecks } from "@/lib/latest";
+import { threadWaiting } from "@/lib/thread-wait";
+import { consumeMessageFocus, guardedDetailLoader } from "@/lib/exact-world-navigation";
+import type { DetailIntent } from "@/lib/navigation-details";
 
 export interface ThreadItem {
   key: string;
@@ -39,8 +44,6 @@ export interface ThreadItem {
   onDelete?: () => Promise<void>;
   memory?: { line: string; answered: string | null; onAnswer: (choice: string) => Promise<void> };
 }
-
-const THINKING_WINDOW_MS = 30 * 60 * 1000;
 
 const NO_CANDIDATES: MentionCandidate[] = [];
 
@@ -95,6 +98,7 @@ export function ThreadPanel({
   subtitle,
   draftKey,
   load,
+  working,
   refreshOn,
   send,
   quoteTarget,
@@ -110,14 +114,19 @@ export function ThreadPanel({
   waitingFor,
   note,
   typing,
+  focus,
+  visible,
 }: {
   waitingFor?: string;
   note?: ReactNode;
   typing?: ReactNode;
+  focus?: { id: string; nonce: number } | null;
+  visible: boolean;
   title: string;
   subtitle?: string;
   draftKey: string;
-  load: () => Promise<ThreadItem[]>;
+  load: (intent: DetailIntent) => Promise<ThreadItem[] | undefined>;
+  working?: () => Promise<boolean | null>;
   refreshOn: (ev: WorldEvent) => boolean;
   send: (text: string, spoken: boolean, attachments: string[], quote: MessageQuote | null) => Promise<void>;
   quoteTarget?: string;
@@ -139,25 +148,51 @@ export function ThreadPanel({
   const [quote, setQuote] = useQuote(quoteTarget ?? null);
   const inputRef = useRef<HTMLTextAreaElement | HTMLInputElement | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLElement>(null);
+  const [highlighted, setHighlighted] = useState<string | null>(null);
   const loadRef = useRef(load);
   loadRef.current = load;
+  const workingRef = useRef(working);
+  workingRef.current = working;
+  const [runOpen, setRunOpen] = useState<boolean | null>(null);
+  const draftKeyRef = useRef(draftKey);
+  draftKeyRef.current = draftKey;
+  const focusNonceRef = useRef(focus?.nonce);
+  focusNonceRef.current = focus?.nonce;
+  const focusIdRef = useRef(focus?.id);
+  focusIdRef.current = focus?.id;
+  const visibleRef = useRef(visible);
+  visibleRef.current = visible;
   const refreshRef = useRef(refreshOn);
   refreshRef.current = refreshOn;
 
+  const reads = useRef(guardedDetailLoader()).current;
   const refresh = useCallback(() => {
-    void loadRef
-      .current()
-      .then((next) => {
+    if (!visibleRef.current) return;
+    const currentDraft = draftKeyRef.current;
+    const currentFocus = focusNonceRef.current;
+    const intent = reads.begin(() => visibleRef.current && draftKeyRef.current === currentDraft && focusNonceRef.current === currentFocus);
+    void Promise.all([loadRef.current(intent), workingRef.current?.().catch(() => null) ?? Promise.resolve(null)])
+      .then(([next, open]) => {
+        if (!intent.current() || !next) return;
         setItems(next);
+        setRunOpen(open);
         setFailed(false);
       })
-      .catch(() => setFailed(true));
-  }, []);
+      .catch(() => { if (intent.current()) setFailed(true); });
+  }, [reads]);
 
   useEffect(() => {
     setItems(null);
+  }, [draftKey, focus?.nonce]);
+  useEffect(() => {
+    if (!visible) {
+      reads.invalidate();
+      return;
+    }
     refresh();
-  }, [draftKey, refresh]);
+    return () => reads.invalidate();
+  }, [draftKey, focus?.nonce, reads, refresh, visible]);
 
   useEffect(() => {
     const onEvent = (e: Event) => {
@@ -237,10 +272,43 @@ export function ThreadPanel({
   const [root, ...allReplies] = items ?? [];
   const replies = trash ? allReplies.filter((r) => r.key !== trash.key) : allReplies;
   const lastReply = replies[replies.length - 1];
-  const thinking = !!waitingFor && !!lastReply && !lastReply.agent && Date.now() - new Date(lastReply.createdAt).getTime() < THINKING_WINDOW_MS;
+  const thinking =
+    !!waitingFor &&
+    !!lastReply &&
+    threadWaiting({ working: runOpen, lastIsPerson: !lastReply.agent, lastAt: new Date(lastReply.createdAt).getTime(), now: Date.now() });
+  useEffect(() => {
+    if (!thinking) return;
+    return startRechecks(refresh);
+  }, [thinking, refresh]);
+
+  const focusId = focus?.id;
+  const focusNonce = focus?.nonce;
+  const readyToReveal = visible && !!focusId && !!items?.some((item) => item.key === focusId);
+  const revealed = useRef<number | undefined>(undefined);
+  const highlightTimer = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(highlightTimer.current), []);
+  useEffect(() => {
+    if (!focusId || focusNonce === undefined || !readyToReveal || revealed.current === focusNonce) return;
+    const reveal = window.setTimeout(() => {
+      if (!visibleRef.current || focusNonceRef.current !== focusNonce || focusIdRef.current !== focusId) return;
+      const row = panelRef.current?.querySelector<HTMLElement>(`[data-message-id="${CSS.escape(focusId)}"]`);
+      if (!row || !consumeMessageFocus(revealed, focusNonce)) return;
+      scrollWithin(row, { block: "center", smooth: false });
+      setHighlighted(focusId);
+      window.clearTimeout(highlightTimer.current);
+      highlightTimer.current = window.setTimeout(() => setHighlighted(null), 2600);
+    }, 60);
+    return () => window.clearTimeout(reveal);
+  }, [focusId, focusNonce, readyToReveal]);
+  useEffect(() => {
+    if (focusId) return;
+    setHighlighted(null);
+    window.clearTimeout(highlightTimer.current);
+  }, [focusId]);
 
   return (
     <aside
+      ref={panelRef}
       aria-label="Thread"
       onKeyDown={(e) => {
         if (e.key !== "Escape" || e.defaultPrevented) return;
@@ -265,14 +333,14 @@ export function ThreadPanel({
           <p className="px-4 text-w-sm text-w-muted">This message is gone.</p>
         ) : (
           <>
-            <Row item={root} quoteTarget={quoteTarget} handles={handles} people={people} onOpenAgent={onOpenAgent} onOpenPerson={onOpenPerson} onSaved={refresh} />
+            <Row item={root} highlighted={highlighted === root.key} quoteTarget={quoteTarget} handles={handles} people={people} onOpenAgent={onOpenAgent} onOpenPerson={onOpenPerson} onSaved={refresh} />
             <div className="my-2 flex items-center gap-2 px-4 text-w-xs text-w-muted">
               <span>{replies.length === 0 ? "No replies yet" : replies.length === 1 ? "1 reply" : `${replies.length} replies`}</span>
               <span className="h-0 flex-1 border-t border-dashed border-w-line2" />
             </div>
             {replies.map((item) => (
               <Fragment key={item.key}>
-                <Row item={item} quoteTarget={quoteTarget} handles={handles} people={people} onOpenAgent={onOpenAgent} onOpenPerson={onOpenPerson} onRemove={item.onDelete ? () => remove(item) : undefined} onSaved={refresh} />
+                <Row item={item} highlighted={highlighted === item.key} quoteTarget={quoteTarget} handles={handles} people={people} onOpenAgent={onOpenAgent} onOpenPerson={onOpenPerson} onRemove={item.onDelete ? () => remove(item) : undefined} onSaved={refresh} />
               </Fragment>
             ))}
             {thinking && (
@@ -335,6 +403,7 @@ export function ThreadPanel({
 
 function Row({
   item,
+  highlighted,
   quoteTarget,
   handles,
   people,
@@ -344,6 +413,7 @@ function Row({
   onSaved,
 }: {
   item: ThreadItem;
+  highlighted?: boolean;
   quoteTarget?: string;
   handles: Map<string, WorldAgent>;
   people?: Map<string, Person>;
@@ -357,10 +427,12 @@ function Row({
   const memory = item.memory;
   return (
     <MessageRow
+      id={item.key}
       flat
       createdAt={item.createdAt}
       avatar={item.avatar}
       editing={editing}
+      highlighted={highlighted}
       header={
         <MessageAuthor name={item.name} agent={item.agent} createdAt={item.createdAt} editedAt={item.editedAt}>
           {(item.spoken || item.call) && <SpokenMark call={item.call} />}

@@ -21,6 +21,7 @@ pub enum Action {
     Devices,
     Keys,
     Github,
+    Storage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -415,6 +416,26 @@ fn github_feed(s: &Signals) -> Feature {
     )
 }
 
+fn disk_low(runner: &RunnerView) -> bool {
+    runner.capabilities.get("workspaces").and_then(|workspaces| workspaces.get("low")).and_then(Value::as_bool) == Some(true)
+}
+
+fn disk(s: &Signals) -> Feature {
+    const KEY: &str = "disk";
+    const LABEL: &str = "Disk space";
+    let low: Vec<&RunnerView> = s.own.iter().filter(|r| r.status != "revoked" && disk_low(r)).collect();
+    if low.is_empty() {
+        return ready(KEY, LABEL, "Your devices have room for new quest runs.");
+    }
+    setup(
+        KEY,
+        LABEL,
+        format!("{} is almost out of disk space, so quest runs there wait until there is room and then start by themselves.", names(low.into_iter())),
+        "Loka clears build files and closed quests there on its own. If the device stays low, the bell says what is left for you to do, such as quitting a program that still uses a quest's folder or freeing space outside Loka.",
+        Some(Action::Storage),
+    )
+}
+
 fn coding_clis(s: &Signals) -> Feature {
     const KEY: &str = "clis";
     const LABEL: &str = "Coding CLIs";
@@ -682,6 +703,7 @@ pub fn evaluate(signals: &Signals) -> Readiness {
             live_voice(signals),
             keys(signals),
             opencode(signals),
+            disk(signals),
         ],
         clis: clis(signals),
     }
@@ -760,6 +782,20 @@ mod tests {
         assert_eq!(state(&r, "terminal"), State::NeedsSetup);
         assert_eq!(state(&r, "live_voice"), State::Unavailable);
         assert!(r.clis.is_empty());
+    }
+
+    #[test]
+    fn a_nearly_full_device_asks_for_a_cleanup_and_a_roomy_one_does_not() {
+        let roomy = runner("Studio", "macos", "online", json!({"workspaces": {"low": false, "free_gb": 80}}));
+        let full = runner("Laptop", "macos", "offline", json!({"workspaces": {"low": true, "free_gb": 1}}));
+        let none = runner("Cloud", "linux", "online", json!({}));
+        let ok = evaluate(&Signals { own: vec![roomy.clone(), none], ..Signals::default() });
+        assert_eq!(state(&ok, "disk"), State::Ready);
+        let low = evaluate(&Signals { own: vec![roomy, full], ..Signals::default() });
+        assert_eq!(state(&low, "disk"), State::NeedsSetup);
+        let feature = find(&low, "disk").unwrap();
+        assert!(feature.reason.contains("Laptop") && !feature.reason.contains("Studio"), "{}", feature.reason);
+        assert_eq!(feature.action, Some(Action::Storage));
     }
 
     #[test]

@@ -315,6 +315,61 @@ impl WorldStore {
         self.agent_thread_transcript(agent_id, root, THREAD_CONTEXT).await
     }
 
+    fn quick_message<'a>(
+        agent: &WorldAgent,
+        session: &AgentSession,
+        author_user: Option<Uuid>,
+        body: &'a str,
+        run_id: Option<Uuid>,
+        meta: Value,
+    ) -> NewMessage<'a> {
+        let author_kind = match author_user {
+            Some(_) => "user",
+            None if meta.get("system").and_then(Value::as_bool) == Some(true) => "system",
+            None => "agent",
+        };
+        let mut meta = crate::guests::in_thread(meta, asker(session));
+        meta["quick"] = json!(session.id);
+        NewMessage {
+            agent_id: agent.id,
+            author_kind,
+            author_user_id: author_user,
+            author_agent_id: (author_kind == "agent").then_some(agent.id),
+            body,
+            session_id: Some(session.id),
+            run_id,
+            meta,
+        }
+    }
+
+    async fn announce_quick_message(&self, agent: &WorldAgent, session: &AgentSession, msg: &AgentMessage) -> Result<()> {
+        sqlx::query("UPDATE agent_sessions SET updated_at = NOW() WHERE id = $1")
+            .bind(session.id)
+            .execute(self.pool())
+            .await?;
+        self.emit(
+            NewEvent::new("message.created")
+                .agent(agent.id)
+                .actor(msg.author_user_id)
+                .session(session.id)
+                .payload(crate::guests::in_thread(
+                    json!({
+                        "message_id": msg.id,
+                        "author": if msg.author_kind == "agent" { agent.name.clone() } else { asker_name(session) },
+                        "author_kind": msg.author_kind,
+                        "body": crate::links::excerpt(&msg.body, 400),
+                        "reply_to": thread_root(session),
+                        "quick_session_id": session.id,
+                        "quiet": true,
+                    }),
+                    asker(session),
+                )),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn post_quick_message(
         &self,
         agent: &WorldAgent,
@@ -324,53 +379,9 @@ impl WorldStore {
         run_id: Option<Uuid>,
         meta: Value,
     ) -> Result<AgentMessage> {
-        let author_kind = match author_user {
-            Some(_) => "user",
-            None if meta.get("system").and_then(Value::as_bool) == Some(true) => "system",
-            None => "agent",
-        };
-        let mut meta = crate::guests::in_thread(meta, asker(session));
-        meta["quick"] = json!(session.id);
-        let root = thread_root(session);
-        let msg = self
-            .insert_reply(
-                NewMessage {
-                    agent_id: agent.id,
-                    author_kind,
-                    author_user_id: author_user,
-                    author_agent_id: (author_kind == "agent").then_some(agent.id),
-                    body,
-                    session_id: Some(session.id),
-                    run_id,
-                    meta: meta.clone(),
-                },
-                root,
-            )
-            .await?;
-        sqlx::query("UPDATE agent_sessions SET updated_at = NOW() WHERE id = $1")
-            .bind(session.id)
-            .execute(self.pool())
-            .await?;
-        self.emit(
-            NewEvent::new("message.created")
-                .agent(agent.id)
-                .actor(author_user)
-                .session(session.id)
-                .payload(crate::guests::in_thread(
-                    json!({
-                        "message_id": msg.id,
-                        "author": if author_kind == "agent" { agent.name.clone() } else { asker_name(session) },
-                        "author_kind": author_kind,
-                        "body": crate::links::excerpt(body, 400),
-                        "reply_to": root,
-                        "quick_session_id": session.id,
-                        "quiet": true,
-                    }),
-                    asker(session),
-                )),
-            None,
-        )
-        .await?;
+        let new = Self::quick_message(agent, session, author_user, body, run_id, meta);
+        let msg = self.insert_reply(new, thread_root(session)).await?;
+        self.announce_quick_message(agent, session, &msg).await?;
         Ok(msg)
     }
 
@@ -382,24 +393,55 @@ impl WorldStore {
         text: &str,
         failed: bool,
     ) -> Result<Option<AgentMessage>> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(None);
+        }
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(format!("quick-reply:{run_id}"))
+            .execute(&mut *tx)
+            .await?;
         let posted = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (SELECT 1 FROM agent_messages WHERE run_id = $1 AND author_kind <> 'user')",
         )
         .bind(run_id)
-        .fetch_one(self.pool())
+        .fetch_one(&mut *tx)
         .await?;
-        let text = text.trim();
-        if posted || text.is_empty() {
+        if posted {
             return Ok(None);
         }
         let meta = if failed { json!({ "failed": true }) } else { json!({}) };
-        let msg = self.post_quick_message(agent, session, None, text, Some(run_id), meta).await?;
+        let new = Self::quick_message(agent, session, None, text, Some(run_id), meta);
+        let msg = self.insert_reply_with(&mut *tx, new, thread_root(session)).await?;
+        tx.commit().await?;
+        self.announce_quick_message(agent, session, &msg).await?;
         sqlx::query("UPDATE agent_sessions SET summary = $2 WHERE id = $1")
             .bind(session.id)
             .bind(crate::links::excerpt(text, 2000))
             .execute(self.pool())
             .await?;
         Ok(Some(msg))
+    }
+
+    pub async fn quick_runs_without_reply(&self, session: Option<Uuid>, grace_secs: i64) -> Result<Vec<SessionRun>> {
+        Ok(sqlx::query_as::<_, SessionRun>(&format!(
+            "SELECT {RUN_COLUMNS} FROM session_runs r
+             WHERE r.kind = 'quick'
+               AND r.status IN ('completed', 'failed', 'timed_out')
+               AND (r.status = 'completed' OR r.stop_requested_by IS NULL)
+               AND r.finished_at < NOW() - make_interval(secs => $2::double precision)
+               AND r.finished_at > NOW() - INTERVAL '1 hour'
+               AND ($1::uuid IS NULL OR r.session_id = $1)
+               AND EXISTS (SELECT 1 FROM agent_sessions s WHERE s.id = r.session_id AND s.status <> 'archived')
+               AND NOT EXISTS (SELECT 1 FROM agent_messages m WHERE m.run_id = r.id AND m.author_kind <> 'user')
+             ORDER BY r.finished_at
+             LIMIT 50"
+        ))
+        .bind(session)
+        .bind(grace_secs as f64)
+        .fetch_all(self.pool())
+        .await?)
     }
 
     pub async fn offer_memory(&self, agent: &WorldAgent, session_id: Uuid, line: &str) -> Result<AgentMessage> {
@@ -714,6 +756,171 @@ mod tests {
         assert_eq!(status, "cancelled");
         assert!(store.queue_quick(&session, "Sam: still there?").await.is_err());
         assert!(store.quick_sessions(owner, org, None, false, 10).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_without_a_reply_is_found_in_every_starting_state() -> Result<()> {
+        let Ok(url) = std::env::var("QUICK_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email, name, world_role) VALUES ($1, 'Sam', 'write') RETURNING id")
+            .bind(format!("lost-{tag}@test.dev"))
+            .fetch_one(&pool)
+            .await?;
+        crate::orgs::join_default_for_tests(&pool, owner, None).await?;
+        let agent_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id) VALUES ($1, 'Quill', 'claude', 'haiku', $2) RETURNING id",
+        )
+        .bind(format!("lost-{tag}"))
+        .bind(owner)
+        .fetch_one(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO agent_sessions (agent_id, role, backend, model, cli_session_id, working_dir, status)
+             VALUES ($1, 'main', 'claude', 'haiku', 'main-cli', $2, 'active')",
+        )
+        .bind(agent_id)
+        .bind(format!("agents/lost-{tag}"))
+        .execute(&pool)
+        .await?;
+        let agent = store.get_agent(agent_id).await?.expect("agent");
+        let choice = AsideChoice::default();
+        let end = |run: Uuid, status: &'static str, seconds_ago: i64| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query("UPDATE session_runs SET status = $2, finished_at = NOW() - make_interval(secs => $3::double precision), output = 'Here you go.', error = CASE WHEN $2 = 'completed' THEN NULL ELSE 'It broke' END WHERE id = $1")
+                    .bind(run)
+                    .bind(status)
+                    .bind(seconds_ago as f64)
+                    .execute(&pool)
+                    .await
+            }
+        };
+        let open = || store.open_quick(Opening { agent_id, user_id: owner, asker: "Sam", text: "hi", choice: &choice, thread_root: None });
+
+        let plain = open().await?;
+        store.post_quick_message(&agent, &plain, Some(owner), "hi", None, json!({})).await?;
+        let run = store.queue_quick(&plain, "hi").await?;
+        assert!(store.quick_runs_without_reply(Some(plain.id), 20).await?.is_empty(), "a queued run is not lost");
+        end(run.id, "completed", 120).await?;
+        let lost = store.quick_runs_without_reply(Some(plain.id), 20).await?;
+        assert_eq!(lost.iter().map(|r| r.id).collect::<Vec<_>>(), [run.id], "plain chat: a completed run with no message is found");
+        end(run.id, "completed", 2).await?;
+        assert!(store.quick_runs_without_reply(Some(plain.id), 20).await?.is_empty(), "a run that just ended still has its own handler's grace");
+        end(run.id, "completed", 120).await?;
+        assert!(store.quick_runs_without_reply(None, 20).await?.iter().any(|r| r.id == run.id), "the sweep sees it without a session filter");
+        store.record_quick_reply(&agent, &plain, run.id, "Here you go.", false).await?;
+        assert!(store.quick_runs_without_reply(Some(plain.id), 20).await?.is_empty(), "once the reply is a message it is no longer lost");
+
+        let after_call = open().await?;
+        store
+            .post_quick_message(&agent, &after_call, Some(owner), "so what should I do", None, json!({ "kind": "voice", "call_id": "c1", "spoken": true }))
+            .await?;
+        store.post_quick_message(&agent, &after_call, Some(owner), "and the last bit was cut o", None, json!({ "kind": "voice", "call_id": "c1", "partial": true })).await?;
+        let typed = store.post_quick_message(&agent, &after_call, Some(owner), "what about taxes?", None, json!({})).await?;
+        let run = store.queue_quick(&after_call, "what about taxes?").await?;
+        end(run.id, "completed", 90).await?;
+        let lost = store.quick_runs_without_reply(Some(after_call.id), 20).await?;
+        assert_eq!(lost.len(), 1, "after a voice call: the call's own lines never count as the reply");
+        assert_eq!(lost[0].id, run.id);
+        store.record_quick_reply(&agent, &after_call, run.id, "Here you go.", false).await?;
+        let rows = store.quick_messages(after_call.id, 50).await?;
+        assert_eq!(rows.last().map(|m| m.author_kind.as_str()), Some("agent"), "the reply lands after the typed message");
+        assert!(rows.iter().any(|m| m.id == typed.id));
+
+        let failed = open().await?;
+        store.post_quick_message(&agent, &failed, Some(owner), "hello?", None, json!({})).await?;
+        let run = store.queue_quick(&failed, "hello?").await?;
+        end(run.id, "failed", 60).await?;
+        assert_eq!(store.quick_runs_without_reply(Some(failed.id), 20).await?.len(), 1, "a failed run with no note is found");
+        store.record_quick_reply(&agent, &failed, run.id, "I could not answer that: It broke", true).await?;
+        assert!(store.quick_runs_without_reply(Some(failed.id), 20).await?.is_empty());
+
+        let stopped = open().await?;
+        store.post_quick_message(&agent, &stopped, Some(owner), "stop that", None, json!({})).await?;
+        let cancelled = store.queue_quick(&stopped, "stop that").await?;
+        end(cancelled.id, "cancelled", 120).await?;
+        assert!(store.quick_runs_without_reply(Some(stopped.id), 20).await?.is_empty(), "a cancelled run is never given a note");
+        let by_person = store.queue_quick(&stopped, "again").await?;
+        end(by_person.id, "failed", 120).await?;
+        sqlx::query("UPDATE session_runs SET stop_requested_by = 'Sam' WHERE id = $1").bind(by_person.id).execute(&pool).await?;
+        assert!(store.quick_runs_without_reply(Some(stopped.id), 20).await?.is_empty(), "a run a person or a budget stopped is never given a note");
+        let finished_anyway = store.queue_quick(&stopped, "once more").await?;
+        end(finished_anyway.id, "completed", 120).await?;
+        sqlx::query("UPDATE session_runs SET stop_requested_by = 'Sam' WHERE id = $1").bind(finished_anyway.id).execute(&pool).await?;
+        assert_eq!(
+            store.quick_runs_without_reply(Some(stopped.id), 20).await?.iter().map(|r| r.id).collect::<Vec<_>>(),
+            [finished_anyway.id],
+            "a stop that still ended with an answer keeps that answer"
+        );
+
+        let old = open().await?;
+        let ancient = store.queue_quick(&old, "long ago").await?;
+        end(ancient.id, "failed", 3 * 3600).await?;
+        assert!(store.quick_runs_without_reply(Some(old.id), 20).await?.is_empty(), "runs older than an hour are not backfilled");
+        assert!(store.quick_runs_without_reply(None, 20).await?.iter().all(|r| r.id != ancient.id), "and the sweep skips them too");
+        let recent = store.queue_quick(&old, "just now").await?;
+        end(recent.id, "failed", 600).await?;
+        assert_eq!(store.quick_runs_without_reply(Some(old.id), 20).await?.iter().map(|r| r.id).collect::<Vec<_>>(), [recent.id], "a recent failure still gets its note");
+
+        let closed = open().await?;
+        let run = store.queue_quick(&closed, "bye").await?;
+        end(run.id, "completed", 60).await?;
+        store.close_quick(closed.id).await?;
+        assert!(store.quick_runs_without_reply(Some(closed.id), 20).await?.is_empty(), "a closed chat is left alone");
+
+        let slow = open().await?;
+        let run = store.queue_quick(&slow, "think hard").await?;
+        sqlx::query("UPDATE session_runs SET status = 'running', started_at = NOW() - INTERVAL '10 minutes' WHERE id = $1").bind(run.id).execute(&pool).await?;
+        assert!(store.quick_runs_without_reply(Some(slow.id), 20).await?.is_empty(), "a slow run that is still running is not lost");
+        assert!(store.session_busy(slow.id).await?, "and the chat reports it as busy");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn two_deliveries_of_one_runs_reply_post_one_message() -> Result<()> {
+        let Ok(url) = std::env::var("QUICK_RACE_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new().max_connections(6).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let owner: Uuid = sqlx::query_scalar("INSERT INTO users (email, name, world_role) VALUES ($1, 'Sam', 'write') RETURNING id")
+            .bind(format!("race-{tag}@test.dev"))
+            .fetch_one(&pool)
+            .await?;
+        crate::orgs::join_default_for_tests(&pool, owner, None).await?;
+        let agent_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id) VALUES ($1, 'Quill', 'claude', 'haiku', $2) RETURNING id",
+        )
+        .bind(format!("race-{tag}"))
+        .bind(owner)
+        .fetch_one(&pool)
+        .await?;
+        sqlx::query("INSERT INTO agent_sessions (agent_id, role, backend, model, cli_session_id, status) VALUES ($1, 'main', 'claude', 'haiku', 'main-cli', 'active')")
+            .bind(agent_id)
+            .execute(&pool)
+            .await?;
+        let agent = store.get_agent(agent_id).await?.expect("agent");
+        let session = store
+            .open_quick(Opening { agent_id, user_id: owner, asker: "Sam", text: "hi", choice: &AsideChoice::default(), thread_root: None })
+            .await?;
+        for round in 0..5 {
+            let run = store.queue_quick(&session, &format!("hi {round}")).await?;
+            let (a, b, c) = tokio::join!(
+                store.record_quick_reply(&agent, &session, run.id, "From the handler.", false),
+                store.record_quick_reply(&agent, &session, run.id, "From the sweep.", false),
+                store.record_quick_reply(&agent, &session, run.id, "From a read.", false),
+            );
+            let posted = [a?, b?, c?].into_iter().flatten().count();
+            assert_eq!(posted, 1, "round {round}: concurrent deliveries post once");
+            let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_messages WHERE run_id = $1 AND author_kind <> 'user'").bind(run.id).fetch_one(&pool).await?;
+            assert_eq!(rows, 1);
+        }
         Ok(())
     }
 

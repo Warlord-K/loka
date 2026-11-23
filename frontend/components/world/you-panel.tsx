@@ -1,17 +1,17 @@
 "use client";
 
 import { SOLO } from "@/lib/edition";
-import { AgentAvatar, AgentFace } from "./channel-ui";
+import { AgentAvatar, AgentFace, usePortrait } from "./channel-ui";
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { ArrowsClockwise, Broom, Code, Crown, Desktop, GithubLogo, Star, Key, Keyboard, ListChecks, Microphone, Palette, Play, Plus, Scroll, ShareNetwork, SpeakerHigh, UserCircle } from "@phosphor-icons/react";
 import { cn } from "@/lib/utils";
 import { ShortcutList } from "./shortcuts";
 import { worldApi, type WorldAgent, type WorldRule } from "@/lib/world";
-import { portraitUrl } from "./characters";
 import { ConfirmDelete, WSelect } from "./controls";
 import { PLAYER_LOOK } from "./engine";
-import type { Me } from "./hud";
+import type { BeforeBigWork, Me } from "./hud";
 import { BTN, BTN_MD, BTN_PRIMARY, BTN_SECONDARY, BTN_SM, INPUT, PILL_NEUTRAL, SEGMENT, SEGMENT_ITEM, SEGMENT_OFF, SEGMENT_ON } from "./styles";
+import { Shimmer } from "./work-ui";
 import { MicCheck, PushToTalkKeys, VoiceField } from "./voice-ui";
 import { Keycap } from "./keycap";
 import { EnvironmentPanel } from "./environment";
@@ -36,6 +36,18 @@ const SCOPES = [
   { value: "work", label: "When working", hint: "how they do quests" },
   { value: "allow", label: "Approved action", hint: "quests may do it without being stopped" },
 ];
+
+const BEFORE_BIG_WORK = [
+  { value: "ask_when_unclear", label: "Ask when unclear", hint: "default" },
+  { value: "just_build", label: "Just build", hint: "make reasonable assumptions" },
+  { value: "always_show_plan", label: "Always show a plan", hint: "for big work" },
+];
+
+const BEFORE_BIG_WORK_HELP: Record<BeforeBigWork, string> = {
+  ask_when_unclear: "Your agents ask a few specific questions when missing details could change the result.",
+  just_build: "Your agents make reasonable assumptions and ask only when they cannot continue.",
+  always_show_plan: "Your agents show you a plan before big work starts.",
+};
 
 const STATUS_PRESETS: [string, string][] = [
   ["📅", "In a meeting"],
@@ -281,10 +293,12 @@ export function YouPanel({
   onRename,
   onStatus,
   onNewArt,
+  onBeforeBigWork,
   onOpenAssistant,
   onOpenPro,
   controlPlane,
   focusSection,
+  onNavigate,
   onClose,
 }: {
   me: Me | null;
@@ -294,10 +308,12 @@ export function YouPanel({
   onRename: (name: string) => Promise<boolean>;
   onStatus: (emoji: string, text: string) => Promise<boolean>;
   onNewArt: (on: boolean) => Promise<boolean>;
+  onBeforeBigWork: (value: BeforeBigWork) => Promise<boolean>;
   onOpenAssistant: () => void;
   onOpenPro: () => void;
   controlPlane: "connecting" | "online" | "offline";
   focusSection: { id: string; at: number; recordId?: string } | null;
+  onNavigate: (select: () => void) => void;
   onClose: () => void;
 }) {
   useEffect(() => {
@@ -305,13 +321,19 @@ export function YouPanel({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
-  const portrait = useMemo(() => portraitUrl(PLAYER_LOOK, 6), []);
+  const portrait = usePortrait(PLAYER_LOOK, 6);
   const [name, setName] = useState(me?.name ?? "");
   const [nameNote, setNameNote] = useState<string | null>(null);
   const [rules, setRules] = useState<WorldRule[]>([]);
   const [draft, setDraft] = useState("");
   const [scope, setScope] = useState("all");
   const [global, setGlobal] = useState(false);
+  const [beforeBigWork, setBeforeBigWork] = useState<BeforeBigWork>(me?.before_big_work ?? "ask_when_unclear");
+  const [beforeBigWorkSaving, setBeforeBigWorkSaving] = useState(false);
+  const [beforeBigWorkNote, setBeforeBigWorkNote] = useState<string | null>(null);
+  useEffect(() => {
+    setBeforeBigWork(me?.before_big_work ?? "ask_when_unclear");
+  }, [me?.before_big_work]);
   const admin = me?.role === "admin";
   const canWrite = me?.role === "write" || admin;
   const live = useFeature("live_voice");
@@ -321,7 +343,7 @@ export function YouPanel({
     () =>
       [
         { id: "profile", label: "Profile", group: "Account", icon: UserCircle, keywords: "name handle email status" },
-        canWrite && { id: "main-agent", label: "Main agent", group: "Account", icon: Star, keywords: "assistant juniper crown" },
+        canWrite && { id: "main-agent", label: "Main agent", group: "Account", icon: Star, keywords: "assistant juniper crown plan before big work ask clarify unclear just build" },
         { id: "rules", label: "Rules", group: "Agents", icon: Scroll, keywords: "instructions talking working" },
         canWrite && { id: "setup", label: "Setup status", group: "Connections", icon: ListChecks, keywords: "ready readiness checklist" },
         canWrite && { id: "devices", label: "Devices", group: "Connections", icon: Desktop, keywords: "runner mac computer execution" },
@@ -350,10 +372,12 @@ export function YouPanel({
   const active = page !== "pro" && items.some((i) => i.id === page) ? page : items[0].id;
   const select = (id: string) => {
     if (id === "pro") return onOpenPro();
-    setPage(id);
-    try {
-      window.localStorage.setItem(PAGE_KEY, id);
-    } catch {}
+    onNavigate(() => {
+      setPage(id);
+      try {
+        window.localStorage.setItem(PAGE_KEY, id);
+      } catch {}
+    });
   };
 
   const refresh = useCallback(() => {
@@ -427,8 +451,9 @@ export function YouPanel({
       )}
 
       {active === "main-agent" && (
-        <SettingsGroup title="Main agent" description="Your main agent hears about everything first and can reach your other agents.">
-          <SettingsCard rows>
+        <>
+          <SettingsGroup title="Main agent" description="Your main agent hears about everything first and can reach your other agents.">
+            <SettingsCard rows>
             {assistant ? (
               <SettingsRow
                 title={
@@ -455,8 +480,40 @@ export function YouPanel({
               />
             )}
             <SettingsRow title="Change it" description="Any of your agents can be your main agent: use Make main agent in their Settings tab. Change their model, voice, persona or powers there too." />
-          </SettingsCard>
-        </SettingsGroup>
+            </SettingsCard>
+          </SettingsGroup>
+          <SettingsGroup title="Before big work" description="Choose how your agents begin larger requests. Small, clear work starts right away.">
+            <SettingsCard rows>
+              <SettingsRow
+                title="How to begin"
+                description={beforeBigWorkSaving ? <Shimmer>Saving</Shimmer> : beforeBigWorkNote ?? BEFORE_BIG_WORK_HELP[beforeBigWork]}
+                control={
+                  <WSelect
+                    className="w-52"
+                    ariaLabel="Before big work"
+                    value={beforeBigWork}
+                    disabled={beforeBigWorkSaving}
+                    options={BEFORE_BIG_WORK}
+                    onChange={async (next) => {
+                      const value = next as BeforeBigWork;
+                      const previous = beforeBigWork;
+                      setBeforeBigWork(value);
+                      setBeforeBigWorkSaving(true);
+                      const saved = await onBeforeBigWork(value);
+                      setBeforeBigWorkSaving(false);
+                      if (saved) {
+                        setBeforeBigWorkNote(`Saved. ${BEFORE_BIG_WORK_HELP[value]}`);
+                      } else {
+                        setBeforeBigWork(previous);
+                        setBeforeBigWorkNote("Could not save. Try again.");
+                      }
+                    }}
+                  />
+                }
+              />
+            </SettingsCard>
+          </SettingsGroup>
+        </>
       )}
 
       {active === "rules" && (

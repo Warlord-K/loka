@@ -31,7 +31,7 @@ pub fn presets() -> Value {
         "visibility": "private"
     }])
 }
-const PRIVATE_PREFIXES: &[&str] = &["region.", "npc.", "challenge.", "adventure.", "academy.", "music.", "report.", "team."];
+const PRIVATE_PREFIXES: &[&str] = &["region.", "npc.", "challenge.", "adventure.", "academy.", "music.", "report.", "presence.", "team."];
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct Region {
@@ -139,7 +139,7 @@ pub fn hidden_from(event: &WorldEvent, viewer: Uuid) -> bool {
     }
     let public = event.payload.get("visibility").and_then(Value::as_str) == Some("public");
     if PRIVATE_PREFIXES.iter().any(|p| event.event_type.starts_with(p)) {
-        return !((event.event_type.starts_with("region.") || event.event_type.starts_with("report.")) && public);
+        return !((event.event_type.starts_with("region.") || event.event_type.starts_with("report.") || event.event_type.starts_with("presence.")) && public);
     }
     event.event_type.starts_with("item.") && event.payload.get("private").and_then(Value::as_bool) == Some(true)
 }
@@ -830,6 +830,11 @@ mod tests {
         assert!(!hidden_from(&open_item, me));
         assert!(!hidden_from(&team, me));
         assert!(hidden_from(&team, other));
+        let presence = |visibility: &str| event(crate::canvas::PRESENCE_EVENT, json!({ "owner_user_id": other, "visibility": visibility }));
+        assert!(hidden_from(&presence("private"), me), "people never see who is on someone else's private canvas");
+        assert!(!hidden_from(&presence("private"), other));
+        assert!(!hidden_from(&presence("public"), me));
+        assert!(crate::event_scope::org_visible(crate::canvas::PRESENCE_EVENT));
         assert!(hidden_from(&owner_only_team, me));
         assert!(!hidden_from(&event("task.finished", json!({})), me));
     }

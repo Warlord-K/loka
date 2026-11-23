@@ -16379,6 +16379,7 @@
     "front",
     "side"
    ],
+   "side_faces": "left",
    "size_basis": "head_width",
    "sizes": {
     "44": {
@@ -16616,6 +16617,7 @@
     "side",
     "back"
    ],
+   "side_faces": "right",
    "size_basis": "head_width",
    "sizes": {
     "44": {
@@ -16889,6 +16891,7 @@
     "side",
     "back"
    ],
+   "side_faces": "right",
    "size_basis": "head_width",
    "sizes": {
     "44": {
@@ -17165,6 +17168,7 @@
     "side",
     "back"
    ],
+   "side_faces": "right",
    "size_basis": "head_width",
    "sizes": {
     "44": {
@@ -17441,6 +17445,7 @@
     "side",
     "back"
    ],
+   "side_faces": "right",
    "size_basis": "head_width",
    "sizes": {
     "44": {
@@ -17715,6 +17720,7 @@
     "side",
     "back"
    ],
+   "side_faces": "right",
    "size_basis": "head_width",
    "sizes": {
     "44": {
@@ -17995,6 +18001,7 @@
     "side",
     "back"
    ],
+   "side_faces": "right",
    "size_basis": "head_width",
    "sizes": {
     "44": {
@@ -18281,6 +18288,7 @@
     "side",
     "back"
    ],
+   "side_faces": "right",
    "size_basis": "head_width",
    "sizes": {
     "44": {
@@ -18568,6 +18576,7 @@
     "side",
     "back"
    ],
+   "side_faces": "right",
    "size_basis": "head_width",
    "sizes": {
     "44": {
@@ -18858,6 +18867,7 @@
     "side",
     "back"
    ],
+   "side_faces": "right",
    "size_basis": "head_width",
    "sizes": {
     "44": {
@@ -19131,6 +19141,7 @@
     "front",
     "side"
    ],
+   "side_faces": "right",
    "size_basis": "head_width",
    "sizes": {
     "44": {
@@ -19346,6 +19357,7 @@
     "side",
     "back"
    ],
+   "side_faces": "right",
    "size_basis": "body_width",
    "sizes": {
     "44": {
@@ -19620,6 +19632,7 @@
     "side",
     "back"
    ],
+   "side_faces": "right",
    "size_basis": "body_width",
    "sizes": {
     "44": {
@@ -19894,6 +19907,7 @@
     "side",
     "back"
    ],
+   "side_faces": "right",
    "size_basis": "body_width",
    "sizes": {
     "44": {
@@ -20168,6 +20182,7 @@
     "side",
     "back"
    ],
+   "side_faces": "right",
    "size_basis": "body_width",
    "sizes": {
     "44": {
@@ -20442,6 +20457,7 @@
     "side",
     "back"
    ],
+   "side_faces": "right",
    "size_basis": "head_width",
    "sizes": {
     "44": {

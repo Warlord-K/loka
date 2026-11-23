@@ -7,7 +7,7 @@ import { figureOf, figurePending, heldGearOf, newArtOn, placeArt, rememberThing,
 import { T, type Activity, type Light, type Npc, type Place, type Spot, type World, type WorldObject } from "./world";
 import { drawBookArt, drawHeldArt, drawIconArt, drawParticleArt, drawPips, drawPipsArt, drawRune, drawSlime, drawSlimeArt, drawStation, drawStationArt, drawStatusArt, drawTool, drawToolArt, slimeArtAt, slimeAt, stationAt, STRIKE_PERIOD, tempo, WORK_LIGHT } from "./work";
 import { TEXT_SCALE_EVENT } from "@/lib/text-scale";
-import { MAX_DPR, placed, snapScale, walkFrame } from "@/lib/sprite-manifest";
+import { MAX_DPR, placed, snapScale, spriteGrid, walkFrame } from "@/lib/sprite-manifest";
 
 export type Target =
   | { kind: "resident"; id: string }
@@ -2182,7 +2182,7 @@ export class LokaEngine {
       const pose = figure.poses[dir];
       const idle = this.opts.reducedMotion ? 0 : walkFrame((this.t * IDLE_FPS + x * 0.37) / pose.idle.length, pose.idle.length);
       const img = step === null ? pose.idle[idle] : pose.walk[walkFrame(step / CODE_WALK_FRAMES, pose.walk.length)];
-      const [px, py] = placed(pose.anchor, figure.density, x, y);
+      const [px, py] = placed(pose.anchor, figure.density, x, y, this.P);
       const grow = figure.height / CODE_HEIGHT;
       ctx.drawImage(this.shadow, Math.round(x - 6 * grow), Math.round(y - 2), Math.round(12 * grow), 4);
       const w = img.width / figure.density;
@@ -2259,8 +2259,9 @@ export class LokaEngine {
     const d = art.density;
     const w = (art.img.width / d) * scale;
     const h = (art.img.height / d) * scale;
-    const left = Math.round((x - (art.ax / d) * scale) * d) / d;
-    const top = Math.round((centre ? y - h / 2 : y - (art.ay / d) * scale) * d) / d;
+    const grid = spriteGrid(d, this.P);
+    const left = Math.round((x - (art.ax / d) * scale) * grid) / grid;
+    const top = Math.round((centre ? y - h / 2 : y - (art.ay / d) * scale) * grid) / grid;
     const ctx = this.ctx;
     if (!flip) {
       ctx.drawImage(art.img, left, top, w, h);

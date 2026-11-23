@@ -66,7 +66,6 @@
     --ring: 40 90% 56%;
     --radius: 0.625rem;
 
-    /* Motion tokens — tight, Linear/Cursor-like easing and durations */
     --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
     --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
     --dur-fast: 120ms;
@@ -122,6 +121,31 @@
     --w-chart-3: 98 80 214;
     --w-chart-4: 196 130 0;
     --w-chart-5: 217 88 140;
+    --w-term-bg: 18 12 21;
+    --w-term-bar: 23 16 27;
+    --w-term-raise: 34 25 39;
+    --w-term-line: 54 40 58;
+    --w-term-text: 233 220 198;
+    --w-term-dim: 150 132 150;
+    --w-term-cursor: 232 182 74;
+    --w-term-select: 66 50 80;
+    --w-term-focus: 25 184 184;
+    --w-term-0: 29 20 34;
+    --w-term-1: 224 122 95;
+    --w-term-2: 123 224 107;
+    --w-term-3: 232 182 74;
+    --w-term-4: 107 199 232;
+    --w-term-5: 195 155 255;
+    --w-term-6: 25 184 184;
+    --w-term-7: 233 220 198;
+    --w-term-8: 102 85 104;
+    --w-term-9: 255 143 168;
+    --w-term-10: 155 240 139;
+    --w-term-11: 242 198 106;
+    --w-term-12: 159 220 255;
+    --w-term-13: 217 191 255;
+    --w-term-14: 107 224 224;
+    --w-term-15: 255 248 234;
   }
   :root[data-theme="dark"]:not(:has([data-landing])) {
     color-scheme: dark;
@@ -237,7 +261,6 @@
     padding-top: env(safe-area-inset-top);
   }
 
-  /* Shared interaction primitives — keep micro-interactions consistent */
   .focus-ring {
     outline: none;
   }
@@ -262,8 +285,6 @@
   }
 }
 
-/* Decorative golden background — a single, very subtle bottom glow (kept faint
-   so it reads like ambient depth, not decoration). */
 .board-bg-decoration {
   pointer-events: none;
   position: fixed;
@@ -285,7 +306,6 @@
   filter: blur(80px);
 }
 
-/* Card entrance animation */
 @keyframes card-enter {
   from {
     opacity: 0;
@@ -301,7 +321,6 @@
   animation: card-enter var(--dur-slow) var(--ease-out) both;
 }
 
-/* Generic mount animations */
 @keyframes fade-in {
   from { opacity: 0; }
   to { opacity: 1; }
@@ -324,13 +343,11 @@
   animation: scale-in var(--dur-base) var(--ease-out) both;
 }
 
-/* Tab indicator slide */
 @keyframes tab-glow {
   0%, 100% { box-shadow: 0 0 4px hsl(40 90% 56% / 0.2); }
   50% { box-shadow: 0 0 8px hsl(40 90% 56% / 0.35); }
 }
 
-/* Card hover glow border */
 .card-hover-glow {
   position: relative;
 }
@@ -350,12 +367,10 @@
   box-shadow: 0 0 12px hsl(40 90% 56% / 0.06);
 }
 
-/* Active status glow */
 .status-glow-active {
   box-shadow: 0 0 6px currentColor;
 }
 
-/* Lightning bolt shimmer */
 @keyframes lightning-shimmer {
   0%, 100% { filter: brightness(1); }
   50% { filter: brightness(1.4); }
@@ -375,7 +390,6 @@
   }
 }
 
-/* Respect reduced-motion: drop entrance/looping animations and snap transitions. */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

@@ -179,6 +179,7 @@ export function PracticeView({
   agents,
   meId,
   focusItem,
+  focusRequest,
   onOpenAgent,
   onChanged,
   embedded = false,
@@ -187,6 +188,7 @@ export function PracticeView({
   agents: WorldAgent[];
   meId: string | null;
   focusItem: string | null;
+  focusRequest?: number;
   onOpenAgent: (id: string) => void;
   onChanged: () => void;
   embedded?: boolean;
@@ -256,7 +258,7 @@ export function PracticeView({
   useEffect(() => {
     const id = attemptFromItem(focusItem);
     if (id) setViewing(id);
-  }, [focusItem]);
+  }, [focusItem, focusRequest]);
 
   const load = useCallback(() => {
     practiceApi

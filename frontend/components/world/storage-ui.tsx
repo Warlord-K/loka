@@ -8,7 +8,7 @@ import { BTN_DANGER, BTN_SECONDARY } from "./styles";
 import { RelativeTime } from "./relative-time";
 import { Shimmer } from "./work-ui";
 
-type CleanupKind = "run_logs" | "quests" | "chats" | "activity" | "workspaces";
+type CleanupKind = "run_logs" | "quests" | "chats" | "activity" | "quest_folders" | "caches";
 
 type AgentStorage = {
   agent_id: string;
@@ -50,7 +50,8 @@ type WorkspaceUse = {
   temp_bytes: number;
   reclaimable_temp_bytes: number;
   build_bytes: number;
-  reclaimable_build_bytes: number;
+  seed_bytes: number;
+  reclaimable_cache_bytes: number;
 };
 
 type Report = { agents: AgentStorage[]; total_bytes: number; cleanups: PastCleanup[]; workspaces: WorkspaceUse[] };
@@ -63,9 +64,15 @@ const KINDS: { kind: CleanupKind; title: string; description: string; scoped?: b
   { kind: "chats", title: "Old chat messages", description: "Messages between you, other people and your agents. Agents keep what they remember in their own sessions and notes." },
   { kind: "activity", title: "Old activity", description: "The activity feed behind quest rooms and the bell, including cleared bell items." },
   {
-    kind: "workspaces",
-    title: "Closed quest workspaces, temp folders and build folders",
-    description: "Checkouts, build output, test databases and scratch files of closed quests on your devices, oldest first, plus the node_modules, .next and cargo target folders of idle open quests. Open quests keep their checkouts. Branches, commits and pull requests stay, and the next build starts from scratch.",
+    kind: "quest_folders",
+    title: "Closed quest folders and temp folders",
+    description: "Checkouts, test databases and scratch files of closed quests on your devices, oldest first. Open quests keep their checkouts. Branches, commits and pull requests stay.",
+    scoped: false,
+  },
+  {
+    kind: "caches",
+    title: "Build caches",
+    description: "Cargo target, node_modules and .next folders of every quest that is not building right now, plus the dependency caches quests share. Source, branches and unsaved work are never touched. The next build is just slower.",
     scoped: false,
   },
 ];
@@ -77,7 +84,7 @@ const AGES = [
   { value: "365", label: "Older than a year" },
 ];
 
-const LABEL: Record<CleanupKind, string> = { run_logs: "Run step logs", quests: "Closed quests", chats: "Chat messages", activity: "Activity", workspaces: "Quest workspaces and temp folders" };
+const LABEL: Record<CleanupKind, string> = { run_logs: "Run step logs", quests: "Closed quests", chats: "Chat messages", activity: "Activity", quest_folders: "Quest folders and temp folders", caches: "Build caches" };
 
 function size(bytes: number): string {
   if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
@@ -133,7 +140,9 @@ function Cleanup({
             ? "Nothing was left to delete."
             : scoped
               ? `Deleted ${result.rows.toLocaleString()} items, about ${size(result.bytes)} freed.`
-              : `Asked your devices to remove the workspaces and temp folders of ${result.rows.toLocaleString()} closed quests, about ${size(result.bytes)}. They finish within a minute or two.`,
+              : kind === "caches"
+                ? `Asked your devices to clear their build caches, up to ${size(result.bytes)}. They finish within a minute or two.`
+                : `Asked your devices to remove the quest folders and temp folders of ${result.rows.toLocaleString()} closed quests, about ${size(result.bytes)}. They finish within a minute or two.`,
         );
         onDone();
       } else {
@@ -168,15 +177,15 @@ function Cleanup({
       {preview && (
         <div className="mt-3 rounded-lg border-2 border-dashed border-w-line2 px-3 py-2.5">
           {preview.rows === 0 ? (
-            <p className="text-w-sm text-w-muted">{scoped ? "Nothing that old. There is nothing to delete here." : "No closed quest workspaces or temp folders to remove right now."}</p>
+            <p className="text-w-sm text-w-muted">{scoped ? "Nothing that old. There is nothing to delete here." : kind === "caches" ? "No build caches to clear right now." : "No closed quest folders or temp folders to remove right now."}</p>
           ) : (
             <>
               <p className="text-w-sm text-w-text">
-                {preview.rows.toLocaleString()} {scoped ? "items" : "closed quests"}, about <span className="font-semibold">{size(preview.bytes)}</span>. Deleting them is permanent and cannot be undone.
+                {kind === "caches" ? `${preview.rows.toLocaleString()} ${preview.rows === 1 ? "device" : "devices"}` : `${preview.rows.toLocaleString()} ${scoped ? "items" : "closed quests"}`}, {kind === "caches" ? "up to " : "about "}<span className="font-semibold">{size(preview.bytes)}</span>. {kind === "caches" ? "Builds rerun from scratch, nothing else is lost." : "Deleting them is permanent and cannot be undone."}
               </p>
               <div className="mt-2.5 flex flex-wrap gap-2">
                 <button type="button" className={BTN_DANGER} onClick={() => void run(true)} disabled={busy}>
-                  {busy ? <Shimmer>Deleting</Shimmer> : "Delete permanently"}
+                  {busy ? <Shimmer>{kind === "caches" ? "Clearing" : "Deleting"}</Shimmer> : kind === "caches" ? "Clear build caches" : "Delete permanently"}
                 </button>
                 <button type="button" className={BTN_SECONDARY} onClick={() => setPreview(null)} disabled={busy}>
                   Keep them
@@ -242,8 +251,8 @@ export function StorageSection() {
 
       {report && report.workspaces.length > 0 && (
         <SettingsGroup
-          title="Quest workspaces on your devices"
-          description="Each quest works in its own checkout and its own temp folder (build output and test databases) on the device that runs it. Loka clears the temp folder an hour after a quest closes, the checkout 3 days after it is done (7 days when it failed), and build folders first, then closed folders, when the disk runs low."
+          title="Quest folders on your devices"
+          description="Each quest works in its own checkout and its own temp folder (build output and test databases) on the device that runs it. Loka clears the temp folder an hour after a quest closes, the checkout 3 days after it is done (7 days when it failed), and when the disk runs low it clears on its own the build caches of every quest that is not running first, then closed folders."
         >
           <SettingsCard rows>
             {report.workspaces.map((w) => (
@@ -254,7 +263,7 @@ export function StorageSection() {
                 </span>
                 <span className="text-w-sm font-semibold tabular-nums text-w-strong">{size(w.bytes)}</span>
                 <span className="basis-full text-w-xs leading-relaxed text-w-muted">
-                  {w.tasks.toLocaleString()} folders{w.temp_bytes > 0 ? `, ${size(w.temp_bytes)} of it temp build output and test databases` : ""}, {size(w.reclaimable_bytes)} from closed quests ({w.reclaimable_tasks.toLocaleString()}){w.reclaimable_temp_bytes > 0 ? `, ${size(w.reclaimable_temp_bytes)} of that temp` : ""}.{w.build_bytes > 0 ? ` Build folders (cargo target, node_modules, .next) take ${size(w.build_bytes)}${w.reclaimable_build_bytes > 0 ? `, ${size(w.reclaimable_build_bytes)} of it from idle open quests can be cleared` : ""}.` : ""}
+                  {w.tasks.toLocaleString()} folders{w.temp_bytes > 0 ? `, ${size(w.temp_bytes)} of it temp build output and test databases` : ""}, {size(w.reclaimable_bytes)} from closed quests ({w.reclaimable_tasks.toLocaleString()}){w.reclaimable_temp_bytes > 0 ? `, ${size(w.reclaimable_temp_bytes)} of that temp` : ""}.{w.reclaimable_cache_bytes > 0 ? ` Build caches take ${size(w.build_bytes)}${w.seed_bytes > 0 ? ` plus ${size(w.seed_bytes)} of shared dependency caches` : ""}, and can be cleared without losing anything.` : ""}
                   {w.free_gb !== null && (
                     <>
                       {" "}

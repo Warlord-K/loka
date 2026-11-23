@@ -29,6 +29,26 @@ pub enum StreamEvent {
 
 pub type EventSender = mpsc::UnboundedSender<StreamEvent>;
 
+pub use loka_shared::redaction::Redactor;
+
+impl StreamEvent {
+    pub fn redacted_clip(self, redactor: &Redactor, text_max: usize) -> Self {
+        match self {
+            StreamEvent::ToolUse { tool, input_summary } => StreamEvent::ToolUse {
+                tool: redactor.redact(&tool),
+                input_summary: redactor.clip(&input_summary, TOOL_INPUT_MAX_CHARS.min(text_max)),
+            },
+            StreamEvent::ToolResult { tool, output } => StreamEvent::ToolResult {
+                tool: redactor.redact(&tool),
+                output: redactor.clip(&output, text_max),
+            },
+            StreamEvent::AssistantText(text) => StreamEvent::AssistantText(redactor.clip(&text, text_max)),
+            StreamEvent::Error(text) => StreamEvent::Error(redactor.clip(&text, text_max)),
+            other => other,
+        }
+    }
+}
+
 pub struct Steer {
     pub text: String,
     pub interrupt: bool,
@@ -97,12 +117,16 @@ pub(crate) fn runner_private_paths() -> Vec<PathBuf> {
     paths
 }
 
-fn private_paths_in(root: &Path) -> Vec<PathBuf> {
+pub(crate) fn private_paths_in(root: &Path) -> Vec<PathBuf> {
     ["leases", "runner.log", "identity", "browser", MCP_AUTH_DIR].iter().map(|name| root.join(name)).collect()
 }
 
 tokio::task_local! {
     static JOB_UID: JobUid;
+}
+
+tokio::task_local! {
+    pub(crate) static SESSION_TEMP: uuid::Uuid;
 }
 
 static FREE_JOB_UIDS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
@@ -202,11 +226,129 @@ pub(crate) fn temp_dir() -> PathBuf {
 }
 
 pub(crate) const QUEST_TEMP_PREFIX: &str = "loka-q-";
+pub(crate) const SESSION_TEMP_PREFIX: &str = "loka-s-";
+pub(crate) const PRIVATE_TEMP_OWNER: &str = ".loka-owner";
+pub(crate) const PRIVATE_TEMP_NAME_LEN: usize = QUEST_TEMP_PREFIX.len() + 12;
+pub(crate) const SHORT_TEMP_ROOT: &str = "/tmp";
+const CLAUDE_SHELL_TEMP_LIMIT: usize = 44;
+const CLAUDE_SHELL_TEMP_SUFFIX: &str = "/claude-";
+
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(not(unix))]
+fn current_uid() -> u32 {
+    0
+}
+
+pub(crate) fn short_enough_for_shell_temp(root: &Path) -> bool {
+    let uid_digits = current_uid().to_string().len();
+    let longest = root.as_os_str().len() + 1 + PRIVATE_TEMP_NAME_LEN + CLAUDE_SHELL_TEMP_SUFFIX.len() + uid_digits;
+    longest <= CLAUDE_SHELL_TEMP_LIMIT
+}
+
+pub(crate) const PRIVATE_TEMP_ROOT_ENV: &str = "PRIVATE_TEMP_ROOT";
+
+pub(crate) fn private_temp_root() -> PathBuf {
+    match loka_shared::loka_env::var(PRIVATE_TEMP_ROOT_ENV).filter(|root| !root.is_empty()) {
+        Some(root) => PathBuf::from(root),
+        None => private_temp_root_in(std::env::temp_dir()),
+    }
+}
+
+fn private_temp_root_in(preferred: PathBuf) -> PathBuf {
+    if cfg!(unix) && !short_enough_for_shell_temp(&preferred) {
+        return PathBuf::from(SHORT_TEMP_ROOT);
+    }
+    preferred
+}
+
+pub(crate) fn private_temp_homes() -> Vec<PathBuf> {
+    let mut homes = vec![private_temp_root()];
+    let shared = std::env::temp_dir();
+    if !homes.contains(&shared) {
+        homes.push(shared);
+    }
+    homes
+}
+
+pub(crate) fn private_temp_grants(dir: &Path) -> Vec<PathBuf> {
+    let mut grants = vec![dir.to_path_buf()];
+    if let Ok(real) = std::fs::canonicalize(dir) {
+        if real != dir {
+            grants.push(real);
+        }
+    }
+    grants
+}
+
+pub(crate) async fn scope_session_temp<F: std::future::Future>(session: Option<uuid::Uuid>, future: F) -> F::Output {
+    match session {
+        Some(id) => SESSION_TEMP.scope(id, future).await,
+        None => future.await,
+    }
+}
+
+pub(crate) fn session_temp_name(id: uuid::Uuid) -> String {
+    format!("{SESSION_TEMP_PREFIX}{}", &id.simple().to_string()[..12])
+}
+
+pub(crate) fn private_temp_owner(dir: &Path) -> Option<(uuid::Uuid, PathBuf)> {
+    let text = std::fs::read_to_string(dir.join(PRIVATE_TEMP_OWNER)).ok()?;
+    let mut lines = text.lines();
+    let id: uuid::Uuid = lines.next()?.parse().ok()?;
+    let name = dir.file_name()?.to_str()?;
+    (name == session_temp_name(id) || name == quest_temp_name(id)).then(|| (id, PathBuf::from(lines.next().unwrap_or_default())))
+}
+
+pub(crate) fn mark_private_temp_owner(dir: &Path, id: uuid::Uuid, root: &Path) -> std::io::Result<()> {
+    let marker = dir.join(PRIVATE_TEMP_OWNER);
+    if marker.exists() {
+        return Ok(());
+    }
+    std::fs::write(marker, format!("{id}\n{}\n", root.display()))
+}
+
+pub(crate) fn private_temp_dir(working_dir: &Path) -> Option<PathBuf> {
+    if job_user().is_some() {
+        return None;
+    }
+    let name = match quest_id(working_dir) {
+        Some(quest) => quest_temp_name(quest),
+        None => session_temp_name(SESSION_TEMP.try_with(|id| *id).ok()?),
+    };
+    Some(private_temp_root().join(name))
+}
+
+pub(crate) fn set_temp_env(cmd: &mut tokio::process::Command, dir: &Path) {
+    for name in ["TMPDIR", "TMP", "TEMP"] {
+        cmd.env(name, dir);
+    }
+}
+
+fn prepare_private_temp_dir(dir: &Path, working_dir: &Path) -> std::io::Result<()> {
+    ensure_private_dir(dir)?;
+    if let Some((quest, root)) = quest_place(working_dir).filter(|(quest, _)| dir.ends_with(quest_temp_name(*quest))) {
+        return mark_private_temp_owner(dir, quest, &root);
+    }
+    let Some(id) = SESSION_TEMP.try_with(|id| *id).ok().filter(|id| dir.ends_with(session_temp_name(*id))) else {
+        return Ok(());
+    };
+    mark_private_temp_owner(dir, id, Path::new(&std::env::var("WORLD_RUNNER_ROOT").unwrap_or_default()))
+}
+
+pub(crate) fn quest_place(working_dir: &Path) -> Option<(uuid::Uuid, PathBuf)> {
+    let parts: Vec<std::path::Component> = working_dir.components().collect();
+    let at = parts.windows(2).position(|pair| pair[0].as_os_str() == "tasks" && pair[1].as_os_str().to_str().is_some_and(|id| id.parse::<uuid::Uuid>().is_ok()))?;
+    let id = parts[at + 1].as_os_str().to_str()?.parse().ok()?;
+    let root_end = if at > 0 && parts[at - 1].as_os_str() == "workspaces" { at - 1 } else { at };
+    Some((id, parts[..root_end].iter().collect()))
+}
 
 pub(crate) fn quest_id(working_dir: &Path) -> Option<uuid::Uuid> {
-    let parts: Vec<&std::ffi::OsStr> = working_dir.components().map(|part| part.as_os_str()).collect();
-    let at = parts.windows(2).position(|pair| pair[0] == "tasks" && pair[1].to_str().is_some_and(|id| id.parse::<uuid::Uuid>().is_ok()))?;
-    parts[at + 1].to_str()?.parse().ok()
+    quest_place(working_dir).map(|(id, _)| id)
 }
 
 pub(crate) fn quest_temp_name(id: uuid::Uuid) -> String {
@@ -217,21 +359,29 @@ pub(crate) fn quest_temp_dir(working_dir: &Path) -> Option<PathBuf> {
     if job_user().is_some() {
         return None;
     }
-    Some(std::env::temp_dir().join(quest_temp_name(quest_id(working_dir)?)))
+    Some(private_temp_root().join(quest_temp_name(quest_id(working_dir)?)))
 }
 
 pub(crate) const QUEST_TARGET_DIR: &str = "cargo-target";
 
-fn is_quest_target(dir: &Path) -> bool {
-    dir.file_name().is_some_and(|name| name == QUEST_TARGET_DIR)
-        && dir.parent().and_then(Path::file_name).is_some_and(|name| name.to_string_lossy().starts_with(QUEST_TEMP_PREFIX))
+const QUEST_SHELL_ENV: [&str; 5] = ["TMP", "TEMP", "CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "CARGO_PROFILE_DEV_DEBUG"];
+
+const LEAN_CARGO_ENV: [(&str, &str); 2] = [("CARGO_INCREMENTAL", "0"), ("CARGO_PROFILE_DEV_DEBUG", "0")];
+
+pub(crate) fn quest_target_dir(working_dir: &Path) -> Option<PathBuf> {
+    quest_temp_dir(working_dir).map(|dir| dir.join(QUEST_TARGET_DIR))
 }
 
-pub(crate) fn drop_default_quest_target(cmd: &mut tokio::process::Command) {
-    let default = cmd.as_std().get_envs().find(|(name, _)| *name == "CARGO_TARGET_DIR").and_then(|(_, value)| value).map(PathBuf::from);
-    if default.is_some_and(|dir| is_quest_target(&dir)) {
-        cmd.env_remove("CARGO_TARGET_DIR");
-    }
+pub(crate) fn prepare_quest_temp_dir(working_dir: &Path) -> std::io::Result<Option<PathBuf>> {
+    let Some(dir) = quest_temp_dir(working_dir) else {
+        return Ok(None);
+    };
+    prepare_private_temp_dir(&dir, working_dir)?;
+    Ok(Some(dir.join(QUEST_TARGET_DIR)))
+}
+
+pub(crate) fn owned_temp_dir(working_dir: &Path) -> Option<PathBuf> {
+    std::fs::canonicalize(private_temp_dir(working_dir)?).ok()
 }
 
 fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
@@ -239,7 +389,22 @@ fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     builder.recursive(true);
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    builder.create(dir)
+    builder.create(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let found = std::fs::symlink_metadata(dir)?;
+        if !found.is_dir() || found.uid() != current_uid() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{} already exists and is not a folder of this user, so it cannot be a private temp folder", dir.display()),
+            ));
+        }
+        if found.permissions().mode() & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
 }
 
 fn job_temp_dir() -> Option<PathBuf> {
@@ -351,7 +516,7 @@ pub(crate) fn job_std_command(program: impl AsRef<std::ffi::OsStr>) -> std::proc
         .arg(program);
     set_git_config(&mut command, JOB_GIT_CONFIG);
     if let Some(dir) = job_temp_dir() {
-        command.env("TMPDIR", &dir).env("HOME", dir);
+        command.env("TMPDIR", &dir).env("TMP", &dir).env("TEMP", &dir).env("HOME", dir);
     }
     #[cfg(unix)]
     unsafe {
@@ -496,8 +661,54 @@ pub(crate) fn socket_path(wanted: &Path) -> std::io::Result<PathBuf> {
     if text.len() <= SOCKET_PATH_MAX && !text.chars().any(char::is_whitespace) {
         return Ok(wanted.to_path_buf());
     }
-    let hash = text.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
-    let dir = std::env::temp_dir().join(format!("loka-{:012x}", hash & 0xffff_ffff_ffff));
+    let dir = short_runner_dir(&std::env::temp_dir(), wanted)?;
+    let name = wanted.file_name().map(|n| n.to_owned()).unwrap_or_else(|| "socket".into());
+    let short = dir.join(name);
+    if short.as_os_str().len() > SOCKET_PATH_MAX {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("no short enough place for the socket {}", wanted.display())));
+    }
+    Ok(short)
+}
+
+pub(crate) fn launcher_exe() -> Option<String> {
+    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+    shell_safe_exe(&exe, &std::env::temp_dir())
+}
+
+pub(crate) fn launcher_alias_dir() -> Option<PathBuf> {
+    let temp = std::env::temp_dir();
+    PathBuf::from(launcher_exe()?).parent().filter(|dir| dir.starts_with(&temp)).map(Path::to_path_buf)
+}
+
+fn shell_safe_exe(exe: &Path, temp: &Path) -> Option<String> {
+    if let Some(word) = shell_word(exe) {
+        return Some(word);
+    }
+    let alias = short_runner_dir(temp, exe).ok()?.join(exe.file_name()?);
+    link_to(&alias, exe).ok()?;
+    shell_word(&alias)
+}
+
+fn shell_word(path: &Path) -> Option<String> {
+    let text = path.to_str()?;
+    text.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+".contains(c)).then(|| text.to_string())
+}
+
+fn link_to(alias: &Path, target: &Path) -> std::io::Result<()> {
+    if std::fs::read_link(alias).is_ok_and(|current| current == target) {
+        return Ok(());
+    }
+    let staged = alias.with_extension(format!("link-{}", uuid::Uuid::new_v4().simple()));
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, &staged)?;
+    std::fs::rename(&staged, alias).inspect_err(|_| {
+        let _ = std::fs::remove_file(&staged);
+    })
+}
+
+fn short_runner_dir(temp: &Path, key: &Path) -> std::io::Result<PathBuf> {
+    let hash = key.to_string_lossy().bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+    let dir = temp.join(format!("loka-{:012x}", hash & 0xffff_ffff_ffff));
     match std::fs::create_dir(&dir) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -512,12 +723,7 @@ pub(crate) fn socket_path(wanted: &Path) -> std::io::Result<PathBuf> {
         }
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o711))?;
     }
-    let name = wanted.file_name().map(|n| n.to_owned()).unwrap_or_else(|| "socket".into());
-    let short = dir.join(name);
-    if short.as_os_str().len() > SOCKET_PATH_MAX {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("no short enough place for the socket {}", wanted.display())));
-    }
-    Ok(short)
+    Ok(dir)
 }
 
 #[cfg(unix)]
@@ -527,6 +733,13 @@ pub(crate) fn runner_uid() -> u32 {
 
 pub fn steer_interrupt_after() -> Duration {
     Duration::from_secs(env_secs("WORLD_STEER_INTERRUPT_SECS", 180))
+}
+
+pub fn background_wait_cap() -> Option<Duration> {
+    match env_secs("WORLD_BACKGROUND_WAIT_SECS", 1200) {
+        0 => None,
+        secs => Some(Duration::from_secs(secs)),
+    }
 }
 
 pub fn silent_after() -> Option<Duration> {
@@ -636,6 +849,27 @@ pub(crate) fn parent_pid(pid: u32) -> Option<u32> {
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub(crate) fn parent_pid(_pid: u32) -> Option<u32> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn process_exe(pid: u32) -> Option<PathBuf> {
+    let mut buf = vec![0u8; 4096];
+    let len = unsafe { libc::proc_pidpath(pid as libc::c_int, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    if len <= 0 {
+        return None;
+    }
+    buf.truncate(len as usize);
+    Some(PathBuf::from(<std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(buf)))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn process_exe(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn process_exe(_pid: u32) -> Option<PathBuf> {
     None
 }
 
@@ -813,7 +1047,7 @@ pub fn announce_spawn(event_tx: Option<&EventSender>, child: &tokio::process::Ch
     note_spawn(event_tx, child.id());
 }
 
-pub fn stderr_tail(pipe: Option<tokio::process::ChildStderr>) -> std::sync::Arc<std::sync::Mutex<String>> {
+pub fn stderr_tail(pipe: Option<tokio::process::ChildStderr>, redactor: Redactor) -> std::sync::Arc<std::sync::Mutex<String>> {
     use tokio::io::AsyncReadExt;
     let sink = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     if let Some(mut pipe) = pipe {
@@ -826,6 +1060,7 @@ pub fn stderr_tail(pipe: Option<tokio::process::ChildStderr>) -> std::sync::Arc<
                 }
                 let mut text = tail.lock().unwrap();
                 text.push_str(&String::from_utf8_lossy(&buf[..n]));
+                *text = redactor.redact(&text);
                 if text.len() > STDERR_TAIL {
                     let from = text.len() - STDERR_TAIL;
                     let cut = (from..text.len()).find(|i| text.is_char_boundary(*i)).unwrap_or(text.len());
@@ -954,15 +1189,13 @@ impl CliOptions<'_> {
         environment
     }
 
-    pub fn secret_values(&self) -> Vec<String> {
-        let mut values: Vec<String> = self.child_environment().into_values().filter(|value| value.len() >= 4).collect();
+    pub fn redactor(&self) -> Redactor {
+        let mut values: Vec<String> = self.child_environment().into_values().collect();
         if let Some(Ok(mcp)) = self.mcp_config_json.as_deref().map(serde_json::from_str) {
             crate::remote_runner::collect_json_strings(&mcp, &mut values);
         }
         values.extend(host_secrets().iter().cloned());
-        values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-        values.dedup();
-        values
+        Redactor::new(values)
     }
 }
 
@@ -1107,6 +1340,7 @@ pub fn shell_environment_patterns(granted: &BTreeMap<String, String>) -> (Vec<St
         .map(|name| name.to_string())
         .chain(INHERITED_PREFIXES.iter().map(|prefix| format!("{prefix}*")))
         .chain(["GIT_CONFIG_*".to_string()])
+        .chain(QUEST_SHELL_ENV.iter().map(|name| name.to_string()))
         .chain(granted.keys().cloned())
         .collect();
     let exclude = loka_shared::providers::env_names()
@@ -1130,8 +1364,15 @@ fn inherits(name: &str, provider_names: &[&str], share_server_keys: bool) -> boo
     INHERITED_ENV.contains(&name) || INHERITED_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
 }
 
+#[cfg(test)]
+pub(crate) fn passed_on(name: &str) -> bool {
+    inherits(name, &loka_shared::providers::env_names().collect::<Vec<_>>(), true)
+}
+
+const RUNTIME_ENV: [&str; 8] = [crate::browser::LAUNCHER_ENV, crate::browser::ROOT_ENV, crate::browser::SOCKET_ENV, crate::screen::LAUNCHER_ENV, crate::apps::LAUNCHER_ENV, crate::apps::LEASE_ENV, loka_shared::command_rules::ENV, loka_shared::approvals::ENV];
+
 fn runtime_name(name: &str) -> bool {
-    [crate::browser::LAUNCHER_ENV, crate::browser::ROOT_ENV, crate::screen::LAUNCHER_ENV, crate::apps::LAUNCHER_ENV, crate::apps::LEASE_ENV, loka_shared::command_rules::ENV, loka_shared::approvals::ENV].contains(&name)
+    RUNTIME_ENV.contains(&name)
 }
 
 pub fn configure_child_environment(
@@ -1153,12 +1394,20 @@ pub fn configure_child_environment(
     }
     cmd.envs(explicit);
     let target_chosen = cmd.as_std().get_envs().any(|(name, value)| name == "CARGO_TARGET_DIR" && value.is_some());
-    if let Some(dir) = cmd.as_std().get_current_dir().and_then(quest_temp_dir) {
-        ensure_private_dir(&dir)?;
-        if !target_chosen {
-            cmd.env("CARGO_TARGET_DIR", dir.join(QUEST_TARGET_DIR));
+    let working_dir = cmd.as_std().get_current_dir().map(Path::to_path_buf);
+    if let Some(dir) = private_temp_dir(working_dir.as_deref().unwrap_or(Path::new(""))) {
+        prepare_private_temp_dir(&dir, working_dir.as_deref().unwrap_or(Path::new("")))?;
+        if working_dir.as_deref().and_then(quest_temp_dir).is_some() {
+            if !target_chosen {
+                cmd.env("CARGO_TARGET_DIR", dir.join(QUEST_TARGET_DIR));
+            }
+            for (name, lean) in LEAN_CARGO_ENV {
+                if !cmd.as_std().get_envs().any(|(set, value)| set == name && value.is_some()) {
+                    cmd.env(name, lean);
+                }
+            }
         }
-        cmd.env("TMPDIR", dir);
+        set_temp_env(cmd, &dir);
     }
     for (name, value) in environment {
         anyhow::ensure!(
@@ -1186,6 +1435,10 @@ pub fn host_secrets() -> &'static [String] {
         values.dedup();
         values
     })
+}
+
+pub fn host_redactor() -> Redactor {
+    Redactor::new(host_secrets())
 }
 
 fn secret_like(name: &str, value: &str) -> bool {
@@ -1230,7 +1483,7 @@ pub fn summarize_tool_input(tool: &str, input: &serde_json::Value) -> String {
             .to_string(),
         "Bash" => {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            loka_shared::text::clip_with_ellipsis(cmd, 120)
+            cmd.to_string()
         }
         "Write" | "Edit" => input
             .get("file_path")
@@ -1246,7 +1499,7 @@ pub fn summarize_tool_input(tool: &str, input: &serde_json::Value) -> String {
     }
 }
 
-pub const TOOL_OUTPUT_MAX_CHARS: usize = 3000;
+pub const TOOL_INPUT_MAX_CHARS: usize = 120;
 
 pub async fn collect_stderr(mut handle: JoinHandle<String>) -> String {
     match tokio::time::timeout(Duration::from_secs(1), &mut handle).await {
@@ -1262,21 +1515,6 @@ pub async fn collect_stderr(mut handle: JoinHandle<String>) -> String {
             String::new()
         }
     }
-}
-
-pub fn truncate_for_log(text: &str, max_chars: usize) -> String {
-    if text.is_empty() {
-        return String::new();
-    }
-    let mut out = String::new();
-    for (idx, ch) in text.chars().enumerate() {
-        if idx >= max_chars {
-            out.push('…');
-            return out;
-        }
-        out.push(ch);
-    }
-    out
 }
 
 pub fn summarize_tool_output(value: &serde_json::Value) -> String {
@@ -1316,6 +1554,83 @@ mod environment_tests {
     use super::{configure_child_environment, inherits, secret_like, shell_environment_patterns};
     use std::collections::BTreeMap;
 
+    fn set_by_runs() -> Vec<&'static str> {
+        super::LEAN_CARGO_ENV
+            .iter()
+            .map(|(name, _)| *name)
+            .chain(super::RUNTIME_ENV)
+            .chain(["CARGO_TARGET_DIR", "CLAUDE_CODE_TMPDIR", "GIT_CONFIG_COUNT", "GIT_TEMPLATE_DIR", crate::cmd_hub::HUB_ENV, crate::cmd_hub::REAL_SHELL_ENV])
+            .chain([crate::cmd_hub::Hook::ClaudeShell, crate::cmd_hub::Hook::Shell].map(crate::cmd_hub::Hook::variable).into_iter().filter(|name| *name != "SHELL"))
+            .collect()
+    }
+
+    #[test]
+    fn every_variable_a_quest_run_sets_is_one_tests_start_without() {
+        for name in set_by_runs() {
+            assert!(crate::test_env::from_quest_run(name), "{name}");
+        }
+        assert_eq!(crate::cmd_hub::REAL_SHELL_ENV, crate::test_env::REAL_SHELL);
+        assert_eq!(super::PRIVATE_TEMP_ROOT_ENV, crate::test_env::PRIVATE_TEMP_ROOT);
+        assert_eq!(crate::test_env::QUEST_TEMP_PREFIXES, [super::QUEST_TEMP_PREFIX, super::SESSION_TEMP_PREFIX]);
+        for name in super::HOST_SESSION_ENV {
+            assert!(crate::test_env::from_quest_run(name), "{name} belongs to the Claude session hosting the quest");
+        }
+    }
+
+    #[test]
+    fn tests_keep_every_variable_clis_get_from_the_host() {
+        let set = set_by_runs();
+        for name in super::INHERITED_ENV.iter().filter(|name| !set.contains(name)) {
+            assert!(super::passed_on(name), "{name}");
+            assert!(!crate::test_env::from_quest_run(name), "{name} reaches CLIs in production, so tests keep it");
+        }
+    }
+
+    #[test]
+    fn tests_that_spawn_clis_and_git_pass_inside_a_quest_run_environment() {
+        let base = std::env::temp_dir().join(format!("quest-run-env-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&base).unwrap();
+        let global = base.join("gitconfig");
+        std::fs::write(&global, "[user]\n\tname = Leaked Quest\n\temail = leak@example.com\n[branch]\n\tautoSetupMerge = false\n").unwrap();
+        let quest_temp = super::private_temp_root().join(super::quest_temp_name(uuid::Uuid::new_v4())).join("claude-501");
+        let tests = [
+            "claude::tests::quest_claude_runs_get_their_own_writable_temp_dir",
+            "claude::sandbox::live_tests::owner_quest_branches_off_a_remote_branch_never_write_tracking_to_the_shared_config",
+            "git::workspace::tests::owner_identity_comes_from_gh_repo_level_only",
+            "git::workspace::tests::missing_owner_identity_falls_back_without_global_writes",
+            "test_env::tests::the_test_process_starts_without_quest_run_variables",
+        ];
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(tests)
+            .args(["--exact", "--test-threads=1"])
+            .env("CLAUDE_CODE_TMPDIR", &quest_temp)
+            .env("CLAUDE_CODE_SHELL", base.join("bash"))
+            .env("GIT_CONFIG_COUNT", "2")
+            .env("GIT_CONFIG_KEY_0", "branch.autoSetupMerge")
+            .env("GIT_CONFIG_VALUE_0", "false")
+            .env("GIT_CONFIG_KEY_1", "user.name")
+            .env("GIT_CONFIG_VALUE_1", "Leaked Quest")
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .env("GIT_CONFIG_PARAMETERS", "'user.email=leak@example.com'")
+            .env("GIT_DIR", base.join("not-a-repo"))
+            .env("GIT_WORK_TREE", base.join("not-a-tree"))
+            .env("GIT_TEMPLATE_DIR", "")
+            .env("CARGO_TARGET_DIR", base.join("cargo-target"))
+            .env("CARGO_INCREMENTAL", "0")
+            .env("CARGO_PROFILE_DEV_DEBUG", "0")
+            .env(crate::cmd_hub::HUB_ENV, base.join("hub.sock"))
+            .env(crate::cmd_hub::REAL_SHELL_ENV, "/bin/sh")
+            .env(loka_shared::approvals::ENV, "[]")
+            .env("WORLD_TASK_SANDBOX", "off")
+            .env("KARNA_TASK_SANDBOX", "off")
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(&base).ok();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+        assert!(stdout.contains(&format!("test result: ok. {} passed", tests.len())), "{stdout}");
+    }
+
     fn child_env(command: &tokio::process::Command) -> BTreeMap<String, Option<String>> {
         command
             .as_std()
@@ -1343,12 +1658,101 @@ mod environment_tests {
         let one = temp_of(&tree(first)).expect("quest temp dir");
         let two = temp_of(&tree(second)).expect("quest temp dir");
         assert_ne!(one, two);
-        assert_eq!(one, std::env::temp_dir().join(super::quest_temp_name(first)).to_string_lossy().to_string());
+        assert_eq!(one, super::private_temp_root().join(super::quest_temp_name(first)).to_string_lossy().to_string());
         assert!(std::path::Path::new(&one).is_dir());
         assert_eq!(temp_of(&tree(first).join("src")).as_deref(), Some(one.as_str()));
         assert!(one.len() < 100 && !one.contains(' '));
         let _ = std::fs::remove_dir_all(&one);
         let _ = std::fs::remove_dir_all(&two);
+    }
+
+    #[test]
+    fn private_temp_roots_stay_short_enough_for_claude_shell_temp_and_unix_sockets() {
+        use std::path::PathBuf;
+        let shell_temp = |dir: &std::path::Path| format!("{}/claude-{}", dir.display(), super::current_uid());
+        for preferred in [
+            "/var/folders/hx/nz8b2hjn2z31tnxfzn48rfl80000gn/T",
+            "/var/folders/hx/nz8b2hjn2z31tnxfzn48rfl80000gn/T/loka-q-0123456789ab/claude-501",
+            "/home/someone/a/long/place/for/temp",
+            "/tmp",
+        ] {
+            let root = super::private_temp_root_in(PathBuf::from(preferred));
+            let dir = root.join(super::quest_temp_name(uuid::Uuid::new_v4()));
+            assert!(shell_temp(&dir).len() <= 44, "Claude Code falls back to the shared /tmp/claude-<uid> past 44 bytes: {}", shell_temp(&dir));
+            assert!(format!("{}/claude-501/cc-socks/12345.sock", dir.display()).len() < 104, "{preferred}");
+        }
+        assert_eq!(super::private_temp_root_in(PathBuf::from("/var/folders/hx/nz8b2hjn2z31tnxfzn48rfl80000gn/T")), PathBuf::from("/tmp"));
+        assert_eq!(super::private_temp_root_in(PathBuf::from("/tmp")), PathBuf::from("/tmp"));
+        assert_eq!(super::private_temp_root_in(PathBuf::from("/var/tmp")), PathBuf::from("/var/tmp"));
+        assert!(super::private_temp_homes().contains(&std::env::temp_dir()), "folders made under the old root are still found and cleaned");
+    }
+
+    #[test]
+    fn a_folder_someone_else_made_never_becomes_a_private_temp_dir() {
+        let base = std::env::temp_dir().join(format!("private-dir-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&base).unwrap();
+        let fresh = base.join("fresh");
+        super::ensure_private_dir(&fresh).unwrap();
+        let loose = base.join("loose");
+        std::fs::create_dir(&loose).unwrap();
+        std::fs::set_permissions(&loose, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        super::ensure_private_dir(&loose).unwrap();
+        let mode = |dir: &std::path::Path| std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(dir).unwrap().permissions()) & 0o777;
+        assert_eq!((mode(&fresh), mode(&loose)), (0o700, 0o700));
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let planted = base.join("planted");
+        std::os::unix::fs::symlink(&elsewhere, &planted).unwrap();
+        assert!(super::ensure_private_dir(&planted).is_err(), "a symlink planted at the name is refused");
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn every_cli_exports_and_grants_the_same_quest_temp_dir() {
+        use serde_json::{json, Value};
+        let quest = uuid::Uuid::new_v4();
+        let cwd = std::path::PathBuf::from(format!("/Users/a/Library/Application Support/dev.ygpt.loka/runner/workspaces/tasks/{quest}/world"));
+        let dir = super::private_temp_root().join(super::quest_temp_name(quest));
+        let mut command = tokio::process::Command::new("true");
+        command.current_dir(&cwd);
+        configure_child_environment(&mut command, &BTreeMap::new()).unwrap();
+        let env = child_env(&command);
+        for name in ["TMPDIR", "TMP", "TEMP"] {
+            assert_eq!(env[name].as_deref(), Some(dir.to_str().unwrap()), "{name}: every CLI and every shell it starts gets the quest dir");
+        }
+        assert_eq!(env["CARGO_TARGET_DIR"].as_deref(), Some(dir.join(super::QUEST_TARGET_DIR).to_str().unwrap()));
+        let grants = super::private_temp_grants(&dir);
+        assert!(grants.contains(&dir) && grants.contains(&std::fs::canonicalize(&dir).unwrap()));
+
+        let mut claude = json!({ "sandbox": { "filesystem": { "allowWrite": [] }, "network": {} } });
+        crate::claude::sandbox::allow_private_dir(&mut claude, &dir);
+        let listed = |value: &Value| -> Vec<String> { value.as_array().unwrap().iter().filter_map(|path| path.as_str().map(String::from)).collect() };
+        let granted: Vec<String> = grants.iter().map(|grant| grant.display().to_string()).collect();
+        assert_eq!(listed(&claude["sandbox"]["filesystem"]["allowWrite"]), granted, "claude writes");
+        assert_eq!(listed(&claude["sandbox"]["network"]["allowUnixSockets"]), granted, "claude sockets");
+
+        let policy = crate::cursor::sandbox::policy(crate::claude::sandbox::Mode::Auto, &cwd, &[], Some(&dir)).unwrap();
+        let cursor = listed(&policy["additionalReadwritePaths"]);
+        assert!(granted.iter().all(|grant| cursor.contains(grant)), "cursor writes (its policy has no separate socket switch): {cursor:?}");
+
+        let spec = crate::sandbox_wrap::Spec { working_dir: cwd.clone(), ..Default::default() };
+        let wrapped = crate::sandbox_wrap::paths(&spec, &BTreeMap::new(), Some(&dir));
+        let real = std::fs::canonicalize(&dir).unwrap();
+        assert!(wrapped.writable.contains(&real) && wrapped.sockets.contains(&real), "omp and opencode wrapper: {wrapped:?}");
+        let profile = crate::sandbox_wrap::seatbelt_profile(&wrapped);
+        assert!(profile.contains(&format!("(allow network-bind (local unix-socket (subpath \"{}\")", real.display())), "{profile}");
+        assert!(profile.contains(&format!("(allow network-outbound (remote unix-socket (subpath \"{}\")", real.display())), "{profile}");
+        let binds = crate::sandbox_wrap::bwrap_args(&wrapped, |_| Some(true));
+        assert!(binds.windows(2).any(|pair| pair[0] == "--bind" && pair[1] == real.as_os_str()), "{binds:?}");
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let roots = runtime.block_on(crate::codex::writable_roots(&cwd));
+        assert!(grants.iter().all(|grant| roots.contains(grant)), "codex writes: {roots:?}");
+        let (include, _) = super::shell_environment_patterns(&BTreeMap::new());
+        for name in ["TMPDIR", "TMP", "TEMP", "CARGO_TARGET_DIR"] {
+            assert!(include.iter().any(|kept| kept == name), "codex shells keep {name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1360,8 +1764,126 @@ mod environment_tests {
         let mut elsewhere = tokio::process::Command::new("true");
         elsewhere.current_dir("/r/workspaces/agents/main");
         configure_child_environment(&mut elsewhere, &BTreeMap::new()).unwrap();
-        let temp = child_env(&elsewhere).get("TMPDIR").cloned().flatten().unwrap_or_default();
-        assert!(!temp.contains(super::QUEST_TEMP_PREFIX));
+        let temp = child_env(&elsewhere).get("TMPDIR").cloned().flatten();
+        assert_eq!(temp, std::env::var("TMPDIR").ok(), "a run outside a quest keeps the temp dir it inherits");
+    }
+
+    fn temp_vars(command: &tokio::process::Command) -> Vec<Option<String>> {
+        ["TMPDIR", "TMP", "TEMP"].iter().map(|name| child_env(command).get(*name).cloned().flatten()).collect()
+    }
+
+    fn configured_in(session: Option<uuid::Uuid>, cwd: &str) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("true");
+        command.current_dir(cwd);
+        let mut configure = || configure_child_environment(&mut command, &BTreeMap::new()).unwrap();
+        match session {
+            Some(id) => super::SESSION_TEMP.sync_scope(id, configure),
+            None => configure(),
+        }
+        command
+    }
+
+    #[test]
+    fn tmpdir_tmp_and_temp_all_name_the_same_private_folder() {
+        let quest = uuid::Uuid::new_v4();
+        let session = uuid::Uuid::new_v4();
+        let in_quest = temp_vars(&configured_in(None, &format!("/r/workspaces/tasks/{quest}/world")));
+        let in_folder = temp_vars(&configured_in(Some(session), "/Users/a/Projects/app"));
+        let quest_dir = super::private_temp_root().join(super::quest_temp_name(quest)).to_string_lossy().to_string();
+        let session_dir = super::private_temp_root().join(super::session_temp_name(session)).to_string_lossy().to_string();
+        assert_eq!(in_quest, vec![Some(quest_dir.clone()); 3]);
+        assert_eq!(in_folder, vec![Some(session_dir.clone()); 3]);
+        let _ = std::fs::remove_dir_all(quest_dir);
+        let _ = std::fs::remove_dir_all(session_dir);
+    }
+
+    #[test]
+    fn folder_and_quick_sessions_get_one_folder_each_that_a_resume_keeps() {
+        let (first, second) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let temp_of = |id: uuid::Uuid, cwd: &str| temp_vars(&configured_in(Some(id), cwd))[0].clone().expect("session temp dir");
+        let one = temp_of(first, "/Users/a/Projects/app");
+        let two = temp_of(second, "/Users/a/Projects/app");
+        assert_ne!(one, two, "two sessions in one folder never share a temp dir");
+        assert_eq!(temp_of(first, "/Users/a/Projects/app"), one, "a resumed session keeps its folder");
+        assert_eq!(temp_of(first, "/Users/a/Projects/app/src"), one);
+        assert!(one.ends_with(&super::session_temp_name(first)) && std::path::Path::new(&one).is_dir());
+        let owner = super::private_temp_owner(std::path::Path::new(&one)).expect("owner marker");
+        assert_eq!(owner.0, first);
+        assert!(super::private_temp_owner(&super::private_temp_root().join(super::session_temp_name(second)).join("nested")).is_none());
+        assert!(child_env(&configured_in(Some(first), "/Users/a/Projects/app")).get("CARGO_TARGET_DIR").cloned().flatten().is_none(), "a person's own folder keeps its own build output");
+        let _ = std::fs::remove_dir_all(one);
+        let _ = std::fs::remove_dir_all(two);
+    }
+
+    #[test]
+    fn a_quest_temp_folder_names_its_quest_and_runner_so_it_is_found_without_its_checkout() {
+        let quest = uuid::Uuid::new_v4();
+        let root = std::path::Path::new("/Users/a/Library/Application Support/dev.ygpt.loka/runner");
+        let working_dir = root.join("workspaces").join("tasks").join(quest.to_string()).join("world");
+        assert_eq!(super::quest_place(&working_dir), Some((quest, root.to_path_buf())));
+        assert_eq!(super::quest_place(&root.join("workspaces").join("tasks").join(quest.to_string()).join("world-2").join("src")), Some((quest, root.to_path_buf())));
+        assert_eq!(super::quest_place(std::path::Path::new(&format!("tasks/{quest}/app"))).map(|(id, _)| id), Some(quest));
+        let target = super::prepare_quest_temp_dir(&working_dir).unwrap().expect("quest build folder");
+        let folder = target.parent().unwrap().to_path_buf();
+        assert_eq!(super::private_temp_owner(&folder), Some((quest, root.to_path_buf())));
+        let other = super::private_temp_root().join(super::quest_temp_name(uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::copy(folder.join(super::PRIVATE_TEMP_OWNER), other.join(super::PRIVATE_TEMP_OWNER)).unwrap();
+        assert_eq!(super::private_temp_owner(&other), None, "a marker copied into another quest's folder names nobody");
+        let _ = std::fs::remove_dir_all(folder);
+        let _ = std::fs::remove_dir_all(other);
+    }
+
+    #[test]
+    fn follow_ups_and_reviews_of_a_quest_use_the_quests_folder_even_inside_a_session() {
+        let (quest, session) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let command = configured_in(Some(session), &format!("/r/workspaces/tasks/{quest}/world"));
+        let expected = super::private_temp_root().join(super::quest_temp_name(quest)).to_string_lossy().to_string();
+        assert_eq!(temp_vars(&command), vec![Some(expected.clone()); 3]);
+        assert!(child_env(&command).get("CARGO_TARGET_DIR").cloned().flatten().is_some());
+        let _ = std::fs::remove_dir_all(expected);
+    }
+
+    #[test]
+    fn runs_with_no_quest_and_no_session_keep_the_shared_temp_dir() {
+        let command = configured_in(None, "/Users/a/Projects/app");
+        for (name, value) in ["TMPDIR", "TMP", "TEMP"].into_iter().zip(temp_vars(&command)) {
+            if let Some(value) = value {
+                assert_eq!(Some(value), std::env::var(name).ok(), "a run outside a quest keeps the {name} it inherits");
+            }
+        }
+    }
+
+    #[test]
+    fn odd_paths_never_name_a_temp_dir_outside_the_temp_root() {
+        let id = uuid::Uuid::new_v4();
+        let temp = super::private_temp_root();
+        for cwd in [
+            format!("/r/workspaces/tasks/../../etc/{id}"),
+            format!("/r/workspaces/tasks/{id}/../../../x"),
+            format!("/r/workspaces/tasks/{}/world", id.to_string().to_uppercase()),
+            format!("/r/workspaces/tasks/{{{id}}}/world"),
+            "/r/workspaces/tasks/../x".to_string(),
+            "/r/workspaces/tasks//world".to_string(),
+            String::new(),
+        ] {
+            if let Some(dir) = super::private_temp_dir(std::path::Path::new(&cwd)) {
+                assert_eq!(dir.parent(), Some(temp.as_path()), "{cwd}");
+                let name = dir.file_name().unwrap().to_string_lossy().to_string();
+                assert!(name.starts_with(super::QUEST_TEMP_PREFIX) && name.len() == super::QUEST_TEMP_PREFIX.len() + 12 && name.chars().skip(7).all(|c| c.is_ascii_hexdigit()), "{cwd}: {name}");
+            }
+        }
+        let session = uuid::Uuid::new_v4();
+        let dir = super::SESSION_TEMP.sync_scope(session, || super::private_temp_dir(std::path::Path::new("/r/workspaces/tasks/../x"))).unwrap();
+        assert_eq!(dir.parent(), Some(temp.as_path()));
+        assert!(dir.ends_with(super::session_temp_name(session)));
+    }
+
+    #[test]
+    fn wrapped_clis_set_all_three_temp_variables_through_one_helper() {
+        let mut command = tokio::process::Command::new("true");
+        super::set_temp_env(&mut command, std::path::Path::new("/run/private"));
+        assert_eq!(temp_vars(&command), vec![Some("/run/private".to_string()); 3]);
     }
 
     #[test]
@@ -1372,26 +1894,41 @@ mod environment_tests {
             command.current_dir(format!("/r/workspaces/tasks/{id}/world"));
             configure_child_environment(&mut command, granted).unwrap();
             let target = child_env(&command).get("CARGO_TARGET_DIR").cloned().flatten();
-            let _ = std::fs::remove_dir_all(std::env::temp_dir().join(super::quest_temp_name(id)));
+            let _ = std::fs::remove_dir_all(super::private_temp_root().join(super::quest_temp_name(id)));
             (target, command)
         };
         let none = BTreeMap::new();
-        let (one, mut command) = target_of(first, &none);
+        let (one, _) = target_of(first, &none);
         let (two, _) = target_of(second, &none);
-        let expected = |id: uuid::Uuid| std::env::temp_dir().join(super::quest_temp_name(id)).join("cargo-target").to_string_lossy().to_string();
+        let expected = |id: uuid::Uuid| super::private_temp_root().join(super::quest_temp_name(id)).join("cargo-target").to_string_lossy().to_string();
         assert_eq!(one, Some(expected(first)));
         assert_eq!(two, Some(expected(second)));
-        super::drop_default_quest_target(&mut command);
-        assert!(child_env(&command).get("CARGO_TARGET_DIR").cloned().flatten().is_none(), "sandboxes with their own temp dir drop it");
         let granted = BTreeMap::from([("CARGO_TARGET_DIR".to_string(), "/granted".to_string())]);
-        let (kept, mut command) = target_of(first, &granted);
+        let (kept, _) = target_of(first, &granted);
         assert_eq!(kept.as_deref(), Some("/granted"));
-        super::drop_default_quest_target(&mut command);
-        assert_eq!(child_env(&command).get("CARGO_TARGET_DIR").cloned().flatten().as_deref(), Some("/granted"), "a chosen target is never dropped");
         let mut elsewhere = tokio::process::Command::new("true");
         elsewhere.current_dir("/r/workspaces/agents/main");
         configure_child_environment(&mut elsewhere, &none).unwrap();
         assert!(child_env(&elsewhere).get("CARGO_TARGET_DIR").cloned().flatten().is_none(), "only quest runs get one");
+    }
+
+    #[test]
+    fn quest_cargo_builds_skip_incremental_state_and_debug_info_unless_granted() {
+        let id = uuid::Uuid::new_v4();
+        let lean = |granted: &BTreeMap<String, String>, cwd: &str, name: &str| {
+            let mut command = tokio::process::Command::new("true");
+            command.current_dir(cwd);
+            configure_child_environment(&mut command, granted).unwrap();
+            child_env(&command).get(name).cloned().flatten()
+        };
+        let quest = format!("/r/workspaces/tasks/{id}/world");
+        for name in ["CARGO_INCREMENTAL", "CARGO_PROFILE_DEV_DEBUG"] {
+            assert_eq!(lean(&BTreeMap::new(), &quest, name).as_deref(), Some("0"), "{name}");
+            let granted = BTreeMap::from([(name.to_string(), "1".to_string())]);
+            assert_eq!(lean(&granted, &quest, name).as_deref(), Some("1"), "a granted {name} wins");
+            assert!(lean(&BTreeMap::new(), "/r/workspaces/agents/main", name).is_none(), "only quest runs are lean");
+        }
+        let _ = std::fs::remove_dir_all(super::private_temp_root().join(super::quest_temp_name(id)));
     }
 
     #[test]
@@ -1557,9 +2094,41 @@ mod tests {
         let _ = std::fs::remove_file(&moved);
     }
 
+    #[test]
+    fn a_launcher_inside_an_app_folder_with_spaces_is_still_one_shell_word() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("loka-launcher-{}", uuid::Uuid::new_v4().simple()));
+        let temp = base.join("temp");
+        std::fs::create_dir_all(&temp).unwrap();
+        let plain = base.join("bin").join("loka-agent");
+        let spaced = base.join("Application Support").join("Loka.app").join("Contents").join("MacOS").join("loka-agent");
+        for exe in [&plain, &spaced] {
+            std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+            std::fs::write(exe, "#!/bin/sh\necho \"ran $1 $2\"\n").unwrap();
+            std::fs::set_permissions(exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(super::shell_safe_exe(&plain, &temp).as_deref(), plain.to_str());
+        assert!(std::fs::read_dir(&temp).unwrap().next().is_none(), "a plain path needs no alias");
+        let launcher = super::shell_safe_exe(&spaced, &temp).unwrap();
+        assert_eq!(super::shell_word(Path::new(&launcher)).as_deref(), Some(launcher.as_str()));
+        assert!(launcher.starts_with(temp.to_str().unwrap()), "{launcher}");
+        assert_eq!(std::fs::read_link(&launcher).unwrap(), spaced);
+        let ran = std::process::Command::new("/bin/sh").arg("-c").arg(format!("{launcher} browser abc")).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&ran.stdout), "ran browser abc\n");
+        assert_eq!(super::shell_safe_exe(&spaced, &temp).as_deref(), Some(launcher.as_str()), "stable across calls");
+        std::fs::remove_file(&launcher).unwrap();
+        std::os::unix::fs::symlink(&plain, &launcher).unwrap();
+        assert_eq!(super::shell_safe_exe(&spaced, &temp).as_deref(), Some(launcher.as_str()));
+        assert_eq!(std::fs::read_link(&launcher).unwrap(), spaced, "a stale alias is pointed back at the app");
+        let spaced_temp = base.join("temp with space");
+        std::fs::create_dir_all(&spaced_temp).unwrap();
+        assert_eq!(super::shell_safe_exe(&spaced, &spaced_temp), None, "an alias that would need quoting is never offered");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
     use super::{
-        collect_stderr, session_id_from_init, summarize_tool_output, truncate_for_log, JobUid,
-        FREE_JOB_UIDS, JOB_UID, TOOL_OUTPUT_MAX_CHARS,
+        collect_stderr, session_id_from_init, summarize_tool_output, JobUid,
+        FREE_JOB_UIDS, JOB_UID,
     };
 
     #[test]
@@ -1584,6 +2153,29 @@ mod tests {
     use std::time::Duration;
 
     #[tokio::test]
+    async fn a_secret_at_the_start_of_the_stderr_window_is_not_left_in_pieces() {
+        let secret = "sk-live-0123456789abcdef";
+        for kept_after in [2usize, 11, 23, 24, 30] {
+            let junk = 4000 - kept_after;
+            let text = format!("{}{secret}{}", "j".repeat(junk), "k".repeat(kept_after));
+            let mut child = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg("printf '%s' \"$TEXT\" >&2")
+                .env("TEXT", &text)
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let tail = super::stderr_tail(child.stderr.take(), super::Redactor::new([secret]));
+            child.wait().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let shown = tail.lock().unwrap().clone();
+            for start in 0..=secret.len() - loka_shared::redaction::MIN_SECRET_BYTES {
+                assert!(!shown.contains(&secret[start..start + loka_shared::redaction::MIN_SECRET_BYTES]), "kept_after {kept_after}: a piece of the secret is in the stderr tail");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn job_uids_return_to_the_pool_only_after_every_holder_lets_go() {
         FREE_JOB_UIDS.lock().unwrap().push(4242);
         let job = JobUid::take().await.unwrap().unwrap();
@@ -1596,11 +2188,25 @@ mod tests {
     }
 
     #[test]
-    fn truncates_tool_output_to_log_cap() {
-        let long = "a".repeat(TOOL_OUTPUT_MAX_CHARS + 64);
-        let truncated = truncate_for_log(&long, TOOL_OUTPUT_MAX_CHARS);
-        assert!(truncated.ends_with('…'));
-        assert_eq!(truncated.chars().count(), TOOL_OUTPUT_MAX_CHARS + 1);
+    fn events_are_redacted_before_they_are_cut() {
+        let secret = "sk-live-0123456789abcdef";
+        let redactor = super::Redactor::new([secret]);
+        let output = format!("{}{secret}", "a".repeat(3000 - 6));
+        let command = format!("{}{secret}", "b".repeat(super::TOOL_INPUT_MAX_CHARS - 6));
+        let super::StreamEvent::ToolResult { output: shown, .. } =
+            super::StreamEvent::ToolResult { tool: "Bash".into(), output }.redacted_clip(&redactor, 3000)
+        else {
+            panic!("result expected")
+        };
+        let super::StreamEvent::ToolUse { input_summary, .. } =
+            super::StreamEvent::ToolUse { tool: "Bash".into(), input_summary: command }.redacted_clip(&redactor, 4000)
+        else {
+            panic!("use expected")
+        };
+        assert_eq!(shown.chars().count(), 3000);
+        assert!(shown.ends_with("[REDAC"));
+        assert!(input_summary.ends_with("[REDAC"));
+        assert!(!shown.contains("sk-") && !input_summary.contains("sk-"));
     }
 
     #[test]
@@ -2015,5 +2621,59 @@ mod parent_pid_tests {
     fn parent_pid_matches_getppid() {
         assert_eq!(super::parent_pid(std::process::id()), Some(unsafe { libc::getppid() } as u32));
         assert_eq!(super::parent_pid(u32::MAX - 7), None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod straddle {
+    use super::{Redactor, StreamEvent};
+
+    pub const SECRET: &str = "sk-live-0123456789abcdef";
+
+    pub fn around(pad: usize) -> String {
+        format!("{}{SECRET}{}", "x".repeat(pad), "z".repeat(40))
+    }
+
+    pub fn pads() -> Vec<usize> {
+        [super::TOOL_INPUT_MAX_CHARS, 200, 300, 2_000, 3_000, 4_000]
+            .into_iter()
+            .flat_map(|limit| limit - SECRET.len() - 1..=limit + 1)
+            .collect()
+    }
+
+    pub fn texts(events: &[StreamEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolUse { input_summary, .. } => Some(input_summary.as_str()),
+                StreamEvent::ToolResult { output, .. } => Some(output.as_str()),
+                StreamEvent::AssistantText(text) | StreamEvent::Error(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn assert_whole_then_hidden(events: Vec<StreamEvent>, expected: usize, label: &str, pad: usize) {
+        let whole = texts(&events).into_iter().filter(|text| text.contains(SECRET)).count();
+        assert_eq!(whole, expected, "{label} cut the text before redaction at pad {pad}");
+        let redactor = Redactor::new([SECRET]);
+        for limit in [2_000, 4_000] {
+            for event in events.iter().cloned() {
+                let shown = event.redacted_clip(&redactor, limit);
+                for text in texts(std::slice::from_ref(&shown)) {
+                    for start in 0..=SECRET.len() - loka_shared::redaction::MIN_SECRET_BYTES {
+                        assert!(!text.contains(&SECRET[start..start + loka_shared::redaction::MIN_SECRET_BYTES]), "{label} leaked a piece of the secret at pad {pad}, limit {limit}");
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn drain(mut receiver: tokio::sync::mpsc::UnboundedReceiver<StreamEvent>) -> Vec<StreamEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
+        }
+        events
     }
 }

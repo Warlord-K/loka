@@ -32,9 +32,9 @@ export function readyToType(at: { bracketed: boolean; sinceLive: number; sinceOu
 
 export type Typed = "typed" | "copied" | "not_copied" | "empty" | "cancelled";
 
-export type ShellPhase = "idle" | "starting" | "connecting" | "live" | "ended" | "error";
+export type ShellPhase = "idle" | "starting" | "connecting" | "live" | "ended" | "error" | "elsewhere";
 
-export type TypePlan = "type" | "queue" | "ask" | "open" | "none";
+export type TypePlan = "type" | "queue" | "new_tab" | "open" | "none";
 
 function opening(phase: ShellPhase): boolean {
   return phase === "starting" || phase === "connecting" || phase === "live";
@@ -43,15 +43,8 @@ function opening(phase: ShellPhase): boolean {
 export function planRequest(at: { phase: ShellPhase; current: string | null; target: string | null }): TypePlan {
   if (!at.target) return "none";
   if (!opening(at.phase)) return "open";
-  if (at.current !== at.target) return "ask";
+  if (at.current !== at.target) return "new_tab";
   return at.phase === "live" ? "type" : "queue";
-}
-
-export function planSwitch(at: { go: boolean; phase: ShellPhase; current: string | null; target: string }): { plan: TypePlan; device: string | null } {
-  if (at.go) return { plan: "open", device: at.target };
-  if (!at.current) return { plan: "none", device: null };
-  if (!opening(at.phase)) return { plan: "open", device: at.current };
-  return { plan: at.phase === "live" ? "type" : "queue", device: at.current };
 }
 
 export type TypedReport = { result: Typed; device: string; note: string; context: string };

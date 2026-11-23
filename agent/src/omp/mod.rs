@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 use crate::cli::{
     announce_spawn, configure_child_environment, give_to_job_user, job_command, job_user, stderr_tail,
     summarize_tool_output,
-    truncate_for_log, CliOptions, CliResult, StreamEvent, Usage, TOOL_OUTPUT_MAX_CHARS,
+    CliOptions, CliResult, StreamEvent, Usage,
 };
 
 const AGENT_PREAMBLE: &str = "\
@@ -392,7 +392,7 @@ fn summarize_input(tool: &str, args: &Value) -> String {
         "task" => field("description"),
         _ => None,
     };
-    truncate_for_log(text.unwrap_or_default(), 120)
+    text.unwrap_or_default().to_string()
 }
 
 fn message_text(message: &Value) -> String {
@@ -488,7 +488,7 @@ impl RpcProbe {
         cmd.stderr(std::process::Stdio::piped());
         let mut child = cmd.spawn().context("Failed to spawn omp in rpc mode")?;
         announce_spawn(opts.event_tx.as_ref(), &child);
-        let stderr = stderr_tail(child.stderr.take());
+        let stderr = stderr_tail(child.stderr.take(), opts.redactor());
         let stdin = child.stdin.take().context("omp stdin missing")?;
         let lines = BufReader::new(child.stdout.take().context("omp stdout missing")?).lines();
         Ok(Self { child, stdin, lines, stderr, _run_dir: run_dir })
@@ -721,9 +721,9 @@ struct Reader {
 }
 
 impl Reader {
-    fn feed(&mut self, json: &Value, opts: &CliOptions<'_>) {
+    fn feed(&mut self, json: &Value, events: Option<&crate::cli::EventSender>) {
         let send = |event: StreamEvent| {
-            if let Some(tx) = &opts.event_tx {
+            if let Some(tx) = events {
                 let _ = tx.send(event);
             }
         };
@@ -777,7 +777,7 @@ impl Reader {
                 }
                 send(StreamEvent::ToolResult {
                     tool: tool.to_string(),
-                    output: truncate_for_log(&summarize_tool_output(&json["result"]), TOOL_OUTPUT_MAX_CHARS),
+                    output: summarize_tool_output(&json["result"]),
                 });
             }
             _ => {}
@@ -919,7 +919,7 @@ where
                         open += 1;
                     }
                     _ => {
-                        reader.feed(&json, opts);
+                        reader.feed(&json, opts.event_tx.as_ref());
                         if first_output_ms.is_none() && !reader.output.is_empty() {
                             first_output_ms = Some(started.elapsed().as_millis() as u64);
                         }
@@ -1000,7 +1000,7 @@ async fn run_steerable(opts: &CliOptions<'_>, steer: crate::cli::SteerReceiver) 
         .spawn()
         .context("Failed to spawn omp CLI. Install it with: bun install -g @oh-my-pi/pi-coding-agent")?;
     announce_spawn(opts.event_tx.as_ref(), &child);
-    let stderr = stderr_tail(child.stderr.take());
+    let stderr = stderr_tail(child.stderr.take(), opts.redactor());
     let mut stdin = child.stdin.take().context("omp stdin missing")?;
     let mut lines = BufReader::new(child.stdout.take().context("omp stdout missing")?).lines();
     stdin.write_all(frame("get_state", "state", None).as_bytes()).await?;
@@ -1035,7 +1035,7 @@ impl WarmOmp {
             .spawn()
             .context("Failed to spawn omp CLI. Install it with: bun install -g @oh-my-pi/pi-coding-agent")?;
         announce_spawn(opts.event_tx.as_ref(), &child);
-        let stderr = stderr_tail(child.stderr.take());
+        let stderr = stderr_tail(child.stderr.take(), opts.redactor());
         let mut stdin = child.stdin.take().context("omp stdin missing")?;
         let mut lines = BufReader::new(child.stdout.take().context("omp stdout missing")?).lines();
         stdin.write_all(frame("get_state", "state", None).as_bytes()).await?;
@@ -1139,7 +1139,7 @@ async fn run_print(opts: CliOptions<'_>) -> Result<CliResult> {
         .spawn()
         .context("Failed to spawn omp CLI. Install it with: bun install -g @oh-my-pi/pi-coding-agent")?;
     announce_spawn(opts.event_tx.as_ref(), &child);
-    let stderr = stderr_tail(child.stderr.take());
+    let stderr = stderr_tail(child.stderr.take(), opts.redactor());
     {
         let mut stdin = child.stdin.take().expect("stdin piped");
         stdin.write_all(opts.prompt.as_bytes()).await?;
@@ -1153,7 +1153,7 @@ async fn run_print(opts: CliOptions<'_>) -> Result<CliResult> {
         let Ok(json) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
         };
-        reader.feed(&json, &opts);
+        reader.feed(&json, opts.event_tx.as_ref());
     }
     let Reader { session_id, output, totals, error_message, .. } = reader;
 
@@ -1399,5 +1399,27 @@ mod tests {
         assert!(reply.contains("heliotrope") && reply.contains("marmalade"), "{}", answer.output);
         eprintln!("after compaction answered with context {}", answer.usage.context_tokens);
         assert!(compacted.usage.context_tokens < second.usage.context_tokens);
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use crate::cli::straddle::{around, assert_whole_then_hidden, drain, pads};
+    use serde_json::json;
+
+    #[test]
+    fn the_omp_parser_sends_whole_text_so_a_secret_across_any_cut_is_hidden() {
+        for pad in pads() {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut reader = super::Reader::default();
+            reader.feed(&json!({"type": "tool_execution_start", "toolName": "bash", "args": {"command": around(pad)}}), Some(&tx));
+            reader.feed(&json!({"type": "tool_execution_end", "toolName": "bash", "result": around(pad)}), Some(&tx));
+            reader.feed(
+                &json!({"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": around(pad)}]}}),
+                Some(&tx),
+            );
+            drop(tx);
+            assert_whole_then_hidden(drain(rx), 3, "omp", pad);
+        }
     }
 }

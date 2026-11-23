@@ -71,7 +71,7 @@ Why not:
 | claude | One `claude` process (single-binary runtime) | Temp MCP JSON file with no key values |
 | codex | npm `node` shim plus the `codex` binary | A rewind spawns an extra app-server |
 | omp | One `bun` process, inside `sandbox-exec` or `bwrap` for task runs | Fresh `PI_CODING_AGENT_DIR` per run with copied `models.yml`, `config.yml`, `mcp.json`, `system.md` |
-| cursor | `cursor-agent` (node), or `cursor-agent acp` for warm main turns | Temp plugin dir and in-place edits of `.cursor/cli.json` and `.cursor/sandbox.json`, restored afterwards; a private `TMPDIR`; a fork or rewind copies one chat store |
+| cursor | `cursor-agent` (node), or `cursor-agent acp` for warm main turns | Temp plugin dir and in-place edits of `.cursor/cli.json` and `.cursor/sandbox.json`, restored afterwards; the quest or session temp folder as `TMPDIR`; a fork or rewind copies one chat store |
 | opencode | `opencode run`, or `opencode acp` for warm main turns, inside the sandbox wrapper for task runs | Temp `opencode.json`, the lean or read-only agent as `OPENCODE_CONFIG_CONTENT`; the prompt goes on stdin; a fork or rewind runs `opencode export` and `opencode import` |
 
 ## Shared MCP servers

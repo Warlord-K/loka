@@ -1074,20 +1074,47 @@ export function AttachmentGrid({ items, collapsed }: { items: Attachment[]; coll
   );
 }
 
-export function AskChoices({ choices, answered, onAnswer }: { choices: string[]; answered: boolean; onAnswer: (choice: string) => void }) {
-  if (!choices.length || answered) return null;
+export function AskChoices({ choices, answered, allowReply = false, onAnswer }: { choices: string[]; answered: boolean; allowReply?: boolean; onAnswer: (choice: string) => void }) {
+  const [replying, setReplying] = useState(false);
+  const [reply, setReply] = useState("");
+  if ((!choices.length && !allowReply) || answered) return null;
   return (
-    <div className="mt-2 flex flex-wrap gap-2">
-      {choices.map((c, i) => (
-        <button
-          key={c}
-          type="button"
-          onClick={() => onAnswer(c)}
-          className={cn(CHUNKY, "px-3 py-1 text-w-sm", i === 0 ? "bg-w-teal hover:bg-w-teal2" : "bg-w-field hover:bg-w-sand")}
+    <div className="mt-2 space-y-2">
+      <div className="flex flex-wrap gap-2">
+        {choices.map((c, i) => (
+          <button
+            key={c}
+            type="button"
+            onClick={() => onAnswer(c)}
+            className={cn(CHUNKY, "px-3 py-1 text-w-sm", i === 0 ? "bg-w-teal hover:bg-w-teal2" : "bg-w-field hover:bg-w-sand")}
+          >
+            {c}
+          </button>
+        ))}
+        {allowReply && !replying && choices.length > 0 && (
+          <button type="button" onClick={() => setReplying(true)} className={cn(BTN_SECONDARY_SM, "h-auto min-h-8")}>Reply</button>
+        )}
+      </div>
+      {allowReply && (replying || !choices.length) && (
+        <form
+          className="flex items-end gap-2"
+          onSubmit={(event) => {
+            event.preventDefault();
+            const text = reply.trim();
+            if (text) onAnswer(text);
+          }}
         >
-          {c}
-        </button>
-      ))}
+          <textarea
+            autoFocus={replying}
+            rows={2}
+            value={reply}
+            onChange={(event) => setReply(event.target.value)}
+            aria-label="Your answer"
+            className={cn("min-w-0 flex-1 resize-none rounded-lg border-2 border-w-line2 bg-w-paper px-2.5 py-2 text-w-sm text-w-text", FOCUS)}
+          />
+          <button type="submit" disabled={!reply.trim()} className={BTN_PRIMARY_SM}>Send</button>
+        </form>
+      )}
     </div>
   );
 }

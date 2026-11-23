@@ -10,8 +10,7 @@ pub mod app_server;
 use crate::claude::sandbox;
 use crate::cli::{
     collect_stderr, configure_child_environment, job_command, own_cli_state, session_id_from_init, summarize_tool_output,
-    truncate_for_log, valid_environment_name, CliOptions, CliResult, StreamEvent,
-    TOOL_OUTPUT_MAX_CHARS,
+    valid_environment_name, CliOptions, CliResult, StreamEvent,
 };
 
 const AGENT_PREAMBLE: &str = "\
@@ -225,6 +224,7 @@ fn lean_overrides_for(opts: &CliOptions<'_>, mode: sandbox::Mode) -> Vec<String>
 pub(crate) async fn writable_roots(dir: &Path) -> Vec<PathBuf> {
     let env_dir = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from);
     let mut roots: Vec<PathBuf> = crate::cli::git_common_dir(dir).await.into_iter().collect();
+    roots.extend(crate::cli::private_temp_dir(dir).into_iter().flat_map(|temp| crate::cli::private_temp_grants(&temp)));
     roots.extend(env_dir("WORLD_RUNNER_CODEX_STATE_DIR"));
     if crate::cli::JobUid::current().is_none() {
         roots.extend(owner_cache_roots(env_dir("HOME").as_deref()));
@@ -372,89 +372,7 @@ async fn run_exec(opts: CliOptions<'_>) -> Result<CliResult> {
                     let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
                     if let Some(tx) = &opts.event_tx {
-                        match item_type {
-                            "command_execution" if event_type == "item.started" => {
-                                let command =
-                                    item.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                                let summary = loka_shared::text::clip_with_ellipsis(command, 120);
-                                let _ = tx.send(StreamEvent::ToolUse {
-                                    tool: "Bash".to_string(),
-                                    input_summary: summary,
-                                });
-                            }
-                            "command_execution" if event_type == "item.completed" => {
-                                let output = extract_codex_item_output(item);
-                                if !output.is_empty() {
-                                    let _ = tx.send(StreamEvent::ToolResult {
-                                        tool: "Bash".to_string(),
-                                        output,
-                                    });
-                                }
-                            }
-                            "file_change" if event_type == "item.completed" => {
-                                if let Some(changes) =
-                                    item.get("changes").and_then(|v| v.as_array())
-                                {
-                                    for change in changes {
-                                        let path = change
-                                            .get("path")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("unknown");
-                                        let kind = change
-                                            .get("kind")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("update");
-                                        let tool = match kind {
-                                            "add" => "Write",
-                                            "delete" => "Delete",
-                                            _ => "Edit",
-                                        };
-                                        let _ = tx.send(StreamEvent::ToolUse {
-                                            tool: tool.to_string(),
-                                            input_summary: shorten_path(path),
-                                        });
-                                    }
-                                }
-                            }
-                            "mcp_tool_call" if event_type == "item.started" => {
-                                let server =
-                                    item.get("server").and_then(|v| v.as_str()).unwrap_or("mcp");
-                                let tool = item
-                                    .get("tool")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("unknown");
-                                let _ = tx.send(StreamEvent::ToolUse {
-                                    tool: format!("{server}/{tool}"),
-                                    input_summary: String::new(),
-                                });
-                            }
-                            "mcp_tool_call" if event_type == "item.completed" => {
-                                let output = extract_codex_item_output(item);
-                                if !output.is_empty() {
-                                    let server = item
-                                        .get("server")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("mcp");
-                                    let tool = item
-                                        .get("tool")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("unknown");
-                                    let _ = tx.send(StreamEvent::ToolResult {
-                                        tool: format!("{server}/{tool}"),
-                                        output,
-                                    });
-                                }
-                            }
-                            "agent_message" if event_type == "item.completed" => {
-                                let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                                if !text.trim().is_empty() {
-                                    last_agent_message = text.to_string();
-                                    let truncated: String = text.trim().chars().take(300).collect();
-                                    let _ = tx.send(StreamEvent::AssistantText(truncated));
-                                }
-                            }
-                            _ => {}
-                        }
+                        emit_item_events(tx, item_type, event_type, item, &mut last_agent_message);
                     }
 
                     if item_type == "agent_message" && event_type == "item.completed" {
@@ -815,6 +733,90 @@ fn shorten_path(path: &str) -> String {
     format!("…/{}", shortened.join("/"))
 }
 
+fn emit_item_events(tx: &crate::cli::EventSender, item_type: &str, event_type: &str, item: &serde_json::Value, last_agent_message: &mut String) {
+    match item_type {
+        "command_execution" if event_type == "item.started" => {
+            let command =
+                item.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            let _ = tx.send(StreamEvent::ToolUse {
+                tool: "Bash".to_string(),
+                input_summary: command.to_string(),
+            });
+        }
+        "command_execution" if event_type == "item.completed" => {
+            let output = extract_codex_item_output(item);
+            if !output.is_empty() {
+                let _ = tx.send(StreamEvent::ToolResult {
+                    tool: "Bash".to_string(),
+                    output,
+                });
+            }
+        }
+        "file_change" if event_type == "item.completed" => {
+            if let Some(changes) =
+                item.get("changes").and_then(|v| v.as_array())
+            {
+                for change in changes {
+                    let path = change
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let kind = change
+                        .get("kind")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("update");
+                    let tool = match kind {
+                        "add" => "Write",
+                        "delete" => "Delete",
+                        _ => "Edit",
+                    };
+                    let _ = tx.send(StreamEvent::ToolUse {
+                        tool: tool.to_string(),
+                        input_summary: shorten_path(path),
+                    });
+                }
+            }
+        }
+        "mcp_tool_call" if event_type == "item.started" => {
+            let server =
+                item.get("server").and_then(|v| v.as_str()).unwrap_or("mcp");
+            let tool = item
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let _ = tx.send(StreamEvent::ToolUse {
+                tool: format!("{server}/{tool}"),
+                input_summary: String::new(),
+            });
+        }
+        "mcp_tool_call" if event_type == "item.completed" => {
+            let output = extract_codex_item_output(item);
+            if !output.is_empty() {
+                let server = item
+                    .get("server")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("mcp");
+                let tool = item
+                    .get("tool")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let _ = tx.send(StreamEvent::ToolResult {
+                    tool: format!("{server}/{tool}"),
+                    output,
+                });
+            }
+        }
+        "agent_message" if event_type == "item.completed" => {
+            let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            if !text.trim().is_empty() {
+                *last_agent_message = text.to_string();
+                let _ = tx.send(StreamEvent::AssistantText(text.trim().to_string()));
+            }
+        }
+        _ => {}
+    }
+}
+
 fn extract_codex_item_output(item: &serde_json::Value) -> String {
     let candidates = [
         "output",
@@ -841,7 +843,7 @@ fn extract_codex_item_output(item: &serde_json::Value) -> String {
             }
         }
     }
-    truncate_for_log(&chunks.join("\n"), TOOL_OUTPUT_MAX_CHARS)
+    chunks.join("\n")
 }
 
 #[cfg(test)]
@@ -1244,5 +1246,30 @@ mod live_tests {
         server.shutdown().await;
         eprintln!("app-server context {}", warm.usage.context_tokens);
         assert!(warm.usage.context_tokens > 0);
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use crate::cli::straddle::{around, assert_whole_then_hidden, drain, pads};
+    use serde_json::json;
+
+    #[test]
+    fn the_exec_parser_sends_whole_text_so_a_secret_across_any_cut_is_hidden() {
+        for pad in pads() {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut last = String::new();
+            let items = [
+                ("item.started", json!({"type": "command_execution", "command": around(pad)})),
+                ("item.completed", json!({"type": "command_execution", "output": around(pad)})),
+                ("item.completed", json!({"type": "agent_message", "text": around(pad)})),
+                ("item.completed", json!({"type": "mcp_tool_call", "server": "s", "tool": "t", "result": around(pad)})),
+            ];
+            for (event_type, item) in &items {
+                super::emit_item_events(&tx, item["type"].as_str().unwrap(), event_type, item, &mut last);
+            }
+            drop(tx);
+            assert_whole_then_hidden(drain(rx), 4, "codex exec", pad);
+        }
     }
 }

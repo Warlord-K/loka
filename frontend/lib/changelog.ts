@@ -6,6 +6,22 @@ export type ChangelogEntry = {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    date: "2026-11-23",
+    title: "Workspaces, many terminals, agents that ask first",
+    items: [
+      "**Workspaces**: open a canvas as a workspace (B or Cmd K) with your main agent's chat and channels beside it. Put a live terminal or a running quest on any canvas, and agents show up as named cursors while they work on it.",
+      "**Many terminals at once**: open tabs, split terminals side by side or stacked, drag them where you want, and dock the terminal to the bottom or a side so it stays open while you use the rest of Loka. Loka remembers your layout and uses Ghostty keys like Cmd T and Cmd D.",
+      "**Agent browsers work quietly in the background**: they never pop up a window or pull you away. Watch any agent's browser live in Loka, take control when you want, and when a site needs your sign-in, press one button and do it right there. Each quest gets its own tabs.",
+      "**Agents ask before unclear work**: under Settings > Before big work, choose whether agents ask a few specific questions, make reasonable assumptions or always show a plan before larger requests.",
+      "**Resume any stuck quest**: a failed, blocked or in-review quest has a **Resume quest** button in its room, and your agent can resume it too, even when its old session is gone. When a quest cannot be resumed you see why.",
+      "**Your disk takes care of itself**: quests share dependency caches and keep builds lean, Loka clears the build files of quests that are not running and stops test databases they left behind, and when the disk is full, quests wait with Waiting for disk space and start by themselves once there is room.",
+      "**Quests finish what they start**: Loka waits for tests that still run when an agent ends its turn, unreviewed work gets its review instead of failing, and a quest that forgot its report saves its changes as a pull request for you to check.",
+      "Claude agents use your Claude plan whenever Claude Code is signed in with it, and fall back to an Anthropic API key only when there is no plan sign-in.",
+      "Cmd K and links open the exact result, including older to-dos, canvas items and replies, and closing Reports or Lists takes you back to what you had open.",
+      "Minor fixes: quick chats and thread replies no longer get stuck on thinking, you can hear the agent in calls in the Mac app, forked agents start working right away, quests can open dev servers at 127.0.0.1 or 0.0.0.0, and the new art turns glasses with the head.",
+    ],
+  },
+  {
     date: "2026-11-22",
     title: "Upgrade to Pro, Academy courses, Settings and new art",
     items: [
@@ -42,7 +58,7 @@ export const CHANGELOG: ChangelogEntry[] = [
     title: "Canvases, lean quests, safer by default",
     items: [
       "**Canvases**: agents can lay out images, videos, 3D models, notes and runnable steps on a board with arrows, right in Reports. Pan, zoom, drag, draw, and pin a mark or stick a note on anything; the agent that made the canvas picks it up, iterates and replies under your mark. Put quests, reports, to-dos, messages and live cards on a canvas with L, find canvases and their items with Cmd K, and quote a canvas or one item into chat.",
-      "**Your disk no longer fills up with old quests**: Loka removes a quest's checkout 3 days after it is done (7 days when it failed) and an hour after it is cancelled, and clears closed ones oldest first when your disk drops below 5 GB, with a bell notice. You > Storage shows what quest workspaces take and can clear closed ones.",
+      "**Your disk no longer fills up with old quests**: Loka removes a quest's checkout 3 days after it is done (7 days when it failed) and an hour after it is cancelled, and clears closed ones oldest first when your disk drops below 5 GB, with a bell notice. Settings > Storage shows what quest folders take and can clear closed ones.",
       "**Locked to the app**: Loka's local server now answers only the Loka window and this launch's secret, so websites in your browser and other programs on your Mac can no longer act as you. Opening Loka in a browser tab needs a fresh link from `loka-api login-link`.",
       "**Quests fail safe**: when a coding CLI cannot run in auto mode, the quest stops and says how to fix it instead of quietly taking full access, and quests stay in the sandbox unless you turn it off. Agents can read only your ssh config, known hosts and signing keys, never your other private keys.",
       "**Lean quests by default**: new quests start from the agent's notes, rules, repo notes and recent quests instead of its whole main chat, so they no longer run out of room on the first turn. Pick Lean, Auto or Full per agent under Access, or for one quest next to How to approach it.",

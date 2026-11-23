@@ -6,8 +6,7 @@ use tracing::{debug, info, warn};
 
 use crate::cli::{
     collect_stderr, configure_child_environment, job_command, session_id_from_init, summarize_tool_input,
-    summarize_tool_output, truncate_for_log, workspace_command, CliOptions, CliResult, StreamEvent,
-    TOOL_OUTPUT_MAX_CHARS,
+    summarize_tool_output, workspace_command, CliOptions, CliResult, StreamEvent,
 };
 
 const AGENT_PREAMBLE: &str = "\
@@ -27,7 +26,7 @@ const WORK_MODE: &str = "default";
 const PLUGIN_NAME: &str = "loka-world";
 
 pub(crate) mod chats;
-mod sandbox;
+pub(crate) mod sandbox;
 
 pub async fn run(opts: CliOptions<'_>) -> Result<CliResult> {
     let plugin_dir = if let Some(mcp_json) = opts.mcp_config_json.as_deref() {
@@ -69,10 +68,9 @@ pub(crate) async fn acp_setup(opts: &CliOptions<'_>) -> Result<crate::acp::Setup
     }
     let sandbox_mode = crate::claude::sandbox::mode();
     if sandbox_mode != crate::claude::sandbox::Mode::Off {
-        let temp = sandbox::run_temp().context("Failed to create the Cursor run temp dir")?;
-        command.env("TMPDIR", &temp.0);
-        crate::cli::drop_default_quest_target(&mut command);
-        if let Some(policy) = sandbox::policy(crate::claude::sandbox::mode(), opts.working_dir, &opts.readable_files, Some(&temp.0)) {
+        let temp = sandbox::run_temp(opts.working_dir).context("Failed to create the Cursor run temp dir")?;
+        crate::cli::set_temp_env(&mut command, &temp.0);
+        if let Some(policy) = sandbox::policy(sandbox_mode, opts.working_dir, &opts.readable_files, Some(&temp.0)) {
             keep.push(Box::new(install_sandbox_policy(opts.working_dir, &policy).await?));
         }
         keep.push(Box::new(temp));
@@ -470,6 +468,128 @@ fn cursor_tool_call(json: &serde_json::Value) -> Option<(String, &serde_json::Va
     Some((tool, args))
 }
 
+fn emit_cursor_events(
+    json: &serde_json::Value,
+    tx: Option<&crate::cli::EventSender>,
+    tool_use_names: &mut HashMap<String, String>,
+    last_assistant_text: &mut String,
+) {
+    match json.get("type").and_then(|v| v.as_str()) {
+        Some("tool_call") => {
+            let call_id = json.get("call_id").and_then(|value| value.as_str());
+            let subtype = json.get("subtype").and_then(|value| value.as_str());
+            if let Some((tool, input)) = cursor_tool_call(json) {
+                if subtype == Some("started") {
+                    if let Some(call_id) = call_id {
+                        tool_use_names.insert(call_id.to_string(), tool.clone());
+                    }
+                    if let Some(tx) = tx {
+                        let _ = tx.send(StreamEvent::ToolUse {
+                            tool: tool.clone(),
+                            input_summary: cursor_tool_summary(&tool, input),
+                        });
+                    }
+                } else if subtype == Some("completed") {
+                    if let Some(tx) = tx {
+                        let tool = call_id
+                            .and_then(|call_id| tool_use_names.get(call_id))
+                            .cloned()
+                            .unwrap_or(tool);
+                        if let Some(result) = json
+                            .get("tool_call")
+                            .and_then(|call| call.as_object())
+                            .and_then(|call| {
+                                call.values().find(|value| value.get("result").is_some())
+                            })
+                            .and_then(|value| value.get("result"))
+                        {
+                            let output = summarize_tool_output(result);
+                            let output = output.trim().to_string();
+                            if !output.is_empty() {
+                                let _ = tx.send(StreamEvent::ToolResult { tool, output });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Some("assistant") => {
+            if let Some(content) = json.pointer("/message/content").and_then(|v| v.as_array()) {
+                for block in content {
+                    match block.get("type").and_then(|v| v.as_str()) {
+                        Some("tool_use") => {
+                            if let Some(tx) = tx {
+                                let tool = block
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
+                                let input = block
+                                    .get("input")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                                let summary = summarize_tool_input(tool, &input);
+                                if let Some(tool_use_id) =
+                                    block.get("id").and_then(|v| v.as_str())
+                                {
+                                    tool_use_names
+                                        .insert(tool_use_id.to_string(), tool.to_string());
+                                }
+                                let _ = tx.send(StreamEvent::ToolUse {
+                                    tool: tool.to_string(),
+                                    input_summary: summary,
+                                });
+                            }
+                        }
+                        Some("text") => {
+                            let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                            if !text.trim().is_empty() {
+                                *last_assistant_text = text.to_string();
+                                if let Some(tx) = tx {
+                                    let _ = tx.send(StreamEvent::AssistantText(text.trim().to_string()));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Some("user") => {
+            if let Some(tx) = tx {
+                if let Some(content) = json.pointer("/message/content") {
+                    let blocks: Vec<&serde_json::Value> =
+                        if let Some(array) = content.as_array() {
+                            array.iter().collect()
+                        } else {
+                            vec![content]
+                        };
+                    for block in blocks {
+                        if block.get("type").and_then(|v| v.as_str()) != Some("tool_result") {
+                            continue;
+                        }
+                        let tool = block
+                            .get("tool_use_id")
+                            .and_then(|v| v.as_str())
+                            .and_then(|tool_use_id| tool_use_names.get(tool_use_id))
+                            .cloned()
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let output = block
+                            .get("content")
+                            .map(summarize_tool_output)
+                            .unwrap_or_default();
+                        let output = output.trim().to_string();
+                        if output.is_empty() {
+                            continue;
+                        }
+                        let _ = tx.send(StreamEvent::ToolResult { tool, output });
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn cursor_tool_summary(tool: &str, input: &serde_json::Value) -> String {
     let summary = summarize_tool_input(tool, input);
     if !summary.is_empty() {
@@ -477,7 +597,7 @@ fn cursor_tool_summary(tool: &str, input: &serde_json::Value) -> String {
     }
     for field in ["path", "command", "description", "pattern"] {
         if let Some(value) = input.get(field).and_then(|value| value.as_str()) {
-            return truncate_for_log(value, 300);
+            return value.to_string();
         }
     }
     String::new()
@@ -504,10 +624,9 @@ async fn run_inner(opts: &CliOptions<'_>, plugin_dir: Option<&Path>) -> Result<C
     readable.extend(opts.image_paths.iter().cloned());
     let sandbox_mode = crate::claude::sandbox::mode();
     let sandboxed = sandbox_mode != crate::claude::sandbox::Mode::Off;
-    let run_temp = if sandboxed { Some(sandbox::run_temp().context("Failed to create the Cursor run temp dir")?) } else { None };
+    let run_temp = if sandboxed { Some(sandbox::run_temp(opts.working_dir).context("Failed to create the Cursor run temp dir")?) } else { None };
     if let Some(temp) = &run_temp {
-        cmd.env("TMPDIR", &temp.0);
-        crate::cli::drop_default_quest_target(&mut cmd);
+        crate::cli::set_temp_env(&mut cmd, &temp.0);
     }
     let policy = sandbox::policy(sandbox_mode, opts.working_dir, &readable, run_temp.as_ref().map(|t| t.0.as_path()));
     let _policy_file = match &policy {
@@ -621,119 +740,6 @@ async fn run_inner(opts: &CliOptions<'_>, plugin_dir: Option<&Path>) -> Result<C
         }
 
         match json.get("type").and_then(|v| v.as_str()) {
-            Some("tool_call") => {
-                let call_id = json.get("call_id").and_then(|value| value.as_str());
-                let subtype = json.get("subtype").and_then(|value| value.as_str());
-                if let Some((tool, input)) = cursor_tool_call(&json) {
-                    if subtype == Some("started") {
-                        if let Some(call_id) = call_id {
-                            tool_use_names.insert(call_id.to_string(), tool.clone());
-                        }
-                        if let Some(tx) = &opts.event_tx {
-                            let _ = tx.send(StreamEvent::ToolUse {
-                                tool: tool.clone(),
-                                input_summary: cursor_tool_summary(&tool, input),
-                            });
-                        }
-                    } else if subtype == Some("completed") {
-                        if let Some(tx) = &opts.event_tx {
-                            let tool = call_id
-                                .and_then(|call_id| tool_use_names.get(call_id))
-                                .cloned()
-                                .unwrap_or(tool);
-                            if let Some(result) = json
-                                .get("tool_call")
-                                .and_then(|call| call.as_object())
-                                .and_then(|call| {
-                                    call.values().find(|value| value.get("result").is_some())
-                                })
-                                .and_then(|value| value.get("result"))
-                            {
-                                let output = summarize_tool_output(result);
-                                let output = truncate_for_log(output.trim(), TOOL_OUTPUT_MAX_CHARS);
-                                if !output.is_empty() {
-                                    let _ = tx.send(StreamEvent::ToolResult { tool, output });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Some("assistant") => {
-                if let Some(content) = json.pointer("/message/content").and_then(|v| v.as_array()) {
-                    for block in content {
-                        match block.get("type").and_then(|v| v.as_str()) {
-                            Some("tool_use") => {
-                                if let Some(tx) = &opts.event_tx {
-                                    let tool = block
-                                        .get("name")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("unknown");
-                                    let input = block
-                                        .get("input")
-                                        .cloned()
-                                        .unwrap_or(serde_json::Value::Null);
-                                    let summary = summarize_tool_input(tool, &input);
-                                    if let Some(tool_use_id) =
-                                        block.get("id").and_then(|v| v.as_str())
-                                    {
-                                        tool_use_names
-                                            .insert(tool_use_id.to_string(), tool.to_string());
-                                    }
-                                    let _ = tx.send(StreamEvent::ToolUse {
-                                        tool: tool.to_string(),
-                                        input_summary: summary,
-                                    });
-                                }
-                            }
-                            Some("text") => {
-                                let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                                if !text.trim().is_empty() {
-                                    last_assistant_text = text.to_string();
-                                    if let Some(tx) = &opts.event_tx {
-                                        let truncated: String =
-                                            text.trim().chars().take(300).collect();
-                                        let _ = tx.send(StreamEvent::AssistantText(truncated));
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            Some("user") => {
-                if let Some(tx) = &opts.event_tx {
-                    if let Some(content) = json.pointer("/message/content") {
-                        let blocks: Vec<&serde_json::Value> =
-                            if let Some(array) = content.as_array() {
-                                array.iter().collect()
-                            } else {
-                                vec![content]
-                            };
-                        for block in blocks {
-                            if block.get("type").and_then(|v| v.as_str()) != Some("tool_result") {
-                                continue;
-                            }
-                            let tool = block
-                                .get("tool_use_id")
-                                .and_then(|v| v.as_str())
-                                .and_then(|tool_use_id| tool_use_names.get(tool_use_id))
-                                .cloned()
-                                .unwrap_or_else(|| "unknown".to_string());
-                            let output = block
-                                .get("content")
-                                .map(summarize_tool_output)
-                                .unwrap_or_default();
-                            let output = truncate_for_log(output.trim(), TOOL_OUTPUT_MAX_CHARS);
-                            if output.is_empty() {
-                                continue;
-                            }
-                            let _ = tx.send(StreamEvent::ToolResult { tool, output });
-                        }
-                    }
-                }
-            }
             Some("result") => {
                 result_text = json
                     .get("result")
@@ -749,7 +755,7 @@ async fn run_inner(opts: &CliOptions<'_>, plugin_dir: Option<&Path>) -> Result<C
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
             }
-            _ => {}
+            _ => emit_cursor_events(&json, opts.event_tx.as_ref(), &mut tool_use_names, &mut last_assistant_text),
         }
     }
 
@@ -1097,5 +1103,32 @@ for line in sys.stdin:
             assert!(!workdir.join(".cursor").exists());
         }
         tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use crate::cli::straddle::{around, assert_whole_then_hidden, drain, pads};
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    #[test]
+    fn the_cursor_parser_sends_whole_text_so_a_secret_across_any_cut_is_hidden() {
+        for pad in pads() {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let (mut names, mut last) = (HashMap::new(), String::new());
+            let lines = [
+                json!({"type": "assistant", "message": {"content": [
+                    {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": around(pad)}},
+                    {"type": "text", "text": around(pad)}]}}),
+                json!({"type": "user", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": around(pad)}]}}),
+            ];
+            for line in &lines {
+                super::emit_cursor_events(line, Some(&tx), &mut names, &mut last);
+            }
+            drop(tx);
+            assert_whole_then_hidden(drain(rx), 3, "cursor", pad);
+        }
     }
 }

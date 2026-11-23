@@ -562,14 +562,14 @@ impl WorldStore {
         if !diagnosis.fork_too_long() {
             return Ok(None);
         }
-        let run = sqlx::query_as::<_, (Uuid, Uuid, Option<Uuid>, String, String, Option<Uuid>, i32, Option<String>)>(
-            "SELECT session_id, agent_id, task_id, kind, prompt, fork_from, timeout_secs, retry_cause
+        let run = sqlx::query_as::<_, (Uuid, Uuid, Option<Uuid>, String, String, Option<Uuid>, Option<String>)>(
+            "SELECT session_id, agent_id, task_id, kind, prompt, fork_from, retry_cause
              FROM session_runs WHERE id = $1",
         )
         .bind(run_id)
         .fetch_optional(self.pool())
         .await?;
-        let Some((session_id, agent_id, Some(task_id), kind, prompt, fork_from, timeout_secs, retry_cause)) = run else {
+        let Some((session_id, agent_id, Some(task_id), kind, prompt, fork_from, retry_cause)) = run else {
             return Ok(None);
         };
         if retry_cause.as_deref() == Some(crate::run_causes::FRESH_RETRY_CAUSE) {
@@ -636,20 +636,21 @@ impl WorldStore {
         .bind(session_id)
         .execute(&mut *tx)
         .await?;
-        let id = sqlx::query_scalar::<_, Uuid>(
-            "INSERT INTO session_runs
-               (session_id, agent_id, task_id, kind, status, fork_from, prompt, timeout_secs, activity, retry_cause)
-             VALUES ($1, $2, $3, 'task', 'queued', NULL, $4, $5, 'Starting fresh from notes', $6)
-             RETURNING id",
+        let id = crate::world::clone_run(
+            &mut tx,
+            run_id,
+            crate::world::RunClone {
+                kind: Some("task"),
+                fork_from: None,
+                prompt: &format!("{memory}\n\n{prompt}"),
+                activity: Some("Starting fresh from notes"),
+                retry_cause: Some(crate::run_causes::FRESH_RETRY_CAUSE),
+                not_before: None,
+                retry: true,
+            },
         )
-        .bind(session_id)
-        .bind(agent_id)
-        .bind(task_id)
-        .bind(format!("{memory}\n\n{prompt}"))
-        .bind(timeout_secs)
-        .bind(crate::run_causes::FRESH_RETRY_CAUSE)
-        .fetch_one(&mut *tx)
-        .await?;
+        .await?
+        .id;
         tx.commit().await?;
         let compacting = kind == "task"
             && compact_unsupported(&backend).is_none()

@@ -1,6 +1,6 @@
 mod feeds_tools;
 mod items_tools;
-mod kit;
+pub(crate) mod kit;
 pub mod mcp;
 pub(crate) mod prompts;
 mod loka_tools;
@@ -12,6 +12,7 @@ mod practice_tools;
 mod runs;
 mod schedule;
 mod teams_tools;
+pub mod tool_catalog;
 mod turn;
 pub mod warm;
 mod watch;

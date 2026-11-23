@@ -26,8 +26,10 @@ fn start_dir(root: &Path) -> PathBuf {
     }
 }
 
-pub async fn run_session(api: &RunnerApi, root: &Path, job: TerminalJob) -> Result<()> {
-    let url = api.terminal_socket_url(job.id);
+pub(crate) type ApiSocket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+pub(crate) async fn connect_api(api: &RunnerApi, session: uuid::Uuid) -> Result<ApiSocket> {
+    let url = api.terminal_socket_url(session);
     let mut request = url.as_str().into_client_request().context("invalid terminal socket url")?;
     request.headers_mut().insert(
         "Authorization",
@@ -36,7 +38,14 @@ pub async fn run_session(api: &RunnerApi, root: &Path, job: TerminalJob) -> Resu
     let (socket, _) = tokio_tungstenite::connect_async_with_config(request, None, false)
         .await
         .context("terminal socket connect failed")?;
-    let (mut ws_write, mut ws_read) = socket.split();
+    Ok(socket)
+}
+
+pub async fn run_session(api: &RunnerApi, root: &Path, job: TerminalJob) -> Result<()> {
+    if job.kind == loka_shared::terminal::BROWSER {
+        return crate::browser_view::run_session(api, root, job).await;
+    }
+    let (mut ws_write, mut ws_read) = connect_api(api, job.id).await?.split();
     let cwd = start_dir(root);
     let pair = native_pty_system()
         .openpty(PtySize { rows: (job.rows as u16).max(2), cols: (job.cols as u16).max(10), pixel_width: 0, pixel_height: 0 })
@@ -148,7 +157,7 @@ pub async fn run_session(api: &RunnerApi, root: &Path, job: TerminalJob) -> Resu
     Ok(())
 }
 
-async fn send_frame(write: &mut (impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin), frame: &TermFrame) -> Result<()> {
+pub(crate) async fn send_frame(write: &mut (impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin), frame: &TermFrame) -> Result<()> {
     let text = serde_json::to_string(frame)?;
     write.send(Message::Text(text.into())).await?;
     Ok(())

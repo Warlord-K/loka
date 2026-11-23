@@ -72,6 +72,9 @@ Everything has a working default.
 | Variable | Default | Effect |
 |---|---|---|
 | `WORLD_TASK_TIMEOUT_SECS` | 3600 | Default time limit for task, follow-up and review runs |
+| `WORLD_BACKGROUND_WAIT_SECS` | 1200 | How long a Claude run stays open for background commands still running when its turn ends; `0` closes it at once |
+| `WORLD_TOOL_INDEX` | on | `off` gives every agent the full World tool list instead of a small core plus `find_tools` |
+| `LOKA_PRIVATE_TEMP_ROOT` | system temp, or `/tmp` | Folder that holds each quest's private temp folder (`loka-q-<id>`). Set it only when `/tmp` is not writable; keep it under 13 characters, or Claude shells fall back to a shared folder |
 | `WORLD_TASK_SANDBOX` | `auto` | `auto` (owner quests stay sandboxed), `strict` (fail if the sandbox cannot start) or `off` |
 | `WORLD_CLAUDE_EFFORT` | `medium` for chat, `high` for work | Claude Code effort when a message does not pick one |
 | `WORLD_REVIEWS` | on | `off` disables independent reviews |

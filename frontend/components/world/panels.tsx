@@ -14,7 +14,9 @@ import {
   RUN_PAGE,
   CLI_OPTIONS,
   reviewerLabel,
+  WAITING_FOR_DISK,
   worldApi,
+  WorldApiError,
   type Notifications,
   type RunEvent,
   type SessionBrief,
@@ -23,10 +25,11 @@ import {
   type WorldAgent,
   type WorldEvent,
 } from "@/lib/world";
-import { BTN_PRIMARY_SM, BTN_SECONDARY, BTN_SECONDARY_SM, CHUNKY, FOCUS, TAB, TAB_OFF, TAB_ON, ITEM_CARD, NAV_OFF, NAV_ON, PANEL, PILL_DANGER, PILL_NEUTRAL, PILL_OK, SIDEBAR, TAG_X, UNREAD } from "./styles";
+import { BTN_PRIMARY_SM, BTN_SECONDARY, BTN_SECONDARY_SM, CHUNKY, FOCUS, TAB, TAB_OFF, TAB_ON, ITEM_CARD, NAV_OFF, NAV_ON, PANEL, PILL_DANGER, PILL_NEUTRAL, PILL_OK, PILL_WARN, SIDEBAR, TAG_X, UNREAD } from "./styles";
 import { AgentFace } from "./channel-ui";
 import { BoardColumn, BoardHint } from "./board-kit";
 import { Keycap } from "./keycap";
+import { requestSetup } from "./setup-hint";
 import { milestoneProgress } from "./milestones-ui";
 import { isDesktopApp } from "@/lib/desktop";
 import { WCombobox, WSelect } from "./controls";
@@ -41,6 +44,9 @@ import { AssigneeBadge, assigneeName, QUEST_STATUSES, SelectionBar, StatusIcon, 
 import { EmptyState, WindowHeader } from "./settings-shell";
 import { runtimeName } from "@/lib/model-names";
 import { escapeTaken } from "@/lib/escape";
+import { EMBED_DRAG, embedDragData } from "@/lib/canvas-embeds";
+import { questNeedsYou } from "@/lib/quest-status";
+import { useQuestsChanged } from "./live-quests";
 
 export function useEscape(onClose: () => void) {
   useEffect(() => {
@@ -91,14 +97,6 @@ interface RunRequest {
   notes: string[];
 }
 
-function between(text: string, start: string, end: string): string | null {
-  const i = text.indexOf(start);
-  if (i < 0) return null;
-  const rest = text.slice(i + start.length);
-  const j = end ? rest.indexOf(end) : -1;
-  return (j < 0 ? rest : rest.slice(0, j)).trim();
-}
-
 function turnText(prompt: string): { text: string; refreshed: boolean } {
   const first = prompt.indexOf("[event]");
   const refreshed = first > 0 && /^\[(rules updated|instructions updated|memory handoff)\]/.test(prompt);
@@ -112,40 +110,29 @@ function turnText(prompt: string): { text: string; refreshed: boolean } {
 }
 
 function runRequest(run: SessionRun, session: SessionBrief, agentName: string): RunRequest {
-  const [base, ...retries] = run.prompt.split("\n\n[retry]\n");
-  const notes: string[] = retries.length ? [retries.length > 1 ? `Retry ${retries.length}` : "Retry"] : [];
-  const title = base.match(/^Task: (.*)$/m)?.[1]?.trim() ?? session.task_title ?? "";
-  if (run.kind === "followup") {
-    const m = base.match(/^\[follow-up from ([^\]\n]+)\]\n([\s\S]*?)\n\nAnswer briefly\./);
-    if (m) return { from: m[1], text: m[2].trim(), notes };
-  }
-  if (run.kind === "direct") return { from: "You", text: base.trim(), notes };
-  if (run.kind === "aside") {
-    const asker = base.match(/^\[aside\] (.+?) pulled you aside/)?.[1];
-    const question = between(base, "asks:\n", "\n\nThis is a side conversation");
-    if (question !== null) return { from: asker ?? "Someone", text: question, notes };
-  }
-  if (run.kind === "task") {
-    const description = between(base, `Task: ${title}\n`, "\n\nWorkspace:") ?? "";
-    const brief = between(base, "\n\nYour brief:\n", "");
-    if (base.includes("The independent reviewer asked for changes")) {
-      const findings = between(base, "Address every finding:\n", "\nDo the work end to end") ?? "";
-      return { from: "Reviewer", text: `Please fix the review findings on **${title}**.\n\n\`\`\`json\n${findings}\n\`\`\``, notes: ["Fix round", ...notes] };
+  const asked = run.request ?? {};
+  const notes: string[] = asked.retry ? [asked.retry > 1 ? `Retry ${asked.retry}` : "Retry"] : [];
+  const title = session.task_title ?? "";
+  const worked = run.kind === "task" || run.kind === "followup";
+  if ((worked || run.kind === "aside") && asked.from && asked.findings === undefined) return { from: asked.from, text: asked.text ?? "", notes };
+  if (run.kind === "direct") return { from: "You", text: run.prompt.trim(), notes };
+  if (worked && (run.kind === "task" || asked.text || asked.brief || asked.findings !== undefined)) {
+    if (asked.findings !== undefined) {
+      return { from: asked.from ?? "Reviewer", text: `Please fix the review findings on **${title}**.\n\n\`\`\`json\n${asked.findings}\n\`\`\``, notes: ["Fix round", ...notes] };
     }
-    const lines = [title && `**${title}**`, description, brief && `**Brief:** ${brief}`].filter(Boolean);
+    const lines = [title && `**${title}**`, asked.text, asked.brief && `**Brief:** ${asked.brief}`].filter(Boolean);
     return { from: "Quest", text: lines.join("\n\n"), notes };
   }
   if (run.kind === "review") {
-    const focus = base.match(/^Focus especially on: (.*)$/m)?.[1]?.trim();
-    const lines = [title ? `Review the work on **${title}**.` : "Review the work in this workspace.", focus && `**Focus:** ${focus}`].filter(Boolean);
+    const lines = [title ? `Review the work on **${title}**.` : "Review the work in this quest folder.", asked.focus && `**Focus:** ${asked.focus}`].filter(Boolean);
     return { from: "Review request", text: lines.join("\n\n"), notes };
   }
   if (run.kind === "turn") {
-    if (base.trim() === "/compact") return { from: "Runtime", text: `Compact ${agentName}'s memory.`, notes };
-    const { text, refreshed } = turnText(base);
+    if (run.prompt.trim() === "/compact") return { from: "Runtime", text: `Compact ${agentName}'s memory.`, notes };
+    const { text, refreshed } = turnText(run.prompt);
     return { from: "Inbox", text, notes: refreshed ? ["Instructions refreshed", ...notes] : notes };
   }
-  return { from: "Prompt", text: base.trim(), notes };
+  return { from: "Prompt", text: run.prompt.trim(), notes };
 }
 
 export interface BlockCard {
@@ -441,7 +428,7 @@ export function RunTurn({
   const items = useMemo(() => threadItems(run, events), [run, events]);
   const live = run.status === "running" || run.status === "queued";
   const statusText = useMemo(() => {
-    if (run.status === "queued") return run.kind === "followup" ? "Waiting for the running work to take it" : run.kind === "direct" ? "Handing it to your Mac" : "Waiting for a free slot";
+    if (run.status === "queued") return run.waiting_for === "disk" ? WAITING_FOR_DISK : run.kind === "followup" ? "Waiting for the running work to take it" : run.kind === "direct" ? "Handing it to your Mac" : "Waiting for a free slot";
     const list = events ?? [];
     const latest = list[list.length - 1];
     const latestAt = latest ? Date.parse(latest.created_at) : 0;
@@ -540,7 +527,7 @@ export function RunTurn({
           <span>
             {run.retry_mode === "resume"
               ? "Continues in the same CLI session with its previous conversation context."
-              : "Starts a new CLI session in the same workspace, with its saved files still available."}
+              : "Starts a new CLI session in the same quest folder, with its saved files still available."}
           </span>
         </div>
       )}
@@ -760,7 +747,7 @@ export function SessionDetail({
       setNote(null);
       refresh();
     } catch (error) {
-      setNote(error instanceof Error && /^4\d\d /.test(error.message) ? error.message.slice(4) : isMain ? "Could not send that message." : "Could not send that follow-up.");
+      setNote(error instanceof WorldApiError ? error.message : error instanceof Error && /^4\d\d /.test(error.message) ? error.message.slice(4) : isMain ? "Could not send that message." : "Could not send that follow-up.");
     } finally {
       setSending(false);
     }
@@ -774,8 +761,8 @@ export function SessionDetail({
       setShowReview(false);
       setNote("Review requested. The verdict goes to the agent and shows up as a new reviewer session.");
       onSessionRefresh();
-    } catch {
-      setNote("Could not request a review for this session.");
+    } catch (error) {
+      setNote(error instanceof WorldApiError ? error.message : "Could not request a review for this session.");
     }
   };
 
@@ -950,12 +937,14 @@ export function HistoryPanel({
   agents,
   initialAgentId,
   focus = null,
+  onNavigate,
   onClose,
   onOpenAgent = () => {},
 }: {
   agents: WorldAgent[];
   initialAgentId: string | null;
   focus?: SessionFocus | null;
+  onNavigate: (select: () => void) => void;
   onClose: () => void;
   onOpenAgent?: (id: string) => void;
 }) {
@@ -1012,7 +1001,7 @@ export function HistoryPanel({
               ariaLabel="Whose sessions"
               className="w-full"
               value={agentId}
-              onChange={setAgentId}
+              onChange={(id) => onNavigate(() => setAgentId(id))}
               options={[{ value: "", label: "Everyone" }, ...agents.map((a) => ({ value: a.id, label: a.name }))]}
             />
             <FilterField value={filter} onChange={setFilter} placeholder="Filter sessions" />
@@ -1029,7 +1018,7 @@ export function HistoryPanel({
                 <li key={s.id}>
                   <button
                     type="button"
-                    onClick={() => setSelected(s.id)}
+                    onClick={() => onNavigate(() => setSelected(s.id))}
                     className={cn("w-full rounded-lg px-2.5 py-2.5 text-left text-w-sm transition-colors", selected === s.id ? NAV_ON : NAV_OFF)}
                   >
                     <span className="flex items-center gap-2">
@@ -1082,11 +1071,13 @@ const COLUMN_EMPTY: Record<string, string> = {
 };
 
 export function QuestBoard({
+  active = true,
   agents,
   viewer,
   onOpenAgent,
   onOpenQuest,
 }: {
+  active?: boolean;
   agents: WorldAgent[];
   viewer: QuestViewer | null;
   onOpenAgent: (id: string) => void;
@@ -1106,8 +1097,7 @@ export function QuestBoard({
     worldApi.tasks().then(setTasks).catch(() => {});
   }, []);
   useEffect(() => refresh(), [refresh]);
-  const match = useCallback((e: WorldEvent) => e.type.startsWith("task.") || e.type === "milestones.updated", []);
-  useWorldRefresh(refresh, match);
+  useQuestsChanged(refresh);
   const [filter, setFilter] = useState("");
   const everyone = useEveryone();
   const byId = useMemo(() => new Map(agents.map((a) => [a.id, a])), [agents]);
@@ -1124,7 +1114,7 @@ export function QuestBoard({
     [shown],
   );
   const order = useMemo(() => columns.flatMap((c) => c.items.map((t) => t.id)), [columns]);
-  const q = useQuestControls({ tasks, setTasks, agents, viewer, order });
+  const q = useQuestControls({ active, tasks, setTasks, agents, viewer, order });
   const acceptDrop = (e: React.DragEvent, column: string) => {
     if (!dragging) return;
     e.preventDefault();
@@ -1177,8 +1167,9 @@ export function QuestBoard({
                       draggable={canEdit}
                       onDragStart={(e) => {
                         const ids = picked ? [...q.selected] : [t.id];
-                        e.dataTransfer.effectAllowed = "move";
+                        e.dataTransfer.effectAllowed = "copyMove";
                         e.dataTransfer.setData("text/plain", ids.join(","));
+                        if (ids.length === 1) e.dataTransfer.setData(EMBED_DRAG, embedDragData({ kind: "quest", target: t.id }, t.title));
                         setDragging(ids);
                       }}
                       onDragEnd={() => {
@@ -1231,6 +1222,11 @@ export function QuestBoard({
                           disabled={!a}
                         >
                           <span className="block font-semibold leading-snug text-w-strong">{t.title}</span>
+                          {questNeedsYou(t) && (
+                            <span className={cn(PILL_WARN, "mt-1")} title="The plan is waiting for your approval in chat">
+                              Needs you
+                            </span>
+                          )}
                           {progress && (
                             <span className="mt-1 flex items-center gap-1.5 text-w-xs text-w-muted">
                               <Flag size={11} weight="bold" className="shrink-0" />
@@ -1490,6 +1486,7 @@ export function NotificationsPanel({
     else if (e.type === "channel.message" && typeof e.payload.channel_id === "string")
       window.dispatchEvent(new CustomEvent("world:open-channel", { detail: { id: e.payload.channel_id } }));
     else if (e.type === "todo.nudge" || e.type === "timer.done") window.dispatchEvent(new Event("world:open-lists"));
+    else if (e.type === "runner.disk_low") requestSetup("storage");
     else if (e.agent_id) onOpenAgent(e.agent_id);
   };
   const openCount = list.length && view === "open" ? list.reduce((n, g) => n + g.seqs.length, 0) : 0;

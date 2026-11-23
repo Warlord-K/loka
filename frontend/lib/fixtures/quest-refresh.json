@@ -1,0 +1,236 @@
+[
+  {
+    "refresh": true,
+    "why": "the status, title, PR or assignee of a quest changed",
+    "event": {
+      "seq": 1,
+      "type": "task.changed",
+      "agent_id": "a1b2c3d4-0000-4000-8000-0000000000a1",
+      "task_id": "0f8e2c1a-3b4d-4e5f-8a9b-0c1d2e3f4a5b",
+      "run_id": null,
+      "session_id": null,
+      "actor_user_id": null,
+      "payload": {
+        "task_id": "0f8e2c1a-3b4d-4e5f-8a9b-0c1d2e3f4a5b",
+        "status": "in_progress",
+        "title": "Fix the drawer",
+        "changed": "status",
+        "quiet": true
+      },
+      "created_at": "2026-11-27T10:00:00Z",
+      "org_id": null
+    }
+  },
+  {
+    "refresh": true,
+    "why": "a quest finished",
+    "event": {
+      "seq": 2,
+      "type": "task.finished",
+      "agent_id": "a1b2c3d4-0000-4000-8000-0000000000a1",
+      "task_id": "0f8e2c1a-3b4d-4e5f-8a9b-0c1d2e3f4a5b",
+      "run_id": null,
+      "session_id": "5e550000-0000-4000-8000-000000000001",
+      "actor_user_id": null,
+      "payload": {
+        "title": "Fix the drawer",
+        "report": {
+          "status": "done",
+          "summary": "Closed on Esc"
+        },
+        "pr_url": "https://github.com/acme/app/pull/7"
+      },
+      "created_at": "2026-11-27T10:00:00Z",
+      "org_id": null
+    }
+  },
+  {
+    "refresh": true,
+    "why": "a plan waits for approval",
+    "event": {
+      "seq": 3,
+      "type": "task.plan_ready",
+      "agent_id": "a1b2c3d4-0000-4000-8000-0000000000a1",
+      "task_id": "0f8e2c1a-3b4d-4e5f-8a9b-0c1d2e3f4a5b",
+      "run_id": null,
+      "session_id": "5e550000-0000-4000-8000-000000000001",
+      "actor_user_id": null,
+      "payload": {
+        "session_id": "5e550000-0000-4000-8000-000000000001",
+        "title": "Fix the drawer"
+      },
+      "created_at": "2026-11-27T10:00:00Z",
+      "org_id": null
+    }
+  },
+  {
+    "refresh": true,
+    "why": "a quest was deleted, with no task row left",
+    "event": {
+      "seq": 4,
+      "type": "task.deleted",
+      "agent_id": "a1b2c3d4-0000-4000-8000-0000000000a1",
+      "task_id": "0f8e2c1a-3b4d-4e5f-8a9b-0c1d2e3f4a5b",
+      "run_id": null,
+      "session_id": null,
+      "actor_user_id": null,
+      "payload": {
+        "title": "Fix the drawer"
+      },
+      "created_at": "2026-11-27T10:00:00Z",
+      "org_id": null
+    }
+  },
+  {
+    "refresh": false,
+    "why": "live activity of a quest run",
+    "event": {
+      "seq": 5,
+      "type": "run.activity",
+      "agent_id": "a1b2c3d4-0000-4000-8000-0000000000a1",
+      "task_id": "0f8e2c1a-3b4d-4e5f-8a9b-0c1d2e3f4a5b",
+      "run_id": "12340000-0000-4000-8000-000000000002",
+      "session_id": "5e550000-0000-4000-8000-000000000001",
+      "actor_user_id": null,
+      "payload": {
+        "text": "Running cargo test",
+        "quiet": true
+      },
+      "created_at": "2026-11-27T10:00:00Z",
+      "org_id": null
+    }
+  },
+  {
+    "refresh": false,
+    "why": "a progress line from the agent",
+    "event": {
+      "seq": 6,
+      "type": "agent.progress",
+      "agent_id": "a1b2c3d4-0000-4000-8000-0000000000a1",
+      "task_id": "0f8e2c1a-3b4d-4e5f-8a9b-0c1d2e3f4a5b",
+      "run_id": "12340000-0000-4000-8000-000000000002",
+      "session_id": null,
+      "actor_user_id": null,
+      "payload": {
+        "text": "Reading the drawer code",
+        "run_kind": "task"
+      },
+      "created_at": "2026-11-27T10:00:00Z",
+      "org_id": null
+    }
+  },
+  {
+    "refresh": false,
+    "why": "a run waiting for disk space",
+    "event": {
+      "seq": 7,
+      "type": "run.waiting",
+      "agent_id": "a1b2c3d4-0000-4000-8000-0000000000a1",
+      "task_id": "0f8e2c1a-3b4d-4e5f-8a9b-0c1d2e3f4a5b",
+      "run_id": "12340000-0000-4000-8000-000000000002",
+      "session_id": "5e550000-0000-4000-8000-000000000001",
+      "actor_user_id": null,
+      "payload": {
+        "waiting": true,
+        "quiet": true
+      },
+      "created_at": "2026-11-27T10:00:00Z",
+      "org_id": null
+    }
+  },
+  {
+    "refresh": false,
+    "why": "a run retrying after a hiccup",
+    "event": {
+      "seq": 8,
+      "type": "run.retrying",
+      "agent_id": "a1b2c3d4-0000-4000-8000-0000000000a1",
+      "task_id": "0f8e2c1a-3b4d-4e5f-8a9b-0c1d2e3f4a5b",
+      "run_id": "12340000-0000-4000-8000-000000000002",
+      "session_id": "5e550000-0000-4000-8000-000000000001",
+      "actor_user_id": null,
+      "payload": {
+        "task_id": "0f8e2c1a-3b4d-4e5f-8a9b-0c1d2e3f4a5b",
+        "retry_run_id": "12340000-0000-4000-8000-000000000002",
+        "quiet": true,
+        "cause": "cli_error"
+      },
+      "created_at": "2026-11-27T10:00:00Z",
+      "org_id": null
+    }
+  },
+  {
+    "refresh": false,
+    "why": "milestones ticked, carried to cards by task.changed instead",
+    "event": {
+      "seq": 9,
+      "type": "milestones.updated",
+      "agent_id": "a1b2c3d4-0000-4000-8000-0000000000a1",
+      "task_id": "0f8e2c1a-3b4d-4e5f-8a9b-0c1d2e3f4a5b",
+      "run_id": null,
+      "session_id": null,
+      "actor_user_id": null,
+      "payload": {
+        "quiet": true
+      },
+      "created_at": "2026-11-27T10:00:00Z",
+      "org_id": null
+    }
+  },
+  {
+    "refresh": false,
+    "why": "a review finished, its quest status change arrives as task.changed",
+    "event": {
+      "seq": 10,
+      "type": "review.finished",
+      "agent_id": "a1b2c3d4-0000-4000-8000-0000000000a1",
+      "task_id": "0f8e2c1a-3b4d-4e5f-8a9b-0c1d2e3f4a5b",
+      "run_id": null,
+      "session_id": "5e550000-0000-4000-8000-000000000001",
+      "actor_user_id": null,
+      "payload": {
+        "verdict": "approve"
+      },
+      "created_at": "2026-11-27T10:00:00Z",
+      "org_id": null
+    }
+  },
+  {
+    "refresh": false,
+    "why": "a chat message about something else",
+    "event": {
+      "seq": 11,
+      "type": "message.created",
+      "agent_id": "a1b2c3d4-0000-4000-8000-0000000000a1",
+      "task_id": null,
+      "run_id": null,
+      "session_id": null,
+      "actor_user_id": null,
+      "payload": {
+        "body": "hello",
+        "author_kind": "agent"
+      },
+      "created_at": "2026-11-27T10:00:00Z",
+      "org_id": null
+    }
+  },
+  {
+    "refresh": false,
+    "why": "a report edit",
+    "event": {
+      "seq": 12,
+      "type": "report.updated",
+      "agent_id": "a1b2c3d4-0000-4000-8000-0000000000a1",
+      "task_id": null,
+      "run_id": null,
+      "session_id": null,
+      "actor_user_id": null,
+      "payload": {
+        "report_id": "r1",
+        "quiet": true
+      },
+      "created_at": "2026-11-27T10:00:00Z",
+      "org_id": null
+    }
+  }
+]

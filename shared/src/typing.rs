@@ -82,7 +82,7 @@ impl WorldStore {
             if let Some(session) = session_id {
                 event = event.session(session);
             }
-            self.emit(event, None).await?;
+            self.signal(event, agent.org_id).await?;
         }
         Ok(())
     }

@@ -70,7 +70,7 @@ pub(crate) async fn replay_with<H: Hub>(
     let start = match &remote {
         Some(tip) => match start_for_remote(dir, tip, onto).await? {
             Some(start) => start,
-            None => return Ok(Replay::Unsupported("the remote branch holds commits this workspace does not have".to_string())),
+            None => return Ok(Replay::Unsupported("the remote branch holds commits this quest folder does not have".to_string())),
         },
         None => match git_output(dir, &["merge-base", "HEAD", &format!("origin/{onto}")]).await {
             Ok(base) => base.trim().to_string(),
@@ -190,7 +190,7 @@ async fn verify_and_sync(dir: &Path, branch: &str, quest_branch: &str, tip: &str
     let remote_tree = git_output(dir, &["rev-parse", &format!("{tip}^{{tree}}")]).await?;
     let local_tree = git_output(dir, &["rev-parse", "HEAD^{tree}"]).await?;
     if remote_tree.trim() != local_tree.trim() {
-        bail!("the commits made through the API do not match this workspace, so the branch was not trusted");
+        bail!("the commits made through the API do not match this quest folder, so the branch was not trusted");
     }
     let current = git_output(dir, &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
     let current = current.trim();

@@ -61,14 +61,8 @@ pub fn set_granted(root: &Path, lease: Uuid, on: bool) {
     }
 }
 
-fn launcher_exe() -> Option<String> {
-    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
-    let exe = exe.to_str()?.to_string();
-    exe.chars().all(|c| c.is_ascii_alphanumeric() || "/._-+".contains(c)).then_some(exe)
-}
-
 pub fn launcher(agent_id: Uuid) -> Option<String> {
-    Some(format!("{} apps {agent_id}", launcher_exe()?))
+    Some(format!("{} apps {agent_id}", crate::cli::launcher_exe()?))
 }
 
 pub fn excluded_commands(launcher: &str) -> Vec<String> {

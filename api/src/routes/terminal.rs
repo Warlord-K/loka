@@ -25,9 +25,36 @@ fn internal(error: anyhow::Error) -> ApiError {
 
 #[derive(Deserialize)]
 pub struct NewTerminal {
-    runner_id: Uuid,
+    runner_id: Option<Uuid>,
+    agent_id: Option<Uuid>,
+    task_id: Option<Uuid>,
     cols: Option<i32>,
     rows: Option<i32>,
+}
+
+pub const VIEW_NOT_YOURS: &str = "Only the owner of this agent can watch its browser";
+pub const VIEW_NO_DEVICE: &str = "This agent has no device yet, so it has no browser to watch.";
+pub const VIEW_NOT_ITS_QUEST: &str = "This quest is not this agent's, so its browser cannot be watched from here.";
+
+fn view_refusal(device: &str, capabilities: &Value) -> Option<String> {
+    if capabilities.get("browser").and_then(Value::as_bool) != Some(true) {
+        return Some(format!("This agent works on {device}, which has no agent browser to watch."));
+    }
+    (!loka_shared::terminal::runner_shows_browsers(capabilities)).then(|| format!("Update Loka on {device} to watch agent browsers inside Loka."))
+}
+
+async fn view_target(state: &AppState, user: Uuid, agent_id: Uuid) -> Result<(Uuid, String), ApiError> {
+    let agent = state
+        .world
+        .get_agent(agent_id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| problem(StatusCode::NOT_FOUND, "not_found", "Agent not found"))?;
+    if agent.owner_user_id != Some(user) {
+        return Err(problem(StatusCode::FORBIDDEN, "not_owner", VIEW_NOT_YOURS));
+    }
+    let runner_id = agent.runner_id.ok_or_else(|| problem(StatusCode::CONFLICT, "no_device", VIEW_NO_DEVICE))?;
+    Ok((runner_id, agent.name))
 }
 
 pub async fn open_session(
@@ -36,9 +63,27 @@ pub async fn open_session(
     headers: HeaderMap,
     Json(request): Json<NewTerminal>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let view = match request.agent_id {
+        Some(agent_id) => Some((agent_id, view_target(&state, user.0, agent_id).await?)),
+        None => None,
+    };
+    let quest = match (&view, request.task_id) {
+        (Some((agent_id, _)), Some(task_id)) => {
+            if !state.world.agent_works_on(*agent_id, task_id).await.map_err(internal)? {
+                return Err(problem(StatusCode::NOT_FOUND, "not_found", VIEW_NOT_ITS_QUEST));
+            }
+            Some(task_id)
+        }
+        _ => None,
+    };
+    let runner_id = match (&view, request.runner_id) {
+        (Some((_, (runner_id, _))), _) => *runner_id,
+        (None, Some(runner_id)) => runner_id,
+        (None, None) => return Err(problem(StatusCode::BAD_REQUEST, "missing_device", "Pick a device")),
+    };
     let runner = state
         .runners
-        .get_live(request.runner_id)
+        .get_live(runner_id)
         .await
         .map_err(internal)?
         .ok_or_else(|| problem(StatusCode::NOT_FOUND, "not_found", "Device not found"))?;
@@ -48,20 +93,25 @@ pub async fn open_session(
     if runner.status != "online" {
         return Err(problem(StatusCode::CONFLICT, "device_offline", format!("{} is offline. Start it, then try again.", runner.name)));
     }
+    if let Some(refusal) = view.as_ref().and_then(|_| view_refusal(&runner.name, &runner.capabilities)) {
+        return Err(problem(StatusCode::CONFLICT, "no_browser_view", refusal));
+    }
     let cols = request.cols.unwrap_or(80).clamp(20, 400);
     let rows = request.rows.unwrap_or(24).clamp(5, 120);
+    let cap = if view.is_some() { loka_shared::terminal::max_views_per_device() } else { loka_shared::terminal::max_per_device() };
     let session = match state
         .world
-        .create_terminal(user.0, runner.id, cols, rows, loka_shared::terminal::max_per_device())
+        .create_terminal(user.0, runner.id, view.as_ref().map(|(agent, _)| loka_shared::terminal::Watched { agent: *agent, quest }), cols, rows, cap)
         .await
         .map_err(internal)?
     {
         loka_shared::terminal::NewTerminal::Created(session) => session,
-        loka_shared::terminal::NewTerminal::Busy { live } => {
+        loka_shared::terminal::NewTerminal::Busy { .. } => {
+            let what = if view.is_some() { "browser views" } else { "terminals" };
             return Err(problem(
                 StatusCode::CONFLICT,
                 "device_busy",
-                format!("{} already has {live} open terminal sessions.", runner.name),
+                format!("{} runs at most {cap} {what} at once. Close one to open another.", runner.name),
             ));
         }
     };
@@ -74,6 +124,7 @@ pub async fn open_session(
         Json(json!({
             "session_id": session.id,
             "device": runner.name,
+            "agent": view.map(|(_, (_, name))| name),
             "socket": socket_url(&origin, &ticket),
             "expires_at": exp,
         })),
@@ -150,10 +201,10 @@ pub async fn claim(
     if runner.status == "paused" {
         return Err(problem(StatusCode::CONFLICT, "runner_paused", "Runner is paused"));
     }
-    let Some((id, cols, rows)) = state.runners.claim_terminal(runner_id).await.map_err(internal)? else {
+    let Some(job) = state.runners.claim_terminal(runner_id, loka_shared::terminal::TerminalRoom::SHELLS).await.map_err(internal)? else {
         return Ok(StatusCode::NO_CONTENT.into_response());
     };
-    Ok(Json(loka_shared::terminal::TerminalJob { id, cols, rows }).into_response())
+    Ok(Json(job).into_response())
 }
 
 pub async fn runner_socket(
@@ -189,4 +240,17 @@ pub async fn runner_socket(
         .max_message_size(loka_shared::terminal::RUNNER_FRAME_MAX)
         .max_frame_size(loka_shared::terminal::RUNNER_FRAME_MAX)
         .on_upgrade(move |socket| terminal::serve_runner(socket, hub, world, runner_id, session))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_view_says_why_a_device_cannot_show_the_browser() {
+        assert_eq!(view_refusal("Studio", &json!({"browser": true, "browser_view": true})), None);
+        assert_eq!(view_refusal("Studio", &json!({"browser": true})).as_deref(), Some("Update Loka on Studio to watch agent browsers inside Loka."));
+        assert_eq!(view_refusal("Cloud", &json!({})).as_deref(), Some("This agent works on Cloud, which has no agent browser to watch."));
+        assert_eq!(view_refusal("Cloud", &json!({"browser": false, "browser_view": true})).as_deref(), Some("This agent works on Cloud, which has no agent browser to watch."));
+    }
 }

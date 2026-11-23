@@ -225,9 +225,13 @@ const GLOW_EDGE = 0.72;
 const GLOWING = ["spark", "flare", "hit"];
 const stretched = new WeakMap<HTMLCanvasElement, Map<number, HTMLCanvasElement>>();
 
+function gridOf(ctx: Ctx): number {
+  return Math.abs(ctx.getTransform().a);
+}
+
 function blit(ctx: Ctx, art: ThingImage, x: number, y: number, img: HTMLCanvasElement = art.img): void {
   const d = art.density;
-  const [left, top] = placed([art.ax, art.ay], d, x, y);
+  const [left, top] = placed([art.ax, art.ay], d, x, y, gridOf(ctx));
   ctx.drawImage(img, left, top, img.width / d, img.height / d);
 }
 
@@ -281,7 +285,7 @@ export function drawStationArt(ctx: Ctx, trade: Trade, sx: number, sy: number, t
   const spot = art.points.glow?.[0];
   const light = WORK_LIGHT[trade];
   if (!spot || !light) return true;
-  const [left, top] = placed([art.ax, art.ay], art.density, sx, sy);
+  const [left, top] = placed([art.ax, art.ay], art.density, sx, sy, gridOf(ctx));
   const gx = left + spot[0] / art.density;
   const gy = top + spot[1] / art.density;
   const grad = ctx.createRadialGradient(gx, gy, 0, gx, gy, STATION_GLOW_REACH);
@@ -399,7 +403,7 @@ export function drawPipsArt(ctx: Ctx, jobs: string[], x: number, tipY: number, t
   const more = jobs.length > n ? 4 : 0;
   const extra = Math.max(0, n * step + more + 10 - bubble.img.width);
   const img = widened(bubble, extra);
-  const [left, top] = placed([bubble.ax + Math.ceil(extra / 2), bubble.ay], d, x, tipY);
+  const [left, top] = placed([bubble.ax + Math.ceil(extra / 2), bubble.ay], d, x, tipY, gridOf(ctx));
   ctx.drawImage(img, left, top, img.width / d, img.height / d);
   const cy = top + (bubble.points.centre?.[0][1] ?? bubble.img.height / 2) / d;
   const x0 = left + (img.width - n * step + 2 - more) / 2 / d;
@@ -421,7 +425,7 @@ export function drawStatusArt(ctx: Ctx, kind: "dots" | "alert" | "error", x: num
   const bubble = propOf("bubble_thought");
   if (!bubble || !propOf(kind === "dots" ? "icon_dot_on" : `icon_${kind}`)) return false;
   const d = bubble.density;
-  const [left, top] = placed([bubble.ax, bubble.ay], d, x, tipY);
+  const [left, top] = placed([bubble.ax, bubble.ay], d, x, tipY, gridOf(ctx));
   ctx.drawImage(bubble.img, left, top, bubble.img.width / d, bubble.img.height / d);
   const [cx, cy] = bubble.points.centre?.[0] ?? [bubble.ax, bubble.img.height / 2];
   const mx = left + cx / d;

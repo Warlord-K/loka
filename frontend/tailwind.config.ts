@@ -89,6 +89,17 @@ const config: Config = {
           "chart-4": "rgb(var(--w-chart-4) / <alpha-value>)",
           "chart-5": "rgb(var(--w-chart-5) / <alpha-value>)",
           wood: "rgb(var(--w-wood) / <alpha-value>)",
+          term: {
+            bg: "rgb(var(--w-term-bg) / <alpha-value>)",
+            bar: "rgb(var(--w-term-bar) / <alpha-value>)",
+            raise: "rgb(var(--w-term-raise) / <alpha-value>)",
+            line: "rgb(var(--w-term-line) / <alpha-value>)",
+            text: "rgb(var(--w-term-text) / <alpha-value>)",
+            dim: "rgb(var(--w-term-dim) / <alpha-value>)",
+            cursor: "rgb(var(--w-term-cursor) / <alpha-value>)",
+            focus: "rgb(var(--w-term-focus) / <alpha-value>)",
+            red: "rgb(var(--w-term-1) / <alpha-value>)",
+          },
         },
         gray: {
           1: "#131210",

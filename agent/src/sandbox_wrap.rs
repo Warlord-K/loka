@@ -18,20 +18,23 @@ pub(crate) struct Spec {
     pub state: Vec<PathBuf>,
 }
 
-pub(crate) struct RunTemp(PathBuf);
+pub(crate) struct RunTemp(PathBuf, bool);
 
 impl Drop for RunTemp {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if !self.1 {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Paths {
     pub hidden: Vec<PathBuf>,
     pub readable: Vec<PathBuf>,
     pub writable: Vec<PathBuf>,
     pub owner_temp: Vec<PathBuf>,
+    pub sockets: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,8 +95,10 @@ pub(crate) fn paths(spec: &Spec, granted: &BTreeMap<String, String>, run_temp: O
     let git_roots: Vec<PathBuf> = sandbox::git_write_roots(&spec.working_dir).into_iter().map(PathBuf::from).collect();
     readable.extend(git_roots.iter().cloned());
     readable.extend(crate::mcp_hub::get().map(|hub| hub.socket().to_path_buf()));
+    readable.extend(crate::cli::launcher_alias_dir());
     readable.extend(std::env::var_os("SSH_AUTH_SOCK").filter(|v| !v.is_empty()).map(PathBuf::from));
-    let mut writable: Vec<PathBuf> = spec.state.iter().cloned().chain(run_temp.map(Path::to_path_buf)).collect();
+    let temp_grants: Vec<PathBuf> = run_temp.map(crate::cli::private_temp_grants).unwrap_or_default();
+    let mut writable: Vec<PathBuf> = spec.state.iter().cloned().chain(temp_grants.iter().cloned()).collect();
     if !spec.read_only {
         writable.push(spec.working_dir.clone());
         writable.extend(git_roots);
@@ -103,7 +108,8 @@ pub(crate) fn paths(spec: &Spec, granted: &BTreeMap<String, String>, run_temp: O
     let owner_temp = if spec.read_only { Vec::new() } else { sandbox::user_temp_dirs() };
     let hidden = dedup(hidden.iter().map(|p| resolve(p)).collect());
     let writable = dedup(writable.iter().map(|p| resolve(p)).collect());
-    Paths { hidden, readable: dedup(readable.iter().map(|p| resolve(p)).collect()), writable, owner_temp: dedup(owner_temp) }
+    let sockets = dedup(temp_grants.iter().map(|p| resolve(p)).collect());
+    Paths { hidden, readable: dedup(readable.iter().map(|p| resolve(p)).collect()), writable, owner_temp: dedup(owner_temp), sockets }
 }
 
 fn quote(path: &Path) -> String {
@@ -134,6 +140,10 @@ pub(crate) fn seatbelt_profile(paths: &Paths) -> String {
     rules.push(format!("(allow file-write* (regex #\"{DEV_WRITES}\"))"));
     for path in &paths.writable {
         rules.push(format!("(allow file-write* {})", subpaths(path)));
+    }
+    for path in &paths.sockets {
+        rules.push(format!("(allow network-bind (local unix-socket {}))", subpaths(path)));
+        rules.push(format!("(allow network-outbound (remote unix-socket {}))", subpaths(path)));
     }
     for path in &paths.hidden {
         let reopened = paths.writable.iter().chain(&paths.readable).any(|p| p.starts_with(path) && p != path);
@@ -257,14 +267,17 @@ fn rebuild(original: &tokio::process::Command, wrapper: &str, wrapper_args: Vec<
     cmd
 }
 
-fn run_temp() -> Result<RunTemp> {
+fn run_temp(working_dir: &Path) -> Result<RunTemp> {
+    if let Some(owned) = crate::cli::owned_temp_dir(working_dir) {
+        return Ok(RunTemp(owned, true));
+    }
     let dir = crate::cli::temp_dir().join(format!("loka-sandbox-tmp-{}", uuid::Uuid::new_v4().simple()));
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder.create(&dir).context("Failed to create the sandbox temp dir")?;
     crate::cli::give_to_job_user(&dir)?;
-    Ok(RunTemp(dir))
+    Ok(RunTemp(dir, false))
 }
 
 pub(crate) fn unavailable_error(backend: &str) -> String {
@@ -292,14 +305,13 @@ pub(crate) fn wrap(
         warn!(backend, "No OS sandbox is available here, running without one");
         return Ok((cmd, None));
     };
-    let temp = run_temp()?;
+    let temp = run_temp(&spec.working_dir)?;
     let paths = paths(spec, granted, Some(&temp.0));
     let mut wrapped = match kind {
         Kind::Seatbelt => rebuild(&cmd, SANDBOX_EXEC, vec!["-p".into(), seatbelt_profile(&paths).into()]),
         Kind::Bubblewrap => rebuild(&cmd, BWRAP, bwrap_args(&paths, on_disk).into_iter().chain([OsString::from("--")]).collect()),
     };
-    wrapped.env("TMPDIR", &temp.0);
-    crate::cli::drop_default_quest_target(&mut wrapped);
+    crate::cli::set_temp_env(&mut wrapped, &temp.0);
     Ok((wrapped, Some(temp)))
 }
 
@@ -307,12 +319,43 @@ pub(crate) fn wrap(
 mod tests {
     use super::*;
 
+    #[test]
+    fn wrapped_runs_keep_the_quest_or_session_folder_and_never_delete_it() {
+        let quest = uuid::Uuid::new_v4();
+        let owned = crate::cli::private_temp_root().join(crate::cli::quest_temp_name(quest));
+        std::fs::create_dir_all(&owned).unwrap();
+        let temp = run_temp(Path::new(&format!("/r/workspaces/tasks/{quest}/world"))).unwrap();
+        assert_eq!(temp.0, std::fs::canonicalize(&owned).unwrap());
+        drop(temp);
+        assert!(owned.is_dir());
+        let _ = std::fs::remove_dir_all(&owned);
+
+        let session = uuid::Uuid::new_v4();
+        let owned = crate::cli::private_temp_root().join(crate::cli::session_temp_name(session));
+        std::fs::create_dir_all(&owned).unwrap();
+        let temp = crate::cli::SESSION_TEMP.sync_scope(session, || run_temp(Path::new("/Users/a/Projects/app"))).unwrap();
+        assert_eq!(temp.0, std::fs::canonicalize(&owned).unwrap());
+        drop(temp);
+        assert!(owned.is_dir());
+        let _ = std::fs::remove_dir_all(&owned);
+    }
+
+    #[test]
+    fn wrapped_runs_with_no_owner_get_a_throwaway_folder() {
+        let temp = run_temp(Path::new("/Users/a/Projects/app")).unwrap();
+        let dir = temp.0.clone();
+        assert!(dir.is_dir());
+        drop(temp);
+        assert!(!dir.exists());
+    }
+
     fn sample() -> Paths {
         Paths {
             hidden: vec![PathBuf::from("/home/a/.aws"), PathBuf::from("/home/a/.ssh"), PathBuf::from("/tmp")],
             readable: vec![PathBuf::from("/home/a/.ssh/known_hosts"), PathBuf::from("/tmp/run/config.json")],
             writable: vec![PathBuf::from("/work/repo"), PathBuf::from("/tmp/run")],
             owner_temp: Vec::new(),
+            sockets: vec![PathBuf::from("/tmp/run")],
         }
     }
 
@@ -386,13 +429,13 @@ mod tests {
 
     #[test]
     fn seatbelt_covers_both_spellings_of_private_dirs() {
-        let paths = Paths { hidden: vec![PathBuf::from("/private/var/folders/x/T")], readable: vec![], writable: vec![], owner_temp: Vec::new() };
+        let paths = Paths { hidden: vec![PathBuf::from("/private/var/folders/x/T")], readable: vec![], writable: vec![], ..Paths::default() };
         assert!(seatbelt_profile(&paths).contains("(subpath \"/private/var/folders/x/T\") (subpath \"/var/folders/x/T\")"));
     }
 
     #[test]
     fn seatbelt_quotes_paths() {
-        let paths = Paths { hidden: vec![PathBuf::from("/a\"b\\c")], readable: vec![], writable: vec![], owner_temp: Vec::new() };
+        let paths = Paths { hidden: vec![PathBuf::from("/a\"b\\c")], readable: vec![], writable: vec![], ..Paths::default() };
         assert!(seatbelt_profile(&paths).contains("(subpath \"/a\\\"b\\\\c\")"));
     }
 
@@ -440,6 +483,17 @@ mod tests {
         let profile = seatbelt_profile(&paths);
         assert!(profile.contains("dev.ygpt.loka/local.json\"))"), "{profile}");
         assert!(profile.contains("loka-session/app-session.key\"))"), "{profile}");
+    }
+
+    #[test]
+    fn a_launcher_alias_in_the_hidden_temp_folder_stays_runnable() {
+        let spec = Spec { working_dir: std::env::temp_dir(), read_only: false, readable: Vec::new(), state: Vec::new() };
+        let paths = paths(&spec, &BTreeMap::new(), None);
+        if let Some(dir) = crate::cli::launcher_alias_dir() {
+            let dir = resolve(&dir);
+            assert!(paths.readable.contains(&dir), "{} must stay readable: {:?}", dir.display(), paths.readable);
+            assert!(seatbelt_profile(&paths).contains(dir.to_str().unwrap()));
+        }
     }
 
     #[test]
@@ -563,7 +617,7 @@ for line in sys.stdin:
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
     async fn live_sandboxed_task_reaches_the_mcp_hub() {
-        let bin = std::env::var("LOKA_AGENT_BIN").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/loka-agent").to_string());
+        let bin = crate::test_env::host_var("LOKA_AGENT_BIN").unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/loka-agent").to_string());
         let hub_dir = scratch("hub");
         let work = scratch("hub-work");
         let script = hub_dir.0.join("echo.py");
@@ -579,7 +633,7 @@ for line in sys.stdin:
         );
         let prepared = hub
             .prepare(
-                crate::mcp_hub::Job { isolation: crate::mcp_hub::isolation_for(None, agent), agent, cwd: &work.0, pids: pids.clone(), passthrough: &[] },
+                crate::mcp_hub::Job { isolation: crate::mcp_hub::isolation_for(None, agent), agent, cwd: &work.0, pids: pids.clone(), passthrough: &[], tools: Default::default() },
                 &servers,
             )
             .await

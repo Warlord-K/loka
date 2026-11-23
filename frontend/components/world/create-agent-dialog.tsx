@@ -12,8 +12,9 @@ import { CloseButton, WindowHeader } from "./settings-shell";
 import { escapeTaken } from "@/lib/escape";
 import { LookFields } from "./look-fields";
 import type { Accessory } from "./types";
+import type { NavigationRequest } from "@/lib/exact-world-navigation";
 
-export function CreateAgentDialog({ onCreated, onClose }: { onCreated: (agent: WorldAgent) => void; onClose: () => void }) {
+export function CreateAgentDialog({ onBeginNavigation, onCreated, onClose }: { onBeginNavigation: () => NavigationRequest; onCreated: (agent: WorldAgent, navigation: NavigationRequest) => void; onClose: () => void }) {
   const [backends, setBackends] = useState<Record<string, BackendModels>>({});
   const [name, setName] = useState("");
   const [persona, setPersona] = useState("");
@@ -25,6 +26,7 @@ export function CreateAgentDialog({ onCreated, onClose }: { onCreated: (agent: W
   const [tags, setTags] = useState<string[]>([]);
   const [expertise, setExpertise] = useState("");
   const [busy, setBusy] = useState(false);
+  const [created, setCreated] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const cliRef = useRef(cli);
   const cliTouched = useRef(false);
@@ -73,7 +75,8 @@ export function CreateAgentDialog({ onCreated, onClose }: { onCreated: (agent: W
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (busy || !name.trim() || !persona.trim() || !model.trim()) return;
+    if (busy || created || !name.trim() || !persona.trim() || !model.trim()) return;
+    const navigation = onBeginNavigation();
     setBusy(true);
     setError(null);
     try {
@@ -89,7 +92,9 @@ export function CreateAgentDialog({ onCreated, onClose }: { onCreated: (agent: W
         tags,
         expertise: expertise.trim() || undefined,
       });
-      onCreated(agent);
+      setCreated(true);
+      setBusy(false);
+      onCreated(agent, navigation);
     } catch {
       setError("Could not create that bot. Check the details and try again.");
       setBusy(false);
@@ -142,8 +147,8 @@ export function CreateAgentDialog({ onCreated, onClose }: { onCreated: (agent: W
           <VoiceField ariaLabel="Quest gear" value={gear} onChange={setGear} placeholder="sword and lantern" />
         </label>
         {error && <p role="alert" className="rounded-lg border-2 border-w-danger bg-w-rose p-2 text-w-danger">{error}</p>}
-        <button type="submit" disabled={busy || !name.trim() || !persona.trim() || !model.trim()} className={BTN_PRIMARY}>
-          {busy ? "Creating..." : "Create bot"}
+        <button type="submit" disabled={busy || created || !name.trim() || !persona.trim() || !model.trim()} className={BTN_PRIMARY}>
+          {busy ? "Creating..." : created ? "Created" : "Create bot"}
         </button>
       </form>
     </div>

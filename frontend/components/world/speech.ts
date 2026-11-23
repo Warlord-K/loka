@@ -1,5 +1,6 @@
 import { holdMusic } from "./music";
 import { holdSounds } from "./sounds";
+import { CallSpeaker, SoundNotice } from "@/lib/call-speaker";
 
 type Listener = (status: SpeechStatus) => void;
 
@@ -130,13 +131,13 @@ class Speech {
   private next = 1;
   private pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
   private listeners = new Set<Listener>();
-  private ctx: AudioContext | null = null;
+  private out: { ctx: AudioContext; speaker: CallSpeaker } | null = null;
+  private notice = new SoundNotice(SOUND_BLOCKED);
   private queue: Promise<void> = Promise.resolve();
   private epoch = 0;
   private source: AudioBufferSourceNode | null = null;
   private remaining = 0;
   private held: (() => void) | null = null;
-  private waitingForGesture = false;
   status: SpeechStatus = { loading: { stt: null, tts: null }, device: null, speaking: false, error: null };
 
   private ensure(): Worker {
@@ -171,7 +172,8 @@ class Speech {
   }
 
   private set(patch: Partial<SpeechStatus>) {
-    this.status = { ...this.status, ...patch };
+    if ("error" in patch) this.notice.setError(patch.error ?? null);
+    this.status = { ...this.status, ...patch, error: this.notice.shown() };
     for (const l of this.listeners) l(this.status);
   }
 
@@ -246,76 +248,61 @@ class Speech {
     if (this.status.speaking) this.set({ speaking: false });
   }
 
+  private speaker(): { ctx: AudioContext; speaker: CallSpeaker } {
+    if (this.out) return this.out;
+    const ctx = new AudioContext();
+    const speaker = new CallSpeaker(ctx);
+    this.out = { ctx, speaker };
+    speaker.subscribe((blocked) => {
+      this.notice.setBlocked(blocked);
+      this.set({});
+    });
+    return this.out;
+  }
+
   private play(audio: Float32Array, rate: number): Promise<void> {
-    this.ctx ??= new AudioContext();
-    const ctx = this.ctx;
+    const { ctx, speaker } = this.speaker();
     const buffer = ctx.createBuffer(1, audio.length, rate);
     buffer.copyToChannel(audio as Float32Array<ArrayBuffer>, 0);
     const src = ctx.createBufferSource();
     src.buffer = buffer;
-    src.connect(ctx.destination);
-    if (ctx.state !== "running" && this.status.error === SOUND_BLOCKED) {
-      this.resumeOnGesture(ctx);
-      return Promise.resolve();
-    }
+    src.connect(speaker.input);
+    if (speaker.blocked) return Promise.resolve();
     this.source = src;
     const epoch = this.epoch;
     return new Promise((resolve) => {
       let gaveUp = false;
       const current = () => epoch === this.epoch && this.source === src;
-      const blocked = () => {
+      const giveUp = () => {
         gaveUp = true;
-        if (current()) {
-          this.set({ error: SOUND_BLOCKED });
-          this.resumeOnGesture(ctx);
-        }
         if (this.source === src) this.source = null;
         resolve();
       };
-      const wait = window.setTimeout(blocked, 3000);
+      const wait = window.setTimeout(() => {
+        speaker.check();
+        giveUp();
+      }, 3000);
       src.onended = () => {
         window.clearTimeout(wait);
         if (this.source === src) this.source = null;
         resolve();
       };
-      ctx
-        .resume()
-        .then(() => {
-          if (gaveUp) return;
-          if (!current()) {
-            window.clearTimeout(wait);
-            resolve();
-            return;
-          }
-          if (ctx.state !== "running") throw new Error("audio is not running");
-          window.clearTimeout(wait);
-          if (this.status.error === SOUND_BLOCKED) this.set({ error: null });
-          src.start();
-        })
-        .catch(() => {
-          window.clearTimeout(wait);
-          if (!gaveUp) blocked();
-        });
+      speaker.check();
+      void speaker.start().then((ok) => {
+        if (gaveUp) return;
+        window.clearTimeout(wait);
+        if (!ok) speaker.check();
+        if (!current() || !ok) {
+          giveUp();
+          return;
+        }
+        src.start();
+      });
     });
   }
 
-  private resumeOnGesture(ctx: AudioContext) {
-    if (this.waitingForGesture) return;
-    this.waitingForGesture = true;
-    const resume = () => {
-      window.removeEventListener("pointerdown", resume, true);
-      window.removeEventListener("keydown", resume, true);
-      this.waitingForGesture = false;
-      void ctx
-        .resume()
-        .then(() => {
-          if (ctx.state !== "running") throw new Error("audio is not running");
-          if (this.status.error === SOUND_BLOCKED) this.set({ error: null });
-        })
-        .catch(() => this.resumeOnGesture(ctx));
-    };
-    window.addEventListener("pointerdown", resume, true);
-    window.addEventListener("keydown", resume, true);
+  hear() {
+    void this.speaker().speaker.hear();
   }
 
   clearError() {
@@ -323,8 +310,7 @@ class Speech {
   }
 
   unlock() {
-    this.ctx ??= new AudioContext();
-    void this.ctx.resume();
+    void this.speaker().speaker.start();
   }
 }
 

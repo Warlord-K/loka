@@ -7,6 +7,8 @@ use serde_json::{json, Value};
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
+use crate::run_causes::Required;
+
 pub const CHANNEL_EVENTS: &str = "world_events";
 
 pub const COMPACT_PROMPT: &str = "/compact";
@@ -35,6 +37,12 @@ impl EventWake {
         self.org.is_none_or(|own| own == org)
     }
 }
+pub const PLAN_WAITING_NOTE: &str = "needs you: plan waiting for approval";
+
+pub fn plan_waiting_sql(task: &str) -> String {
+    format!("({task}.status NOT IN ('done', 'cancelled') AND EXISTS (SELECT 1 FROM agent_sessions s WHERE s.task_id = {task}.id AND s.plan_state = 'awaiting' AND s.status <> 'archived'))")
+}
+
 pub const CHANNEL_INBOX: &str = "agent_inbox";
 pub const CHANNEL_RUNS: &str = "session_runs";
 pub const CHANNEL_SCHEDULES: &str = "schedules_changed";
@@ -292,6 +300,9 @@ pub struct SessionRun {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+    #[sqlx(default)]
+    #[serde(default)]
+    pub request: Option<Value>,
 }
 
 async fn kept_memory(tx: &mut Transaction<'_, Postgres>, session_id: Uuid, before: DateTime<Utc>) -> Result<String> {
@@ -365,6 +376,15 @@ pub enum Rewound {
     Done { deleted: Vec<Uuid>, rewound_session: bool },
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum DiskWaitKey {
+    Run,
+    Session,
+    Quest,
+}
+
+pub const WAITING_FOR_DISK_NOTE: &str = "waiting for disk space on its device, starts by itself once there is room";
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionRunView {
     #[serde(flatten)]
@@ -373,6 +393,7 @@ pub struct SessionRunView {
     pub retry_mode: Option<String>,
     pub steered_into: Option<Uuid>,
     pub interrupt: bool,
+    pub waiting_for: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -444,17 +465,32 @@ impl AsideChoice {
 }
 
 pub const FOLLOWUP_ASK: &str =
-    "Answer briefly. If you change anything in the workspace, describe it and end with an updated report block.";
+    "Answer briefly. If you change anything in the quest folder, describe it and end with an updated report block. Loka publishes the work after a done report, so a pull request that is not open yet is never a reason to report blocked.";
 
-pub const REPORT_NUDGE: &str = "[report missing]\nYour last message ended without the report block, so the Loka cannot tell whether this quest is finished. Do not start over and do not redo finished steps. If the work is not finished, keep going from where you stopped. When it is finished, or you are blocked, end your final message with the report block in exactly this form (an HTML comment holding one JSON object, not a markdown section or a YAML code fence), with status done or blocked and the other fields from the task prompt:\n<!-- report\n{\"status\": \"done\", \"summary\": \"What you did in 2-4 sentences\", \"pr_title\": \"...\", \"commit_message\": \"...\", \"checks\": [{\"check\": \"...\", \"how\": \"...\", \"result\": \"pass\"}], \"milestones_done\": [1, 2]}\nreport -->";
+pub const REOPENED_ASK: &str = "Answer briefly. This quest ended without being finished and is open again: do what the message asks, then end with the full report block from your task prompt: status done once the work is finished, or blocked with what still stops you. Loka commits, pushes and opens the pull request itself after a done report, so a pull request that is not open yet is never a reason to report blocked.";
 
-pub const REPORT_NUDGES: i64 = 2;
+pub const REPORT_NUDGE: &str = "[report missing]\nYour last message ended without the report block, so the Loka cannot tell whether this quest is finished. Do not start over and do not redo finished steps. If you started any command in the background, wait for it to finish and read its output. If the work is not finished, keep going from where you stopped. When it is finished, or you are blocked, end your final message with the report block in exactly this form (an HTML comment holding one JSON object, not a markdown section or a YAML code fence), with status done or blocked and the other fields from the task prompt:\n<!-- report\n{\"status\": \"done\", \"summary\": \"What you did in 2-4 sentences\", \"pr_title\": \"...\", \"commit_message\": \"...\", \"checks\": [{\"check\": \"...\", \"how\": \"...\", \"result\": \"pass\"}], \"milestones_done\": [1, 2]}\nreport -->";
 
-pub const VERDICT_NUDGE: &str = "[verdict missing]\nYour last message ended without the verdict block, so the author cannot tell whether the work passed. Commands you started in the background are stopped when your turn ends, so do not wait for them: run any check you still need in the foreground and let it finish, or leave it out and say so. Do not start the review over. Then end your final message with the verdict block in exactly this form (an HTML comment holding one JSON object):\n<!-- verdict\n{\"verdict\": \"approve\" | \"changes\", \"summary\": \"...\", \"findings\": [{\"severity\": \"high|medium|low\", \"path\": \"...\", \"issue\": \"...\"}]}\nverdict -->";
+pub const REPORT_NUDGE_LAST: &str = "[report missing]\nThis is the last reminder: your last two messages ended without the report block. Do not run any more commands and do not redo any work. Reply now with only the report block, in exactly this form (an HTML comment holding one JSON object, not a markdown section or a YAML code fence). Say plainly in the summary what is finished and what is not, and use status done only when every check passed, otherwise blocked:\n<!-- report\n{\"status\": \"blocked\", \"summary\": \"What is finished and what is not, in 2-4 sentences\", \"pr_title\": \"...\", \"commit_message\": \"...\", \"checks\": [{\"check\": \"...\", \"how\": \"...\", \"result\": \"pass\"}], \"milestones_done\": [1, 2]}\nreport -->";
+
+pub const REPORT_NUDGE_MARK: &str = "[report missing]";
+
+pub const VERDICT_NUDGE: &str = "[verdict missing]\nYour last message ended without the verdict block, so the author cannot tell whether the work passed. Do not start the review over. If you started any command in the background, wait for it to finish and read its output. Then end your final message with the verdict block in exactly this form (an HTML comment holding one JSON object):\n<!-- verdict\n{\"verdict\": \"approve\" | \"changes\", \"summary\": \"...\", \"findings\": [{\"severity\": \"high|medium|low\", \"path\": \"...\", \"issue\": \"...\"}]}\nverdict -->";
 
 pub const VERDICT_NUDGE_MARK: &str = "[verdict missing]";
 
-pub const VERDICT_NUDGES: i64 = 2;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Nudge {
+    Queued(Uuid),
+    Open,
+    Exhausted,
+}
+
+impl Nudge {
+    pub fn handled(self) -> bool {
+        self != Nudge::Exhausted
+    }
+}
 
 pub const APPROVAL_MODES: [&str; 3] = ["auto", "full", "read_only"];
 pub const DEFAULT_MAIN_SUBSCRIPTIONS: &[&str] = &["task.finished", "run.failed", "run.timed_out", "agent.created"];
@@ -518,12 +554,36 @@ pub fn urgent_inbox_sql(alias: &str) -> String {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowupAdvance {
+    Wait,
+    Advance { was_completed: bool },
+}
+
 #[derive(Debug, Clone)]
 pub enum TaskResume {
     Fresh,
-    Busy(Uuid),
+    Busy { session_id: Uuid, kind: String, status: String },
     AwaitingPlan(Uuid),
+    AwaitingClarification(Uuid),
     Resumed { session_id: Uuid, run_id: Uuid },
+}
+
+impl TaskResume {
+    pub fn problem(&self) -> Option<String> {
+        match self {
+            TaskResume::Busy { session_id, kind, status } => Some(crate::quests::busy_problem(&crate::quests::ActiveRun {
+                session_id: *session_id,
+                kind: kind.clone(),
+                status: status.clone(),
+            })),
+            TaskResume::AwaitingPlan(session_id) => Some(format!("session {session_id} has a plan that {}", crate::quests::PLAN_WAITING)),
+            TaskResume::AwaitingClarification(session_id) => {
+                Some(format!("session {session_id} {}", crate::quests::CLARIFICATION_WAITING))
+            }
+            TaskResume::Fresh | TaskResume::Resumed { .. } => None,
+        }
+    }
 }
 
 pub const KEY_REJECTED_PAUSE: &str = "Model key rejected";
@@ -549,16 +609,63 @@ pub fn requeue_inbox_sql(target: &str) -> String {
     )
 }
 
+pub async fn display_name_on<'e>(executor: impl sqlx::PgExecutor<'e>, user_id: Uuid) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar::<_, Option<String>>("SELECT COALESCE(name, email) FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(executor)
+        .await?
+        .flatten())
+}
+
+pub struct RunClone<'a> {
+    pub kind: Option<&'a str>,
+    pub fork_from: Option<Uuid>,
+    pub prompt: &'a str,
+    pub activity: Option<&'a str>,
+    pub retry_cause: Option<&'a str>,
+    pub not_before: Option<DateTime<Utc>>,
+    pub retry: bool,
+}
+
+pub async fn clone_run(tx: &mut Transaction<'_, Postgres>, source: Uuid, clone: RunClone<'_>) -> Result<SessionRun> {
+    Ok(sqlx::query_as::<_, SessionRun>(
+        "INSERT INTO session_runs
+           (session_id, agent_id, task_id, kind, status, fork_from, prompt, timeout_secs, activity, retry_cause, not_before, request)
+         SELECT session_id, agent_id, task_id, COALESCE($2, kind), 'queued', $3, $4, timeout_secs, $5, $6, $7,
+                CASE WHEN $8 THEN COALESCE(request, '{}'::jsonb)
+                                  || jsonb_build_object('retry', COALESCE((request->>'retry')::int, 0) + 1)
+                     ELSE request END
+         FROM session_runs WHERE id = $1
+         RETURNING id, session_id, agent_id, task_id, kind, status, fork_from, prompt, output, error,
+                       timeout_secs, cost_usd, input_tokens, cached_input_tokens, output_tokens,
+                       created_at, started_at, finished_at, request",
+    )
+    .bind(source)
+    .bind(clone.kind)
+    .bind(clone.fork_from)
+    .bind(clone.prompt)
+    .bind(clone.activity)
+    .bind(clone.retry_cause)
+    .bind(clone.not_before)
+    .bind(clone.retry)
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
 pub fn resume_prompt(from: &str, brief: Option<&str>) -> String {
     let brief = brief.map(str::trim).filter(|b| !b.is_empty());
     format!(
-        "[follow-up from {from}]\nPick this quest back up in this same session and workspace. Check what is already done (diff, commits, branch, PR) before changing anything, and keep what works.{}\n\nWhen it is finished, or you are blocked, end with the full report block as the task prompt describes.",
+        "[follow-up from {from}]\nPick this quest back up in this same session and quest folder. Check what is already done (diff, commits, branch, PR) before changing anything, and keep what works.{}\n\nWhen it is finished, or you are blocked, end with the full report block as the task prompt describes.",
         brief.map(|b| format!("\n\n{b}")).unwrap_or_default()
     )
 }
 
 pub fn steer_text(prompt: &str) -> String {
-    let body = prompt.strip_suffix(FOLLOWUP_ASK).unwrap_or(prompt).trim_end();
+    let body = [FOLLOWUP_ASK, REOPENED_ASK]
+        .iter()
+        .find_map(|ask| prompt.strip_suffix(ask))
+        .unwrap_or(prompt)
+        .trim_end();
     format!(
         "{body}\n\nThis arrived while you were working. Take it into account and keep going. If it asks a question, answer it briefly in your next message. When you finish, end with the full report block as usual."
     )
@@ -1216,6 +1323,7 @@ pub struct NewRun<'a> {
     pub fork_from: Option<Uuid>,
     pub prompt: &'a str,
     pub timeout_secs: i32,
+    pub request: Option<crate::run_request::RunRequest>,
 }
 
 pub struct RunOutcome<'a> {
@@ -1235,6 +1343,7 @@ const AGENT_COLUMNS: &str = "id, slug, name, avatar_emoji, cli, model, system_pr
     COALESCE((SELECT jsonb_agg(jsonb_build_object(
         'run_id', jr.id, 'session_id', jr.session_id, 'task_id', jr.task_id, 'kind', jr.kind, 'status', jr.status,
         'title', COALESCE(jt.title, js.title), 'activity', jr.activity,
+        'waiting', CASE WHEN jr.status = 'queued' AND (jr.runner_id IS NULL OR EXISTS (SELECT 1 FROM world_runners wr WHERE wr.id = jr.runner_id AND wr.last_seen_at > NOW() - INTERVAL '75 seconds')) THEN jr.waiting_for END,
         'started_at', COALESCE(jr.started_at, jr.created_at)) ORDER BY jr.created_at)
       FROM session_runs jr
       JOIN agent_sessions js ON js.id = jr.session_id
@@ -1243,7 +1352,79 @@ const AGENT_COLUMNS: &str = "id, slug, name, avatar_emoji, cli, model, system_pr
         AND jr.kind IN ('task', 'review', 'followup', 'publish')
         AND jr.status IN ('queued', 'running')), '[]'::jsonb) AS jobs";
 
-pub type MeRow = (Uuid, Option<String>, Option<String>, Option<Uuid>, Option<String>, Option<String>);
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BeforeBigWork {
+    #[default]
+    AskWhenUnclear,
+    JustBuild,
+    AlwaysShowPlan,
+}
+
+impl BeforeBigWork {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AskWhenUnclear => "ask_when_unclear",
+            Self::JustBuild => "just_build",
+            Self::AlwaysShowPlan => "always_show_plan",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "ask_when_unclear" => Some(Self::AskWhenUnclear),
+            "just_build" => Some(Self::JustBuild),
+            "always_show_plan" => Some(Self::AlwaysShowPlan),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for BeforeBigWork {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod before_big_work_tests {
+    use super::{BeforeBigWork, WorldStore};
+    use anyhow::Result;
+    use sqlx::postgres::PgPoolOptions;
+    use uuid::Uuid;
+
+    #[test]
+    fn preference_codes_round_trip() {
+        for value in [BeforeBigWork::AskWhenUnclear, BeforeBigWork::JustBuild, BeforeBigWork::AlwaysShowPlan] {
+            assert_eq!(BeforeBigWork::parse(value.as_str()), Some(value));
+            assert_eq!(serde_json::from_str::<BeforeBigWork>(&format!("\"{}\"", value.as_str())).unwrap(), value);
+        }
+        assert_eq!(BeforeBigWork::default(), BeforeBigWork::AskWhenUnclear);
+        assert_eq!(BeforeBigWork::parse("always_ask"), None);
+    }
+
+    #[tokio::test]
+    async fn preference_defaults_and_changes() -> Result<()> {
+        let Ok(url) = std::env::var("QUESTS_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let options = url.parse::<sqlx::postgres::PgConnectOptions>()?.statement_cache_capacity(0);
+        let pool = PgPoolOptions::new().max_connections(1).connect_with(options).await?;
+        let store = WorldStore::new(pool.clone());
+        let user: Uuid = sqlx::query_scalar("INSERT INTO users (email) VALUES ($1) RETURNING id")
+            .bind(format!("{}@before-big-work.test", Uuid::new_v4()))
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(store.before_big_work(user).await?, BeforeBigWork::AskWhenUnclear);
+        for value in [BeforeBigWork::JustBuild, BeforeBigWork::AlwaysShowPlan, BeforeBigWork::AskWhenUnclear] {
+            store.set_before_big_work(user, value).await?;
+            assert_eq!(store.before_big_work(user).await?, value);
+        }
+        Ok(())
+    }
+}
+
+pub type MeRow = (Uuid, Option<String>, Option<String>, Option<Uuid>, Option<String>, Option<String>, String);
 
 pub const OWNER_SPEECH_KINDS: &[&str] = &["message", "channel.message", "channel.mention"];
 const OWNER_SPOKE: &str = "payload->>'from_owner' = 'true' AND COALESCE(payload->>'shell_share', 'false') <> 'true'";
@@ -1301,16 +1482,20 @@ impl WorldStore {
         pr_url: Option<&str>,
         error: Option<&str>,
     ) -> Result<bool> {
-        let payload: Option<Value> = sqlx::query_scalar(
-            "SELECT payload FROM world_events
-             WHERE session_id = $1 AND type = 'task.finished'
-             ORDER BY seq DESC LIMIT 1",
+        let last = sqlx::query_as::<_, (Value, Option<String>)>(
+            "SELECT e.payload, t.status FROM world_events e
+             JOIN agent_sessions s ON s.id = e.session_id
+             LEFT JOIN agent_tasks t ON t.id = s.task_id
+             WHERE e.session_id = $1 AND e.type = 'task.finished'
+             ORDER BY e.seq DESC LIMIT 1",
         )
         .bind(session_id)
         .fetch_optional(&self.pool)
         .await?;
-        let Some(payload) = payload else { return Ok(false) };
-        Ok(payload.get("report") == Some(report)
+        let Some((payload, quest_status)) = last else { return Ok(false) };
+        let reopened = error.is_some() && quest_status.as_deref().is_some_and(|status| status != "failed");
+        Ok(!reopened
+            && payload.get("report") == Some(report)
             && payload.get("pr_url").cloned().unwrap_or(Value::Null) == json!(pr_url)
             && payload.get("error").cloned().unwrap_or(Value::Null) == json!(error))
     }
@@ -1356,13 +1541,7 @@ impl WorldStore {
     }
 
     pub async fn user_display_name(&self, user_id: Uuid) -> Result<Option<String>> {
-        Ok(sqlx::query_scalar::<_, Option<String>>(
-            "SELECT COALESCE(name, email) FROM users WHERE id = $1",
-        )
-        .bind(user_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .flatten())
+        display_name_on(&self.pool, user_id).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1815,15 +1994,17 @@ impl WorldStore {
     }
 
     pub async fn owner_tasks(&self, owner: Uuid, org: Option<Uuid>, agent_id: Option<Uuid>, open_only: bool, limit: i64) -> Result<Vec<TaskBrief>> {
-        Ok(sqlx::query_as::<_, TaskBrief>(
-            "SELECT t.id, t.title, t.status, t.repo, t.pr_url, t.assigned_agent_id, t.assignee_user_id, t.result_content, t.updated_at
+        Ok(sqlx::query_as::<_, TaskBrief>(&format!(
+            "SELECT t.id, t.title, t.status, t.repo, t.pr_url, t.assigned_agent_id, t.assignee_user_id, t.result_content, t.updated_at,
+                    {} AS plan_waiting
              FROM agent_tasks t
              WHERE ($2::uuid IS NULL OR t.assigned_agent_id = $2) AND ($5::uuid IS NULL OR t.org_id = $5)
                AND (NOT $3 OR t.status NOT IN ('done', 'cancelled'))
                AND (EXISTS (SELECT 1 FROM agent_profiles p WHERE p.id = t.assigned_agent_id AND p.owner_user_id = $1)
                     OR (t.assigned_agent_id IS NULL AND (t.user_id = $1 OR t.assignee_user_id = $1)))
              ORDER BY t.updated_at DESC NULLS LAST LIMIT $4",
-        )
+            plan_waiting_sql("t")
+        ))
         .bind(owner)
         .bind(agent_id)
         .bind(open_only)
@@ -1869,13 +2050,14 @@ impl WorldStore {
     }
 
     pub async fn agent_tasks(&self, agent_id: Option<Uuid>, open_only: bool, limit: i64) -> Result<Vec<TaskBrief>> {
-        Ok(sqlx::query_as::<_, TaskBrief>(
-            "SELECT id, title, status, repo, pr_url, assigned_agent_id, assignee_user_id, result_content, updated_at
+        Ok(sqlx::query_as::<_, TaskBrief>(&format!(
+            "SELECT id, title, status, repo, pr_url, assigned_agent_id, assignee_user_id, result_content, updated_at, {} AS plan_waiting
              FROM agent_tasks
              WHERE ($1::uuid IS NULL OR assigned_agent_id = $1)
                AND (NOT $2 OR status NOT IN ('done', 'cancelled'))
              ORDER BY updated_at DESC NULLS LAST LIMIT $3",
-        )
+            plan_waiting_sql("agent_tasks")
+        ))
         .bind(agent_id)
         .bind(open_only)
         .bind(limit)
@@ -2035,16 +2217,17 @@ impl WorldStore {
         };
         let run = sqlx::query_as::<_, SessionRun>(
             "INSERT INTO session_runs
-               (session_id, agent_id, kind, status, fork_from, prompt, timeout_secs)
-             VALUES ($1, $2, 'aside', 'queued', $3, $4, 600)
+               (session_id, agent_id, kind, status, fork_from, prompt, timeout_secs, request)
+             VALUES ($1, $2, 'aside', 'queued', $3, $4, 600, $5)
              RETURNING id, session_id, agent_id, task_id, kind, status, fork_from, prompt, output, error,
                        timeout_secs, cost_usd, input_tokens, cached_input_tokens, output_tokens,
-                       created_at, started_at, finished_at",
+                       created_at, started_at, finished_at, request",
         )
         .bind(session.id)
         .bind(agent_id)
         .bind(forks.then_some(main.id))
         .bind(prompt)
+        .bind(crate::run_request::RunRequest::asked(&asker, Some(question)).value())
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -2715,8 +2898,20 @@ impl WorldStore {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| anyhow::anyhow!("session not found"))?;
+        let clarification = sqlx::query_scalar::<_, Option<String>>("SELECT plan_state FROM agent_sessions WHERE id = $1")
+            .bind(session.id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if clarification.as_deref() == Some("clarifying") {
+            anyhow::bail!("that quest is waiting for answers to its clarification card. Answer the card instead of messaging the session");
+        }
         if current.2 == "archived" {
-            anyhow::bail!("archived sessions cannot receive follow-ups");
+            match current.3 {
+                Some(task_id) => anyhow::bail!(
+                    "archived sessions cannot receive follow-ups. Resume the quest instead: start_task on task_id {task_id} continues it in a fresh session on the same branch, with the last report handed over"
+                ),
+                None => anyhow::bail!("archived sessions cannot receive follow-ups"),
+            }
         }
         let publishing = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (
@@ -2785,8 +2980,14 @@ impl WorldStore {
             if current.1.is_some() || current.0 == "review" && running {
                 anyhow::bail!("that session is being reviewed; wait for the review to finish or stop the review run, then message it again");
             }
-            anyhow::bail!("that session has not started yet");
+            match current.3 {
+                Some(task_id) => anyhow::bail!(
+                    "that session has not started yet. If the quest stalled before it began, start_task on task_id {task_id} opens a fresh session for it"
+                ),
+                None => anyhow::bail!("that session has not started yet"),
+            }
         }
+        let reopened = current.0 == "task" && current.2 == "failed" && reopen_failed_session(&mut tx, session.id, current.3).await?;
         let (plan_state, plan_first) = sqlx::query_as::<_, (Option<String>, bool)>(
             "SELECT s.plan_state, COALESCE(t.plan_first, FALSE)
              FROM agent_sessions s LEFT JOIN agent_tasks t ON t.id = s.task_id WHERE s.id = $1",
@@ -2818,23 +3019,26 @@ impl WorldStore {
             crate::quests::PLAN_SKIPPED
         } else if replan {
             crate::quests::PLAN_AGAIN
+        } else if reopened {
+            REOPENED_ASK
         } else {
             FOLLOWUP_ASK
         };
         let prompt = format!("[follow-up from {from}]\n{text}\n\n{ask}");
         let run = sqlx::query_as::<_, SessionRun>(
             "INSERT INTO session_runs
-               (session_id, agent_id, task_id, kind, status, prompt, timeout_secs, interrupt)
-             VALUES ($1, $2, $3, 'followup', 'queued', $4, 3600, $5)
+               (session_id, agent_id, task_id, kind, status, prompt, timeout_secs, interrupt, request)
+             VALUES ($1, $2, $3, 'followup', 'queued', $4, 3600, $5, $6)
              RETURNING id, session_id, agent_id, task_id, kind, status, fork_from, prompt, output, error,
                        timeout_secs, cost_usd, input_tokens, cached_input_tokens, output_tokens,
-                       created_at, started_at, finished_at",
+                       created_at, started_at, finished_at, request",
         )
         .bind(session.id)
         .bind(session.agent_id)
         .bind(session.task_id)
         .bind(prompt)
         .bind(interrupt)
+        .bind(crate::run_request::RunRequest::asked(from, Some(text)).value())
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -2848,13 +3052,13 @@ impl WorldStore {
     }
 
     pub async fn resume_after_update(&self, run_id: Uuid) -> Result<bool> {
-        let run = sqlx::query_as::<_, (Uuid, String, String, Option<Uuid>, i32)>(
-            "SELECT session_id, kind, prompt, fork_from, timeout_secs FROM session_runs WHERE id = $1",
+        let run = sqlx::query_as::<_, (Uuid, String, String, Option<Uuid>)>(
+            "SELECT session_id, kind, prompt, fork_from FROM session_runs WHERE id = $1",
         )
         .bind(run_id)
         .fetch_optional(&self.pool)
         .await?;
-        let Some((session_id, kind, prompt, fork_from, timeout_secs)) = run else {
+        let Some((session_id, kind, prompt, fork_from)) = run else {
             return Ok(false);
         };
         if !matches!(kind.as_str(), "direct" | "aside" | "quick") {
@@ -2875,16 +3079,19 @@ impl WorldStore {
         }
         let resume = matches!(kind.as_str(), "direct" | "quick") && cli_session_id.is_some();
         let prompt = if resume { crate::run_causes::RESUME_DIRECT_AFTER_UPDATE.to_string() } else { prompt };
-        sqlx::query(
-            "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, fork_from, prompt, timeout_secs, activity, retry_cause)
-             SELECT session_id, agent_id, task_id, kind, 'queued', $2, $3, $4, 'Picking up after the update', 'update'
-             FROM session_runs WHERE id = $1",
+        clone_run(
+            &mut tx,
+            run_id,
+            RunClone {
+                kind: None,
+                fork_from: if resume { None } else { fork_from },
+                prompt: &prompt,
+                activity: Some("Picking up after the update"),
+                retry_cause: Some("update"),
+                not_before: None,
+                retry: false,
+            },
         )
-        .bind(run_id)
-        .bind(if resume { None } else { fork_from })
-        .bind(prompt)
-        .bind(timeout_secs)
-        .execute(&mut *tx)
         .await?;
         sqlx::query("UPDATE agent_sessions SET status = 'active', updated_at = NOW() WHERE id = $1")
             .bind(session_id)
@@ -2927,81 +3134,132 @@ impl WorldStore {
         Ok(run)
     }
 
-    pub async fn nudge_for_report(&self, session_id: Uuid) -> Result<Option<Uuid>> {
+    pub async fn nudge_missing(&self, run_id: Uuid, session_id: Uuid, required: Required) -> Result<Nudge> {
+        let (role, kinds, kind, reminders, mark, activity) = match required {
+            Required::Report => ("task", &["task", "followup"][..], "followup", &[REPORT_NUDGE, REPORT_NUDGE_LAST][..], REPORT_NUDGE_MARK, "Writing up the report"),
+            Required::Verdict => ("review", &["review"][..], "review", &[VERDICT_NUDGE][..], VERDICT_NUDGE_MARK, "Waiting for the review verdict"),
+        };
         let mut tx = self.pool.begin().await?;
         let session = sqlx::query_as::<_, (Uuid, Option<Uuid>, Option<String>)>(
-            "SELECT agent_id, task_id, cli_session_id FROM agent_sessions WHERE id = $1 AND role = 'task' FOR UPDATE",
+            "SELECT agent_id, task_id, cli_session_id FROM agent_sessions WHERE id = $1 AND role = $2 FOR UPDATE",
         )
         .bind(session_id)
+        .bind(role)
         .fetch_optional(&mut *tx)
         .await?;
         let Some((agent_id, task_id, Some(_))) = session else {
-            return Ok(None);
+            return Ok(Nudge::Exhausted);
         };
-        let nudged = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM session_runs
-             WHERE session_id = $1 AND kind = 'followup' AND starts_with(prompt, '[report missing]')",
+        let (open, sent) = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT COUNT(*) FILTER (WHERE status IN ('queued', 'running') AND id <> $4),
+                    COUNT(*) FILTER (WHERE COALESCE(starts_with(prompt, $3), false)
+                                       AND created_at >= COALESCE((SELECT MAX(created_at) FROM session_runs
+                                                                   WHERE session_id = $1 AND kind = ANY($2)
+                                                                     AND NOT COALESCE(starts_with(prompt, $3), false)),
+                                                                 '-infinity'))
+             FROM session_runs WHERE session_id = $1 AND kind = ANY($2)",
         )
         .bind(session_id)
+        .bind(kinds)
+        .bind(mark)
+        .bind(run_id)
         .fetch_one(&mut *tx)
         .await?;
-        if nudged >= REPORT_NUDGES {
-            return Ok(None);
+        if open > 0 {
+            return Ok(Nudge::Open);
         }
-        let run_id = sqlx::query_scalar::<_, Uuid>(
+        let Some(prompt) = usize::try_from(sent).ok().and_then(|sent| reminders.get(sent)) else {
+            return Ok(Nudge::Exhausted);
+        };
+        let nudge = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, prompt, timeout_secs, activity)
-             VALUES ($1, $2, $3, 'followup', 'queued', $4, 3600, 'Writing up the report')
+             VALUES ($1, $2, $3, $4, 'queued', $5, 3600, $6)
              RETURNING id",
         )
         .bind(session_id)
         .bind(agent_id)
         .bind(task_id)
-        .bind(REPORT_NUDGE)
+        .bind(kind)
+        .bind(prompt)
+        .bind(activity)
         .fetch_one(&mut *tx)
         .await?;
+        if required == Required::Verdict {
+            sqlx::query("UPDATE agent_sessions SET status = 'active', updated_at = NOW() WHERE id = $1")
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
-        Ok(Some(run_id))
+        Ok(Nudge::Queued(nudge))
     }
 
-    pub async fn nudge_for_verdict(&self, review_session_id: Uuid) -> Result<Option<Uuid>> {
+    pub async fn fail_missing(&self, run_id: Uuid, required: Required, output: &str) -> Result<crate::run_causes::Diagnosis> {
+        let kind = sqlx::query_scalar::<_, String>("SELECT kind FROM session_runs WHERE id = $1")
+            .bind(run_id)
+            .fetch_one(&self.pool)
+            .await?;
+        let mut diagnosis = self.record_run_end(run_id, &kind, None, output, false).await?;
+        diagnosis.cause = required.cause();
+        diagnosis.reason = required.missed().to_string();
         let mut tx = self.pool.begin().await?;
-        let session = sqlx::query_as::<_, (Uuid, Option<Uuid>, Option<String>)>(
-            "SELECT agent_id, task_id, cli_session_id FROM agent_sessions WHERE id = $1 AND role = 'review' FOR UPDATE",
+        let flipped = sqlx::query_as::<_, (Uuid, Uuid, Option<Uuid>)>(
+            "UPDATE session_runs SET status = 'failed', error = $2, cause = $3, diagnosis = $4
+             WHERE id = $1 AND status = 'completed'
+             RETURNING agent_id, session_id, task_id",
         )
-        .bind(review_session_id)
+        .bind(run_id)
+        .bind(required.missed())
+        .bind(diagnosis.cause.as_str())
+        .bind(serde_json::to_value(&diagnosis)?)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((agent_id, task_id, Some(_))) = session else {
-            return Ok(None);
-        };
-        let (nudged, open) = sqlx::query_as::<_, (i64, i64)>(
-            "SELECT COUNT(*) FILTER (WHERE starts_with(prompt, '[verdict missing]')),
-                    COUNT(*) FILTER (WHERE status IN ('queued', 'running'))
-             FROM session_runs WHERE session_id = $1 AND kind = 'review'",
-        )
-        .bind(review_session_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if nudged >= VERDICT_NUDGES || open > 0 {
-            return Ok(None);
+        if let Some((agent_id, session_id, task_id)) = flipped {
+            if !run_end_announced(&mut tx, run_id).await? {
+                let mut payload = crate::cli_errors::failure_payload(task_id, required.missed(), session_id, &kind);
+                diagnosis.merge_into(&mut payload);
+                payload["quiet"] = json!(true);
+                let event = NewEvent::new("run.failed").agent(agent_id).session(session_id).run(run_id).task(task_id).payload(payload);
+                emit_in(&mut tx, &event, None).await?;
+            }
         }
-        let run_id = sqlx::query_scalar::<_, Uuid>(
-            "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, prompt, timeout_secs, activity)
-             VALUES ($1, $2, $3, 'review', 'queued', $4, 3600, 'Waiting for the review verdict')
-             RETURNING id",
-        )
-        .bind(review_session_id)
-        .bind(agent_id)
-        .bind(task_id)
-        .bind(VERDICT_NUDGE)
-        .fetch_one(&mut *tx)
-        .await?;
-        sqlx::query("UPDATE agent_sessions SET status = 'active', updated_at = NOW() WHERE id = $1")
-            .bind(review_session_id)
-            .execute(&mut *tx)
-            .await?;
         tx.commit().await?;
-        Ok(Some(run_id))
+        Ok(diagnosis)
+    }
+
+    pub async fn settle_missing(&self, run_id: Uuid, session_id: Uuid, required: Required, output: &str) -> Result<Nudge> {
+        let nudge = self.nudge_missing(run_id, session_id, required).await?;
+        if nudge.handled() {
+            self.announce_completed(run_id).await?;
+        } else {
+            self.fail_missing(run_id, required, output).await?;
+        }
+        Ok(nudge)
+    }
+
+    pub async fn announce_completed(&self, run_id: Uuid) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let run = sqlx::query_as::<_, (Uuid, Uuid, Option<Uuid>, f64)>(
+            "SELECT agent_id, session_id, task_id, cost_usd FROM session_runs WHERE id = $1 AND status = 'completed' FOR UPDATE",
+        )
+        .bind(run_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((agent_id, session_id, task_id, cost_usd)) = run else {
+            return Ok(false);
+        };
+        if run_end_announced(&mut tx, run_id).await? {
+            return Ok(false);
+        }
+        let event = NewEvent::new("run.completed")
+            .agent(agent_id)
+            .session(session_id)
+            .run(run_id)
+            .task(task_id)
+            .payload(json!({ "cost_usd": cost_usd }));
+        emit_in(&mut tx, &event, None).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     pub async fn record_run_end(
@@ -3070,13 +3328,13 @@ impl WorldStore {
             return Ok(None);
         }
         let mut tx = self.pool.begin().await?;
-        let run = sqlx::query_as::<_, (Uuid, Uuid, Option<Uuid>, String, String, Option<Uuid>, i32)>(
-            "SELECT session_id, agent_id, task_id, kind, prompt, fork_from, timeout_secs FROM session_runs WHERE id = $1",
+        let run = sqlx::query_as::<_, (Uuid, Uuid, Option<Uuid>, String, String, Option<Uuid>)>(
+            "SELECT session_id, agent_id, task_id, kind, prompt, fork_from FROM session_runs WHERE id = $1",
         )
         .bind(run_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((session_id, agent_id, Some(task_id), kind, prompt, fork_from, timeout_secs)) = run else {
+        let Some((session_id, agent_id, Some(task_id), kind, prompt, fork_from)) = run else {
             return Ok(None);
         };
         if !matches!(kind.as_str(), "task" | "followup" | "review") {
@@ -3122,24 +3380,21 @@ impl WorldStore {
         } else {
             (kind, prompt, fork_from)
         };
-        let id = sqlx::query_scalar::<_, Uuid>(
-            "INSERT INTO session_runs
-               (session_id, agent_id, task_id, kind, status, fork_from, prompt, timeout_secs, activity, retry_cause, not_before)
-             VALUES ($1, $2, $3, $4, 'queued', $5, $6, $7, $10, $8, $9)
-             RETURNING id",
+        let id = clone_run(
+            &mut tx,
+            run_id,
+            RunClone {
+                kind: Some(&kind),
+                fork_from,
+                prompt: &prompt,
+                activity: Some(if update { "Picking up after the update" } else { "Trying again after a hiccup" }),
+                retry_cause: Some(if update { "update" } else { diagnosis.cause.as_str() }),
+                not_before: Some(diagnosis.retry_at(Utc::now())),
+                retry: !update,
+            },
         )
-        .bind(session_id)
-        .bind(agent_id)
-        .bind(task_id)
-        .bind(&kind)
-        .bind(fork_from)
-        .bind(&prompt)
-        .bind(timeout_secs)
-        .bind(if update { "update" } else { diagnosis.cause.as_str() })
-        .bind(diagnosis.retry_at(Utc::now()))
-        .bind(if update { "Picking up after the update" } else { "Trying again after a hiccup" })
-        .fetch_one(&mut *tx)
-        .await?;
+        .await?
+        .id;
         sqlx::query("UPDATE agent_sessions SET status = 'active', updated_at = NOW() WHERE id = $1")
             .bind(session_id)
             .execute(&mut *tx)
@@ -3161,6 +3416,72 @@ impl WorldStore {
         )
         .await?;
         Ok(Some(id))
+    }
+
+    pub async fn disk_waiting(&self, by: DiskWaitKey, ids: &[Uuid]) -> Result<std::collections::HashSet<Uuid>> {
+        if ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let column = match by {
+            DiskWaitKey::Run => "id",
+            DiskWaitKey::Session => "session_id",
+            DiskWaitKey::Quest => "task_id",
+        };
+        let waiting = sqlx::query_scalar::<_, Uuid>(&format!(
+            "SELECT DISTINCT {column} FROM session_runs WHERE {column} = ANY($1) AND status = 'queued' AND waiting_for = 'disk'"
+        ))
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(waiting.into_iter().collect())
+    }
+
+    pub async fn resume_disk_stranded(&self) -> Result<Vec<Uuid>> {
+        let mut tx = self.pool.begin().await?;
+        let runs = sqlx::query_as::<_, (Uuid, Uuid, Uuid, Option<Uuid>, String)>(
+            "UPDATE session_runs r SET status = 'queued', waiting_for = 'disk', error = NULL, cause = NULL, diagnosis = NULL,
+               finished_at = NULL, claimed_by = NULL, started_at = NULL, heartbeat_at = NULL, lease_expires_at = NULL
+             FROM agent_tasks t, agent_profiles a
+             WHERE r.status = 'failed' AND r.kind = ANY($1) AND r.runner_id IS NOT NULL
+               AND r.diagnosis->>'failure' = 'disk_full' AND r.diagnosis->>'stage' = 'start'
+               AND COALESCE((r.diagnosis->>'turns')::bigint, 0) = 0
+               AND NOT EXISTS (SELECT 1 FROM session_run_events e WHERE e.run_id = r.id AND e.kind IN ('text', 'tool') AND e.body NOT LIKE $2)
+               AND r.finished_at > NOW() - INTERVAL '3 days'
+               AND t.id = r.task_id AND t.status = 'failed'
+               AND a.id = r.agent_id AND a.paused_reason IS NULL
+               AND NOT EXISTS (SELECT 1 FROM session_runs n WHERE n.session_id = r.session_id AND (n.created_at, n.id) > (r.created_at, r.id))
+               AND NOT EXISTS (SELECT 1 FROM session_runs live WHERE live.task_id = r.task_id AND live.status IN ('queued', 'running'))
+             RETURNING r.id, r.session_id, r.agent_id, r.task_id, r.kind",
+        )
+        .bind(crate::runners::WORK_RUN_KINDS.map(String::from).to_vec())
+        .bind(SESSION_STARTED_LIKE)
+        .fetch_all(&mut *tx)
+        .await?;
+        for (run_id, session_id, agent_id, task_id, kind) in &runs {
+            sqlx::query(
+                "UPDATE agent_sessions SET status = 'active', updated_at = NOW()
+                 WHERE status = 'failed' AND role IN ('task', 'review') AND attempt_state IS NULL
+                   AND (id = $1 OR id = (SELECT parent_session_id FROM agent_sessions WHERE id = $1))",
+            )
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+            reopen_quest(&mut tx, *task_id).await?;
+            emit_in(
+                &mut tx,
+                &NewEvent::new("run.waiting").agent(*agent_id).session(*session_id).run(*run_id).task(*task_id).payload(json!({
+                    "waiting": true,
+                    "reason": "disk",
+                    "run_kind": kind,
+                    "task_id": task_id,
+                    "quiet": true,
+                })),
+                None,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(runs.into_iter().map(|run| run.0).collect())
     }
 
     pub async fn run_diagnosis(&self, run_id: Uuid) -> Result<Option<crate::run_causes::Diagnosis>> {
@@ -3187,65 +3508,42 @@ impl WorldStore {
         Ok(value.and_then(|value| serde_json::from_value(value).ok()))
     }
 
-    pub async fn resume_task_session(&self, agent_id: Uuid, task_id: Uuid, prompt: &str) -> Result<TaskResume> {
+    pub async fn resume_task_session(&self, agent_id: Uuid, task_id: Uuid, from: &str, brief: Option<&str>) -> Result<TaskResume> {
+        let prompt = resume_prompt(from, brief);
         let mut tx = self.pool.begin().await?;
-        let status = sqlx::query_scalar::<_, String>("SELECT status FROM agent_tasks WHERE id = $1 FOR UPDATE")
-            .bind(task_id)
-            .fetch_one(&mut *tx)
-            .await?;
-        if status == "cancelled" {
-            anyhow::bail!("this quest was cancelled, so it will not be started");
-        }
-        let busy = sqlx::query_scalar::<_, Option<Uuid>>(
-            "SELECT session_id FROM session_runs
-             WHERE task_id = $1 AND kind IN ('task', 'followup', 'review', 'publish') AND status IN ('queued', 'running')
-             ORDER BY created_at DESC LIMIT 1",
-        )
-        .bind(task_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .flatten();
-        if let Some(session_id) = busy {
-            return Ok(TaskResume::Busy(session_id));
-        }
-        let session = sqlx::query_as::<_, (Uuid, Option<String>, bool)>(
-            "SELECT s.id, s.plan_state, COALESCE(t.plan_first, FALSE)
-             FROM agent_sessions s JOIN agent_tasks t ON t.id = s.task_id
-             WHERE s.agent_id = $1 AND s.task_id = $2 AND s.role = 'task' AND s.status <> 'archived'
-               AND s.cli_session_id IS NOT NULL
-             ORDER BY s.created_at DESC LIMIT 1 FOR UPDATE OF s",
-        )
-        .bind(agent_id)
-        .bind(task_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some((session_id, plan_state, plan_first)) = session else {
-            return Ok(TaskResume::Fresh);
+        let facts = crate::quests::load_resume_facts(&mut tx, agent_id, task_id, true).await?;
+        let (session_id, plan_skipped) = match crate::quests::decide_resume(&facts) {
+            crate::quests::ResumePlan::Refused(reason) => anyhow::bail!(reason),
+            crate::quests::ResumePlan::Busy(active) => {
+                return Ok(TaskResume::Busy { session_id: active.session_id, kind: active.kind, status: active.status })
+            }
+            crate::quests::ResumePlan::AwaitingPlan(session_id) => return Ok(TaskResume::AwaitingPlan(session_id)),
+            crate::quests::ResumePlan::AwaitingClarification(session_id) => return Ok(TaskResume::AwaitingClarification(session_id)),
+            crate::quests::ResumePlan::Fresh => return Ok(TaskResume::Fresh),
+            crate::quests::ResumePlan::Resume { session_id, plan_skipped } => (session_id, plan_skipped),
         };
-        if plan_first && plan_state.as_deref() == Some("awaiting") {
-            return Ok(TaskResume::AwaitingPlan(session_id));
-        }
-        let plan_skipped = !plan_first && matches!(plan_state.as_deref(), Some("awaiting" | "planning"));
         if plan_skipped {
             sqlx::query("UPDATE agent_sessions SET plan_state = 'approved' WHERE id = $1")
                 .bind(session_id)
                 .execute(&mut *tx)
                 .await?;
         }
-        let prompt = if plan_skipped { format!("{}\n\n{prompt}", crate::quests::PLAN_SKIPPED) } else { prompt.to_string() };
+        let prompt = if plan_skipped { format!("{}\n\n{prompt}", crate::quests::PLAN_SKIPPED) } else { prompt };
         sqlx::query("UPDATE agent_sessions SET status = 'active', review_rounds = 0, updated_at = NOW() WHERE id = $1")
             .bind(session_id)
             .execute(&mut *tx)
             .await?;
+        reopen_quest(&mut tx, Some(task_id)).await?;
         let run_id = sqlx::query_scalar::<_, Uuid>(
-            "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, prompt, timeout_secs, activity)
-             VALUES ($1, $2, $3, 'followup', 'queued', $4, 3600, 'Picking the quest back up')
+            "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, prompt, timeout_secs, activity, request)
+             VALUES ($1, $2, $3, 'followup', 'queued', $4, 3600, 'Picking the quest back up', $5)
              RETURNING id",
         )
         .bind(session_id)
         .bind(agent_id)
         .bind(task_id)
         .bind(prompt)
+        .bind(crate::run_request::RunRequest::asked(from, brief).value())
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -3628,6 +3926,7 @@ impl WorldStore {
         });
         emit_in(&mut tx, &event, None).await?;
         tx.commit().await?;
+        let _ = self.clear_clarification_waiting(&cleanup.clarification_agents).await;
         Ok(CancelledTask { task, was_open, dropped: cleanup.dropped, running: cleanup.running, archived: cleanup.archived })
     }
 
@@ -3655,6 +3954,7 @@ impl WorldStore {
             cleanup.dropped += more.dropped;
             cleanup.archived += more.archived;
             cleanup.running.extend(more.running);
+            cleanup.clarification_agents.extend(more.clarification_agents);
         }
         sqlx::query("DELETE FROM agent_tasks WHERE id = $1").bind(task_id).execute(&mut *tx).await?;
         let mut event = NewEvent::new("task.deleted");
@@ -3671,24 +3971,33 @@ impl WorldStore {
         });
         emit_in(&mut tx, &event, None).await?;
         tx.commit().await?;
+        let _ = self.clear_clarification_waiting(&cleanup.clarification_agents).await;
         Ok(DeletedTask { task, subtasks: subtasks.len(), dropped: cleanup.dropped, running: cleanup.running, archived: cleanup.archived })
     }
 
     pub async fn quests(&self, viewer: Uuid, org: Uuid, limit: i64) -> Result<Vec<TaskBrief>> {
-        Ok(sqlx::query_as::<_, TaskBrief>(
+        Ok(sqlx::query_as::<_, TaskBrief>(&format!(
             "SELECT id, title, status, repo, pr_url, assigned_agent_id, assignee_user_id, result_content, updated_at, user_id,
-                    plan_first, attempts, pace,
-                    EXISTS (SELECT 1 FROM agent_sessions s WHERE s.task_id = agent_tasks.id AND s.plan_state = 'awaiting' AND s.status <> 'archived') AS plan_waiting
+                    plan_first, attempts, pace, {} AS plan_waiting
              FROM agent_tasks
              WHERE org_id = $3 AND (assigned_agent_id IS NOT NULL
                 OR (COALESCE(source, '') <> 'chat' AND (user_id = $1 OR assignee_user_id = $1)))
              ORDER BY updated_at DESC NULLS LAST LIMIT $2",
-        )
+            plan_waiting_sql("agent_tasks")
+        ))
         .bind(viewer)
         .bind(limit)
         .bind(org)
         .fetch_all(&self.pool)
         .await?)
+    }
+
+    pub async fn plan_waiting(&self, task_id: Uuid) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, bool>(&format!("SELECT {} FROM agent_tasks t WHERE t.id = $1", plan_waiting_sql("t")))
+            .bind(task_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .unwrap_or(false))
     }
 
     pub const MIN_TIME_LIMIT_MINUTES: i64 = 5;
@@ -3745,8 +4054,11 @@ impl WorldStore {
             None => (from_agent, from_user),
         };
         let mut running = Vec::new();
+        let mut clarification_agents = Vec::new();
         if let Some(old) = from_agent.filter(|old| agent != Some(*old)) {
-            running.extend(release_quest(&mut tx, task_id, old, &format!("Quest handed off by {by}")).await?);
+            let (released, settled) = release_quest(&mut tx, task_id, old, &format!("Quest handed off by {by}")).await?;
+            running.extend(released);
+            clarification_agents.extend(settled);
         }
         if edit.status.is_none() && agent.is_some() && agent != from_agent && closed(&status) {
             status = "todo".into();
@@ -3760,7 +4072,13 @@ impl WorldStore {
             .await?;
         if status != from_status && matches!(status.as_str(), "done" | "cancelled") {
             let verb = if status == "done" { "marked done" } else { "cancelled" };
-            running.extend(clean_up_task(&mut tx, task_id, &closing_note(verb, by, None)).await?.running);
+            let cleanup = clean_up_task(&mut tx, task_id, &closing_note(verb, by, None)).await?;
+            running.extend(cleanup.running);
+            clarification_agents.extend(cleanup.clarification_agents);
+        } else if status != from_status && matches!(status.as_str(), "todo" | "planning" | "plan_review" | "review") {
+            clarification_agents.extend(
+                settle_task_clarifications(&mut tx, task_id, None, &format!("Quest moved to {status} by {by}")).await?,
+            );
         }
         let mut event = NewEvent::new("task.updated");
         event.agent_id = agent.or(from_agent);
@@ -3779,6 +4097,7 @@ impl WorldStore {
         });
         emit_in(&mut tx, &event, None).await?;
         tx.commit().await?;
+        let _ = self.clear_clarification_waiting(&clarification_agents).await;
         Ok(QuestEdited { status, running })
     }
 
@@ -3809,9 +4128,9 @@ impl WorldStore {
         Ok(completed)
     }
 
-    pub async fn complete_followup(&self, id: Uuid) -> Result<bool> {
+    pub async fn complete_followup(&self, id: Uuid) -> Result<FollowupAdvance> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query_scalar::<_, Uuid>("SELECT id FROM agent_sessions WHERE id = $1 FOR UPDATE")
+        let (role, status) = sqlx::query_as::<_, (String, String)>("SELECT role, status FROM agent_sessions WHERE id = $1 FOR UPDATE")
             .bind(id)
             .fetch_one(&mut *tx)
             .await?;
@@ -3824,19 +4143,17 @@ impl WorldStore {
         .bind(id)
         .fetch_one(&mut *tx)
         .await?;
-        let advance = if waiting {
-            sqlx::query("UPDATE agent_sessions SET status = 'active', updated_at = NOW() WHERE id = $1 AND status <> 'archived'")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-            false
-        } else {
-            sqlx::query("UPDATE agent_sessions SET status = 'completed', updated_at = NOW() WHERE id = $1 AND status = 'active'")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?
-                .rows_affected()
-                == 1
+        let advance = match (role.as_str(), status.as_str()) {
+            ("task", "active" | "completed") if waiting => FollowupAdvance::Wait,
+            ("task", "active") => {
+                sqlx::query("UPDATE agent_sessions SET status = 'completed', updated_at = NOW() WHERE id = $1")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+                FollowupAdvance::Advance { was_completed: false }
+            }
+            ("task", "completed") => FollowupAdvance::Advance { was_completed: true },
+            _ => FollowupAdvance::Wait,
         };
         tx.commit().await?;
         Ok(advance)
@@ -3875,11 +4192,11 @@ impl WorldStore {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| anyhow::anyhow!("session not found"))?;
-        if current.status == "archived" {
-            anyhow::bail!("archived sessions cannot be reviewed");
-        }
         if current.role != "task" {
             anyhow::bail!("only task sessions can be reviewed");
+        }
+        if current.working_dir.as_deref().is_none_or(|dir| dir.trim().is_empty()) {
+            anyhow::bail!("that session has no saved quest folder to review. Resume the quest with start_task, then review its new session");
         }
         let task_id = current
             .task_id
@@ -3904,22 +4221,24 @@ impl WorldStore {
         .bind(serde_json::json!({ "manual": true, "agent_id": requested_by, "reviewer": reviewer.map(|r| r.name.clone()).unwrap_or_else(|| format!("{backend} {model}")) }))
         .fetch_one(&mut *tx)
         .await?;
+        let asked = crate::run_request::RunRequest::review(focus).value();
         let focus = focus.map(|f| format!("\nFocus especially on: {f}\n")).unwrap_or_default();
         let prompt = format!(
-            "You are an independent reviewer. Another session did the work in this workspace and you have no stake in it.{focus}\nInspect the changes (git status and git diff if this is a repository, otherwise read the files). Look only for substantive problems: bugs, missing pieces, security, broken builds or tests. Do not edit files.\n\nEnd with:\n<!-- verdict\n{{\"verdict\": \"approve\" | \"changes\", \"summary\": \"...\", \"findings\": [{{\"severity\": \"high|medium|low\", \"path\": \"...\", \"issue\": \"...\"}}]}}\nverdict -->"
+            "You are an independent reviewer. Another session did the work in this quest folder and you have no stake in it.{focus}\nInspect the changes (git status and git diff if this is a repository, otherwise read the files). Look only for substantive problems: bugs, missing pieces, security, broken builds or tests. Do not edit files.\n\nEnd with:\n<!-- verdict\n{{\"verdict\": \"approve\" | \"changes\", \"summary\": \"...\", \"findings\": [{{\"severity\": \"high|medium|low\", \"path\": \"...\", \"issue\": \"...\"}}]}}\nverdict -->"
         );
         let run = sqlx::query_as::<_, SessionRun>(
             "INSERT INTO session_runs
-               (session_id, agent_id, task_id, kind, status, prompt, timeout_secs)
-             VALUES ($1, $2, $3, 'review', 'queued', $4, 3600)
+               (session_id, agent_id, task_id, kind, status, prompt, timeout_secs, request)
+             VALUES ($1, $2, $3, 'review', 'queued', $4, 3600, $5)
              RETURNING id, session_id, agent_id, task_id, kind, status, fork_from, prompt, output, error,
                        timeout_secs, cost_usd, input_tokens, cached_input_tokens, output_tokens,
-                       created_at, started_at, finished_at",
+                       created_at, started_at, finished_at, request",
         )
         .bind(review.id)
         .bind(current.agent_id)
         .bind(task_id)
         .bind(prompt)
+        .bind(asked)
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -3930,7 +4249,7 @@ impl WorldStore {
         Ok(sqlx::query_as::<_, SessionRun>(
             "SELECT id, session_id, agent_id, task_id, kind, status, fork_from, prompt, output, error,
                     timeout_secs, cost_usd, input_tokens, cached_input_tokens, output_tokens,
-                    created_at, started_at, finished_at
+                    created_at, started_at, finished_at, request
              FROM session_runs WHERE id = $1",
         )
         .bind(id)
@@ -3943,7 +4262,7 @@ impl WorldStore {
         let run = sqlx::query_as::<_, SessionRun>(
             "SELECT id, session_id, agent_id, task_id, kind, status, fork_from, prompt, output, error,
                     timeout_secs, cost_usd, input_tokens, cached_input_tokens, output_tokens,
-                    created_at, started_at, finished_at
+                    created_at, started_at, finished_at, request
              FROM session_runs WHERE id = $1 FOR UPDATE",
         )
         .bind(id)
@@ -3962,7 +4281,7 @@ impl WorldStore {
             return Err(RetryRunError::Conflict("archived sessions cannot be retried".into()));
         }
         if session.working_dir.as_deref().is_none_or(|path| path.trim().is_empty()) {
-            return Err(RetryRunError::Conflict("the saved workspace is missing".into()));
+            return Err(RetryRunError::Conflict("the saved quest folder is missing".into()));
         }
         let newer = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (
@@ -4181,25 +4500,22 @@ impl WorldStore {
             _ => unreachable!(),
         }
         let prompt = format!(
-            "{}\n\n[retry]\nContinue from the saved conversation and workspace. Inspect existing work first and do not repeat side effects that already completed.",
+            "{}\n\n[retry]\nContinue from the saved conversation and quest folder. Inspect existing work first and do not repeat side effects that already completed.",
             run.prompt
         );
-        let retried = sqlx::query_as::<_, SessionRun>(
-            "INSERT INTO session_runs
-               (session_id, agent_id, task_id, kind, status, fork_from, prompt, timeout_secs)
-             VALUES ($1, $2, $3, $4, 'queued', $5, $6, $7)
-             RETURNING id, session_id, agent_id, task_id, kind, status, fork_from, prompt, output, error,
-                       timeout_secs, cost_usd, input_tokens, cached_input_tokens, output_tokens,
-                       created_at, started_at, finished_at",
+        let retried = clone_run(
+            &mut tx,
+            run.id,
+            RunClone {
+                kind: None,
+                fork_from: if session.cli_session_id.is_some() { None } else { run.fork_from },
+                prompt: &prompt,
+                activity: None,
+                retry_cause: None,
+                not_before: None,
+                retry: true,
+            },
         )
-        .bind(run.session_id)
-        .bind(run.agent_id)
-        .bind(run.task_id)
-        .bind(&run.kind)
-        .bind(if session.cli_session_id.is_some() { None } else { run.fork_from })
-        .bind(prompt)
-        .bind(run.timeout_secs)
-        .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
         Ok(RetriedRun { run: Some(retried), retry_mode })
@@ -4287,10 +4603,34 @@ impl WorldStore {
     }
 
     pub async fn me(&self, user_id: Uuid) -> Result<Option<MeRow>> {
-        Ok(sqlx::query_as::<_, MeRow>("SELECT id, name, email, main_agent_id, status_emoji, status_text FROM users WHERE id = $1")
+        Ok(sqlx::query_as::<_, MeRow>("SELECT id, name, email, main_agent_id, status_emoji, status_text, before_big_work FROM users WHERE id = $1")
             .bind(user_id)
             .fetch_optional(&self.pool)
             .await?)
+    }
+
+    pub async fn before_big_work(&self, user_id: Uuid) -> Result<BeforeBigWork> {
+        let value = sqlx::query_scalar::<_, String>("SELECT before_big_work FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(value.as_deref().and_then(BeforeBigWork::parse).unwrap_or_default())
+    }
+
+    pub async fn agent_before_big_work(&self, agent: &WorldAgent) -> Result<BeforeBigWork> {
+        match agent.owner_user_id {
+            Some(owner) => self.before_big_work(owner).await,
+            None => Ok(BeforeBigWork::default()),
+        }
+    }
+
+    pub async fn set_before_big_work(&self, user_id: Uuid, value: BeforeBigWork) -> Result<()> {
+        sqlx::query("UPDATE users SET before_big_work = $2 WHERE id = $1")
+            .bind(user_id)
+            .bind(value.as_str())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn set_user_status(&self, user_id: Uuid, emoji: Option<&str>, text: Option<&str>) -> Result<()> {
@@ -4476,6 +4816,30 @@ impl WorldStore {
                 None,
             )
             .await?;
+        }
+        Ok(())
+    }
+
+    async fn clear_clarification_waiting(&self, agents: &[Uuid]) -> Result<()> {
+        for agent_id in agents {
+            let reset = sqlx::query_scalar::<_, Uuid>(
+                "UPDATE agent_profiles SET status = 'idle', status_detail = NULL, updated_at = NOW()
+                 WHERE id = $1 AND status = 'waiting' AND status_detail = 'Waiting for answers'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM agent_sessions
+                     WHERE agent_id = $1 AND plan_state = 'clarifying' AND status <> 'archived'
+                   ) RETURNING id",
+            )
+            .bind(agent_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            if reset.is_some() {
+                self.emit(
+                    NewEvent::new("agent.status").agent(*agent_id).payload(json!({ "status": "idle", "detail": null })),
+                    None,
+                )
+                .await?;
+            }
         }
         Ok(())
     }
@@ -4846,19 +5210,10 @@ impl WorldStore {
         usage_baseline: Value,
         context_tokens: i64,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE agent_sessions
-             SET cli_session_id = COALESCE($2, cli_session_id), usage_baseline = $3,
-                 summary = CASE WHEN role = 'main' AND $2 IS NOT NULL THEN NULL ELSE summary END,
-                 context_tokens = $4, updated_at = NOW()
-             WHERE id = $1",
-        )
-        .bind(id)
-        .bind(cli_session_id)
-        .bind(usage_baseline)
-        .bind(context_tokens)
-        .execute(&self.pool)
-        .await?;
+        let mut tx = self.pool.begin().await?;
+        crate::run_recording::raise_session_baseline(&mut tx, id, &usage_baseline).await?;
+        crate::run_recording::write_session_after_run(&mut tx, id, cli_session_id, Some(context_tokens)).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -4895,31 +5250,16 @@ impl WorldStore {
         .await?)
     }
 
-    pub async fn review_runs_since_work(&self, task_session_id: Uuid) -> Result<i64> {
-        Ok(sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM session_runs r
-             JOIN agent_sessions s ON s.id = r.session_id
-             WHERE s.parent_session_id = $1 AND s.role = 'review' AND r.kind = 'review'
-               AND COALESCE((s.asked_by->>'manual')::boolean, false) = false
-               AND NOT starts_with(r.prompt, '[verdict missing]')
-               AND r.created_at > COALESCE(
-                 (SELECT MAX(created_at) FROM session_runs WHERE session_id = $1 AND kind IN ('task', 'followup')),
-                 '-infinity')",
-        )
-        .bind(task_session_id)
-        .fetch_one(&self.pool)
-        .await?)
-    }
-
     pub async fn latest_review_output(&self, task_session_id: Uuid) -> Result<Option<String>> {
         Ok(sqlx::query_scalar::<_, Option<String>>(
             "SELECT r.output FROM session_runs r
              JOIN agent_sessions s ON s.id = r.session_id
              WHERE s.parent_session_id = $1 AND s.role = 'review' AND r.kind = 'review'
-               AND r.status = 'completed'
+               AND (r.status = 'completed' OR r.cause = 'no_verdict')
                AND COALESCE((s.asked_by->>'manual')::boolean, false) = false
                AND r.created_at > COALESCE(
-                 (SELECT MAX(created_at) FROM session_runs WHERE session_id = $1 AND kind IN ('task', 'followup')),
+                 (SELECT MAX(created_at) FROM session_runs
+                  WHERE session_id = $1 AND kind IN ('task', 'followup') AND NOT unchanged_work),
                  '-infinity')
              ORDER BY r.created_at DESC, r.id DESC LIMIT 1",
         )
@@ -4929,14 +5269,22 @@ impl WorldStore {
         .flatten())
     }
 
+    pub async fn mark_unchanged_work(&self, run_id: Uuid) -> Result<()> {
+        sqlx::query("UPDATE session_runs SET unchanged_work = TRUE WHERE id = $1 AND kind = 'followup'")
+            .bind(run_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn create_run(&self, new: NewRun<'_>) -> Result<SessionRun> {
         Ok(sqlx::query_as::<_, SessionRun>(
             "INSERT INTO session_runs
-               (session_id, agent_id, task_id, kind, status, fork_from, prompt, timeout_secs, started_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CASE WHEN $5 = 'running' THEN NOW() END)
+               (session_id, agent_id, task_id, kind, status, fork_from, prompt, timeout_secs, started_at, request)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CASE WHEN $5 = 'running' THEN NOW() END, $9)
              RETURNING id, session_id, agent_id, task_id, kind, status, fork_from, prompt, output, error,
                        timeout_secs, cost_usd, input_tokens, cached_input_tokens, output_tokens,
-                       created_at, started_at, finished_at",
+                       created_at, started_at, finished_at, request",
         )
         .bind(new.session_id)
         .bind(new.agent_id)
@@ -4946,6 +5294,7 @@ impl WorldStore {
         .bind(new.fork_from)
         .bind(new.prompt)
         .bind(new.timeout_secs)
+        .bind(new.request.as_ref().map(crate::run_request::RunRequest::value))
         .fetch_one(&self.pool)
         .await?)
     }
@@ -4987,31 +5336,77 @@ impl WorldStore {
     }
 
     pub async fn finish_run(&self, id: Uuid, outcome: RunOutcome<'_>) -> Result<bool> {
-        let live: Option<bool> = sqlx::query_scalar(
-            "WITH prev AS (SELECT id, status IN ('queued', 'running') AS live FROM session_runs WHERE id = $1 FOR UPDATE)
-             UPDATE session_runs r
-             SET status = CASE WHEN prev.live THEN $2 ELSE r.status END,
-                 output = CASE WHEN prev.live THEN $3 ELSE r.output END,
-                 error = CASE WHEN prev.live THEN $4 ELSE r.error END,
-                 cost_usd = CASE WHEN prev.live AND $2 = 'completed' THEN $5 ELSE GREATEST(r.cost_usd, $5) END,
-                 input_tokens = CASE WHEN prev.live AND $2 = 'completed' THEN $6 ELSE GREATEST(r.input_tokens, $6) END,
-                 cached_input_tokens = CASE WHEN prev.live AND $2 = 'completed' THEN $7 ELSE GREATEST(r.cached_input_tokens, $7) END,
-                 output_tokens = CASE WHEN prev.live AND $2 = 'completed' THEN $8 ELSE GREATEST(r.output_tokens, $8) END,
-                 finished_at = CASE WHEN prev.live THEN NOW() ELSE COALESCE(r.finished_at, NOW()) END
-             FROM prev WHERE r.id = prev.id
-             RETURNING prev.live",
+        finish_run_on(&self.pool, id, outcome).await
+    }
+
+    pub async fn complete_run(
+        &self,
+        run: &SessionRun,
+        output: &str,
+        reported: &crate::run_recording::Reported,
+        cli_session_id: Option<&str>,
+        context_tokens: i64,
+    ) -> Result<bool> {
+        let reported = crate::run_recording::accounts_spend(&run.kind).then_some(reported);
+        let mut tx = self.pool.begin().await?;
+        let live = sqlx::query_scalar::<_, bool>("SELECT status IN ('queued', 'running') FROM session_runs WHERE id = $1 FOR UPDATE")
+            .bind(run.id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .unwrap_or(false);
+        if !live {
+            if let Some(reported) = reported {
+                crate::run_recording::keep_spend_of_closed_run(&mut tx, run.id, run.session_id, reported).await?;
+                tx.commit().await?;
+            }
+            return Ok(false);
+        }
+        let billed = match reported {
+            Some(reported) => crate::run_recording::bill_session(&mut tx, run.session_id, reported).await?,
+            None => None,
+        };
+        let outcome = RunOutcome {
+            status: "completed",
+            output: Some(output),
+            error: None,
+            cost_usd: billed.as_ref().map_or(0.0, |billed| billed.cost_usd),
+            input_tokens: billed.as_ref().map_or(0, |billed| billed.input_tokens),
+            cached_input_tokens: billed.as_ref().map_or(0, |billed| billed.cached_input_tokens),
+            output_tokens: billed.as_ref().map_or(0, |billed| billed.output_tokens),
+        };
+        finish_run_on(&mut *tx, run.id, outcome).await?;
+        crate::run_recording::write_session_after_run(&mut tx, run.session_id, cli_session_id, Some(context_tokens)).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn requeue_for_space(&self, run: &SessionRun, error: &str) -> Result<bool> {
+        if !crate::run_recording::waits_for_space(&run.kind, error) {
+            return Ok(false);
+        }
+        let mut tx = self.pool.begin().await?;
+        if !crate::run_recording::requeue_for_space(&mut tx, run.id, None).await? {
+            return Ok(false);
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn release_space_wait(&self, run: &SessionRun) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let released = sqlx::query_scalar::<_, bool>(
+            "WITH prev AS (SELECT id, waiting_for FROM session_runs WHERE id = $1 FOR UPDATE),
+                  cleared AS (UPDATE session_runs r SET waiting_for = NULL FROM prev WHERE r.id = prev.id AND prev.waiting_for IS NOT NULL RETURNING r.id)
+             SELECT EXISTS (SELECT 1 FROM cleared)",
         )
-        .bind(id)
-        .bind(outcome.status)
-        .bind(outcome.output.map(|output| output.replace('\0', "")))
-        .bind(outcome.error.map(|error| error.replace('\0', "")))
-        .bind(outcome.cost_usd)
-        .bind(outcome.input_tokens)
-        .bind(outcome.cached_input_tokens)
-        .bind(outcome.output_tokens)
-        .fetch_optional(&self.pool)
+        .bind(run.id)
+        .fetch_one(&mut *tx)
         .await?;
-        Ok(live.unwrap_or(false))
+        if released {
+            crate::run_recording::emit_waiting(&mut tx, run.id, run.session_id, run.agent_id, run.task_id, &run.kind, false).await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn previous_run_id(&self, session_id: Uuid, run_id: Uuid) -> Result<Option<Uuid>> {
@@ -5066,7 +5461,7 @@ impl WorldStore {
                       CASE WHEN $4 THEN '' ELSE prompt END AS prompt,
                       CASE WHEN $4 THEN NULL ELSE output END AS output, error,
                       timeout_secs, cost_usd, input_tokens, cached_input_tokens, output_tokens,
-                      created_at, started_at, finished_at
+                      created_at, started_at, finished_at, request
                FROM session_runs
                WHERE session_id = $1 AND ($2::timestamptz IS NULL OR created_at < $2)
                ORDER BY created_at DESC LIMIT $3
@@ -5079,7 +5474,7 @@ impl WorldStore {
         .fetch_all(&self.pool)
         .await?;
         let ids: Vec<Uuid> = runs.iter().map(|run| run.id).collect();
-        let states = sqlx::query_as::<_, (Uuid, bool, Option<String>, Option<Uuid>, bool)>(
+        let states = sqlx::query_as::<_, (Uuid, bool, Option<String>, Option<Uuid>, bool, Option<String>)>(
             "SELECT r.id,
                     COALESCE(r.status IN ('failed', 'timed_out')
                     AND s.status <> 'archived'
@@ -5122,7 +5517,7 @@ impl WorldStore {
                       ELSE false
                     END, false),
                     CASE WHEN s.cli_session_id IS NULL THEN 'restart' ELSE 'resume' END,
-                    r.steered_into, r.interrupt
+                    r.steered_into, r.interrupt, CASE WHEN r.status = 'queued' THEN r.waiting_for END
              FROM session_runs r
              JOIN agent_sessions s ON s.id = r.session_id
              LEFT JOIN agent_tasks t ON t.id = r.task_id
@@ -5133,15 +5528,15 @@ impl WorldStore {
         .fetch_all(&self.pool)
         .await?
         .into_iter()
-        .map(|(id, retryable, mode, steered_into, interrupt)| {
-            (id, (retryable, retryable.then_some(mode).flatten(), steered_into, interrupt))
+        .map(|(id, retryable, mode, steered_into, interrupt, waiting_for)| {
+            (id, (retryable, retryable.then_some(mode).flatten(), steered_into, interrupt, waiting_for))
         })
         .collect::<HashMap<_, _>>();
         Ok(runs
             .into_iter()
             .map(|run| {
-                let (retryable, retry_mode, steered_into, interrupt) = states.get(&run.id).cloned().unwrap_or_default();
-                SessionRunView { run, retryable, retry_mode, steered_into, interrupt }
+                let (retryable, retry_mode, steered_into, interrupt, waiting_for) = states.get(&run.id).cloned().unwrap_or_default();
+                SessionRunView { run, retryable, retry_mode, steered_into, interrupt, waiting_for }
             })
             .collect())
     }
@@ -5160,6 +5555,10 @@ impl WorldStore {
     }
 
     pub async fn insert_reply(&self, m: NewMessage<'_>, reply_to: Option<Uuid>) -> Result<AgentMessage> {
+        self.insert_reply_with(&self.pool, m, reply_to).await
+    }
+
+    pub async fn insert_reply_with<'e, E: sqlx::PgExecutor<'e>>(&self, executor: E, m: NewMessage<'_>, reply_to: Option<Uuid>) -> Result<AgentMessage> {
         Ok(sqlx::query_as::<_, AgentMessage>(
             "INSERT INTO agent_messages (agent_id, author_kind, author_user_id, author_agent_id, body, session_id, run_id, meta, reply_to)
              VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, '{}'::jsonb), $9) RETURNING *",
@@ -5173,7 +5572,7 @@ impl WorldStore {
         .bind(m.run_id)
         .bind(if m.meta.is_null() { None } else { Some(&m.meta) })
         .bind(reply_to)
-        .fetch_one(&self.pool)
+        .fetch_one(executor)
         .await?)
     }
 
@@ -5687,7 +6086,7 @@ impl WorldStore {
         Ok(rows)
     }
 
-    pub async fn recent_events_of(&self, org: Option<Uuid>, types: &[String], limit: i64) -> Result<Vec<WorldEvent>> {
+    pub async fn agent_feed(&self, org: Option<Uuid>, agent_id: Option<Uuid>, types: &[String], limit: i64) -> Result<Vec<WorldEvent>> {
         let patterns: Vec<String> = types
             .iter()
             .map(|t| t.trim())
@@ -5698,13 +6097,16 @@ impl WorldStore {
                 None => t.replace('%', ""),
             })
             .collect();
-        if patterns.is_empty() {
-            return self.recent_events_in(org, None, limit).await;
-        }
         let mut rows = sqlx::query_as::<_, WorldEvent>(
-            "SELECT * FROM world_events WHERE type LIKE ANY($1) AND ($3::uuid IS NULL OR org_id = $3) ORDER BY seq DESC LIMIT $2",
+            "SELECT * FROM world_events
+             WHERE (cardinality($1::text[]) = 0 OR type LIKE ANY($1))
+               AND ($2::uuid IS NULL OR agent_id = $2)
+               AND ($4::uuid IS NULL OR org_id = $4)
+               AND COALESCE(payload->>'quiet', '') <> 'true'
+             ORDER BY seq DESC LIMIT $3",
         )
         .bind(&patterns)
+        .bind(agent_id)
         .bind(limit)
         .bind(org)
         .fetch_all(&self.pool)
@@ -5985,6 +6387,7 @@ struct TaskCleanup {
     dropped: u64,
     running: Vec<Uuid>,
     archived: u64,
+    clarification_agents: Vec<Uuid>,
 }
 
 fn closing_note(verb: &str, by: &str, reason: Option<&str>) -> String {
@@ -5994,7 +6397,35 @@ fn closing_note(verb: &str, by: &str, reason: Option<&str>) -> String {
     }
 }
 
-async fn release_quest(tx: &mut Transaction<'_, Postgres>, task_id: Uuid, agent_id: Uuid, note: &str) -> Result<Vec<Uuid>> {
+async fn reopen_failed_session(tx: &mut Transaction<'_, Postgres>, session_id: Uuid, task_id: Option<Uuid>) -> Result<bool> {
+    let reopened = sqlx::query(
+        "UPDATE agent_sessions s SET status = 'active', review_rounds = 0, updated_at = NOW()
+         WHERE s.id = $1 AND s.role = 'task' AND s.status = 'failed'
+           AND (s.attempt_state IS NULL OR s.attempt_state = 'won')
+           AND NOT EXISTS (SELECT 1 FROM agent_tasks t WHERE t.id = s.task_id AND t.status = 'cancelled')",
+    )
+    .bind(session_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected()
+        == 1;
+    if !reopened {
+        return Ok(false);
+    }
+    reopen_quest(tx, task_id).await
+}
+
+pub(crate) async fn reopen_quest(tx: &mut Transaction<'_, Postgres>, task_id: Option<Uuid>) -> Result<bool> {
+    let Some(task_id) = task_id else { return Ok(false) };
+    Ok(sqlx::query("UPDATE agent_tasks SET status = 'in_progress', error_message = NULL WHERE id = $1 AND status = 'failed'")
+        .bind(task_id)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected()
+        == 1)
+}
+
+async fn release_quest(tx: &mut Transaction<'_, Postgres>, task_id: Uuid, agent_id: Uuid, note: &str) -> Result<(Vec<Uuid>, Vec<Uuid>)> {
     let work = "r.agent_id = $2 AND r.kind IN ('task', 'followup', 'review', 'publish')
                 AND (r.task_id = $1 OR r.session_id IN (SELECT id FROM agent_sessions WHERE task_id = $1))";
     sqlx::query(&format!(
@@ -6021,6 +6452,7 @@ async fn release_quest(tx: &mut Transaction<'_, Postgres>, task_id: Uuid, agent_
     .bind(agent_id)
     .execute(&mut **tx)
     .await?;
+    let clarification_agents = settle_task_clarifications(tx, task_id, Some(agent_id), note).await?;
     sqlx::query(
         "UPDATE agent_inbox SET status = 'done'
          WHERE agent_id = $2 AND status = 'pending' AND kind = 'task.assigned' AND payload->>'task_id' = $1::text",
@@ -6029,7 +6461,7 @@ async fn release_quest(tx: &mut Transaction<'_, Postgres>, task_id: Uuid, agent_
     .bind(agent_id)
     .execute(&mut **tx)
     .await?;
-    Ok(running)
+    Ok((running, clarification_agents))
 }
 
 async fn lock_task(tx: &mut Transaction<'_, Postgres>, task_id: Uuid) -> Result<TaskRef> {
@@ -6066,6 +6498,7 @@ async fn clean_up_task(tx: &mut Transaction<'_, Postgres>, task_id: Uuid, note: 
     .execute(&mut **tx)
     .await?
     .rows_affected();
+    let clarification_agents = settle_task_clarifications(tx, task_id, None, note).await?;
     sqlx::query(
         "UPDATE task_milestones SET status = 'skipped', detail = 'Quest closed', next_check_at = NULL, updated_at = NOW()
          WHERE task_id = $1 AND status IN ('pending', 'active')",
@@ -6080,7 +6513,110 @@ async fn clean_up_task(tx: &mut Transaction<'_, Postgres>, task_id: Uuid, note: 
     .bind(task_id)
     .execute(&mut **tx)
     .await?;
-    Ok(TaskCleanup { dropped, running, archived })
+    Ok(TaskCleanup { dropped, running, archived, clarification_agents })
+}
+
+async fn settle_task_clarifications(
+    tx: &mut Transaction<'_, Postgres>,
+    task_id: Uuid,
+    agent_id: Option<Uuid>,
+    note: &str,
+) -> Result<Vec<Uuid>> {
+    let cards = sqlx::query_as::<_, (Uuid, Uuid, Uuid, Uuid)>(
+        "SELECT m.id, s.id, s.agent_id, a.owner_user_id
+         FROM agent_sessions s
+         JOIN agent_profiles a ON a.id = s.agent_id AND a.owner_user_id IS NOT NULL
+         JOIN agent_messages m ON m.agent_id = s.agent_id AND m.meta->'clarification'->>'session_id' = s.id::text
+         WHERE s.task_id = $1 AND ($2::uuid IS NULL OR s.agent_id = $2) AND s.plan_state = 'clarifying'
+           AND NOT EXISTS (SELECT 1 FROM agent_messages answer WHERE answer.agent_id = m.agent_id AND answer.meta->>'answers' = m.id::text)
+         ORDER BY m.created_at FOR UPDATE OF s, m",
+    )
+    .bind(task_id)
+    .bind(agent_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut agents = Vec::new();
+    for (card_id, session_id, agent_id, owner) in cards {
+        let message_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agent_messages (agent_id, author_kind, author_user_id, body, meta)
+             VALUES ($1, 'user', $2, $3, $4) RETURNING id",
+        )
+        .bind(agent_id)
+        .bind(owner)
+        .bind(note)
+        .bind(json!({ "answers": card_id, "auto": true }))
+        .fetch_one(&mut **tx)
+        .await?;
+        emit_in(
+            tx,
+            &NewEvent::new("message.created")
+                .agent(agent_id)
+                .session(session_id)
+                .task(Some(task_id))
+                .actor(Some(owner))
+                .payload(json!({
+                    "message_id": message_id,
+                    "author": "Loka",
+                    "author_kind": "user",
+                    "body": note,
+                    "quiet": true,
+                    "answer_card": card_id,
+                })),
+            None,
+        )
+        .await?;
+        agents.push(agent_id);
+    }
+    agents.extend(sqlx::query_scalar::<_, Uuid>(
+        "UPDATE agent_sessions SET plan_state = NULL, updated_at = NOW()
+         WHERE task_id = $1 AND ($2::uuid IS NULL OR agent_id = $2) AND plan_state = 'clarifying'
+         RETURNING agent_id",
+    )
+    .bind(task_id)
+    .bind(agent_id)
+    .fetch_all(&mut **tx)
+    .await?);
+    agents.sort_unstable();
+    agents.dedup();
+    Ok(agents)
+}
+
+pub const RUN_END_EVENTS: [&str; 3] = ["run.completed", "run.failed", "run.timed_out"];
+
+async fn run_end_announced(tx: &mut Transaction<'_, Postgres>, run_id: Uuid) -> Result<bool> {
+    Ok(sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM world_events WHERE run_id = $1 AND type = ANY($2))")
+        .bind(run_id)
+        .bind(&RUN_END_EVENTS[..])
+        .fetch_one(&mut **tx)
+        .await?)
+}
+
+async fn finish_run_on(executor: impl sqlx::PgExecutor<'_>, id: Uuid, outcome: RunOutcome<'_>) -> Result<bool> {
+    let live: Option<bool> = sqlx::query_scalar(
+        "WITH prev AS (SELECT id, status IN ('queued', 'running') AS live FROM session_runs WHERE id = $1 FOR UPDATE)
+         UPDATE session_runs r
+         SET status = CASE WHEN prev.live THEN $2 ELSE r.status END,
+             output = CASE WHEN prev.live THEN $3 ELSE r.output END,
+             error = CASE WHEN prev.live THEN $4 ELSE r.error END,
+             cost_usd = CASE WHEN prev.live AND $2 = 'completed' THEN $5 ELSE GREATEST(r.cost_usd, $5) END,
+             input_tokens = CASE WHEN prev.live AND $2 = 'completed' THEN $6 ELSE GREATEST(r.input_tokens, $6) END,
+             cached_input_tokens = CASE WHEN prev.live AND $2 = 'completed' THEN $7 ELSE GREATEST(r.cached_input_tokens, $7) END,
+             output_tokens = CASE WHEN prev.live AND $2 = 'completed' THEN $8 ELSE GREATEST(r.output_tokens, $8) END,
+             finished_at = CASE WHEN prev.live THEN NOW() ELSE COALESCE(r.finished_at, NOW()) END
+         FROM prev WHERE r.id = prev.id
+         RETURNING prev.live",
+    )
+    .bind(id)
+    .bind(outcome.status)
+    .bind(outcome.output.map(|output| output.replace('\0', "")))
+    .bind(outcome.error.map(|error| error.replace('\0', "")))
+    .bind(outcome.cost_usd)
+    .bind(outcome.input_tokens)
+    .bind(outcome.cached_input_tokens)
+    .bind(outcome.output_tokens)
+    .fetch_optional(executor)
+    .await?;
+    Ok(live.unwrap_or(false))
 }
 
 pub async fn emit_in(
@@ -6217,9 +6753,10 @@ mod tests {
 
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
-    use super::{parse_skill_markdown, raw_skill_url, resume_prompt, AgentUpdate, ReplayGap, Resume, RetryRunError, TaskResume, WorldStore, REPLAY_MAX_EVENTS, VERDICT_NUDGE};
+    use super::{parse_skill_markdown, raw_skill_url, AgentUpdate, NewEvent, Nudge, QuestEdit, ReplayGap, Resume, RetryRunError, TaskResume, WorldStore, REPLAY_MAX_EVENTS, VERDICT_NUDGE};
+    use crate::run_causes::Required;
     use chrono::{DateTime, Utc};
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use uuid::Uuid;
 
     #[test]
@@ -6284,7 +6821,7 @@ mod tests {
                cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0, input_tokens BIGINT NOT NULL DEFAULT 0,
                cached_input_tokens BIGINT NOT NULL DEFAULT 0, output_tokens BIGINT NOT NULL DEFAULT 0,
                claimed_by TEXT, heartbeat_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-               started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ
+               started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ, request JSONB
              );
              CREATE TABLE world_events (
                seq BIGSERIAL PRIMARY KEY, type TEXT NOT NULL, agent_id UUID, session_id UUID, run_id UUID,
@@ -6340,6 +6877,7 @@ mod tests {
         let retried_run = retried.run.unwrap();
         assert_eq!(retried_run.kind, "task");
         assert!(retried_run.fork_from.is_none());
+        assert_eq!(retried_run.request, Some(serde_json::json!({ "retry": 1 })));
         let recovered: (String, Option<String>, String) = sqlx::query_as(
             "SELECT t.status, t.error_message, s.status FROM agent_tasks t JOIN agent_sessions s ON s.task_id = t.id WHERE t.id = $1",
         )
@@ -6497,12 +7035,17 @@ mod tests {
             "CREATE TABLE world_events (
                seq BIGSERIAL PRIMARY KEY, type TEXT NOT NULL, agent_id UUID, session_id UUID, run_id UUID,
                task_id UUID, actor_user_id UUID, payload JSONB NOT NULL DEFAULT '{}', created_at TIMESTAMPTZ DEFAULT NOW()
-             );",
+             );
+             CREATE TABLE agent_tasks (id UUID PRIMARY KEY, status TEXT NOT NULL);
+             CREATE TABLE agent_sessions (id UUID PRIMARY KEY, task_id UUID);",
         )
         .execute(&pool)
         .await?;
         let store = WorldStore::new(pool.clone());
         let session = Uuid::new_v4();
+        let quest = Uuid::new_v4();
+        sqlx::query("INSERT INTO agent_tasks (id, status) VALUES ($1, 'failed')").bind(quest).execute(&pool).await?;
+        sqlx::query("INSERT INTO agent_sessions (id, task_id) VALUES ($1, $2)").bind(session).bind(quest).execute(&pool).await?;
         let report = serde_json::json!({ "summary": "shipped the fix" });
         let insert = |payload: serde_json::Value| {
             let pool = pool.clone();
@@ -6523,6 +7066,11 @@ mod tests {
         insert(serde_json::json!({ "report": report, "pr_url": "https://example/pr/1", "error": "boom" })).await?;
         assert!(store.finished_report_unchanged(session, &report, Some("https://example/pr/1"), Some("boom")).await?);
         assert!(!store.finished_report_unchanged(session, &report, Some("https://example/pr/1"), None).await?);
+        sqlx::query("UPDATE agent_tasks SET status = 'in_progress' WHERE id = $1").bind(quest).execute(&pool).await?;
+        assert!(
+            !store.finished_report_unchanged(session, &report, Some("https://example/pr/1"), Some("boom")).await?,
+            "a failure is announced again once the quest was reopened"
+        );
         let other_session = Uuid::new_v4();
         assert!(!store.finished_report_unchanged(other_session, &report, Some("https://example/pr/1"), Some("boom")).await?);
         pool.close().await;
@@ -7689,8 +8237,9 @@ mod tests {
             .bind(format!("ana-{tag}@test.dev"))
             .fetch_one(&pool)
             .await?;
-        let agent: Uuid = sqlx::query_scalar("INSERT INTO agent_profiles (slug, name, cli, model) VALUES ($1, 'Pri', 'claude', 'haiku') RETURNING id")
+        let agent: Uuid = sqlx::query_scalar("INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id, status, status_detail) VALUES ($1, 'Pri', 'claude', 'haiku', $2, 'waiting', 'Waiting for answers') RETURNING id")
             .bind(format!("pri-{tag}"))
+            .bind(user)
             .fetch_one(&pool)
             .await?;
         let task: Uuid = sqlx::query_scalar(
@@ -7705,13 +8254,31 @@ mod tests {
             .execute(&pool)
             .await?;
         let session: Uuid = sqlx::query_scalar(
-            "INSERT INTO agent_sessions (agent_id, role, backend, model, cli_session_id, status, task_id)
-             VALUES ($1, 'task', 'claude', 'haiku', 'cli-1', 'active', $2) RETURNING id",
+            "INSERT INTO agent_sessions (agent_id, role, backend, model, cli_session_id, status, task_id, plan_state)
+             VALUES ($1, 'task', 'claude', 'haiku', 'cli-1', 'active', $2, 'clarifying') RETURNING id",
         )
         .bind(agent)
         .bind(task)
         .fetch_one(&pool)
         .await?;
+        let clarification: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_messages (agent_id, author_kind, author_agent_id, body, meta)
+             VALUES ($1, 'agent', $1, 'Which account?', $2) RETURNING id",
+        )
+        .bind(agent)
+        .bind(json!({ "clarification": { "task_id": task, "session_id": session } }))
+        .fetch_one(&pool)
+        .await?;
+        store
+            .emit(
+                NewEvent::new("attention.requested")
+                    .agent(agent)
+                    .session(session)
+                    .task(Some(task))
+                    .payload(json!({ "text": "Which account?", "message_id": clarification, "clarification": true })),
+                None,
+            )
+            .await?;
         let running: Uuid = sqlx::query_scalar(
             "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, prompt, started_at)
              VALUES ($1, $2, $3, 'task', 'running', 'do it', NOW()) RETURNING id",
@@ -7741,7 +8308,31 @@ mod tests {
         let status: String = sqlx::query_scalar("SELECT status FROM agent_tasks WHERE id = $1").bind(task).fetch_one(&pool).await?;
         assert_eq!(status, "cancelled");
         assert_eq!(store.get_run(queued).await?.expect("queued").status, "cancelled");
-        assert_eq!(store.get_session(session).await?.expect("session").status, "archived");
+        let closed = store.get_session(session).await?.expect("session");
+        assert_eq!(closed.status, "archived");
+        assert_eq!(closed.plan_state, None);
+        let settled: (Value, Option<Uuid>) = sqlx::query_as(
+            "SELECT meta, author_user_id FROM agent_messages WHERE agent_id = $1 AND meta->>'answers' = $2",
+        )
+        .bind(agent)
+        .bind(clarification.to_string())
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(settled.0["auto"], json!(true));
+        assert_eq!(settled.1, Some(user));
+        let close_event: Value = sqlx::query_scalar(
+            "SELECT payload FROM world_events WHERE type = 'message.created' AND payload->>'answer_card' = $1",
+        )
+        .bind(clarification.to_string())
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(close_event["quiet"], json!(true));
+        assert_eq!(store.get_agent(agent).await?.expect("agent").status, "idle");
+        let open_ask: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_notifications WHERE kind = 'ask' AND ref = $1 AND cleared_at IS NULL")
+            .bind(clarification.to_string())
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(open_ask, 0);
         let milestone: String = sqlx::query_scalar("SELECT status FROM task_milestones WHERE task_id = $1").bind(task).fetch_one(&pool).await?;
         assert_eq!(milestone, "skipped");
         let pending: i64 = sqlx::query_scalar(
@@ -7786,9 +8377,31 @@ mod tests {
         .bind(child)
         .fetch_one(&pool)
         .await?;
+        sqlx::query("UPDATE agent_sessions SET plan_state = 'clarifying' WHERE id = $1")
+            .bind(child_session)
+            .execute(&pool)
+            .await?;
+        let child_clarification: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_messages (agent_id, author_kind, author_agent_id, body, meta)
+             VALUES ($1, 'agent', $1, 'Which region?', $2) RETURNING id",
+        )
+        .bind(agent)
+        .bind(json!({ "clarification": { "task_id": child, "session_id": child_session } }))
+        .fetch_one(&pool)
+        .await?;
         let refused = store.delete_task(task, "Pri", None).await.expect_err("open subtask");
         assert!(refused.to_string().contains("open subtasks"));
         assert_eq!(store.get_run(child_queued).await?.expect("still queued").status, "queued");
+        let moved = store
+            .edit_quest(child, &QuestEdit { status: Some("review".into()), assignee: None }, user, "Ana")
+            .await?;
+        assert_eq!(moved.status, "review");
+        assert_eq!(store.get_session(child_session).await?.expect("child session").plan_state, None);
+        let child_answers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_messages WHERE meta->>'answers' = $1")
+            .bind(child_clarification.to_string())
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(child_answers, 1);
         sqlx::query("UPDATE agent_tasks SET status = 'done' WHERE id = $1").bind(child).execute(&pool).await?;
 
         let deleted = store.delete_task(task, "Pri", Some("clutter")).await?;
@@ -8241,6 +8854,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_retry_path_keeps_what_the_run_was_asked() -> anyhow::Result<()> {
+        use crate::run_causes::{diagnose, RunEnd};
+        let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let _db = steer_db().write().await;
+        let options = url.parse::<PgConnectOptions>()?.statement_cache_capacity(0);
+        let pool = PgPoolOptions::new().max_connections(1).connect_with(options).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let user: Uuid = sqlx::query_scalar("INSERT INTO users (email, name, world_role) VALUES ($1, 'Tara', 'write') RETURNING id")
+            .bind(format!("tara-{tag}@test.dev"))
+            .fetch_one(&pool)
+            .await?;
+        let agent: Uuid = sqlx::query_scalar("INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id) VALUES ($1, 'Mender', 'claude', 'sonnet', $2) RETURNING id")
+            .bind(format!("mender-{tag}"))
+            .bind(user)
+            .fetch_one(&pool)
+            .await?;
+        let main: Uuid = sqlx::query_scalar("INSERT INTO agent_sessions (agent_id, role, backend, model, cli_session_id) VALUES ($1, 'main', 'claude', 'sonnet', $2) RETURNING id")
+            .bind(agent)
+            .bind(format!("main-{tag}"))
+            .fetch_one(&pool)
+            .await?;
+        let quest = |status: &'static str| {
+            sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO agent_tasks (user_id, title, description, status, assigned_agent_id) VALUES ($1, 'Fix the drawer', 'Close it on Esc', $2, $3) RETURNING id",
+            )
+            .bind(user)
+            .bind(status)
+            .bind(agent)
+            .fetch_one(&pool)
+        };
+        let session = |role: &'static str, task: Option<Uuid>, cli: Option<String>, status: &'static str| {
+            sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO agent_sessions (agent_id, role, backend, model, cli_session_id, status, task_id, working_dir, parent_session_id)
+                 VALUES ($1, $2, 'claude', 'sonnet', $3, $4, $5, '/quests/drawer', $6) RETURNING id",
+            )
+            .bind(agent)
+            .bind(role)
+            .bind(cli)
+            .bind(status)
+            .bind(task)
+            .bind(main)
+            .fetch_one(&pool)
+        };
+        let run = |session: Uuid, task: Option<Uuid>, kind: &'static str, status: &'static str, fork: Option<Uuid>, request: Value| {
+            sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, fork_from, prompt, request, started_at, finished_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, 'the full runtime prompt', $7, NOW() - INTERVAL '3 seconds', NOW()) RETURNING id",
+            )
+            .bind(session)
+            .bind(agent)
+            .bind(task)
+            .bind(kind)
+            .bind(status)
+            .bind(fork)
+            .bind(request)
+            .fetch_one(&pool)
+        };
+        let asked = |id: Uuid| {
+            let pool = pool.clone();
+            async move { sqlx::query_scalar::<_, Option<Value>>("SELECT request FROM session_runs WHERE id = $1").bind(id).fetch_one(&pool).await }
+        };
+        let task_ask = json!({ "text": "Close it on Esc", "brief": "Start with the key handler" });
+        let followup_ask = json!({ "from": "Tara", "text": "Add a test for Esc" });
+        let with_retry = |ask: &Value, n: u32| {
+            let mut ask = ask.clone();
+            ask["retry"] = json!(n);
+            Some(ask)
+        };
+
+        let task = quest("failed").await?;
+        let failed_session = session("task", Some(task), None, "failed").await?;
+        let failed = run(failed_session, Some(task), "task", "failed", None, task_ask.clone()).await?;
+        let retried = store.retry_run(failed, user).await.map_err(|e| anyhow::anyhow!("{e:?}"))?.run.expect("a retried run");
+        assert_eq!(retried.request, with_retry(&task_ask, 1), "Retry keeps the description and brief");
+        sqlx::query("UPDATE session_runs SET status = 'failed', finished_at = NOW() WHERE id = $1").bind(retried.id).execute(&pool).await?;
+        sqlx::query("UPDATE agent_sessions SET status = 'failed' WHERE id = $1").bind(failed_session).execute(&pool).await?;
+        sqlx::query("UPDATE agent_tasks SET status = 'failed' WHERE id = $1").bind(task).execute(&pool).await?;
+        let twice = store.retry_run(retried.id, user).await.map_err(|e| anyhow::anyhow!("{e:?}"))?.run.expect("a second retry");
+        assert_eq!(twice.request, with_retry(&task_ask, 2), "retries count up");
+
+        let task = quest("in_progress").await?;
+        let fresh_session = session("task", Some(task), None, "active").await?;
+        let never = run(fresh_session, Some(task), "task", "completed", None, task_ask.clone()).await?;
+        let diagnosis = store.record_run_end(never, "task", None, "", false).await?;
+        let again = store.auto_retry(never, &diagnosis).await?.expect("a run that never started is retried");
+        assert_eq!(asked(again).await?, with_retry(&task_ask, 1), "auto retry keeps the description and brief");
+
+        let task = quest("in_progress").await?;
+        let live = session("task", Some(task), Some(format!("cli-{tag}")), "active").await?;
+        let cut = run(live, Some(task), "followup", "failed", None, followup_ask.clone()).await?;
+        store.insert_run_event(cut, "tool", Some("Bash"), "cargo test").await?;
+        store.insert_run_event(cut, "text", None, "running the tests").await?;
+        let network = store.record_run_end(cut, "followup", Some("stream disconnected before completion"), "", false).await?;
+        let resumed = store.auto_retry(cut, &network).await?.expect("a cut follow-up is resumed");
+        let (kind, prompt): (String, String) = sqlx::query_as("SELECT kind, prompt FROM session_runs WHERE id = $1").bind(resumed).fetch_one(&pool).await?;
+        assert_eq!(kind, "followup");
+        assert_ne!(prompt, "the full runtime prompt", "the resume sends its own prompt");
+        assert_eq!(asked(resumed).await?, with_retry(&followup_ask, 1), "the history card still shows what was asked");
+
+        let task = quest("in_progress").await?;
+        let forked = session("task", Some(task), Some(format!("fork-{tag}")), "active").await?;
+        let too_long = diagnose(&RunEnd { kind: "task", error: Some("Prompt is too long"), output: "", turns: 1, timed_out: false });
+        let overflow = run(forked, Some(task), "task", "failed", Some(main), task_ask.clone()).await?;
+        sqlx::query("UPDATE session_runs SET cause = 'cli_error', diagnosis = $2 WHERE id = $1")
+            .bind(overflow)
+            .bind(serde_json::to_value(&too_long)?)
+            .execute(&pool)
+            .await?;
+        let fresh = store.fresh_retry(overflow, &too_long).await?.expect("a fork that was too long starts fresh");
+        assert_eq!(asked(fresh).await?, with_retry(&task_ask, 1), "a fresh start keeps the description and brief");
+
+        let aside_ask = json!({ "from": "Mei Chen", "text": "How far along?" });
+        let aside = session("aside", None, None, "active").await?;
+        let paused = run(aside, None, "aside", "failed", Some(main), aside_ask.clone()).await?;
+        assert!(store.resume_after_update(paused).await?);
+        let picked: Value = sqlx::query_scalar("SELECT request FROM session_runs WHERE session_id = $1 AND id <> $2 ORDER BY created_at DESC LIMIT 1")
+            .bind(aside)
+            .bind(paused)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(picked, aside_ask, "picking up after an update is not a retry and keeps the request as it was");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn run_causes_retry_once_and_only_nudge_real_work() -> anyhow::Result<()> {
         use crate::run_causes::Cause;
         let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
@@ -8299,7 +9040,7 @@ mod tests {
         assert!(diagnosis.duration_secs >= 2);
         let stored: Option<String> = sqlx::query_scalar("SELECT cause FROM session_runs WHERE id = $1").bind(first).fetch_one(&pool).await?;
         assert_eq!(stored.as_deref(), Some("never_started"));
-        assert!(store.nudge_for_report(session).await?.is_none(), "a session that never started has nothing to nudge");
+        assert_eq!(store.nudge_missing(first, session, Required::Report).await?, Nudge::Exhausted, "a session that never started has nothing to nudge");
 
         let retry = store.auto_retry(first, &diagnosis).await?.expect("first never_started run is retried");
         let (kind, prompt, retry_cause, delayed): (String, String, Option<String>, bool) = sqlx::query_as(
@@ -8313,7 +9054,7 @@ mod tests {
             store.claim_queued_run("test").await?.is_none_or(|run| run.id != retry),
             "the retry waits for its backoff"
         );
-        assert!(matches!(store.resume_task_session(agent, task, "go").await?, TaskResume::Busy(id) if id == session));
+        assert!(matches!(store.resume_task_session(agent, task, "Fea", Some("go")).await?, TaskResume::Busy { session_id: id, .. } if id == session));
         let retrying: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_events WHERE type = 'run.retrying' AND task_id = $1")
             .bind(task)
             .fetch_one(&pool)
@@ -8388,19 +9129,33 @@ mod tests {
         let quiet = store.record_run_end(worked, "task", None, "All done, tests pass.", false).await?;
         assert_eq!(quiet.cause, Cause::NoReport);
         assert!(store.auto_retry(worked, &quiet).await?.is_none(), "no_report is nudged, never auto retried");
-        let nudge = store.nudge_for_report(session).await?.expect("first nudge");
+        let Nudge::Queued(first_reminder) = store.nudge_missing(worked, session, Required::Report).await? else {
+            panic!("the first miss is reminded");
+        };
+        assert_eq!(store.nudge_missing(worked, session, Required::Report).await?, Nudge::Open, "the queued nudge decides, nothing is settled meanwhile");
+        sqlx::query("UPDATE session_runs SET status = 'completed', finished_at = NOW() WHERE id = $1").bind(first_reminder).execute(&pool).await?;
+        let Nudge::Queued(nudge) = store.nudge_missing(first_reminder, session, Required::Report).await? else {
+            panic!("a reminder that still has no report is reminded once more");
+        };
+        let prompts: Vec<String> = sqlx::query_scalar("SELECT prompt FROM session_runs WHERE id = ANY($1) ORDER BY created_at, id")
+            .bind(vec![first_reminder, nudge])
+            .fetch_all(&pool)
+            .await?;
+        assert_eq!(prompts, [super::REPORT_NUDGE, super::REPORT_NUDGE_LAST], "the second reminder asks for nothing but the report");
         sqlx::query("UPDATE session_runs SET status = 'completed', finished_at = NOW() WHERE id = $1").bind(nudge).execute(&pool).await?;
-        let nudge = store.nudge_for_report(session).await?.expect("second nudge");
-        sqlx::query("UPDATE session_runs SET status = 'completed', finished_at = NOW() WHERE id = $1").bind(nudge).execute(&pool).await?;
-        assert!(store.nudge_for_report(session).await?.is_none(), "nudges run out, so the agent synthesizes a report");
-        store.record_run_end(nudge, "followup", None, "Still all done.", false).await?;
+        assert_eq!(store.nudge_missing(nudge, session, Required::Report).await?, Nudge::Exhausted, "two reminders without a report end the chase");
+        let failed = store.fail_missing(nudge, Required::Report, "Still all done.").await?;
+        assert_eq!((failed.cause, failed.reason.as_str()), (Cause::NoReport, crate::run_causes::MISSED_REPORT));
+        let (status, error, cause): (String, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT status, error, cause FROM session_runs WHERE id = $1").bind(nudge).fetch_one(&pool).await?;
+        assert_eq!((status.as_str(), error.as_deref(), cause.as_deref()), ("failed", Some(crate::run_causes::MISSED_REPORT), Some("no_report")));
         let latest = store.latest_diagnosis(session).await?.expect("last nudge is diagnosed");
         assert_eq!((latest.cause, latest.tail.as_str()), (Cause::NoReport, "Still all done."));
         Ok(())
     }
 
     #[tokio::test]
-    async fn a_review_without_a_verdict_is_resumed_twice_then_left() -> anyhow::Result<()> {
+    async fn a_review_without_a_verdict_is_resumed_once_then_failed_with_its_cause() -> anyhow::Result<()> {
         let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
             return Ok(());
         };
@@ -8428,14 +9183,16 @@ mod tests {
 
         let fresh = Uuid::new_v4();
         insert_session(&pool, fresh, agent, "review", "completed", Some(task), Some(parent), None, None, None).await?;
-        assert!(store.nudge_for_verdict(fresh).await?.is_none(), "a review that never started has nothing to resume");
+        let never = insert_run(&pool, fresh, agent, Some(task), "review", "completed", None).await?;
+        assert_eq!(store.nudge_missing(never, fresh, Required::Verdict).await?, Nudge::Exhausted, "a review that never started has nothing to resume");
 
         let review = Uuid::new_v4();
         insert_session(&pool, review, agent, "review", "completed", Some(task), Some(parent), Some("reviewer-1"), None, Some(serde_json::json!({ "manual": true }))).await?;
         let first = insert_run(&pool, review, agent, Some(task), "review", "completed", None).await?;
-        assert_eq!(store.review_runs_since_work(parent).await?, 0, "manual reviews never count");
-        let one = store.nudge_for_verdict(review).await?.expect("first nudge");
-        assert!(store.nudge_for_verdict(review).await?.is_none(), "one resume at a time");
+        let Nudge::Queued(one) = store.nudge_missing(first, review, Required::Verdict).await? else {
+            panic!("the first miss is nudged once");
+        };
+        assert_eq!(store.nudge_missing(first, review, Required::Verdict).await?, Nudge::Open, "one resume at a time");
         let (kind, status, prompt, session_status): (String, String, String, String) = sqlx::query_as(
             "SELECT r.kind, r.status, r.prompt, s.status FROM session_runs r JOIN agent_sessions s ON s.id = r.session_id WHERE r.id = $1",
         )
@@ -8445,16 +9202,110 @@ mod tests {
         assert_eq!((kind.as_str(), status.as_str(), prompt.as_str(), session_status.as_str()), ("review", "queued", VERDICT_NUDGE, "active"));
         assert_ne!(one, first);
         sqlx::query("UPDATE session_runs SET status = 'completed', finished_at = NOW() WHERE id = $1").bind(one).execute(&pool).await?;
-        let two = store.nudge_for_verdict(review).await?.expect("second nudge");
-        sqlx::query("UPDATE session_runs SET status = 'completed', finished_at = NOW() WHERE id = $1").bind(two).execute(&pool).await?;
-        assert!(store.nudge_for_verdict(review).await?.is_none(), "after two nudges the result says there was no verdict");
+        assert_eq!(store.nudge_missing(one, review, Required::Verdict).await?, Nudge::Exhausted, "a nudge that still has no verdict ends the review");
+        let failed = store.fail_missing(one, Required::Verdict, "Waiting on the test run.").await?;
+        assert_eq!((failed.cause, failed.reason.as_str()), (crate::run_causes::Cause::NoVerdict, crate::run_causes::MISSED_VERDICT));
+        let (status, cause): (String, Option<String>) = sqlx::query_as("SELECT status, cause FROM session_runs WHERE id = $1").bind(one).fetch_one(&pool).await?;
+        assert_eq!((status.as_str(), cause.as_deref()), ("failed", Some("no_verdict")), "a review with no verdict is never counted as completed");
+        assert_eq!(store.latest_diagnosis(parent).await?.map(|d| d.cause), Some(crate::run_causes::Cause::NoVerdict));
 
         let auto = Uuid::new_v4();
         insert_session(&pool, auto, agent, "review", "completed", Some(task), Some(parent), Some("reviewer-2"), None, None).await?;
-        insert_run(&pool, auto, agent, Some(task), "review", "completed", None).await?;
-        let nudge = store.nudge_for_verdict(auto).await?.expect("auto review nudge");
+        let ran = insert_run(&pool, auto, agent, Some(task), "review", "completed", None).await?;
+        let Nudge::Queued(nudge) = store.nudge_missing(ran, auto, Required::Verdict).await? else {
+            panic!("automatic reviews are nudged too");
+        };
         sqlx::query("UPDATE session_runs SET status = 'completed', finished_at = NOW() WHERE id = $1").bind(nudge).execute(&pool).await?;
-        assert_eq!(store.review_runs_since_work(parent).await?, 1, "a nudge is not another review");
+        assert_eq!(store.nudge_missing(nudge, auto, Required::Verdict).await?, Nudge::Exhausted);
+        let later = insert_run(&pool, auto, agent, Some(task), "review", "completed", None).await?;
+        assert!(matches!(store.nudge_missing(later, auto, Required::Verdict).await?, Nudge::Queued(_)), "a later miss gets its own nudge");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn every_run_with_a_contract_emits_exactly_one_terminal_event() -> anyhow::Result<()> {
+        let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let _db = steer_db().read().await;
+        let pool = PgPoolOptions::new().max_connections(2).connect(&url).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let agent: Uuid = sqlx::query_scalar("INSERT INTO agent_profiles (slug, name, cli, model) VALUES ($1, 'Ends', 'claude', 'opus') RETURNING id")
+            .bind(format!("ends-{tag}"))
+            .fetch_one(&pool)
+            .await?;
+        let user: Uuid = sqlx::query_scalar("INSERT INTO users (email, name, world_role) VALUES ($1, 'Ana', 'write') RETURNING id")
+            .bind(format!("ends-{tag}@test.dev"))
+            .fetch_one(&pool)
+            .await?;
+        let task: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_tasks (user_id, title, status, assigned_agent_id) VALUES ($1, 'end once', 'in_progress', $2) RETURNING id",
+        )
+        .bind(user)
+        .bind(agent)
+        .fetch_one(&pool)
+        .await?;
+        let ends = |run: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_as::<_, (String, Value)>("SELECT type, payload FROM world_events WHERE run_id = $1 AND type = ANY($2) ORDER BY seq")
+                    .bind(run)
+                    .bind(&super::RUN_END_EVENTS[..])
+                    .fetch_all(&pool)
+                    .await
+            }
+        };
+        let parent = Uuid::new_v4();
+        insert_session(&pool, parent, agent, "task", "active", Some(task), None, Some("author"), None, None).await?;
+        for (kind, required) in [("task", Required::Report), ("followup", Required::Report), ("review", Required::Verdict)] {
+            let session = match required {
+                Required::Report => parent,
+                Required::Verdict => {
+                    let review = Uuid::new_v4();
+                    insert_session(&pool, review, agent, "review", "active", Some(task), Some(parent), Some(&format!("rev-{kind}")), None, None).await?;
+                    review
+                }
+            };
+            let names = |events: &[(String, Value)]| events.iter().map(|(event, _)| event.clone()).collect::<Vec<_>>();
+            let first = insert_run(&pool, session, agent, Some(task), kind, "completed", None).await?;
+            sqlx::query("UPDATE session_runs SET cost_usd = 0.25 WHERE id = $1").bind(first).execute(&pool).await?;
+            let Nudge::Queued(nudge) = store.settle_missing(first, session, required, "Waiting on the test run.").await? else {
+                panic!("{kind}: the first miss is nudged");
+            };
+            let events = ends(first).await?;
+            assert_eq!(names(&events), ["run.completed"], "{kind}: a nudged run completed, and says so the moment the nudge is queued");
+            assert_eq!(events[0].1["cost_usd"], 0.25, "{kind}");
+            assert!(!store.announce_completed(first).await?, "{kind}: the handler's fallback announce is a no-op");
+
+            sqlx::query("UPDATE session_runs SET status = 'completed', finished_at = NOW() WHERE id = $1").bind(nudge).execute(&pool).await?;
+            let nudge = if required == Required::Report {
+                let Nudge::Queued(last) = store.settle_missing(nudge, session, required, "Still waiting.").await? else {
+                    panic!("{kind}: a report is reminded twice");
+                };
+                assert_eq!(names(&ends(nudge).await?), ["run.completed"], "{kind}: the first reminder completed, and says so");
+                sqlx::query("UPDATE session_runs SET status = 'completed', finished_at = NOW() WHERE id = $1").bind(last).execute(&pool).await?;
+                last
+            } else {
+                nudge
+            };
+            assert_eq!(store.settle_missing(nudge, session, required, "Still waiting.").await?, Nudge::Exhausted, "{kind}");
+            assert!(!store.announce_completed(nudge).await?, "{kind}: a failed run is never announced as completed");
+            let events = ends(nudge).await?;
+            assert_eq!(names(&events), ["run.failed"], "{kind}: one terminal event, and it is the final one");
+            let payload = &events[0].1;
+            assert_eq!(payload["cause"], required.cause().as_str(), "{kind}");
+            let nudge_kind = if required == Required::Report { "followup" } else { "review" };
+            assert_eq!((payload["run_kind"].as_str(), payload["quiet"].as_bool()), (Some(nudge_kind), Some(true)), "{kind}: the quest's own finish wakes the agent");
+            let status: String = sqlx::query_scalar("SELECT status FROM session_runs WHERE id = $1").bind(nudge).fetch_one(&pool).await?;
+            assert_eq!(status, "failed", "{kind}");
+
+            let met = insert_run(&pool, session, agent, Some(task), kind, "completed", None).await?;
+            assert!(store.announce_completed(met).await?);
+            assert!(!store.announce_completed(met).await?, "{kind}: announcing again after the handler is a no-op");
+            assert_eq!(names(&ends(met).await?), ["run.completed"], "{kind}");
+            sqlx::query("UPDATE session_runs SET status = 'cancelled' WHERE session_id = $1 AND status = 'queued'").bind(session).execute(&pool).await?;
+        }
         Ok(())
     }
 
@@ -8482,7 +9333,7 @@ mod tests {
         .bind(agent)
         .fetch_one(&pool)
         .await?;
-        assert!(matches!(store.resume_task_session(agent, task, "go").await?, TaskResume::Fresh));
+        assert!(matches!(store.resume_task_session(agent, task, "Fea", Some("go")).await?, TaskResume::Fresh));
         let session: Uuid = sqlx::query_scalar(
             "INSERT INTO agent_sessions (agent_id, role, backend, model, cli_session_id, status, task_id)
              VALUES ($1, 'task', 'codex', 'gpt', 'thread-1', 'active', $2) RETURNING id",
@@ -8500,29 +9351,46 @@ mod tests {
         .bind(task)
         .fetch_one(&pool)
         .await?;
-        assert!(matches!(store.resume_task_session(agent, task, "go").await?, TaskResume::Busy(id) if id == session));
+        assert!(matches!(store.resume_task_session(agent, task, "Fea", Some("go")).await?, TaskResume::Busy { session_id: id, .. } if id == session));
         sqlx::query("UPDATE session_runs SET status = 'completed', finished_at = NOW() WHERE id = $1")
             .bind(task_run)
             .execute(&pool)
             .await?;
-        let first = store.nudge_for_report(session).await?.expect("first nudge");
-        assert!(matches!(store.resume_task_session(agent, task, "go").await?, TaskResume::Busy(_)));
+        let Nudge::Queued(first) = store.nudge_missing(task_run, session, Required::Report).await? else {
+            panic!("the first miss is reminded");
+        };
+        assert!(matches!(store.resume_task_session(agent, task, "Fea", Some("go")).await?, TaskResume::Busy { .. }));
         sqlx::query("UPDATE session_runs SET status = 'completed', finished_at = NOW() WHERE id = $1")
             .bind(first)
             .execute(&pool)
             .await?;
-        let second = store.nudge_for_report(session).await?.expect("second nudge");
+        let Nudge::Queued(second) = store.nudge_missing(first, session, Required::Report).await? else {
+            panic!("the second reminder follows the first");
+        };
         sqlx::query("UPDATE session_runs SET status = 'completed', finished_at = NOW() WHERE id = $1")
             .bind(second)
             .execute(&pool)
             .await?;
-        assert!(store.nudge_for_report(session).await?.is_none());
+        assert_eq!(store.nudge_missing(second, session, Required::Report).await?, Nudge::Exhausted);
+        let human: Uuid = sqlx::query_scalar(
+            "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, prompt, started_at, finished_at)
+             VALUES ($1, $2, $3, 'followup', 'completed', 'please finish', NOW(), NOW()) RETURNING id",
+        )
+        .bind(session)
+        .bind(agent)
+        .bind(task)
+        .fetch_one(&pool)
+        .await?;
+        assert!(matches!(store.nudge_missing(human, session, Required::Report).await?, Nudge::Queued(_)), "a later miss gets its own reminders");
+        sqlx::query("UPDATE session_runs SET status = 'completed', finished_at = NOW() WHERE session_id = $1 AND status = 'queued'")
+            .bind(session)
+            .execute(&pool)
+            .await?;
         sqlx::query("UPDATE agent_sessions SET status = 'failed' WHERE id = $1")
             .bind(session)
             .execute(&pool)
             .await?;
-        let prompt = resume_prompt("Fea", Some("check the lock release"));
-        let TaskResume::Resumed { session_id, run_id } = store.resume_task_session(agent, task, &prompt).await? else {
+        let TaskResume::Resumed { session_id, run_id } = store.resume_task_session(agent, task, "Fea", Some("check the lock release")).await? else {
             panic!("expected the failed session to be resumed");
         };
         assert_eq!(session_id, session);
@@ -8533,8 +9401,10 @@ mod tests {
                 .await?;
         assert_eq!((kind.as_str(), status.as_str()), ("followup", "queued"));
         assert!(saved.contains("check the lock release"));
+        let asked = store.get_run(run_id).await?.expect("run").request;
+        assert_eq!(asked, Some(serde_json::json!({ "from": "Fea", "text": "check the lock release" })));
         assert_eq!(store.get_session(session).await?.expect("session").status, "active");
-        assert!(matches!(store.resume_task_session(agent, task, "again").await?, TaskResume::Busy(_)));
+        assert!(matches!(store.resume_task_session(agent, task, "Fea", Some("again")).await?, TaskResume::Busy { .. }));
         let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_sessions WHERE task_id = $1")
             .bind(task)
             .fetch_one(&pool)
@@ -8939,6 +9809,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agents_and_calls_read_activity_without_quiet_notes() -> anyhow::Result<()> {
+        let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let _db = steer_db().read().await;
+        let options = url.parse::<PgConnectOptions>()?.statement_cache_capacity(0);
+        let pool = PgPoolOptions::new().max_connections(1).connect_with(options).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let agent: Uuid = sqlx::query_scalar("INSERT INTO agent_profiles (slug, name, cli, model) VALUES ($1, 'Feed', 'claude', 'sonnet') RETURNING id")
+            .bind(format!("feed-{tag}"))
+            .fetch_one(&pool)
+            .await?;
+        for (kind, quiet) in [("task.finished", false), ("task.changed", true), ("run.retrying", true), ("message.created", false)] {
+            let payload = if quiet { json!({ "quiet": true, "tag": tag }) } else { json!({ "tag": tag }) };
+            store.emit(NewEvent::new(kind).agent(agent).payload(payload), None).await?;
+        }
+        let kinds = |events: Vec<super::WorldEvent>| events.into_iter().map(|e| e.event_type).collect::<Vec<_>>();
+        assert_eq!(kinds(store.agent_feed(None, Some(agent), &[], 10).await?), vec!["task.finished", "message.created"]);
+        assert_eq!(kinds(store.agent_feed(None, Some(agent), &["task.".to_string()], 10).await?), vec!["task.finished"]);
+        assert_eq!(store.recent_events(Some(agent), 10).await?.len(), 4, "the raw reader behind the live stream still sees everything");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn every_change_a_quest_card_shows_announces_itself() -> anyhow::Result<()> {
+        let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let _db = steer_db().write().await;
+        let options = url.parse::<PgConnectOptions>()?.statement_cache_capacity(0);
+        let pool = PgPoolOptions::new().max_connections(1).connect_with(options).await?;
+        let store = WorldStore::new(pool.clone());
+        let tag = Uuid::new_v4().simple().to_string();
+        let user: Uuid = sqlx::query_scalar("INSERT INTO users (email, name, world_role) VALUES ($1, 'Ana', 'write') RETURNING id")
+            .bind(format!("status-{tag}@test.dev"))
+            .fetch_one(&pool)
+            .await?;
+        let agent: Uuid = sqlx::query_scalar("INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id) VALUES ($1, 'Pace', 'claude', 'sonnet', $2) RETURNING id")
+            .bind(format!("pace-{tag}"))
+            .bind(user)
+            .fetch_one(&pool)
+            .await?;
+        let quest: Uuid = sqlx::query_scalar("INSERT INTO agent_tasks (user_id, title, status, assigned_agent_id) VALUES ($1, 'Stuck drawer', 'failed', $2) RETURNING id")
+            .bind(user)
+            .bind(agent)
+            .fetch_one(&pool)
+            .await?;
+        let changes = || {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_as::<_, (Option<Uuid>, Value)>("SELECT agent_id, payload FROM world_events WHERE task_id = $1 AND type = 'task.changed' ORDER BY seq")
+                    .bind(quest)
+                    .fetch_all(&pool)
+                    .await
+            }
+        };
+        let card = |status: &str, changed: &str| json!({ "task_id": quest, "status": status, "title": "Stuck drawer", "changed": changed, "quiet": true });
+        assert_eq!(changes().await?, vec![(Some(agent), card("failed", "created"))], "a new quest shows up on boards");
+
+        let session = Uuid::new_v4();
+        insert_session(&pool, session, agent, "task", "failed", Some(quest), None, Some("cli-status"), None, None).await?;
+        let failed = store.get_session(session).await?.expect("session");
+        store.start_followup(&failed, "Try the drawer again", "Ana", false).await?;
+        assert_eq!(changes().await?.last(), Some(&(Some(agent), card("in_progress", "status"))), "a follow-up that reopens a failed quest tells every open card");
+
+        let seen = changes().await?.len();
+        sqlx::query("UPDATE agent_tasks SET status = 'in_progress', title = 'Stuck drawer' WHERE id = $1").bind(quest).execute(&pool).await?;
+        sqlx::query("UPDATE agent_tasks SET error_message = 'noise' WHERE id = $1").bind(quest).execute(&pool).await?;
+        assert_eq!(changes().await?.len(), seen, "writes that change nothing a card shows say nothing");
+
+        sqlx::query("UPDATE agent_tasks SET pr_url = 'https://github.com/acme/app/pull/7' WHERE id = $1").bind(quest).execute(&pool).await?;
+        assert_eq!(changes().await?.last().map(|c| c.1["changed"].clone()), Some(json!("details")), "a PR link on the card");
+
+        sqlx::query("UPDATE agent_sessions SET plan_state = 'awaiting' WHERE id = $1").bind(session).execute(&pool).await?;
+        assert_eq!(changes().await?.last().map(|c| c.1["changed"].clone()), Some(json!("plan")), "Needs you appears");
+        let before = changes().await?.len();
+        sqlx::query("UPDATE agent_sessions SET status = 'archived' WHERE id = $1").bind(session).execute(&pool).await?;
+        assert_eq!(changes().await?.len(), before + 1, "archiving the waiting session clears Needs you");
+
+        let milestone: Uuid = sqlx::query_scalar("INSERT INTO task_milestones (task_id, title) VALUES ($1, 'Write the fix') RETURNING id")
+            .bind(quest)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(changes().await?.last().map(|c| c.1["changed"].clone()), Some(json!("milestones")));
+        let before = changes().await?.len();
+        sqlx::query("UPDATE task_milestones SET next_check_at = NOW(), data = '{\"sha\": \"abc\"}' WHERE id = $1").bind(milestone).execute(&pool).await?;
+        assert_eq!(changes().await?.len(), before, "merge watch bookkeeping is not a card change");
+        sqlx::query("UPDATE task_milestones SET status = 'done' WHERE id = $1").bind(milestone).execute(&pool).await?;
+        assert_eq!(changes().await?.len(), before + 1, "a ticked milestone is");
+
+        let before = changes().await?.len();
+        let mut tx = pool.begin().await?;
+        sqlx::query("UPDATE agent_tasks SET status = 'review' WHERE id = $1").bind(quest).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO task_milestones (task_id, title) VALUES ($1, 'Review'), ($1, 'Ship')").bind(quest).execute(&mut *tx).await?;
+        tx.commit().await?;
+        assert_eq!(changes().await?.len(), before + 1, "one change per quest per transaction");
+
+        let bell: i64 = sqlx::query_scalar("SELECT count(*) FROM world_notifications n JOIN world_events e ON e.seq = n.event_seq WHERE e.task_id = $1 AND e.type = 'task.changed'")
+            .bind(quest)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(bell, 0, "card changes are quiet");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn cancelled_work_runs_fail_their_quest_so_it_can_be_resumed() -> anyhow::Result<()> {
         let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
             return Ok(());
@@ -9068,6 +10045,15 @@ mod tests {
                 .fetch_all(&pool)
                 .await?;
             assert_eq!(events.len(), usize::from(moves), "{name}");
+            let announced: Vec<serde_json::Value> = sqlx::query_scalar("SELECT payload FROM world_events WHERE task_id = $1 AND type = 'task.changed' AND payload->>'changed' = 'status'")
+                .bind(task)
+                .fetch_all(&pool)
+                .await?;
+            assert_eq!(
+                announced,
+                if moves { vec![serde_json::json!({ "task_id": task, "status": "failed", "title": "stuck", "changed": "status", "quiet": true })] } else { Vec::new() },
+                "{name}: a quest that turns failed tells every open card"
+            );
             if moves {
                 assert!(error.as_deref().is_some_and(|e| e.contains("was cancelled") && e.contains("Organization suspended")), "{name}");
                 assert_eq!(events[0]["cause"], "cancelled", "{name}");
@@ -9085,7 +10071,7 @@ mod tests {
         let again = store.settle_cancelled_work().await?;
         assert!(again.is_empty(), "{again:?}");
         let (resume_task, resume_agent) = expected.iter().find(|row| row.4).map(|row| (row.0, row.1)).expect("a quest moved");
-        let resumed = store.resume_task_session(resume_agent, resume_task, "pick it back up").await?;
+        let resumed = store.resume_task_session(resume_agent, resume_task, "Fea", Some("pick it back up")).await?;
         assert!(matches!(resumed, TaskResume::Resumed { .. } | TaskResume::Fresh));
         Ok(())
     }
@@ -9502,7 +10488,7 @@ mod heartbeat_tests {
                cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0, input_tokens BIGINT NOT NULL DEFAULT 0,
                cached_input_tokens BIGINT NOT NULL DEFAULT 0, output_tokens BIGINT NOT NULL DEFAULT 0,
                claimed_by TEXT, heartbeat_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-               started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ
+               started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ, request JSONB
              );
              CREATE TABLE runner_run_inbox (run_id UUID NOT NULL, inbox_id BIGINT NOT NULL, PRIMARY KEY (run_id, inbox_id));",
         )

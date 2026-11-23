@@ -226,7 +226,7 @@ export function DevicesPanel({ controlPlane, embedded = false, focusId }: { cont
                 <button type="button" disabled={busy !== null} onBlur={() => setArmed(false)} onClick={() => armed ? void run("disconnect", desktopApi.disconnect) : setArmed(true)} className={cn(CHUNKY, "flex items-center gap-1.5 px-3 py-1.5 text-w-sm", armed ? "bg-w-alert text-white" : "bg-w-card")}><SignOut size={14} weight="bold" />{armed ? "Disconnect this Mac?" : "Disconnect"}</button>
               </div>
               <div className="grid gap-2 text-w-xs text-w-text2 sm:grid-cols-2">
-                <p><span className="text-w-muted">Workspace</span><br /><span className="select-text font-mono">{native.workspace_root || "Choose a repository"}</span></p>
+                <p><span className="text-w-muted">Folder</span><br /><span className="select-text font-mono">{native.workspace_root || "Choose a repository"}</span></p>
                 <p><span className="text-w-muted">Coding tools</span><br />{native.backends.length ? native.backends.map((backend) => `${backend.name}: ${backend.installed ? backend.authenticated === false ? "sign in needed" : "ready" : "not installed"}`).join(" · ") : "None detected"}</p>
               </div>
               {native.start_at_login !== undefined && <label className="flex items-center gap-2 text-w-sm"><input type="checkbox" checked={native.start_at_login} onChange={(event) => void run("start", () => desktopApi.setStartAtLogin(event.target.checked))} className="h-4 w-4 accent-w-teal" />Start Loka when I sign in to this Mac</label>}

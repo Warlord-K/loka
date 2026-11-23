@@ -312,6 +312,11 @@ async fn beat(state: &AppState, runner_id: Uuid, request: &RunnerHeartbeat) -> R
             )
         })?;
     tell_signing_problem_once(state, &view);
+    match state.runners.set_disk_wait(runner_id, request.disk_low).await {
+        Ok(0) => {}
+        Ok(runs) => tracing::info!(%runner_id, runs, low = request.disk_low, "Marked queued runs as waiting for disk space or released them"),
+        Err(error) => tracing::warn!(%error, %runner_id, "disk wait update failed during runner heartbeat"),
+    }
     match state.runners.adopt_stranded(runner_id, None).await {
         Ok(adopted) if !adopted.is_empty() => {
             tracing::info!(%runner_id, count = adopted.len(), "Put agents with no device on this runner");
@@ -355,12 +360,22 @@ pub async fn poll(
             Err(error) => tracing::warn!(%error, %runner_id, "workspace cleanup lookup failed during runner poll"),
         }
     }
+    if request.heartbeat.is_some() {
+        match state.runners.take_cache_cleanup(runner_id).await {
+            Ok(true) => polled.clean_caches = Some(true),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(%error, %runner_id, "cache cleanup lookup failed during runner poll"),
+        }
+    }
     if polled.status == "paused" {
         return Ok(Json(polled));
     }
     let (shell, terminal, job) = tokio::join!(
         async { if request.shell { Some(state.runners.claim_shell(runner_id).await) } else { None } },
-        async { if request.terminal { Some(state.runners.claim_terminal(runner_id).await) } else { None } },
+        async {
+            let room = loka_shared::terminal::TerminalRoom { shells: request.terminal, views: request.views };
+            if room.any() { Some(state.runners.claim_terminal(runner_id, room).await) } else { None }
+        },
         async { if request.kinds.is_empty() { None } else { Some(claim_job(&state, runner_id, &request.kinds).await) } },
     );
     match shell {
@@ -373,7 +388,7 @@ pub async fn poll(
     }
     match terminal {
         Some(Ok(claimed)) => {
-            polled.terminal = claimed.map(|(id, cols, rows)| loka_shared::terminal::TerminalJob { id, cols, rows })
+            polled.terminal = claimed
         }
         Some(Err(error)) => {
             tracing::warn!(%error, %runner_id, "terminal claim failed during runner poll");
@@ -482,11 +497,16 @@ pub async fn github(
 
 #[derive(serde::Deserialize)]
 pub struct WorkspaceTasks {
+    #[serde(default)]
     tasks: Vec<Uuid>,
+    #[serde(default)]
+    sessions: Vec<Uuid>,
     #[serde(default)]
     pressure: bool,
     #[serde(default)]
     idle: bool,
+    #[serde(default)]
+    prefixes: Vec<String>,
 }
 
 pub async fn workspaces(
@@ -496,6 +516,15 @@ pub async fn workspaces(
     Json(request): Json<WorkspaceTasks>,
 ) -> Result<Json<Value>, ApiError> {
     authenticate_runner(&state, &headers, Some(runner_id)).await?;
+    if !request.prefixes.is_empty() {
+        let quests = state.runners.quests_by_prefix(runner_id, &request.prefixes).await.map_err(internal)?;
+        let quests: Vec<Value> = quests.into_iter().map(|(prefix, id)| json!({ "prefix": prefix, "id": id })).collect();
+        return Ok(Json(json!({ "quests": quests })));
+    }
+    if !request.sessions.is_empty() {
+        let closed = state.runners.closed_sessions(runner_id, &request.sessions).await.map_err(internal)?;
+        return Ok(Json(json!({ "closed_sessions": closed })));
+    }
     let entries = state
         .runners
         .closed_tasks(runner_id, &request.tasks, request.pressure)
@@ -717,38 +746,10 @@ pub async fn events(
         .map_err(internal)?
         .ok_or_else(|| problem(StatusCode::CONFLICT, "lease_stopped", "Stop the local job"))?;
     let coordinator = RunnerCoordinator::new(state.db.clone(), state.world.clone());
-    let (usage, shown): (Vec<_>, Vec<_>) = request
-        .events
-        .into_iter()
-        .partition(|event| event.kind == loka_shared::runners::USAGE_EVENT);
-    if !usage.is_empty() {
-        if let Err(error) = coordinator.record_live_usage(&lease, &usage).await {
-            tracing::warn!(error = %format!("{error:#}"), run = %lease.run_id, "Could not record live usage");
-        }
-    }
-    let events = coordinator
-        .redact_events(&lease, &shown)
+    coordinator
+        .ingest_events(&lease, request.events)
         .await
         .map_err(internal)?;
-    if !events.is_empty() {
-        state
-            .runners
-            .record_events(&lease, &events)
-            .await
-            .map_err(internal)?;
-    }
-    if lease.kind == "turn" {
-        if let Some(text) = events
-            .iter()
-            .rev()
-            .find_map(|e| loka_shared::progress::from_event(&e.kind, e.tool.as_deref(), &e.text))
-        {
-            let _ = state
-                .world
-                .emit_progress(lease.agent_id, lease.run_id, "turn", &text)
-                .await;
-        }
-    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -792,6 +793,15 @@ pub async fn complete(
             ),
             Ok(None) => tracing::warn!(%lease_id, runner = %runner.id, "Runner completion named an unknown lease"),
             Err(error) => tracing::warn!(%error, %lease_id, "Could not read a stale lease"),
+        }
+        let coordinator = RunnerCoordinator::new(state.db.clone(), state.world.clone());
+        if let Err(error) = coordinator.keep_late_spend(runner.id, lease_id, &completion).await {
+            tracing::warn!(error = %format!("{error:#}"), %lease_id, "Could not keep the spend of a completion that arrived after its run was closed");
+            return Err(problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "late_spend_failed",
+                "The spend of a stopped run could not be saved yet, try again",
+            ));
         }
         return Err(problem(StatusCode::CONFLICT, "lease_stopped", "Completion is stale"));
     };

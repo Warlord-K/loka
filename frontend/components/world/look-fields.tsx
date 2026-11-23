@@ -4,8 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { cn } from "@/lib/utils";
 import { HATS, LOOK_ACCESSORIES, SPECIES_OPTIONS, lookFor } from "@/lib/looks";
 import type { Accessory } from "./types";
-import { portraitUrl } from "./characters";
-import { AgentAvatar } from "./channel-ui";
+import { AgentAvatar, usePortrait } from "./channel-ui";
 import { figurePreview } from "./sprites";
 import { WCombobox } from "./controls";
 import { FOCUS, PILL_INK, PILL_NEUTRAL } from "./styles";
@@ -48,7 +47,7 @@ export function LookFields({
     () => lookFor({ slug: slug || "new-agent", persona: "", look: { ...(look ?? {}), species: species.trim() || "human", accessories } }),
     [slug, look, species, accessories],
   );
-  const preview = useMemo(() => portraitUrl(resolved, 6), [resolved]);
+  const preview = usePortrait(resolved, 6);
   const [figure, setFigure] = useState<{ for: typeof resolved; url: string } | null>(null);
   useEffect(() => {
     let live = true;

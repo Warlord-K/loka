@@ -22,6 +22,20 @@ test("an older to-do read cannot replace the new selection", async () => {
   assert.deepEqual(opened, ["newer"]);
 });
 
+test("a late search response cannot replace hits for the current query", async () => {
+  const requests = latestOnly();
+  const older = Promise.withResolvers();
+  let shown = null;
+  const search = (query, read) => applyLatest(read, requests.begin(), (results) => {
+    shown = { query, results };
+  });
+  const first = search("old", () => older.promise);
+  await search("current", () => ["current hit"]);
+  older.resolve(["old hit"]);
+  await first;
+  assert.deepEqual(shown, { query: "current", results: ["current hit"] });
+});
+
 test("identical report requests are independent and a declined edit guard keeps the current view", async () => {
   const requests = latestOnly();
   const { promise, resolve } = Promise.withResolvers();

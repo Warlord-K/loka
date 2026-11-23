@@ -140,6 +140,13 @@ pub async fn list(
     ))
 }
 
+pub async fn deliver_lost_replies(state: &AppState, session: Uuid) {
+    let coordinator = loka_agent::runner_server::RunnerCoordinator::new(state.db.clone(), state.world.clone());
+    if let Err(error) = coordinator.deliver_lost_quick_replies(Some(session)).await {
+        warn!(%error, %session, "could not deliver a lost quick chat reply");
+    }
+}
+
 async fn own_session(state: &AppState, viewer: &Viewer, id: Uuid) -> Result<AgentSession, Refusal> {
     state
         .world
@@ -155,6 +162,7 @@ pub async fn read(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, Refusal> {
     let session = own_session(&state, &viewer, id).await?;
+    deliver_lost_replies(&state, session.id).await;
     let messages = state.world.quick_messages(session.id, 300).await.map_err(|e| failed(internal(e)))?;
     let busy = state.world.session_busy(session.id).await.map_err(|e| failed(internal(e)))?;
     Ok(Json(json!({

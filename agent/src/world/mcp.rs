@@ -10,6 +10,8 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
 
+use super::tool_catalog::{self, Catalog, Delivery, Role as ToolRole};
+
 #[path = "mcp_control.rs"]
 mod control;
 #[path = "mcp_govern.rs"]
@@ -33,6 +35,7 @@ pub(crate) struct Server {
     session: Option<Uuid>,
     quick: Option<Uuid>,
     aside: bool,
+    delivery: Delivery,
 }
 
 pub(crate) const OWNER_DEVICE_POWERS: &[&str] = &["install", "manage_powers", "manage_agents", "govern", "people"];
@@ -93,6 +96,27 @@ fn start_task_guide(args: &Value) -> String {
         Value::Object(action)
     )
 }
+impl Server {
+    async fn start_task_preflight(&self, args: Value) -> String {
+        let args = &args;
+        let guide = start_task_guide(args);
+        let Some(raw) = args.get("task_id").and_then(Value::as_str) else {
+            return guide;
+        };
+        let id = match super::quests::start_target(&self.store, &self.caller, raw).await {
+            Ok(id) => id,
+            Err(problem) => return format!("This start_task would be refused and no run would be queued: {problem}"),
+        };
+        match self.store.resume_preview(self.caller.id, id).await {
+            Err(error) => format!("This start_task would be refused and no run would be queued: could not read the quest ({error})."),
+            Ok(plan) => match plan.problem() {
+                Some(problem) => format!("This start_task would be refused and no run would be queued: {problem}."),
+                None => format!("{guide}\n\nWith this action a run is queued: {}.", plan.describe()),
+            },
+        }
+    }
+}
+
 const SETUP_TOOLS: &[&str] = &["set_rule", "grant_environment_key", "install_mcp_server", "install_skill", "equip", "set_omp_models", "set_powers", "update_agent", "add_feed", "update_feed", "approve_plan", "create_challenge", "create_course", "create_adventure"];
 
 fn follows_open_thread(read_only: bool) -> bool {
@@ -104,7 +128,7 @@ fn get_upload_reaches(read_only: bool, on_shared_device: bool) -> bool {
 }
 
 fn tool_allowed(read_only: bool, name: &str) -> bool {
-    !read_only || matches!(name, "show_media" | "get_upload" | "ask_to_use_apps") || QUEST_CHANNEL_TOOLS.iter().chain(QUEST_MESSAGE_TOOLS).any(|(tool, _)| *tool == name) || quest::QUEST_TOOLS.contains(&name) || READ_ONLY_TOOLS.contains(&name) || super::reports_tools::READ_TOOLS.contains(&name) || super::reports_tools::QUEST_WRITE_TOOLS.contains(&name) || super::canvas_tools::CANVAS_TOOLS.contains(&name) || super::practice_tools::READ_TOOLS.contains(&name) || super::teams_tools::READ_TOOLS.contains(&name)
+    !read_only || matches!(name, "show_media" | "get_upload" | "ask_to_use_apps" | "ask_for_browser_help") || QUEST_CHANNEL_TOOLS.iter().chain(QUEST_MESSAGE_TOOLS).any(|(tool, _)| *tool == name) || quest::QUEST_TOOLS.contains(&name) || READ_ONLY_TOOLS.contains(&name) || super::reports_tools::READ_TOOLS.contains(&name) || super::reports_tools::QUEST_WRITE_TOOLS.contains(&name) || super::canvas_tools::CANVAS_TOOLS.contains(&name) || super::practice_tools::READ_TOOLS.contains(&name) || super::teams_tools::READ_TOOLS.contains(&name)
 }
 
 fn docs_path(page: &str) -> Result<String> {
@@ -211,7 +235,7 @@ fn actions_schema() -> Value {
 
 impl Server {
     pub(crate) fn new(store: WorldStore, db: Database, caller: WorldAgent) -> Self {
-        Self { store, db, caller, read_only: false, on_shared_device: false, quest: None, session: None, quick: None, aside: false }
+        Self { store, db, caller, read_only: false, on_shared_device: false, quest: None, session: None, quick: None, aside: false, delivery: Delivery::Full }
     }
 
     pub(crate) fn in_quick(self, quick: Option<Uuid>) -> Self {
@@ -220,6 +244,10 @@ impl Server {
 
     pub(crate) fn in_aside(self, aside: bool) -> Self {
         Self { aside, ..self }
+    }
+
+    pub(crate) fn delivering(self, delivery: Delivery) -> Self {
+        Self { delivery, ..self }
     }
 
     pub(super) fn quick_session(&self) -> Option<Uuid> {
@@ -256,6 +284,40 @@ impl Server {
         tool_allowed(self.read_only, name) && !hidden_in_session(self.quick.is_some(), self.aside, name) && (name != "offer_memory" || self.quick.is_some()) && (name != "get_upload" || get_upload_reaches(self.read_only, self.on_shared_device))
     }
 
+    fn tool_role(&self) -> ToolRole {
+        if self.quick.is_some() {
+            ToolRole::Quick
+        } else if self.aside {
+            ToolRole::Aside
+        } else if self.read_only {
+            ToolRole::Quest
+        } else {
+            ToolRole::Main
+        }
+    }
+
+    fn catalog(&self, delivery: Option<Delivery>) -> Catalog {
+        Catalog::new(self.tool_role(), delivery.unwrap_or(self.delivery), self.listed_tools())
+    }
+
+    fn unwrapped_call(&self, params: &Value, delivery: Delivery) -> std::result::Result<(String, Value), (String, bool)> {
+        let name = params.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+        let args = params.get("arguments").cloned().unwrap_or(json!({}));
+        if delivery != Delivery::Index {
+            return Ok((name, args));
+        }
+        let catalog = self.catalog(Some(delivery));
+        let (name, args) = match name.as_str() {
+            tool_catalog::FIND_TOOLS => return Err((catalog.find(args.get("query").and_then(Value::as_str).unwrap_or("")), false)),
+            tool_catalog::USE_TOOL => tool_catalog::use_tool_target(&args),
+            _ => (name, args),
+        };
+        if name == tool_catalog::FIND_TOOLS || name == tool_catalog::USE_TOOL {
+            return Err((catalog.unknown_note(&name), true));
+        }
+        Ok((name, args))
+    }
+
     fn listed_tools(&self) -> Vec<Value> {
         let mut tools = self.tools();
         tools.retain(|tool| tool.get("name").and_then(Value::as_str).is_some_and(|name| self.allows(name)));
@@ -284,10 +346,14 @@ impl Server {
                 }
             }),
             "ping" => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
-            "tools/list" => json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": self.listed_tools() } }),
+            "tools/list" => json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": self.catalog(Delivery::of_message(msg)).listed() } }),
             "tools/call" => {
-                let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-                let args = params.get("arguments").cloned().unwrap_or(json!({}));
+                let delivery = Delivery::of_message(msg).unwrap_or(self.delivery);
+                let (name, args) = match self.unwrapped_call(&params, delivery) {
+                    Ok(call) => call,
+                    Err((text, is_error)) => return Some(json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": text }], "isError": is_error } })),
+                };
+                let name = name.as_str();
                 let outcome = if self.allows(name) {
                     self.call(name, &args).await
                 } else if self.quick.is_some() {
@@ -299,7 +365,11 @@ impl Server {
                 };
                 let (text, is_error) = match outcome {
                     Ok(text) => (text, false),
-                    Err(error) => (error.to_string(), true),
+                    Err(error) => {
+                        let text = error.to_string();
+                        let missing = delivery == Delivery::Index && text.starts_with("unknown tool ");
+                        (if missing { self.catalog(Some(delivery)).unknown_note(name) } else { text }, true)
+                    }
                 };
                 json!({ "jsonrpc": "2.0", "id": id, "result": {
                     "content": [{ "type": "text", "text": text }], "isError": is_error
@@ -320,8 +390,9 @@ pub async fn serve() -> Result<()> {
         .await?
         .ok_or_else(|| anyhow!("agent {caller_id} not found"))?;
     let quick = std::env::var("WORLD_QUICK_SESSION").ok().and_then(|id| id.parse::<Uuid>().ok());
-    let aside = std::env::var("WORLD_ASIDE_SESSION").is_ok_and(|v| v == "1");
-    let server = Server::new(store, db, caller).in_quick(quick).in_aside(aside);
+    let aside_env = std::env::var("WORLD_ASIDE_SESSION").unwrap_or_default();
+    let aside = aside_env == "1" || aside_env.parse::<Uuid>().is_ok();
+    let server = Server::new(store, db, caller).in_quick(quick).in_aside(aside).delivering(Delivery::from_env());
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
@@ -441,7 +512,7 @@ impl Server {
         let clis = loka_shared::backends::cli_list_here();
         let mut tools = vec![
             tool("world_agents", "List everyone in the world: name, role, cli and model, the device they run on, what they are doing right now, open task count.", json!({}), &[]),
-            tool("share_link", "Get a full web link to something in Loka for use outside the app: Slack, email, a GitHub PR or issue, docs. Inside Loka chat keep using refs, which show as cards. kind is message, quest, report, todo, list, team, region, place or agent.", json!({ "kind": s("message, quest, report, todo, list, team, region, place or agent"), "ref": s("Its canonical ref, id, first characters, exact name or slug: msg:ch42, quest:<id>, report:<id>, todo:<id>, list:<id>, team:<id>, region:<id>, place:<id>, or an agent name") }), &["kind", "ref"]),
+            tool("share_link", "Get a full web link to something in Loka for use outside the app: Slack, email, a GitHub PR or issue, docs. Inside Loka chat keep using refs, which show as cards. kind is message, quest, report, workspace (a canvas opened with your person's chat and channels beside it), todo, list, team, region, place or agent.", json!({ "kind": s("message, quest, report, workspace, todo, list, team, region, place or agent"), "ref": s("Its canonical ref, id, first characters, exact name or slug: msg:ch42, quest:<id>, report:<id>, todo:<id>, list:<id>, team:<id>, region:<id>, place:<id>, or an agent name") }), &["kind", "ref"]),
             tool("read_docs", "Read Loka's own docs as Markdown. Use it when someone pastes a Loka docs link (any URL with /docs in it) or asks how Loka works: agents, quests, devices, keys, teams, setup. Leave page empty for the list of pages, or pass all for every page at once.", json!({ "page": s("A docs link, a page slug like quests or devices, all, or empty for the list") }), &[]),
             tool("show_ui", loka_shared::ui_cards::GUIDE, json!({ "summary": s("Plain text version of the card: what it shows or asks, one or two sentences"), "spec": { "type": "object", "description": "The json-render spec: root, elements, optional state" } }), &["summary", "spec"]),
             tool("show_media", SHOW_MEDIA_GUIDE, json!({
@@ -634,7 +705,7 @@ impl Server {
             tool("kit", "List installed MCP servers and skills, and which of your owner's agents have each one equipped (global ones reach everyone).", json!({}), &[]),
             tool("rules", "List the rules agents follow: global ones and your owner's own, with ids, scope (talk, work or all) and whether each is on.", json!({}), &[]),
         ];
-        tools.push(tool("start_task", "Start a quest. start_task is an action in your reply's actions block, not a tool: calling this starts nothing and returns the exact action to add.", json!({ "task_id": s("The task id"), "brief": s("Approach, constraints, what done looks like") }), &["task_id"]));
+        tools.push(tool("start_task", "Start a quest, or resume one that failed, timed out, is blocked or sits in review (even when its session was archived: a fresh session continues on the same branch with the last report). start_task is an action in your reply's actions block, not a tool: calling this starts nothing, checks the quest and tells you whether a run would be queued or why not, and returns the exact action to add.", json!({ "task_id": s("The task id"), "brief": s("Approach, constraints, what done looks like") }), &["task_id"]));
         if self.can(powers::ASSIGN_OTHERS) {
             tools.push(tool("create_task", "Create a task on the board and assign it to an agent, or to yourself by leaving agent empty. Another assignee starts it on its own; your own you start in this same reply with a start_task action on the returned task id.", with_quest_options(json!({ "title": s("Short title"), "description": s("What done looks like"), "agent": s("Agent name or slug to assign, optional, defaults to you"), "repo": s("owner/repo. Set it for every quest that changes a GitHub repository: the quest gets a worktree on its own branch and a pull request. Without it the quest runs in an empty folder with no checkout, branch or pull request"), "team": s("Team name from list_teams, optional: gives the quest to that team. Without agent its lead (or best fit member) picks it up; a lead splitting team work sets team and the teammate as agent"), "part_of": s("The quest id (or its first 8 characters) this is one part of: a quest of yours you are splitting into parts instead of starting it, or with team the team quest (defaults to the lead's only open team quest). The parent shows its parts and closes by itself once every part is finished"), "milestones": { "type": "array", "items": { "type": "string" }, "description": "Optional ordered checklist of steps; each is ticked off when the quest reports it done" }, "wait_for_merge": { "type": "boolean", "description": "With a repo: keep the quest open until the PR merges, checking it every 30 minutes and sending review comments back to the quest. Default true when a repo is set" }, "time_limit_minutes": { "type": "integer", "description": "Most minutes each run of this quest may take before it is stopped, 5 to 1440, optional, defaults to the standard limit. Use your estimate plus about a third for long work" } })), &["title", "description"]));
         } else {
@@ -769,6 +840,7 @@ impl Server {
             tools.push(tool("delete_task", "Delete quests from the board for good: cleans each up like cancel_task, then removes the task with its logs, attachments, milestones and closed subtasks. Sessions and history stay. Refused for a quest with open subtasks. Same scope as cancel_task. Only delete when asked.", quests(), &[]));
         }
         if self.quest.is_some() && self.session.is_some() {
+            tools.push(tool("ask_for_browser_help", "Ask your owner to step into your browser when a page needs them: a sign-in, a CAPTCHA, a 2FA code or a consent screen. Pass the page with url (get url first). They get a card and a notification with a button that opens your live browser inside Loka with control on; they do it there and press Done. Their answer reaches you as a message in this session, so keep working on anything else meanwhile. Never type passwords or codes yourself.", json!({ "site": s("The site or app, like GitHub or the Stripe dashboard"), "reason": s("What they need to do there, in one line, like sign in with the team account"), "url": s("The page that needs them, from get url (public http or https). Your tabs close when this run ends, so Loka opens this page again for them") }), &["site", "reason", "url"]));
             tools.push(tool("ask_to_use_apps", "Ask your owner before you use apps on their Mac (the apps launcher) in this quest. Say in one line what you want to do and why. A card asks them to allow it for this quest; until they do, the apps launcher refuses every command. Their answer reaches you as a message, so keep working on anything else meanwhile.", json!({ "reason": s("What you want to do with which app, and why, in one line") }), &["reason"]));
         }
         tools.extend(self.quest_tools(tool));
@@ -845,6 +917,15 @@ impl Server {
                     }
                     None => app_links::report_url(report.id),
                 }
+            }
+            "workspace" => {
+                let owner = owner.ok_or_else(|| anyhow!("you have no person whose canvases you can link"))?;
+                let key = strip("report:");
+                let report = self.store.find_report(owner, self.caller.org_id.unwrap_or_default(), &key).await?.ok_or_else(|| anyhow!("no canvas matches {key}; see list_reports"))?;
+                if report.kind != "canvas" {
+                    bail!("\"{}\" is a written report; only a canvas opens as a workspace", report.title);
+                }
+                app_links::workspace_url(report.id)
             }
             "todo" | "to-do" => {
                 let owner = owner.ok_or_else(|| anyhow!("you have no person whose list you can link"))?;
@@ -1247,19 +1328,7 @@ impl Server {
     }
 
     async fn reachable_quest(&self, prefix: &str, verb: &str) -> Result<loka_shared::world::TaskRef> {
-        if prefix.len() < 4 {
-            bail!("give at least the first 8 characters of the task id");
-        }
-        let matches = self.store.find_tasks_by_prefix_in(self.caller.org_id, prefix).await?;
-        let task = match matches.as_slice() {
-            [] => bail!("no task with that id; list_tasks shows ids"),
-            [one] => one.clone(),
-            many => bail!(
-                "matches {} tasks ({}); use more characters of the id",
-                many.len(),
-                many.iter().map(|t| format!("{} {}", &t.id.to_string()[..8], short(&t.title, 40))).collect::<Vec<_>>().join(", ")
-            ),
-        };
+        let task = super::quests::find_task(&self.store, self.caller.org_id, prefix, verb).await.map_err(|problem| anyhow!(problem))?;
         if task.assigned_agent_id != Some(self.caller.id) {
             if !self.can(powers::OVERSEE) {
                 bail!("that quest is not yours; other agents' quests also need the oversee power");
@@ -1294,7 +1363,7 @@ impl Server {
             "read_docs" => read_docs(arg("page").unwrap_or("")).await,
             "features" => self.feature_guide(arg("feature")),
             "my_quest" => self.my_quest(args).await,
-            "start_task" => Err(anyhow!(start_task_guide(args))),
+            "start_task" => Err(anyhow!(self.start_task_preflight(args.clone()).await)),
             "offer_memory" => match self.quick {
                 Some(session) => {
                     self.store.offer_memory(&self.caller, session, need("line")?).await?;
@@ -1304,6 +1373,14 @@ impl Server {
             },
             "show_media" => self.show_media(args).await,
             "get_upload" => Err(anyhow!("get_upload only works in a quest running on your owner's own device")),
+            "ask_for_browser_help" => match (self.quest, self.session) {
+                (Some(task), Some(session)) => {
+                    let url = arg("url").ok_or_else(|| anyhow!("{}", loka_shared::app_control::HELP_URL_NEEDED))?;
+                    let help = loka_shared::app_control::BrowserHelp { site: need("site")?, reason: arg("reason").unwrap_or(""), url };
+                    self.store.request_browser_help(&self.caller, task, session, help).await
+                }
+                _ => Err(anyhow!("ask_for_browser_help only works inside a quest running on a Mac. Say in your report what your owner needs to do in the browser")),
+            },
             "ask_to_use_apps" => match (self.quest, self.session) {
                 (Some(task), Some(session)) => self.store.request_app_control(&self.caller, task, session, arg("reason").unwrap_or("")).await,
                 _ => Err(anyhow!("ask_to_use_apps only works inside a quest running on a Mac")),
@@ -1385,7 +1462,7 @@ impl Server {
                 let a = self.agent(need("agent")?).await?;
                 let tasks = self.store.agent_tasks(Some(a.id), false, 10).await?;
                 let sessions = self.store.list_sessions(a.id).await?;
-                let events = self.store.recent_events(Some(a.id), 15).await?;
+                let events = self.store.agent_feed(None, Some(a.id), &[], 15).await?;
                 let device = device_label(&a);
                 let mut out = vec![format!(
                     "{} ({}) is {}{}",
@@ -1502,15 +1579,24 @@ impl Server {
                     None => self.store.agent_tasks(Some(agent.unwrap_or(self.caller.id)), !closed, 30).await?,
                 };
                 let names: Vec<WorldAgent> = self.store.list_agents_in(self.caller.org_id).await?;
+                let task_ids: Vec<Uuid> = tasks.iter().map(|t| t.id).collect();
+                let waiting = self.store.disk_waiting(loka_shared::world::DiskWaitKey::Quest, &task_ids).await?;
                 Ok(tasks
                     .into_iter()
                     .map(|t| {
+                        let mut state = t.status.clone();
+                        if t.plan_waiting {
+                            state = format!("{state}, {}", loka_shared::world::PLAN_WAITING_NOTE);
+                        }
+                        if waiting.contains(&t.id) {
+                            state = format!("{state}, {}", loka_shared::world::WAITING_FOR_DISK_NOTE);
+                        }
                         let who = t
                             .assigned_agent_id
                             .and_then(|id| names.iter().find(|a| a.id == id))
                             .map(|a| a.name.clone())
                             .unwrap_or_else(|| "unassigned".into());
-                        format!("- {} [{}] {} ({who}){}", &t.id.to_string()[..8], t.status, t.title, t.pr_url.map(|u| format!(" PR {u}")).unwrap_or_default())
+                        format!("- {} [{}] {} ({who}){}", &t.id.to_string()[..8], state, t.title, t.pr_url.map(|u| format!(" PR {u}")).unwrap_or_default())
                     })
                     .collect::<Vec<_>>()
                     .join("\n"))
@@ -1522,7 +1608,7 @@ impl Server {
                     .and_then(Value::as_array)
                     .map(|list| list.iter().filter_map(Value::as_str).map(str::to_string).collect())
                     .unwrap_or_default();
-                let events = self.store.recent_events_of(self.caller.org_id, &types, limit).await?;
+                let events = self.store.agent_feed(self.caller.org_id, None, &types, limit).await?;
                 let names = self.store.list_agents_in(self.caller.org_id).await?;
                 let owner = self.caller.owner_user_id;
                 let channels = self.store.hidden_channels_among(owner, Some(self.caller.id), &events).await?;
@@ -1971,16 +2057,25 @@ impl Server {
             }
             "my_sessions" => {
                 let rows = self.store.session_briefs(Some(self.caller.id), 30).await?;
+                let session_ids: Vec<Uuid> = rows.iter().map(|s| s.id).collect();
+                let waiting = self.store.disk_waiting(loka_shared::world::DiskWaitKey::Session, &session_ids).await?;
                 let lines: Vec<String> = rows
                     .into_iter()
                     .filter(|s| s.role == "task" || s.role == "review")
                     .map(|s| {
+                        let state = if waiting.contains(&s.id) {
+                            format!(", {}", loka_shared::world::WAITING_FOR_DISK_NOTE)
+                        } else if s.running {
+                            ", working".to_string()
+                        } else {
+                            String::new()
+                        };
                         format!(
                             "- {} {} [{}{}] {}{}",
                             &s.id.to_string()[..8],
                             s.role,
                             s.status,
-                            if s.running { ", working" } else { "" },
+                            state,
                             s.task_title.unwrap_or_default(),
                             s.summary.map(|x| format!(" :: {}", short(&x, 240))).unwrap_or_default()
                         )
@@ -3132,15 +3227,18 @@ fn time_limit_arg(args: &Value) -> Result<Option<i64>> {
     }
 }
 
-pub fn config_json_for(agent_id: Uuid, quick: Option<Uuid>, aside: bool) -> Option<String> {
+pub fn config_json_for(agent_id: Uuid, quick: Option<Uuid>, aside: Option<Uuid>, delivery: Delivery) -> Option<String> {
     let exe = std::env::current_exe().ok()?;
     let mut env = serde_json::Map::new();
     env.insert("WORLD_AGENT_ID".into(), json!(agent_id.to_string()));
     if let Some(quick) = quick {
         env.insert("WORLD_QUICK_SESSION".into(), json!(quick.to_string()));
     }
-    if aside {
-        env.insert("WORLD_ASIDE_SESSION".into(), json!("1"));
+    if let Some(aside) = aside {
+        env.insert("WORLD_ASIDE_SESSION".into(), json!(aside.to_string()));
+    }
+    if delivery != Delivery::Full {
+        env.insert("WORLD_TOOL_DELIVERY".into(), json!(delivery.as_str()));
     }
     for key in ["DATABASE_URL", "REDIS_URL", "WORLD_PUBLIC_API_URL", "AGENT_WEBHOOK_URL", "WORLD_FEEDS_ALLOW_PRIVATE", "SLACK_BOT_TOKEN"] {
         if let Ok(v) = std::env::var(key) {
@@ -3240,6 +3338,79 @@ mod tests {
         assert_eq!(actions.len(), 1, "{guide}");
         let super::super::prompts::Action::StartTask { task_id, brief, .. } = &actions[0] else { panic!("{guide}") };
         assert_eq!((task_id.as_str(), brief.as_deref()), ("abc", None));
+    }
+
+    #[tokio::test]
+    async fn the_start_task_tool_says_whether_a_run_would_be_queued() -> Result<()> {
+        let Ok(url) = std::env::var("STEER_TEST_DATABASE_URL") else {
+            return Ok(());
+        };
+        let db = Database::connect(&url).await?;
+        let store = WorldStore::new(db.pool().clone());
+        let pool = db.pool().clone();
+        let tag = Uuid::new_v4().simple().to_string();
+        let user: Uuid = sqlx::query_scalar("INSERT INTO users (email, name, world_role) VALUES ($1, 'Ana', 'write') RETURNING id")
+            .bind(format!("ana-{tag}@test.dev"))
+            .fetch_one(&pool)
+            .await?;
+        let agent: Uuid = sqlx::query_scalar("INSERT INTO agent_profiles (slug, name, cli, model, owner_user_id) VALUES ($1, 'Pre', 'claude', 'opus', $2) RETURNING id")
+            .bind(format!("pre-{tag}"))
+            .bind(user)
+            .fetch_one(&pool)
+            .await?;
+        let caller = store.get_agent(agent).await?.expect("agent");
+        let server = Server::new(store.clone(), db.clone(), caller);
+        let quest = |status: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Uuid>("INSERT INTO agent_tasks (user_id, title, status, assigned_agent_id) VALUES ($1, 'Pre', $2, $3) RETURNING id")
+                    .bind(user)
+                    .bind(status)
+                    .bind(agent)
+                    .fetch_one(&pool)
+                    .await
+            }
+        };
+        let preflight = |id: Uuid| server.start_task_preflight(json!({ "task_id": id.to_string() }));
+
+        let failed = quest("failed").await?;
+        let archived: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_sessions (agent_id, role, backend, model, cli_session_id, status, task_id) VALUES ($1, 'task', 'claude', 'opus', 'c1', 'archived', $2) RETURNING id",
+        )
+        .bind(agent)
+        .bind(failed)
+        .fetch_one(&pool)
+        .await?;
+        let fresh = preflight(failed).await;
+        assert!(fresh.contains("<!-- actions") && fresh.contains("a run is queued") && fresh.contains("fresh session"), "{fresh}");
+
+        sqlx::query("UPDATE agent_sessions SET status = 'failed' WHERE id = $1").bind(archived).execute(&pool).await?;
+        let resumed = preflight(failed).await;
+        assert!(resumed.contains("a run is queued") && resumed.contains("existing session"), "{resumed}");
+
+        sqlx::query("INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, prompt, started_at) VALUES ($1, $2, $3, 'followup', 'running', 'go', NOW())")
+            .bind(archived)
+            .bind(agent)
+            .bind(failed)
+            .execute(&pool)
+            .await?;
+        let busy = preflight(failed).await;
+        assert!(busy.contains("would be refused and no run would be queued") && busy.contains("already has a followup run running") && !busy.contains("<!-- actions"), "{busy}");
+
+        let cancelled = quest("cancelled").await?;
+        let refused = preflight(cancelled).await;
+        assert!(refused.contains("no run would be queued") && refused.contains("cancelled"), "{refused}");
+        let parent = quest("failed").await?;
+        let part = quest("failed").await?;
+        sqlx::query("UPDATE agent_tasks SET parent_task_id = $1 WHERE id = $2").bind(parent).bind(part).execute(&pool).await?;
+        let split = preflight(parent).await;
+        assert!(split.contains("no run would be queued") && split.contains("split into parts") && !split.contains("<!-- actions"), "{split}");
+        let done = quest("done").await?;
+        let reopened = preflight(done).await;
+        assert!(reopened.contains("a run is queued") && reopened.contains("<!-- actions"), "{reopened}");
+        let unknown = server.start_task_preflight(json!({ "task_id": "00000000" })).await;
+        assert!(unknown.contains("no run would be queued"), "{unknown}");
+        Ok(())
     }
 
     #[tokio::test]
@@ -3376,6 +3547,205 @@ mod tests {
         for name in ["run_history", "run_log", "stop_run", "retry_run", "start_folder_session", "uninstall", "owner_prefs", "notifications", "check_provider"] {
             assert!(!tool_allowed(true, name), "{name}");
         }
+    }
+
+    fn offline_server(configure: impl FnOnce(Server) -> Server) -> Server {
+        let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://loka@127.0.0.1:1/none").expect("lazy pool");
+        let store = WorldStore::new(pool.clone());
+        let caller: WorldAgent = serde_json::from_value(json!({
+            "id": Uuid::new_v4(), "slug": "main", "name": "Main", "avatar_emoji": "a", "cli": "claude", "model": "sonnet",
+            "role": "worker", "look": null, "gear": null, "status": "idle", "visibility": "private", "tags": [],
+            "created_at": chrono::Utc::now(), "revoked_powers": [], "is_main": true, "jobs": [], "owner_user_id": Uuid::new_v4()
+        }))
+        .expect("agent");
+        configure(Server::new(store, Database::from_pool(pool), caller))
+    }
+
+    fn role_servers() -> Vec<(ToolRole, Server)> {
+        vec![
+            (ToolRole::Main, offline_server(|server| server)),
+            (ToolRole::Quest, offline_server(|server| server.in_quest(Some(Uuid::new_v4()), Some(Uuid::new_v4())).read_only())),
+            (ToolRole::Quick, offline_server(|server| server.in_quick(Some(Uuid::new_v4())))),
+            (ToolRole::Aside, offline_server(|server| server.in_aside(true))),
+        ]
+    }
+
+    fn tokens(tools: &[Value]) -> usize {
+        tools.iter().map(tool_catalog::approx_tokens).sum()
+    }
+
+    fn native_tokens(catalog: &Catalog) -> usize {
+        let listed = catalog.listed();
+        let core: Vec<Value> = listed.iter().filter(|tool| tool.get("_meta").is_some()).cloned().collect();
+        let deferred_names: String = listed.iter().filter(|tool| tool.get("_meta").is_none()).filter_map(|tool| tool["name"].as_str()).collect::<Vec<_>>().join("\n");
+        tokens(&core) + deferred_names.len().div_ceil(4)
+    }
+
+    #[tokio::test]
+    async fn schema_tokens_per_role_before_and_after() {
+        println!("| role | tools | full | native (core + names) | index |");
+        for (role, server) in role_servers() {
+            let full = server.catalog(Some(Delivery::Full));
+            let native = server.catalog(Some(Delivery::Native));
+            let index = server.catalog(Some(Delivery::Index));
+            let (full_t, native_t, index_t) = (tokens(&full.listed()), native_tokens(&native), tokens(&index.listed()));
+            println!("| {role:?} | {} | {full_t} | {native_t} | {index_t} |", full.listed().len());
+            assert!(index_t * 5 < full_t * 2, "{role:?}: index {index_t} vs full {full_t}");
+            assert!(native_t * 5 < full_t * 2, "{role:?}: native {native_t} vs full {full_t}");
+            let names: Vec<String> = index.listed().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
+            for core in tool_catalog::core(role) {
+                assert!(full.contains(core) == names.iter().any(|n| n == core), "{role:?} core {core} must be listed exactly when allowed");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_tool_stays_reachable_through_the_index_for_every_role() {
+        for (role, server) in role_servers() {
+            let index = server.catalog(Some(Delivery::Index));
+            let listed: Vec<String> = index.listed().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
+            let everything = server.catalog(Some(Delivery::Full)).listed();
+            let found = index.find("");
+            for tool in &everything {
+                let name = tool["name"].as_str().unwrap();
+                assert!(listed.iter().any(|n| n == name) || found.contains(&format!("- {name}: ")), "{role:?}: {name} is neither loaded nor indexed");
+                assert!(index.find(&format!("select:{name}")).contains(&format!("## {name}\n")), "{role:?}: select:{name} found nothing");
+            }
+        }
+    }
+
+    async fn call_through(server: &Server, delivery: Delivery, name: &str, arguments: Value) -> (String, bool) {
+        let mut request = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": name, "arguments": arguments } });
+        delivery.stamp(&mut request);
+        let response = server.jsonrpc(&request).await.expect("response");
+        (response["result"]["content"][0]["text"].as_str().unwrap_or_default().to_string(), response["result"]["isError"].as_bool().unwrap_or(false))
+    }
+
+    #[tokio::test]
+    async fn use_tool_runs_a_deferred_tool_through_the_normal_path() {
+        let server = offline_server(|server| server);
+        let direct = call_through(&server, Delivery::Full, "show_ui", json!({})).await;
+        let wrapped = call_through(&server, Delivery::Index, "use_tool", json!({ "name": "show_ui", "arguments": {} })).await;
+        assert_eq!(direct, wrapped);
+        assert!(wrapped.1 && wrapped.0.contains("summary is required"), "{wrapped:?}");
+        let as_text = call_through(&server, Delivery::Index, "use_tool", json!({ "name": "show_ui", "arguments": "{}" })).await;
+        assert_eq!(as_text, wrapped);
+    }
+
+    #[tokio::test]
+    async fn deferral_never_widens_what_a_role_may_call() {
+        let quest = offline_server(|server| server.in_quest(Some(Uuid::new_v4()), Some(Uuid::new_v4())).read_only());
+        let direct = call_through(&quest, Delivery::Full, "create_task", json!({ "title": "x", "description": "y" })).await;
+        let wrapped = call_through(&quest, Delivery::Index, "use_tool", json!({ "name": "create_task", "arguments": { "title": "x", "description": "y" } })).await;
+        assert_eq!(direct, wrapped);
+        assert!(wrapped.1 && wrapped.0.contains("not available in task sessions"), "{wrapped:?}");
+        let found = call_through(&quest, Delivery::Index, "find_tools", json!({ "query": "create task" })).await;
+        assert!(!found.0.contains("## create_task"), "{found:?}");
+        let aside = offline_server(|server| server.in_aside(true));
+        let hidden = call_through(&aside, Delivery::Index, "use_tool", json!({ "name": "start_task", "arguments": {} })).await;
+        assert!(hidden.1 && hidden.0.contains("not available in an aside"), "{hidden:?}");
+        let quick = offline_server(|server| server.in_quick(Some(Uuid::new_v4())));
+        let notes = call_through(&quick, Delivery::Index, "use_tool", json!({ "name": "update_my_notes", "arguments": { "body": "x" } })).await;
+        assert!(notes.1 && notes.0.contains("not available in a quick chat"), "{notes:?}");
+    }
+
+    #[tokio::test]
+    async fn a_wrong_tool_name_gets_close_names_not_a_dead_end() {
+        let server = offline_server(|server| server);
+        let (text, is_error) = call_through(&server, Delivery::Index, "use_tool", json!({ "name": "make_canvas", "arguments": {} })).await;
+        assert!(is_error && text.contains("create_canvas") && text.contains("find_tools"), "{text}");
+        let (nested, nested_error) = call_through(&server, Delivery::Index, "use_tool", json!({ "name": "use_tool" })).await;
+        assert!(nested_error && nested.contains("no Loka tool named"), "{nested}");
+        let (miss, miss_error) = call_through(&server, Delivery::Index, "find_tools", json!({ "query": "zzzzzz" })).await;
+        assert!(!miss_error && miss.contains("- create_canvas: "), "{miss}");
+    }
+
+    #[tokio::test]
+    async fn a_plain_call_of_an_unknown_name_under_the_index_gets_close_names() {
+        let server = offline_server(|server| server);
+        let (text, is_error) = call_through(&server, Delivery::Index, "make_canvas", json!({})).await;
+        assert!(is_error && text.contains("create_canvas") && text.contains("find_tools"), "{text}");
+        let (listed, listed_error) = call_through(&server, Delivery::Index, "features", json!({ "feature": "tools" })).await;
+        assert!(!listed_error && listed.contains("find_tools"), "{listed}");
+    }
+
+    #[tokio::test]
+    async fn hidden_aliases_are_dispatched_under_the_index_exactly_as_they_are_directly() {
+        let server = offline_server(|server| server);
+        assert!(!server.catalog(Some(Delivery::Index)).contains("practice_check"));
+        let direct = call_through(&server, Delivery::Full, "practice_check", json!({})).await;
+        let wrapped = call_through(&server, Delivery::Index, "use_tool", json!({ "name": "practice_check", "arguments": {} })).await;
+        let plain = call_through(&server, Delivery::Index, "practice_check", json!({})).await;
+        assert_eq!(direct, wrapped);
+        assert_eq!(direct, plain);
+        assert!(direct.1 && !direct.0.contains("no Loka tool"), "{direct:?}");
+    }
+
+    #[tokio::test]
+    async fn every_core_tool_is_a_real_tool_of_its_role() {
+        for (role, server) in role_servers() {
+            let names: Vec<String> = server.listed_tools().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
+            for core in tool_catalog::core(role) {
+                assert!(names.iter().any(|n| n == core), "{role:?} core names {core}, which the role does not have");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_and_full_ignore_the_meta_tools() {
+        let server = offline_server(|server| server);
+        for delivery in [Delivery::Full, Delivery::Native] {
+            let mut list = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+            delivery.stamp(&mut list);
+            let listed = server.jsonrpc(&list).await.unwrap();
+            let names: Vec<&str> = listed["result"]["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+            assert!(!names.contains(&"find_tools") && !names.contains(&"use_tool") && names.contains(&"create_canvas"), "{delivery:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_delivery_on_the_request_wins_over_the_default() {
+        let server = offline_server(|server| server.delivering(Delivery::Full));
+        let mut list = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+        Delivery::Index.stamp(&mut list);
+        let listed = server.jsonrpc(&list).await.unwrap();
+        let names: Vec<&str> = listed["result"]["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"find_tools") && names.len() < 20, "{names:?}");
+        let plain = server.jsonrpc(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" })).await.unwrap();
+        assert!(plain["result"]["tools"].as_array().unwrap().len() > 100);
+    }
+
+
+    #[tokio::test]
+    #[ignore = "serves the real tool catalog over HTTP so a live CLI can search and call it; LIVE_TOOLS_SECS=120 LIVE_TOOLS_DELIVERY=index|native|full LIVE_TOOLS_ROLE=main|quest LIVE_TOOLS_LOG=<file>"]
+    async fn live_catalog_server() {
+        use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+        use std::sync::Arc;
+        let delivery = std::env::var("LIVE_TOOLS_DELIVERY").ok().and_then(|value| Delivery::parse(&value)).unwrap_or(Delivery::Index);
+        let quest = std::env::var("LIVE_TOOLS_ROLE").is_ok_and(|role| role == "quest");
+        let log = std::env::var("LIVE_TOOLS_LOG").unwrap_or_else(|_| "/dev/null".to_string());
+        let server = offline_server(|server| if quest { server.in_quest(Some(Uuid::new_v4()), Some(Uuid::new_v4())).read_only() } else { server }.delivering(delivery));
+        async fn handle(State(state): State<Arc<(Server, String)>>, Json(message): Json<Value>) -> (StatusCode, Json<Value>) {
+            let (server, log) = &*state;
+            let line = match message.get("method").and_then(Value::as_str) {
+                Some("tools/call") => format!("call {}\n", message["params"]),
+                Some(method) => format!("{method}\n"),
+                None => String::new(),
+            };
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
+                use std::io::Write;
+                let _ = file.write_all(line.as_bytes());
+            }
+            match server.jsonrpc(&message).await {
+                Some(response) => (StatusCode::OK, Json(response)),
+                None => (StatusCode::ACCEPTED, Json(json!({}))),
+            }
+        }
+        let app = Router::new().route("/mcp", post(handle)).with_state(Arc::new((server, log)));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        println!("LIVE_TOOLS_URL=http://{}/mcp", listener.local_addr().unwrap());
+        let seconds = std::env::var("LIVE_TOOLS_SECS").ok().and_then(|value| value.parse().ok()).unwrap_or(120);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(seconds), axum::serve(listener, app)).await;
     }
 }
 

@@ -4,7 +4,7 @@ import { Hammer, HandWaving, WarningCircle } from "@phosphor-icons/react";
 import { Shimmer } from "./shimmer";
 import { useNow } from "@/lib/clock";
 import { cn } from "@/lib/utils";
-import { TRADES, type AgentJob, type WorldAgent } from "@/lib/world";
+import { TRADES, WAITING_FOR_DISK, type AgentJob, type WorldAgent } from "@/lib/world";
 import type { Trade } from "./types";
 import { OpenWorkshop } from "./workbench/open-workshop";
 
@@ -71,7 +71,7 @@ export function JobList({
                 </span>
                 <span key={job.activity ?? (queued ? "queued" : "starting")} className="block animate-fade-in truncate text-w-xs">
                   {queued ? (
-                    <span className="text-w-muted">Waiting for a free workbench</span>
+                    <span className="text-w-muted">{job.waiting === "disk" ? WAITING_FOR_DISK : "Waiting for a free workbench"}</span>
                   ) : (
                     <Shimmer>{job.activity ?? "Getting started"}</Shimmer>
                   )}
@@ -98,7 +98,7 @@ export function LiveJobLine({ job }: { job: AgentJob }) {
   return (
     <p className="mt-1.5 flex items-center gap-2 text-w-sm">
       <span className="min-w-0 flex-1 truncate">
-        {queued ? <span className="text-w-muted">Waiting for a free workbench</span> : <Shimmer>{job.activity ?? "Working on it"}</Shimmer>}
+        {queued ? <span className="text-w-muted">{job.waiting === "disk" ? WAITING_FOR_DISK : "Waiting for a free workbench"}</span> : <Shimmer>{job.activity ?? "Working on it"}</Shimmer>}
       </span>
       <span className="shrink-0 font-mono text-w-2xs tabular-nums text-w-muted">{elapsed(job.started_at, now)}</span>
     </p>

@@ -14,8 +14,7 @@ pub use crate::cli::Timing;
 
 use crate::cli::{
     collect_stderr, configure_child_environment, give_to_job_user, job_command, session_id_from_init,
-    summarize_tool_input, summarize_tool_output, truncate_for_log, CliOptions, CliResult, StreamEvent,
-    TOOL_OUTPUT_MAX_CHARS,
+    summarize_tool_input, summarize_tool_output, CliOptions, CliResult, StreamEvent,
 };
 
 const AGENT_SYSTEM_PROMPT: &str = "\
@@ -211,12 +210,20 @@ fn auth_settings_from(text: &str) -> Option<serde_json::Map<String, serde_json::
     (!picked.is_empty()).then_some(picked)
 }
 
-fn user_settings_path() -> Option<PathBuf> {
-    let dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+pub(crate) fn config_dir_from(value: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    value("CLAUDE_CONFIG_DIR")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").filter(|v| !v.is_empty()).map(|home| PathBuf::from(home).join(".claude")))?;
-    Some(dir.join("settings.json"))
+        .or_else(|| value("HOME").filter(|v| !v.is_empty()).map(|home| PathBuf::from(home).join(".claude")))
+}
+
+fn user_settings_path() -> Option<PathBuf> {
+    Some(config_dir_from(&|name| std::env::var(name).ok())?.join("settings.json"))
+}
+
+fn run_settings_path(cmd: &Command) -> Option<PathBuf> {
+    let env = crate::key_proxy::env_of(cmd);
+    Some(config_dir_from(&|name| env.get(name).cloned())?.join("settings.json"))
 }
 
 pub(crate) fn trusted_settings_file(path: &Path) -> bool {
@@ -233,16 +240,31 @@ pub(crate) fn trusted_settings_file(path: &Path) -> bool {
     }
 }
 
-fn user_settings_trusted() -> bool {
-    crate::cli::job_user().is_none() || user_settings_path().is_none_or(|path| !path.exists() || trusted_settings_file(&path))
+fn settings_trusted(path: Option<&Path>) -> bool {
+    crate::cli::job_user().is_none() || path.is_none_or(|path| !path.exists() || trusted_settings_file(path))
+}
+
+pub(crate) fn user_settings(opts: &CliOptions<'_>, cmd: &Command) -> detect::UserSettings {
+    if opts.lean || !settings_trusted(run_settings_path(cmd).as_deref()) {
+        detect::UserSettings::AppliedByLoka
+    } else {
+        detect::UserSettings::ReadByCli
+    }
 }
 
 pub(crate) fn user_auth_settings() -> Option<serde_json::Map<String, serde_json::Value>> {
-    let path = user_settings_path()?;
-    if !trusted_settings_file(&path) {
+    auth_settings_at(&user_settings_path()?)
+}
+
+pub(crate) fn auth_settings_at(path: &Path) -> Option<serde_json::Map<String, serde_json::Value>> {
+    if !trusted_settings_file(path) {
         return None;
     }
     auth_settings_from(&std::fs::read_to_string(path).ok()?)
+}
+
+pub(crate) fn settings_at(path: &Path) -> Option<serde_json::Map<String, serde_json::Value>> {
+    serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(path).ok()?).ok()?.as_object().cloned()
 }
 
 fn without_attribution(settings: Option<serde_json::Value>) -> serde_json::Value {
@@ -250,27 +272,6 @@ fn without_attribution(settings: Option<serde_json::Value>) -> serde_json::Value
     settings["includeCoAuthoredBy"] = serde_json::json!(false);
     settings["attribution"] = serde_json::json!({ "commit": "", "pr": "" });
     settings
-}
-
-fn with_auth(cmd: &mut Command, settings: Option<serde_json::Value>) -> Option<serde_json::Value> {
-    let Some(mut auth) = user_auth_settings() else {
-        return settings;
-    };
-    if let Some(serde_json::Value::Object(env)) = auth.remove("env") {
-        for (name, value) in env {
-            if let Some(value) = value.as_str() {
-                cmd.env(name, value);
-            }
-        }
-    }
-    if auth.is_empty() {
-        return settings;
-    }
-    let mut settings = settings.unwrap_or_else(|| serde_json::json!({}));
-    for (key, value) in auth {
-        settings[key] = value;
-    }
-    Some(settings)
 }
 
 fn mcp_server_rules(mcp_config_json: Option<&str>) -> String {
@@ -317,15 +318,26 @@ pub(crate) fn expected_mode(opts: &CliOptions<'_>, launch: &Launch) -> Option<&'
     }
 }
 
-pub(crate) fn command(opts: &CliOptions<'_>, mcp_config_path: Option<&Path>, launch: &Launch) -> Result<Command> {
+pub(crate) fn run_command(opts: &CliOptions<'_>, launch: &Launch) -> Result<Command> {
     let mut cmd = job_command(&launch.program);
     cmd.current_dir(opts.working_dir);
     cmd.kill_on_drop(true);
     configure_child_environment(&mut cmd, &opts.child_environment())?;
     opts.sign_commits(&mut cmd);
     launch.configure(&mut cmd);
-    let quest_temp = crate::cli::quest_temp_dir(opts.working_dir);
-    if let Some(dir) = &quest_temp {
+    Ok(cmd)
+}
+
+pub(crate) fn command(opts: &CliOptions<'_>, mcp_config_path: Option<&Path>, launch: &Launch) -> Result<Command> {
+    let mut cmd = run_command(opts, launch)?;
+    let source = user_settings(opts, &cmd);
+    let tool_search = !mcp_server_rules(opts.mcp_config_json.as_deref()).is_empty() && {
+        let facts = crate::world::tool_catalog::ClaudeFacts { version: launch.caps.version.clone(), first_party: detect::ClaudeEnv::of(&cmd, source).first_party_route() };
+        crate::world::tool_catalog::delivery_for("claude", opts.model, &facts) == crate::world::tool_catalog::Delivery::Native
+    };
+    let sign_in = detect::SignIn::settle(&mut cmd, source, launch);
+    let private_temp = crate::cli::private_temp_dir(opts.working_dir);
+    if let Some(dir) = &private_temp {
         cmd.env("CLAUDE_CODE_TMPDIR", dir);
     }
 
@@ -340,6 +352,9 @@ pub(crate) fn command(opts: &CliOptions<'_>, mcp_config_path: Option<&Path>, lau
     };
     let effort = select_effort(opts.effort, configured_effort.as_deref(), opts.lean)?;
 
+    if tool_search {
+        cmd.env("ENABLE_TOOL_SEARCH", "true");
+    }
     let mode = permission(opts, launch);
     let lean_reads = mode == Permission::LeanReads;
     let dont_ask = if launch.caps.mode("dontAsk") { "dontAsk" } else { "default" };
@@ -373,12 +388,12 @@ pub(crate) fn command(opts: &CliOptions<'_>, mcp_config_path: Option<&Path>, lau
     let writable = if sandbox_mode == sandbox::Mode::Off { Vec::new() } else { sandbox::git_write_roots(opts.working_dir) };
     let settings = (!lean_reads).then(|| sandbox::settings(sandbox_mode, &opts.environment, mcp_config_path, &writable, opts.fast)).flatten();
     let settings = if opts.lean { settings } else { Some(without_attribution(settings)) };
-    let skip_user_settings = !opts.lean && !user_settings_trusted();
-    let settings = if (opts.lean && !lean_reads) || skip_user_settings { with_auth(&mut cmd, settings) } else { settings };
+    let skip_user_settings = !opts.lean && !sign_in.reads_user_settings();
+    let settings = if lean_reads { settings } else { sign_in.settings(settings) };
     if let Some(mut settings) = settings {
         sandbox::open_for_owner(&mut settings);
-        if let Some(dir) = &quest_temp {
-            sandbox::allow_write(&mut settings, dir);
+        if let Some(dir) = &private_temp {
+            sandbox::allow_private_dir(&mut settings, dir);
         }
         if sandbox_mode != sandbox::Mode::Off {
             cmd.env("GIT_TEMPLATE_DIR", "");
@@ -420,17 +435,17 @@ pub(crate) fn command(opts: &CliOptions<'_>, mcp_config_path: Option<&Path>, lau
     }
 
     if lean_reads {
-        cmd.arg("--tools").arg("Read");
+        cmd.arg("--tools").arg(if tool_search { "Read,ToolSearch" } else { "Read" });
         cmd.arg("--setting-sources").arg("");
         let read_settings = Some(lean_read_settings(&opts.readable_files, opts.working_dir, opts.fast));
-        let settings = with_auth(&mut cmd, read_settings).unwrap_or_default();
+        let settings = sign_in.settings(read_settings).unwrap_or_default();
         cmd.arg("--settings").arg(settings.to_string());
         let servers = mcp_server_rules(opts.mcp_config_json.as_deref());
         if !servers.is_empty() {
             cmd.arg("--allowedTools").arg(servers);
         }
     } else if opts.lean {
-        cmd.arg("--tools").arg("");
+        cmd.arg("--tools").arg(if tool_search { "ToolSearch" } else { "" });
         cmd.arg("--setting-sources").arg("");
     } else if let Some(tools) = opts.allowed_tools.filter(|_| opts.approval != crate::cli::Approval::ReadOnly) {
         cmd.arg("--allowedTools").arg(tools);
@@ -594,7 +609,7 @@ impl TurnReader {
                         .cloned()
                         .unwrap_or_else(|| "unknown".to_string());
                     let output = block.get("content").map(summarize_tool_output).unwrap_or_default();
-                    let output = truncate_for_log(output.trim(), TOOL_OUTPUT_MAX_CHARS);
+                    let output = output.trim().to_string();
                     if output.is_empty() {
                         continue;
                     }
@@ -645,6 +660,10 @@ async fn run_inner(opts: &CliOptions<'_>, mcp_config_path: Option<&Path>, launch
     let expect = expected_mode(opts, launch);
 
     if let Some(steer) = opts.steer.take() {
+        return run_steerable(opts, cmd, steer, started, expect).await;
+    }
+    if !opts.lean {
+        let (_idle, steer) = tokio::sync::mpsc::unbounded_channel();
         return run_steerable(opts, cmd, steer, started, expect).await;
     }
 
@@ -777,16 +796,124 @@ fn interrupt_line() -> String {
     format!("{line}\n")
 }
 
+pub(crate) const BACKGROUND_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+
+const BACKGROUND_ASKS: u8 = 3;
+
+#[derive(Default)]
+pub(crate) struct Background {
+    running: std::collections::BTreeMap<String, String>,
+    waiting_since: Option<Instant>,
+    ended_at: Option<Instant>,
+    asked: bool,
+    asks: u8,
+    gave_up: bool,
+    turn_limit: Option<u32>,
+    turns: u32,
+    turn_ids: std::collections::HashSet<String>,
+}
+
+impl Background {
+    pub(crate) fn within(max_turns: u32) -> Self {
+        Self { turn_limit: (max_turns > 0).then_some(max_turns), ..Self::default() }
+    }
+
+    fn out_of_turns(&self) -> bool {
+        self.turn_limit.is_some_and(|limit| self.turns >= limit)
+    }
+
+    pub(crate) fn track(&mut self, json: &serde_json::Value) {
+        match json.get("type").and_then(|v| v.as_str()) {
+            Some("assistant") if json.get("parent_tool_use_id").is_none_or(serde_json::Value::is_null) => {
+                self.ended_at = None;
+                match json.pointer("/message/id").and_then(|v| v.as_str()) {
+                    Some(id) if !self.turn_ids.insert(id.to_string()) => {}
+                    _ => self.turns += 1,
+                }
+            }
+            Some("system") => {
+                let Some(id) = json.get("task_id").and_then(|v| v.as_str()) else {
+                    return;
+                };
+                match json.get("subtype").and_then(|v| v.as_str()) {
+                    Some("task_started") => {
+                        let what = json.get("description").and_then(|v| v.as_str()).unwrap_or("a background task");
+                        self.running.insert(id.to_string(), what.trim().chars().take(120).collect());
+                    }
+                    Some("task_notification") => {
+                        self.running.remove(id);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn keep_open(&mut self, now: Instant, cap: Option<std::time::Duration>) -> bool {
+        if self.running.is_empty() || self.gave_up || cap.is_none() || self.out_of_turns() {
+            self.waiting_since = None;
+            self.ended_at = None;
+            return false;
+        }
+        self.waiting_since.get_or_insert(now);
+        self.ended_at = Some(now);
+        self.asked = false;
+        true
+    }
+
+    pub(crate) fn note(&mut self, now: Instant, cap: Option<std::time::Duration>) -> Option<String> {
+        let (since, ended, cap) = (self.waiting_since?, self.ended_at?, cap?);
+        if self.asked || self.out_of_turns() {
+            return None;
+        }
+        let running: Vec<&str> = self.running.values().map(String::as_str).collect();
+        if now.duration_since(since) >= cap {
+            self.asked = true;
+            self.gave_up = true;
+            return Some(stop_waiting_note(&running, cap));
+        }
+        if running.is_empty() {
+            self.asked = true;
+            return Some(BACKGROUND_DONE_NOTE.to_string());
+        }
+        if self.asks < BACKGROUND_ASKS && now.duration_since(ended) >= BACKGROUND_GRACE {
+            self.asked = true;
+            self.asks += 1;
+            return Some(background_note(&running));
+        }
+        None
+    }
+}
+
+pub(crate) const BACKGROUND_DONE_NOTE: &str = "[background tasks finished]\nThe background tasks you were waiting on have finished. Read their output, then finish your answer exactly as your task asks, including any report or verdict block it asks for.";
+
+pub(crate) fn background_note(running: &[&str]) -> String {
+    format!(
+        "[background tasks still running]\nYour turn ended while these background tasks were still running: {}. Loka keeps this run open for them, and they stop when the run ends. Wait for them in the foreground now (block on their output, do not start them again), read the results, then finish your answer exactly as your task asks, including any report or verdict block it asks for.",
+        running.join("; ")
+    )
+}
+
+pub(crate) fn stop_waiting_note(running: &[&str], cap: std::time::Duration) -> String {
+    let what = if running.is_empty() { "Your background tasks".to_string() } else { format!("Your background tasks ({})", running.join("; ")) };
+    format!(
+        "[stop waiting]\n{what} ran for {} minutes, longer than Loka waits. Stop waiting for them. Finish your answer now with what you have, say which checks did not finish, and include any report or verdict block your task asks for.",
+        cap.as_secs().div_ceil(60)
+    )
+}
+
 pub(crate) struct SteerState {
     sent: usize,
     replayed: usize,
     interrupted: bool,
     tools: crate::cli::OpenTools,
+    pub(crate) background: Background,
 }
 
 impl SteerState {
-    pub(crate) fn new() -> Self {
-        Self { sent: 1, replayed: 0, interrupted: false, tools: crate::cli::OpenTools::new() }
+    pub(crate) fn new(max_turns: u32) -> Self {
+        Self { sent: 1, replayed: 0, interrupted: false, tools: crate::cli::OpenTools::new(), background: Background::within(max_turns) }
     }
 
     pub(crate) fn oldest_tool(&self) -> Option<std::time::Duration> {
@@ -798,6 +925,7 @@ impl SteerState {
     }
 
     pub(crate) fn track(&mut self, json: &serde_json::Value) {
+        self.background.track(json);
         let content = json.pointer("/message/content").and_then(|v| v.as_array());
         match json.get("type").and_then(|v| v.as_str()) {
             Some("user") if json.get("isReplay").and_then(|v| v.as_bool()) == Some(true) => self.replayed += 1,
@@ -861,7 +989,7 @@ async fn run_steerable(
     let mut stdin = child.stdin.take().context("claude stdin missing")?;
     stdin.write_all(user_line(opts.prompt, &opts.image_paths).await?.as_bytes()).await?;
     stdin.flush().await?;
-    let stderr = crate::cli::stderr_tail(child.stderr.take());
+    let stderr = crate::cli::stderr_tail(child.stderr.take(), opts.redactor());
     let stdout = child.stdout.take().expect("stdout piped");
     let mut lines = BufReader::new(stdout).lines();
     let mut reader = TurnReader::new(started).expecting(expect);
@@ -870,7 +998,8 @@ async fn run_steerable(
 
     let interrupt_after = crate::cli::steer_interrupt_after();
     let hang_after = crate::cli::tool_hang_after();
-    let mut state = SteerState::new();
+    let background_cap = crate::cli::background_wait_cap();
+    let mut state = SteerState::new(opts.max_turns);
     let mut outputs: Vec<String> = Vec::new();
     let mut watchdog = tokio::time::interval(std::time::Duration::from_secs(15));
     watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -904,6 +1033,10 @@ async fn run_steerable(
                     let _ = next.ack.send(true);
                 }
                 if !state.pending() {
+                    if state.background.keep_open(Instant::now(), background_cap) {
+                        info!("Claude turn ended with background tasks running, keeping the run open");
+                        continue;
+                    }
                     finished = true;
                     break;
                 }
@@ -921,6 +1054,10 @@ async fn run_steerable(
                         warn!(secs = age.as_secs(), "Claude tool call looks stuck, interrupting");
                         state.write(&mut stdin, &crate::cli::hang_notice(age), true).await?;
                     }
+                }
+                if let Some(note) = state.background.note(Instant::now(), background_cap) {
+                    info!("Asking Claude to finish after its background tasks");
+                    state.write(&mut stdin, &note, false).await?;
                 }
             }
         }
@@ -987,7 +1124,8 @@ fn select_effort<'a>(
 #[cfg(test)]
 mod tests {
     use super::detect::{Caps, Launch};
-    use super::{auth_settings_from, command, expected_mode, is_error_result, refusal, select_effort, user_auth_settings, write_mcp_config_temp_file, TurnReader};
+    use super::{auth_settings_from, command, expected_mode, is_error_result, refusal, select_effort, user_auth_settings, write_mcp_config_temp_file, Background, TurnReader, BACKGROUND_ASKS, BACKGROUND_DONE_NOTE, BACKGROUND_GRACE};
+    use std::time::{Duration, Instant};
     use crate::cli::{Approval, CliOptions};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -1080,6 +1218,81 @@ mod tests {
         assert!(!super::trusted_settings_file(&path));
         std::fs::remove_dir_all(&dir).unwrap();
     }
+    fn launch_with_version(version: Option<&str>) -> Launch {
+        Launch { caps: Arc::new(Caps::parse(version.map(str::to_string), "")), ..Launch::assume("claude") }
+    }
+
+    fn on_route(mut opts: CliOptions<'static>, base_url: Option<&str>, cloud: Option<&str>) -> CliOptions<'static> {
+        opts.environment.insert("ANTHROPIC_BASE_URL".to_string(), base_url.unwrap_or("https://api.anthropic.com").to_string());
+        if let Some(name) = cloud {
+            opts.environment.insert(name.to_string(), "1".to_string());
+        }
+        opts
+    }
+
+    fn first_party(opts: CliOptions<'static>) -> CliOptions<'static> {
+        on_route(opts, None, None)
+    }
+
+    fn built(opts: &CliOptions<'_>, launch: &Launch) -> (Vec<String>, Option<String>) {
+        let cmd = command(opts, None, launch).expect("command builds");
+        let args = cmd.as_std().get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        let env = cmd.as_std().get_envs().find(|(key, _)| *key == "ENABLE_TOOL_SEARCH").and_then(|(_, value)| value.map(|value| value.to_string_lossy().into_owned()));
+        (args, env)
+    }
+
+    #[test]
+    fn lean_turns_load_world_tools_through_tool_search_on_a_cli_that_has_it() {
+        let launch = launch_with_version(Some("2.1.330"));
+        let (bare, env) = built(&first_party(options(true, Vec::new(), false, Approval::Full, "sonnet")), &launch);
+        assert_eq!(after(&bare, "--tools"), Some("ToolSearch"));
+        assert_eq!(env.as_deref(), Some("true"));
+        let (reads, env) = built(&first_party(options(true, vec![PathBuf::from("/runner/skills/notes.md")], false, Approval::Full, "opus")), &launch);
+        assert_eq!(after(&reads, "--tools"), Some("Read,ToolSearch"));
+        assert_eq!(after(&reads, "--allowedTools"), Some("mcp__world"));
+        assert_eq!(env.as_deref(), Some("true"));
+        let (work, env) = built(&first_party(options(false, Vec::new(), false, Approval::Auto, "sonnet")), &launch);
+        assert_eq!(after(&work, "--tools"), None);
+        assert_eq!(env.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn lean_turns_stay_as_they_were_without_tool_search() {
+        for (version, model) in [(Some("2.1.6"), "sonnet"), (None, "sonnet"), (Some("2.1.330"), "glm-5")] {
+            let (bare, env) = built(&first_party(options(true, Vec::new(), false, Approval::Full, model)), &launch_with_version(version));
+            assert_eq!(after(&bare, "--tools"), Some(""), "{version:?} {model}");
+            assert_eq!(env, None, "{version:?} {model}");
+        }
+        let mut no_servers = first_party(options(true, Vec::new(), false, Approval::Full, "sonnet"));
+        no_servers.mcp_config_json = None;
+        let (bare, env) = built(&no_servers, &launch_with_version(Some("2.1.330")));
+        assert_eq!((after(&bare, "--tools"), env), (Some(""), None));
+    }
+
+    #[test]
+    fn a_gateway_or_cloud_route_never_gets_tool_search() {
+        let launch = launch_with_version(Some("2.1.330"));
+        for (base_url, cloud) in [(Some("http://localhost:4000"), None), (Some("https://openrouter.ai/api"), None), (None, Some("CLAUDE_CODE_USE_BEDROCK")), (None, Some("CLAUDE_CODE_USE_VERTEX")), (None, Some("CLAUDE_CODE_USE_FOUNDRY"))] {
+            let (bare, env) = built(&on_route(options(true, Vec::new(), false, Approval::Full, "sonnet"), base_url, cloud), &launch);
+            assert_eq!((after(&bare, "--tools"), env), (Some(""), None), "{base_url:?} {cloud:?}");
+        }
+    }
+
+    #[test]
+    fn the_launch_and_the_kit_make_the_same_delivery_decision() {
+        use crate::world::tool_catalog::{delivery_for, ClaudeFacts, Delivery};
+        for version in [None, Some("2.1.6"), Some("2.1.7"), Some("2.1.330")] {
+            for model in ["sonnet", "opus", "glm-5"] {
+                for (base_url, cloud) in [(None, None), (Some("http://localhost:4000"), None), (None, Some("CLAUDE_CODE_USE_BEDROCK"))] {
+                    let opts = on_route(options(true, Vec::new(), false, Approval::Full, model), base_url, cloud);
+                    let (_, env) = built(&opts, &launch_with_version(version));
+                    let kit = delivery_for("claude", model, &ClaudeFacts { version: version.map(str::to_string), first_party: super::detect::route_is_first_party(&super::detect::host_route_lookup(&opts.environment)) });
+                    assert_eq!(env.is_some(), kit == Delivery::Native, "{version:?} {model} {base_url:?} {cloud:?}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn lean_turns_read_only_their_skill_files() {
         let skill = PathBuf::from("/runner/skills/session/atlas-notes.md");
@@ -1147,7 +1360,7 @@ mod tests {
     fn quest_claude_runs_get_their_own_writable_temp_dir() {
         let id = uuid::Uuid::new_v4();
         let tree: &'static Path = Box::leak(Box::new(PathBuf::from(format!("/Users/a/Library/Application Support/dev.ygpt.loka/runner/workspaces/tasks/{id}/world"))));
-        let expected = std::env::temp_dir().join(crate::cli::quest_temp_name(id));
+        let expected = crate::cli::private_temp_root().join(crate::cli::quest_temp_name(id));
         let launch = Launch::assume("claude");
         let build = |working_dir: &'static Path| {
             let mut opts = options(false, Vec::new(), false, Approval::Auto, "sonnet");
@@ -1166,10 +1379,168 @@ mod tests {
         let settings: serde_json::Value = serde_json::from_str(after(&args, "--settings").unwrap()).unwrap();
         let write: Vec<&str> = settings["sandbox"]["filesystem"]["allowWrite"].as_array().unwrap().iter().filter_map(|p| p.as_str()).collect();
         assert!(write.contains(&expected.to_string_lossy().as_ref()), "{write:?}");
+        let sockets: Vec<&str> = settings["sandbox"]["network"]["allowUnixSockets"].as_array().unwrap().iter().filter_map(|p| p.as_str()).collect();
+        assert!(sockets.contains(&expected.to_string_lossy().as_ref()), "a quest may bind and reach unix sockets inside its own temp dir: {sockets:?}");
         let _ = std::fs::remove_dir_all(&expected);
         let elsewhere = build(Path::new("/tmp")).expect("command builds");
         let inherited = elsewhere.as_std().get_envs().find(|(name, _)| *name == "CLAUDE_CODE_TMPDIR").and_then(|(_, value)| value?.to_str());
         assert!(!inherited.is_some_and(|dir| dir.contains(crate::cli::QUEST_TEMP_PREFIX)));
+    }
+
+    #[test]
+    fn folder_sessions_get_their_own_writable_temp_dir_in_claude() {
+        let session = uuid::Uuid::new_v4();
+        let expected = crate::cli::private_temp_root().join(crate::cli::session_temp_name(session));
+        let launch = Launch::assume("claude");
+        let build = || {
+            let opts = options(false, Vec::new(), false, Approval::Auto, "sonnet");
+            crate::cli::SESSION_TEMP.sync_scope(session, || command(&opts, None, &launch)).expect("command builds")
+        };
+        let env_of = |cmd: &tokio::process::Command| -> std::collections::BTreeMap<String, String> {
+            cmd.as_std().get_envs().filter_map(|(name, value)| Some((name.to_string_lossy().into_owned(), value?.to_string_lossy().into_owned()))).collect()
+        };
+        let cmd = build();
+        let env = env_of(&cmd);
+        for name in ["TMPDIR", "TMP", "TEMP", "CLAUDE_CODE_TMPDIR"] {
+            assert_eq!(env[name], expected.to_string_lossy(), "{name}");
+        }
+        let args: Vec<String> = cmd.as_std().get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        let settings: serde_json::Value = serde_json::from_str(after(&args, "--settings").unwrap()).unwrap();
+        let write: Vec<&str> = settings["sandbox"]["filesystem"]["allowWrite"].as_array().unwrap().iter().filter_map(|p| p.as_str()).collect();
+        assert!(write.contains(&expected.to_string_lossy().as_ref()), "{write:?}");
+        let _ = std::fs::remove_dir_all(&expected);
+    }
+
+    fn claude_env(provider_keys: &[(&str, &str)], environment: &[(&str, &str)], plan_signed_in: bool) -> std::collections::BTreeMap<String, String> {
+        let mut opts = options(false, Vec::new(), false, Approval::Full, "sonnet");
+        opts.provider_keys = provider_keys.iter().map(|(name, value)| (name.to_string(), value.to_string())).collect();
+        opts.environment = std::iter::once(("ANTHROPIC_BASE_URL", "https://api.anthropic.com"))
+            .chain(environment.iter().copied())
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        let launch = Launch { plan_signed_in, ..Launch::assume("claude") };
+        let mut cmd = super::run_command(&opts, &launch).expect("command builds");
+        cmd.env("CLAUDE_CONFIG_DIR", "/nonexistent/loka-test-claude-config");
+        let source = super::user_settings(&opts, &cmd);
+        super::detect::SignIn::settle(&mut cmd, source, &launch);
+        cmd.as_std().get_envs().filter_map(|(name, value)| Some((name.to_string_lossy().into_owned(), value?.to_string_lossy().into_owned()))).collect()
+    }
+
+    #[test]
+    fn the_claude_plan_sign_in_wins_over_an_api_key_from_keys() {
+        const KEY: (&str, &str) = ("ANTHROPIC_API_KEY", "sk-ant-api03-from-keys");
+        const TOKEN: (&str, &str) = ("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-plan");
+        const GATEWAY: (&str, &str) = ("ANTHROPIC_AUTH_TOKEN", "gateway-token");
+
+        let signed_in_only = claude_env(&[], &[], true);
+        assert!(!signed_in_only.contains_key("ANTHROPIC_API_KEY"));
+        let token_only = claude_env(&[TOKEN], &[], false);
+        assert!(token_only.contains_key("CLAUDE_CODE_OAUTH_TOKEN"), "a plan token is passed on");
+
+        let key_only = claude_env(&[KEY], &[], false);
+        assert!(key_only.contains_key("ANTHROPIC_API_KEY"), "with no plan sign-in the API key is the fallback");
+
+        let key_and_login = claude_env(&[KEY], &[GATEWAY], true);
+        assert!(!key_and_login.contains_key("ANTHROPIC_API_KEY"), "a stored plan login wins over the key");
+        assert!(!key_and_login.contains_key("ANTHROPIC_AUTH_TOKEN"), "and over a bearer token");
+        let key_and_token = claude_env(&[KEY, TOKEN], &[], false);
+        assert!(!key_and_token.contains_key("ANTHROPIC_API_KEY"), "a plan token wins over the key");
+        assert!(key_and_token.contains_key("CLAUDE_CODE_OAUTH_TOKEN"));
+        let granted_key_and_token = claude_env(&[TOKEN], &[KEY], false);
+        assert!(!granted_key_and_token.contains_key("ANTHROPIC_API_KEY"), "a key granted to the agent loses to the plan too");
+
+        let neither = claude_env(&[], &[], false);
+        assert!(!neither.contains_key("ANTHROPIC_API_KEY") && !neither.contains_key("CLAUDE_CODE_OAUTH_TOKEN"));
+
+        let gateway = claude_env(&[TOKEN], &[GATEWAY, ("ANTHROPIC_BASE_URL", "https://llm-gateway.example.com")], true);
+        assert!(gateway.contains_key("ANTHROPIC_AUTH_TOKEN"), "a gateway keeps its token, so the plan login is never sent to it");
+    }
+
+    #[test]
+    fn a_shell_api_key_in_the_claude_env_gives_way_to_the_plan_sign_in() {
+        let shell_env = |plan_signed_in: bool, token: bool| {
+            let mut cmd = tokio::process::Command::new("claude");
+            cmd.env("PATH", "/usr/bin").env("ANTHROPIC_API_KEY", "sk-ant-api03-from-the-shell");
+            if token {
+                cmd.env("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-plan");
+            }
+            super::detect::SignIn::settle(&mut cmd, super::detect::UserSettings::ReadByCli, &Launch { plan_signed_in, ..Launch::assume("claude") });
+            cmd.as_std().get_envs().filter(|(_, value)| value.is_some()).map(|(name, _)| name.to_string_lossy().into_owned()).collect::<Vec<_>>()
+        };
+        assert!(shell_env(false, false).contains(&"ANTHROPIC_API_KEY".to_string()), "key only: the shell key is used");
+        assert!(!shell_env(true, false).contains(&"ANTHROPIC_API_KEY".to_string()), "stored plan login and a shell key: the plan wins");
+        let both = shell_env(false, true);
+        assert!(!both.contains(&"ANTHROPIC_API_KEY".to_string()) && both.contains(&"CLAUDE_CODE_OAUTH_TOKEN".to_string()), "plan token and a shell key: the plan wins");
+        assert!(shell_env(true, false).contains(&"PATH".to_string()), "nothing else in the shell env changes");
+    }
+
+    struct SettledRun {
+        env: std::collections::BTreeMap<String, String>,
+        settings: serde_json::Value,
+    }
+
+    fn settled_run(lean: bool, home: &Path, process: &[(&str, &str)], plan_signed_in: bool) -> SettledRun {
+        let mut opts = options(lean, Vec::new(), false, Approval::Full, "sonnet");
+        opts.environment = std::iter::once(("ANTHROPIC_BASE_URL", "https://api.anthropic.com"))
+            .chain(process.iter().copied())
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        let launch = Launch { plan_signed_in, ..Launch::assume("claude") };
+        let mut cmd = super::run_command(&opts, &launch).expect("command builds");
+        cmd.env_remove("CLAUDE_CONFIG_DIR").env("HOME", home);
+        let source = super::user_settings(&opts, &cmd);
+        let sign_in = super::detect::SignIn::settle(&mut cmd, source, &launch);
+        let settings = sign_in.settings(Some(serde_json::json!({}))).unwrap();
+        let env = cmd.as_std().get_envs().filter_map(|(name, value)| Some((name.to_string_lossy().into_owned(), value?.to_string_lossy().into_owned()))).collect();
+        SettledRun { env, settings }
+    }
+
+    fn job_home(settings: &str) -> PathBuf {
+        let home = std::env::temp_dir().join(format!("claude-job-home-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(home.join(".claude/settings.json"), settings).unwrap();
+        home
+    }
+
+    #[test]
+    fn an_api_key_in_settings_json_never_beats_the_plan_sign_in() {
+        let home = job_home(r#"{"apiKeyHelper": "/opt/helper", "env": {"ANTHROPIC_API_KEY": "sk-ant-api03-from-settings", "ANTHROPIC_SMALL_FAST_MODEL": "haiku"}}"#);
+
+        let work = settled_run(false, &home, &[], true);
+        assert!(!work.env.contains_key("ANTHROPIC_API_KEY"));
+        assert_eq!(work.settings["env"]["ANTHROPIC_API_KEY"], serde_json::json!(""), "Claude Code applies settings.json env over the process env, so the key is blanked through --settings");
+        assert!(work.settings.get("apiKeyHelper").is_none(), "the CLI reads its own settings.json on work runs");
+
+        let main_turn = settled_run(true, &home, &[], true);
+        assert!(!main_turn.env.contains_key("ANTHROPIC_API_KEY"), "lean turns never copy the settings key back after the plan won");
+        assert_eq!(main_turn.env.get("ANTHROPIC_SMALL_FAST_MODEL").map(String::as_str), Some("haiku"), "the rest of the settings env still applies");
+        assert_eq!(main_turn.settings["apiKeyHelper"], serde_json::json!("/opt/helper"));
+        assert!(main_turn.settings.get("env").is_none());
+
+        let no_plan = settled_run(false, &home, &[], false);
+        assert!(no_plan.settings.get("env").is_none(), "with no plan sign-in the settings key stays the fallback");
+        let no_plan_turn = settled_run(true, &home, &[], false);
+        assert_eq!(no_plan_turn.env.get("ANTHROPIC_API_KEY").map(String::as_str), Some("sk-ant-api03-from-settings"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_gateway_only_in_the_job_users_settings_keeps_its_token() {
+        let home = job_home(r#"{"env": {"ANTHROPIC_BASE_URL": "https://llm-gateway.example.com"}}"#);
+        let token = [("ANTHROPIC_AUTH_TOKEN", "gateway-token")];
+        for lean in [true, false] {
+            let run = settled_run(lean, &home, &token, true);
+            assert_eq!(run.env.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str), Some("gateway-token"), "lean {lean}: the gateway keeps its token");
+            assert!(run.settings.get("env").is_none(), "lean {lean}: nothing is blanked for a gateway");
+        }
+        assert_eq!(
+            settled_run(true, &home, &token, true).env.get("ANTHROPIC_BASE_URL").map(String::as_str),
+            Some("https://llm-gateway.example.com"),
+            "the gateway Loka applies on lean turns comes from the same settings.json the decision read"
+        );
+        std::fs::write(home.join(".claude/settings.json"), r#"{"env": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}}"#).unwrap();
+        assert!(!settled_run(true, &home, &token, true).env.contains_key("ANTHROPIC_AUTH_TOKEN"), "the Anthropic API is no gateway, so the plan wins");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -1339,5 +1710,170 @@ mod tests {
         tokio::fs::remove_file(path)
             .await
             .expect("temp mcp config should be removable");
+    }
+    fn system(subtype: &str, task: &str) -> serde_json::Value {
+        serde_json::json!({"type": "system", "subtype": subtype, "task_id": task, "description": "cargo test -p loka-shared"})
+    }
+
+    #[test]
+    fn a_turn_without_background_tasks_finishes_at_its_result() {
+        let mut background = Background::default();
+        let now = Instant::now();
+        assert!(!background.keep_open(now, Some(Duration::from_secs(1200))));
+        assert!(background.note(now + Duration::from_secs(600), Some(Duration::from_secs(1200))).is_none());
+        background.track(&system("task_started", "t1"));
+        background.track(&system("task_notification", "t1"));
+        assert!(!background.keep_open(now, Some(Duration::from_secs(1200))), "tasks that ended inside the turn need no wait");
+    }
+
+    #[test]
+    fn background_tasks_running_at_the_result_keep_the_run_open_until_they_finish() {
+        let cap = Some(Duration::from_secs(1200));
+        let mut background = Background::default();
+        let start = Instant::now();
+        background.track(&system("task_started", "t1"));
+        assert!(background.keep_open(start, cap));
+        assert!(background.note(start + Duration::from_secs(5), cap).is_none(), "the CLI may pick up its own notification first");
+        let note = background.note(start + BACKGROUND_GRACE, cap).expect("asked to wait in the foreground");
+        assert!(note.contains("cargo test -p loka-shared") && note.contains("in the foreground") && note.contains("verdict"));
+        assert!(background.note(start + BACKGROUND_GRACE * 2, cap).is_none(), "one note per ended turn");
+        assert!(background.keep_open(start + Duration::from_secs(60), cap), "the agent ended again while the task still runs");
+        background.track(&system("task_notification", "t1"));
+        assert_eq!(background.note(start + Duration::from_secs(61), cap).as_deref(), Some(BACKGROUND_DONE_NOTE));
+        assert!(!background.keep_open(start + Duration::from_secs(90), cap), "the answer after the note ends the run");
+    }
+
+    #[test]
+    fn a_turn_the_cli_resumes_by_itself_gets_no_note() {
+        let cap = Some(Duration::from_secs(1200));
+        let mut background = Background::default();
+        let start = Instant::now();
+        background.track(&system("task_started", "t1"));
+        assert!(background.keep_open(start, cap));
+        background.track(&system("task_notification", "t1"));
+        background.track(&serde_json::json!({"type": "assistant", "message": {"content": []}}));
+        assert!(background.note(start + Duration::from_secs(60), cap).is_none());
+        assert!(!background.keep_open(start + Duration::from_secs(61), cap));
+    }
+
+    #[test]
+    fn waiting_stops_at_the_cap_and_the_next_answer_ends_the_run() {
+        let cap = Some(Duration::from_secs(1200));
+        let mut background = Background::default();
+        let start = Instant::now();
+        background.track(&system("task_started", "t1"));
+        for round in 0..BACKGROUND_ASKS {
+            let ended = start + Duration::from_secs(u64::from(round) * 60);
+            assert!(background.keep_open(ended, cap));
+            assert!(background.note(ended + BACKGROUND_GRACE, cap).is_some_and(|note| note.starts_with("[background tasks still running]")));
+        }
+        let ended = start + Duration::from_secs(600);
+        assert!(background.keep_open(ended, cap));
+        assert!(background.note(ended + BACKGROUND_GRACE, cap).is_none(), "stubborn turns are not asked forever");
+        let stop = background.note(start + Duration::from_secs(1200), cap).expect("stop note at the cap");
+        assert!(stop.starts_with("[stop waiting]") && stop.contains("20 minutes") && stop.contains("cargo test"));
+        assert!(!background.keep_open(start + Duration::from_secs(1300), cap), "after the stop note the run ends");
+        let mut off = Background::default();
+        off.track(&system("task_started", "t2"));
+        assert!(!off.keep_open(start, None), "WORLD_BACKGROUND_WAIT_SECS=0 turns waiting off");
+    }
+
+    #[test]
+    fn background_notes_count_toward_max_turns_so_a_spent_run_is_never_kept_open() {
+        let cap = Some(Duration::from_secs(1200));
+        let assistant = |id: &str| serde_json::json!({"type": "assistant", "message": {"id": id, "content": []}});
+        let mut background = Background::within(3);
+        let start = Instant::now();
+        for id in ["m1", "m1", "m2"] {
+            background.track(&assistant(id));
+        }
+        background.track(&system("task_started", "t1"));
+        assert!(background.keep_open(start, cap), "two of three turns used, the run waits");
+        assert!(background.note(start + BACKGROUND_GRACE, cap).is_some());
+        background.track(&assistant("m3"));
+        assert!(!background.keep_open(start + Duration::from_secs(60), cap), "the answer to the note used the last turn, so its result ends the run");
+        assert!(background.note(start + Duration::from_secs(60) + BACKGROUND_GRACE, cap).is_none(), "a run that used its turns gets no more notes");
+        let mut nested = Background::within(3);
+        for (id, parent) in [("m1", None), ("s1", Some("toolu_1")), ("m1", None), ("s2", Some("toolu_1")), ("s3", Some("toolu_1")), ("m2", None), ("s4", Some("toolu_1"))] {
+            nested.track(&serde_json::json!({"type": "assistant", "parent_tool_use_id": parent, "message": {"id": id, "content": []}}));
+        }
+        nested.track(&system("task_started", "t3"));
+        assert!(nested.keep_open(start, cap), "subagent messages and a repeated id are not turns of the run");
+        let mut unlimited = Background::within(0);
+        for id in ["a", "b", "c", "d"] {
+            unlimited.track(&assistant(id));
+        }
+        unlimited.track(&system("task_started", "t2"));
+        assert!(unlimited.keep_open(start, cap), "no turn limit leaves only the wait cap");
+    }
+
+    fn scratch() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("loka-fake-claude-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn fake_claude(dir: &Path, script: &str) -> tokio::process::Command {
+        let path = dir.join("claude");
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let mut cmd = tokio::process::Command::new(path);
+        cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        cmd
+    }
+
+    const FAKE_START: &str = r#"read first
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"s1","permissionMode":"auto"}'
+printf '%s\n' '{"type":"user","isReplay":true,"message":{"role":"user","content":"go"}}'"#;
+
+    #[tokio::test]
+    async fn a_review_that_ends_while_its_tests_run_still_gives_its_verdict() {
+        let dir = scratch();
+        let script = format!(
+            r#"{FAKE_START}
+printf '%s\n' '{{"type":"system","subtype":"task_started","task_id":"b1","description":"cargo test"}}'
+printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"Waiting on the test run.","session_id":"s1","num_turns":3}}'
+sleep 1
+printf '%s\n' '{{"type":"system","subtype":"task_notification","task_id":"b1","status":"completed"}}'
+read note
+case "$note" in *"background tasks finished"*) ;; *) echo '{{"type":"result","subtype":"success","is_error":false,"result":"wrong note"}}'; exit 0;; esac
+printf '%s\n' '{{"type":"user","isReplay":true,"message":{{"role":"user","content":"note"}}}}'
+printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"Tests pass.\n<!-- verdict {{\"verdict\":\"approve\"}} verdict -->","session_id":"s1"}}'
+read rest"#
+        );
+        let opts = options(false, Vec::new(), false, Approval::Auto, "opus");
+        let (_idle, steer) = tokio::sync::mpsc::unbounded_channel();
+        let run = super::run_steerable(&opts, fake_claude(&dir, &script), steer, Instant::now(), None);
+        let (result, _) = tokio::time::timeout(Duration::from_secs(60), run).await.expect("run finished").unwrap();
+        assert!(result.output.starts_with("Waiting on the test run."), "{}", result.output);
+        assert!(result.output.ends_with("<!-- verdict {\"verdict\":\"approve\"} verdict -->"), "{}", result.output);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_normal_run_and_a_cli_that_exits_mid_wait_both_return_at_once() {
+        let dir = scratch();
+        let normal = format!(
+            r#"{FAKE_START}
+printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"<!-- report {{\"status\":\"done\"}} report -->","session_id":"s1"}}'
+read rest"#
+        );
+        let opts = options(false, Vec::new(), false, Approval::Auto, "opus");
+        let (_idle, steer) = tokio::sync::mpsc::unbounded_channel();
+        let run = super::run_steerable(&opts, fake_claude(&dir, &normal), steer, Instant::now(), None);
+        let (result, _) = tokio::time::timeout(Duration::from_secs(10), run).await.expect("no wait without background tasks").unwrap();
+        assert!(result.output.contains("<!-- report"), "{}", result.output);
+
+        let exits = format!(
+            r#"{FAKE_START}
+printf '%s\n' '{{"type":"system","subtype":"task_started","task_id":"b1","description":"sleep"}}'
+printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"Waiting.","session_id":"s1"}}'
+exit 0"#
+        );
+        let (_idle, steer) = tokio::sync::mpsc::unbounded_channel();
+        let run = super::run_steerable(&opts, fake_claude(&dir, &exits), steer, Instant::now(), None);
+        let (result, _) = tokio::time::timeout(Duration::from_secs(10), run).await.expect("a closed CLI ends the wait").unwrap();
+        assert_eq!(result.output, "Waiting.");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

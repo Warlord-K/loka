@@ -12,6 +12,7 @@ use serde_json::Value;
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
+use crate::run_recording::{bill_session, emit_waiting, requeue_for_space, write_session_after_run, Reported};
 use crate::world::{emit_in, NewEvent};
 
 pub const CHANNEL_RUNNER_JOBS: &str = "runner_jobs";
@@ -19,6 +20,7 @@ pub const RUNNER_LEASE_SECONDS: i64 = 60;
 pub const RUNNER_SLEEP_GRACE_SECONDS: i64 = 3 * 3600;
 pub const RUNNER_OUTAGE_GRACE_SECONDS: i64 = 3600;
 pub const RUNNER_ASLEEP_ERROR: &str = "runner lease expired: the device was asleep or offline for over 3 hours";
+pub const WORK_RUN_KINDS: [&str; 4] = ["task", "followup", "review", "publish"];
 pub const RUNNER_UNREACHABLE_ERROR: &str = "runner lease expired: the runner could not reach Loka for over an hour";
 const AWAY_GRACE: &str = "make_interval(secs => CASE WHEN w.platform = 'macos' THEN $1::double precision ELSE $2::double precision END)";
 const RUNNER_AWAY: &str = "(l.expires_at <= NOW() AND (w.last_seen_at IS NULL OR w.last_seen_at < l.expires_at)
@@ -39,6 +41,7 @@ pub const WORKSPACE_SETTLE_SECONDS: f64 = 3600.0;
 pub const WORKSPACE_DONE_GRACE_SECONDS: f64 = 3.0 * 86400.0;
 pub const WORKSPACE_FAILED_GRACE_SECONDS: f64 = 7.0 * 86400.0;
 pub const WORKSPACE_IDLE_BUILD_SECONDS: f64 = 2.0 * 3600.0;
+pub const FOLDER_SESSION_IDLE_SECONDS: f64 = 3.0 * 86400.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct ClosedTask {
@@ -47,13 +50,15 @@ pub struct ClosedTask {
     pub idle_since: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DiskFolder {
     pub name: String,
     pub bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quest: Option<Uuid>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DiskNotice {
     pub free_bytes: u64,
     pub freed_bytes: u64,
@@ -63,30 +68,64 @@ pub struct DiskNotice {
     pub folders: Vec<DiskFolder>,
     #[serde(default)]
     pub caches_bytes: u64,
+    #[serde(default)]
+    pub held_bytes: u64,
+    #[serde(default)]
+    pub kept: Vec<DiskFolder>,
+    #[serde(default)]
+    pub unowned: Vec<DiskFolder>,
+    #[serde(default)]
+    pub outside_bytes: u64,
+}
+
+fn gb(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / 1e9)
+}
+
+fn folder_names(folders: &[DiskFolder]) -> String {
+    folders.iter().map(|folder| format!("{} ({})", folder.name, gb(folder.bytes))).collect::<Vec<_>>().join(", ")
 }
 
 impl DiskNotice {
-    pub fn message(&self, device: &str) -> String {
-        let gb = |bytes: u64| format!("{:.1} GB", bytes as f64 / 1e9);
-        let caches = if self.caches_bytes > 0 { format!(" Loka cleared build caches ({}).", gb(self.caches_bytes)) } else { String::new() };
-        let freed = if self.removed > 0 {
-            format!("{caches} Loka removed {} closed quest workspace{} ({}).", self.removed, if self.removed == 1 { "" } else { "s" }, gb(self.freed_bytes.saturating_sub(self.caches_bytes)))
+    pub fn cleared(&self) -> String {
+        let caches = if self.caches_bytes > 0 { format!(" Loka cleared build output and test scratch of quests that were not running ({}).", gb(self.caches_bytes)) } else { String::new() };
+        if self.removed > 0 {
+            format!("{caches} Loka removed {} closed quest folder{} ({}).", self.removed, if self.removed == 1 { "" } else { "s" }, gb(self.freed_bytes.saturating_sub(self.caches_bytes)))
         } else {
             caches
-        };
-        let biggest = if self.folders.is_empty() {
-            String::new()
-        } else {
-            let names: Vec<String> = self.folders.iter().map(|folder| format!("{} ({})", folder.name, gb(folder.bytes))).collect();
-            format!(" Biggest folders: {}.", names.join(", "))
-        };
+        }
+    }
+
+    pub fn left(&self) -> String {
+        let mut left = if self.removed == 0 && self.caches_bytes == 0 { " There was nothing Loka could safely clear on its own.".to_string() } else { String::new() };
+        if self.held_bytes > 0 {
+            left.push_str(&format!(" Another {} is build output of quests running now, which Loka clears once they finish.", gb(self.held_bytes)));
+        }
+        if !self.kept.is_empty() {
+            left.push_str(&format!(" A program you started still uses the build folders of {}, so Loka left them alone: quit it to free that space.", folder_names(&self.kept)));
+        }
+        if !self.unowned.is_empty() {
+            left.push_str(&format!(" These folders belong to no quest on this device, so delete them if nothing else uses them: {}.", folder_names(&self.unowned)));
+        }
+        if !self.folders.is_empty() {
+            left.push_str(&format!(" Biggest folders: {}.", folder_names(&self.folders)));
+        }
+        if self.outside_bytes > 0 {
+            left.push_str(&format!(" Loka has nothing more it can clear, so free up at least {} outside Loka, for example in Downloads, the Trash or other apps.", gb(self.outside_bytes)));
+        }
+        left
+    }
+
+    pub fn message(&self, device: &str) -> String {
         if self.still_low {
-            format!("{device} has only {} of disk space left.{freed}{biggest} New quest runs are paused there until space is free: delete what is listed, or clean up closed quests under Settings > Storage.", gb(self.free_bytes))
+            format!("{device} has only {} of disk space left, so new quest runs there wait and start by themselves once there is room.{}{}", gb(self.free_bytes), self.cleared(), self.left())
         } else {
-            format!("{device} was running low on disk space ({} free now).{freed}", gb(self.free_bytes))
+            format!("{device} was running low on disk space ({} free now).{}", gb(self.free_bytes), self.cleared())
         }
     }
 }
+
+const PREFIXES_PER_LOOKUP: usize = 500;
 
 pub const RUNNER_MOVED_ERROR: &str = "run stopped: the agent was moved to another device while it ran";
 pub const WORLD_WORKER_APP: &str = "loka-world";
@@ -221,6 +260,8 @@ pub struct RunnerHeartbeat {
     pub capabilities: Value,
     #[serde(default)]
     pub leases: Vec<Uuid>,
+    #[serde(default)]
+    pub disk_low: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +274,8 @@ pub struct RunnerPoll {
     pub shell: bool,
     #[serde(default)]
     pub terminal: bool,
+    #[serde(default)]
+    pub views: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -254,6 +297,8 @@ pub struct RunnerPolled {
     pub apps: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clean_workspaces: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clean_caches: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -446,6 +491,8 @@ pub struct RunnerJob {
     pub metered: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_scan: Option<crate::setup_scan::ScanRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1317,6 +1364,66 @@ impl RunnerStore {
         .await?)
     }
 
+    pub async fn quests_by_prefix(&self, runner_id: Uuid, prefixes: &[String]) -> Result<Vec<(String, Uuid)>> {
+        let (mut names, mut lows, mut highs) = (Vec::new(), Vec::new(), Vec::new());
+        for prefix in prefixes.iter().filter(|prefix| prefix.len() == 12 && prefix.bytes().all(|byte| byte.is_ascii_hexdigit())).take(PREFIXES_PER_LOOKUP) {
+            let (Ok(low), Ok(high)) = (Uuid::parse_str(&format!("{prefix}{}", "0".repeat(20))), Uuid::parse_str(&format!("{prefix}{}", "f".repeat(20)))) else {
+                continue;
+            };
+            names.push(prefix.to_ascii_lowercase());
+            lows.push(low);
+            highs.push(high);
+        }
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(sqlx::query_as::<_, (String, Uuid)>(
+            "WITH me AS (SELECT id, owner_user_id FROM world_runners WHERE id = $4),
+             wanted AS (SELECT * FROM unnest($1::text[], $2::uuid[], $3::uuid[]) AS w(prefix, low, high)),
+             hits AS (
+               SELECT w.prefix, t.id
+                 FROM wanted w
+                 JOIN agent_tasks t ON t.id BETWEEN w.low AND w.high
+                 LEFT JOIN agent_profiles a ON a.id = t.assigned_agent_id
+                 JOIN me ON a.owner_user_id = me.owner_user_id OR a.runner_id = me.id
+                         OR (t.assigned_agent_id IS NULL AND t.user_id = me.owner_user_id)
+             )
+             SELECT prefix, (array_agg(id))[1] FROM hits GROUP BY prefix HAVING count(*) = 1",
+        )
+        .bind(&names)
+        .bind(&lows)
+        .bind(&highs)
+        .bind(runner_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn closed_sessions(&self, runner_id: Uuid, session_ids: &[Uuid]) -> Result<Vec<Uuid>> {
+        Ok(sqlx::query_scalar::<_, Uuid>(
+            "WITH me AS (SELECT id, owner_user_id FROM world_runners WHERE id = $2),
+             state AS (
+               SELECT i.id, s.role, s.status,
+                      COALESCE(GREATEST(s.updated_at, (SELECT MAX(COALESCE(r.finished_at, r.created_at)) FROM session_runs r WHERE r.session_id = i.id)), '-infinity'::timestamptz) AS idle_since
+                 FROM unnest($1::uuid[]) AS i(id)
+                 LEFT JOIN agent_sessions s ON s.id = i.id
+                 LEFT JOIN agent_profiles a ON a.id = s.agent_id
+                 JOIN me ON s.id IS NULL OR a.owner_user_id = me.owner_user_id OR s.runner_id = me.id
+                WHERE NOT EXISTS (SELECT 1 FROM session_runs r WHERE r.session_id = i.id AND r.status IN ('queued', 'running'))
+             )
+             SELECT id FROM state
+              WHERE idle_since < NOW() - make_interval(secs => $3::double precision)
+                AND (role IS NULL
+                     OR role IN ('direct', 'quick') AND status = 'archived'
+                     OR role = 'direct' AND idle_since < NOW() - make_interval(secs => $4::double precision))",
+        )
+        .bind(session_ids)
+        .bind(runner_id)
+        .bind(WORKSPACE_SETTLE_SECONDS)
+        .bind(FOLDER_SESSION_IDLE_SECONDS)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     pub async fn idle_tasks(&self, runner_id: Uuid, task_ids: &[Uuid]) -> Result<Vec<Uuid>> {
         Ok(sqlx::query_scalar::<_, Uuid>(
             "WITH me AS (SELECT id, owner_user_id FROM world_runners WHERE id = $2)
@@ -1348,6 +1455,16 @@ impl RunnerStore {
         .unwrap_or(false))
     }
 
+    pub async fn take_cache_cleanup(&self, runner_id: Uuid) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "UPDATE world_runners SET clean_caches_at = NULL WHERE id = $1 AND clean_caches_at IS NOT NULL RETURNING true",
+        )
+        .bind(runner_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(false))
+    }
+
     pub async fn warn_disk_low(&self, runner_id: Uuid, notice: &DiskNotice) -> Result<bool> {
         let Some((owner, name)) = sqlx::query_as::<_, (Uuid, String)>("SELECT owner_user_id, name FROM world_runners WHERE id = $1")
             .bind(runner_id)
@@ -1365,6 +1482,23 @@ impl RunnerStore {
         .await?;
         if recent {
             return Ok(false);
+        }
+        let mut notice = notice.clone();
+        let quests: Vec<Uuid> = notice.kept.iter().filter_map(|folder| folder.quest).collect();
+        if !quests.is_empty() {
+            let titles: Vec<(Uuid, String)> = sqlx::query_as(
+                "SELECT t.id, t.title FROM agent_tasks t LEFT JOIN agent_profiles a ON a.id = t.assigned_agent_id
+                  WHERE t.id = ANY($1) AND (a.owner_user_id = $2 OR t.user_id = $2)",
+            )
+            .bind(&quests)
+            .bind(owner)
+            .fetch_all(&self.pool)
+            .await?;
+            for folder in &mut notice.kept {
+                if let Some((_, title)) = titles.iter().find(|(id, _)| Some(*id) == folder.quest) {
+                    folder.name = format!("\"{title}\"");
+                }
+            }
         }
         let message = notice.message(&name);
         let mut tx = self.pool.begin().await?;
@@ -1384,6 +1518,52 @@ impl RunnerStore {
             None,
         )
         .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn set_disk_wait(&self, runner_id: Uuid, low: bool) -> Result<usize> {
+        let mut tx = self.pool.begin().await?;
+        let changed = if low {
+            sqlx::query_as::<_, (Uuid, Uuid, Uuid, Option<Uuid>, String)>(
+                "UPDATE session_runs r SET waiting_for = 'disk'
+                 WHERE r.runner_id = $1 AND r.status = 'queued' AND r.waiting_for IS NULL AND r.kind = ANY($2)
+                   AND NOT EXISTS (SELECT 1 FROM session_runs active WHERE active.session_id = r.session_id AND active.status = 'running')
+                 RETURNING r.id, r.session_id, r.agent_id, r.task_id, r.kind",
+            )
+        } else {
+            sqlx::query_as::<_, (Uuid, Uuid, Uuid, Option<Uuid>, String)>(
+                "UPDATE session_runs r SET waiting_for = NULL
+                 WHERE r.runner_id = $1 AND r.status = 'queued' AND r.waiting_for = 'disk' AND r.kind = ANY($2)
+                 RETURNING r.id, r.session_id, r.agent_id, r.task_id, r.kind",
+            )
+        }
+        .bind(runner_id)
+        .bind(WORK_RUN_KINDS.map(String::from).to_vec())
+        .fetch_all(&mut *tx)
+        .await?;
+        for (run_id, session_id, agent_id, task_id, kind) in &changed {
+            emit_waiting(&mut tx, *run_id, *session_id, *agent_id, *task_id, kind, low).await?;
+        }
+        tx.commit().await?;
+        Ok(changed.len())
+    }
+
+    pub async fn requeue_for_space(&self, lease: &LeaseContext, error: &str) -> Result<bool> {
+        if !crate::run_recording::waits_for_space(&lease.kind, error) {
+            return Ok(false);
+        }
+        let mut tx = self.pool.begin().await?;
+        if !lock_finishing_lease(&mut tx, lease).await? {
+            return Ok(false);
+        }
+        if !requeue_for_space(&mut tx, lease.run_id, Some(lease.lease_id)).await? {
+            return Ok(false);
+        }
+        sqlx::query("UPDATE runner_leases SET status = 'completed', finished_at = NOW(), completion_payload = NULL WHERE id = $1 AND status = 'finishing'")
+            .bind(lease.lease_id)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -1449,6 +1629,10 @@ impl RunnerStore {
             tx.rollback().await?;
             return Ok(None);
         };
+        sqlx::query("DELETE FROM runner_leases WHERE run_id = $1 AND status IN ('completed', 'failed', 'cancelled', 'expired')")
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
             "INSERT INTO runner_leases (id, run_id, runner_id, mcp_token_hash, expires_at)
              VALUES ($1, $2, $3, $4, $5)",
@@ -1462,7 +1646,7 @@ impl RunnerStore {
         .await?;
         sqlx::query(
             "UPDATE session_runs SET status = 'running', claimed_by = $2, started_at = NOW(), heartbeat_at = NOW(),
-               lease_id = $3, lease_expires_at = $4 WHERE id = $1",
+               lease_id = $3, lease_expires_at = $4, waiting_for = NULL WHERE id = $1",
         )
         .bind(run_id)
         .bind(format!("runner:{runner_id}"))
@@ -1626,6 +1810,31 @@ impl RunnerStore {
         .await?)
     }
 
+    pub async fn late_lease(&self, runner_id: Uuid, lease_id: Uuid) -> Result<Option<LeaseContext>> {
+        Ok(sqlx::query_as::<_, LeaseContext>(
+            &serving("SELECT l.id AS lease_id, l.run_id, l.runner_id, r.agent_id, r.session_id, a.owner_user_id, r.kind
+             FROM runner_leases l
+             JOIN session_runs r ON r.id = l.run_id
+             JOIN agent_profiles a ON a.id = r.agent_id
+             JOIN world_runners w ON w.id = l.runner_id
+             WHERE l.id = $1 AND l.runner_id = $2
+               AND l.status IN ('cancelled', 'expired', 'failed')
+               AND r.status IN ('failed', 'cancelled', 'timed_out') AND r.lease_id = l.id
+               AND __HOME__ AND __SERVES__"),
+        )
+        .bind(lease_id)
+        .bind(runner_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    pub async fn keep_late_spend(&self, lease: &LeaseContext, reported: &Reported) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let kept = crate::run_recording::keep_spend_of_closed_run(&mut tx, lease.run_id, lease.session_id, reported).await?;
+        tx.commit().await?;
+        Ok(kept)
+    }
+
     pub async fn lease_for_completion(
         &self,
         runner_id: Uuid,
@@ -1787,51 +1996,44 @@ impl RunnerStore {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn apply_success(
         &self,
         lease: &LeaseContext,
         output: &str,
         cli_session_id: Option<&str>,
-        usage_baseline: &Value,
-        context_tokens: i64,
-        cost_usd: f64,
-        input_tokens: i64,
-        cached_input_tokens: i64,
-        output_tokens: i64,
+        reported: Option<&Reported>,
+        context_tokens: Option<i64>,
     ) -> Result<ApplyCompletion> {
         let mut tx = self.pool.begin().await?;
         if !lock_finishing_lease(&mut tx, lease).await? {
             return Ok(ApplyCompletion::Stopped);
         }
-        let changed = sqlx::query(
-            "UPDATE session_runs SET status = 'completed', output = $2, error = NULL,
-               cost_usd = $3, input_tokens = $4, cached_input_tokens = $5,
-               output_tokens = $6, finished_at = NOW()
-             WHERE id = $1 AND status = 'running' AND lease_id = $7",
-        )
-        .bind(lease.run_id)
-        .bind(output)
-        .bind(cost_usd)
-        .bind(input_tokens)
-        .bind(cached_input_tokens)
-        .bind(output_tokens)
-        .bind(lease.lease_id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        if changed == 1 {
+        let live = sqlx::query_scalar::<_, bool>("SELECT status = 'running' AND lease_id = $2 FROM session_runs WHERE id = $1 FOR UPDATE")
+            .bind(lease.run_id)
+            .bind(lease.lease_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .unwrap_or(false);
+        if live {
+            let billed = match reported {
+                Some(reported) => bill_session(&mut tx, lease.session_id, reported).await?,
+                None => None,
+            };
             sqlx::query(
-                "UPDATE agent_sessions SET cli_session_id = COALESCE($2, cli_session_id),
-                   summary = CASE WHEN role = 'main' AND $2 IS NOT NULL THEN NULL ELSE summary END,
-                   usage_baseline = $3, context_tokens = $4, updated_at = NOW() WHERE id = $1",
+                "UPDATE session_runs SET status = 'completed', output = $2, error = NULL,
+                   cost_usd = $3, input_tokens = $4, cached_input_tokens = $5,
+                   output_tokens = $6, finished_at = NOW()
+                 WHERE id = $1",
             )
-            .bind(lease.session_id)
-            .bind(cli_session_id)
-            .bind(usage_baseline)
-            .bind(context_tokens)
+            .bind(lease.run_id)
+            .bind(output)
+            .bind(billed.as_ref().map_or(0.0, |billed| billed.cost_usd))
+            .bind(billed.as_ref().map_or(0, |billed| billed.input_tokens))
+            .bind(billed.as_ref().map_or(0, |billed| billed.cached_input_tokens))
+            .bind(billed.as_ref().map_or(0, |billed| billed.output_tokens))
             .execute(&mut *tx)
             .await?;
+            write_session_after_run(&mut tx, lease.session_id, cli_session_id, context_tokens).await?;
             tx.commit().await?;
             return Ok(ApplyCompletion::Applied);
         }
@@ -1954,14 +2156,25 @@ impl RunnerStore {
              FROM world_runners w, users u, session_runs r
              WHERE l.id = $1 AND l.runner_id = $2 AND l.status = 'finishing'
                AND w.id = l.runner_id AND u.id = w.owner_user_id AND r.id = l.run_id
-               AND r.status IN ('completed', 'failed')",
+               AND (r.status IN ('completed', 'failed') OR (r.status = 'queued' AND r.waiting_for IS NOT NULL))",
         )
         .bind(lease_id)
         .bind(runner_id)
         .execute(&self.pool)
         .await?
         .rows_affected();
-        Ok(changed == 1)
+        if changed == 1 {
+            return Ok(true);
+        }
+        Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM runner_leases l JOIN session_runs r ON r.id = l.run_id
+                            WHERE l.id = $1 AND l.runner_id = $2 AND l.status = 'completed'
+                              AND r.status = 'queued' AND r.lease_id IS NULL AND r.claimed_by IS NULL)",
+        )
+        .bind(lease_id)
+        .bind(runner_id)
+        .fetch_one(&self.pool)
+        .await?)
     }
 
     pub async fn mark_run_inbox(&self, run_id: Uuid, inbox_ids: &[i64]) -> Result<()> {
@@ -2132,6 +2345,20 @@ impl RunnerStore {
         .await?)
     }
 
+    pub async fn realign_session_devices(&self) -> Result<Vec<Uuid>> {
+        Ok(sqlx::query_scalar::<_, Uuid>(
+            "SELECT a.id FROM agent_profiles a
+             WHERE a.runner_id IS NOT NULL
+               AND EXISTS (
+                 SELECT 1 FROM agent_sessions s
+                 WHERE s.agent_id = a.id AND s.runner_id IS NULL AND s.cli_session_id IS NULL
+                   AND s.status <> 'archived' AND s.role <> 'direct')
+               AND world_hand_device_to_sessions(a.id) > 0",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     pub async fn assign_default_runner(&self, agent_id: Uuid) -> Result<Option<Uuid>> {
         if self.cloud_online().await? {
             return Ok(None);
@@ -2237,8 +2464,9 @@ impl RunnerStore {
                JOIN world_runners w ON w.id = t.runner_id
                JOIN users u ON u.id = w.owner_user_id
                WHERE t.status = 'pending' AND t.closed_at IS NULL AND t.runner_id = $1
-                 AND w.status IN ('online', 'offline') AND u.world_role IN ('write', 'admin'))"
-                .replace("{ready}", &crate::world::inbox_ready_sql("a"))),
+                 AND w.status IN ('online', 'offline') AND u.world_role IN ('write', 'admin') AND {serves_kind})"
+                .replace("{ready}", &crate::world::inbox_ready_sql("a"))
+                .replace("{serves_kind}", crate::terminal::SERVES_KIND)),
         )
         .bind(runner_id)
         .fetch_one(&self.pool)
@@ -2451,6 +2679,39 @@ mod tests {
     }
 
     #[test]
+    fn a_disk_notice_names_only_what_is_left_for_the_person() {
+        let gb = 1_000_000_000;
+        let folder = |name: &str, bytes: u64| DiskFolder { name: name.into(), bytes, quest: None };
+        let waiting = DiskNotice { free_bytes: gb / 10, freed_bytes: 9 * gb, caches_bytes: 9 * gb, still_low: true, held_bytes: 6 * gb, ..Default::default() };
+        let message = waiting.message("Mac");
+        assert!(message.starts_with("Mac has only 0.1 GB of disk space left, so new quest runs there wait and start by themselves once there is room."), "{message}");
+        assert!(message.contains("cleared build output and test scratch of quests that were not running (9.0 GB)") && message.contains("6.0 GB is build output of quests running now"), "{message}");
+        for nothing_to_do in ["quit", "delete", "outside Loka", "Biggest folders", "nothing Loka could"] {
+            assert!(!message.contains(nothing_to_do), "running quests clear on their own, so nothing is asked: {message}");
+        }
+
+        let stuck = DiskNotice {
+            still_low: true,
+            free_bytes: gb / 10,
+            kept: vec![DiskFolder { quest: Some(Uuid::new_v4()), ..folder("\"Terminals\"", 3 * gb) }],
+            unowned: vec![folder("/tmp/loka-q-0123456789ab", 5 * gb)],
+            outside_bytes: 2 * gb,
+            ..Default::default()
+        };
+        let message = stuck.message("Mac");
+        assert!(message.contains("nothing Loka could safely clear"), "{message}");
+        assert!(message.contains("still uses the build folders of \"Terminals\" (3.0 GB)") && message.contains("quit it"), "{message}");
+        assert!(message.contains("belong to no quest on this device") && message.contains("/tmp/loka-q-0123456789ab (5.0 GB)"), "{message}");
+        assert!(message.contains("free up at least 2.0 GB outside Loka"), "{message}");
+        assert!(!message.contains('\u{2014}'));
+
+        let older_runner: DiskNotice = serde_json::from_value(json!({ "free_bytes": gb, "freed_bytes": 0, "removed": 0, "still_low": true, "folders": [{ "name": "temp/loka-q-x", "bytes": gb }] })).unwrap();
+        assert!(older_runner.message("Mac").contains("Biggest folders: temp/loka-q-x (1.0 GB)"));
+        let recovered = DiskNotice { free_bytes: 20 * gb, removed: 2, freed_bytes: 12 * gb, ..Default::default() };
+        assert_eq!(recovered.message("Mac"), "Mac was running low on disk space (20.0 GB free now). Loka removed 2 closed quest folders (12.0 GB).");
+    }
+
+    #[test]
     fn a_followup_needs_a_review_only_when_it_changed_the_pull_request() {
         assert_eq!(pr_sync_from(Some("MERGED"), true, true), PrSync::Merged);
         assert_eq!(pr_sync_from(Some("OPEN"), false, false), PrSync::Unchanged);
@@ -2521,7 +2782,7 @@ mod tests {
         let url = std::env::var("TEST_DATABASE_URL").ok()?;
         Some(
             PgPoolOptions::new()
-                .max_connections(8)
+                .max_connections(std::env::var("DATABASE_MAX_CONNECTIONS").ok().and_then(|n| n.parse().ok()).unwrap_or(8))
                 .connect(&url)
                 .await
                 .unwrap(),
@@ -3168,9 +3429,11 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap_err();
-        assert_eq!(
-            followup_error.to_string(),
-            "archived sessions cannot receive follow-ups"
+        assert!(
+            followup_error
+                .to_string()
+                .starts_with("archived sessions cannot receive follow-ups. Resume the quest instead: start_task on task_id"),
+            "{followup_error}"
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -3449,14 +3712,7 @@ mod tests {
                 .apply_success(
                     &lease,
                     "done",
-                    Some("cli-session"),
-                    &json!({}),
-                    12,
-                    0.1,
-                    10,
-                    2,
-                    3,
-                )
+                    Some("cli-session"), Some(&Reported { cost_usd: 0.1, usage: RunnerUsage { input_tokens: 10, cached_input_tokens: 2, output_tokens: 3, context_tokens: 0 } }), Some(12))
                 .await
                 .unwrap(),
             ApplyCompletion::Applied
@@ -3567,6 +3823,288 @@ mod tests {
         sqlx::query("DELETE FROM agent_profiles WHERE id = ANY($1)").bind(vec![fresh, wrong_cli, busy, idle]).execute(&pool).await.unwrap();
     }
 
+    async fn first_turn_is_claimed(pool: &PgPool, store: &RunnerStore, runner: Uuid, agent_id: Uuid, label: &str) {
+        let session: Uuid = match sqlx::query_scalar("SELECT id FROM agent_sessions WHERE agent_id = $1 AND role = 'main' AND status = 'active'")
+            .bind(agent_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+        {
+            Some(existing) => existing,
+            None => sqlx::query_scalar(
+                "INSERT INTO agent_sessions (agent_id, role, backend, model, working_dir) VALUES ($1, 'main', 'codex', 'test-model', $2) RETURNING id",
+            )
+            .bind(agent_id)
+            .bind(format!("agents/{agent_id}"))
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        };
+        let run: Uuid = sqlx::query_scalar(
+            "INSERT INTO session_runs (session_id, agent_id, kind, status, prompt) VALUES ($1, $2, 'turn', 'queued', '[memory handoff] first turn') RETURNING id",
+        )
+        .bind(session)
+        .bind(agent_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(store.has_work(runner).await.unwrap(), "{label}: the device is woken for the first turn");
+        let claimed = store.claim_kinds(runner, &token(label), &["turn".to_string()]).await.unwrap();
+        assert_eq!(claimed.map(|c| c.run_id), Some(run), "{label}: the device claims the first turn");
+    }
+
+    #[tokio::test]
+    async fn the_first_turn_of_a_new_or_forked_agent_runs_on_the_device_that_adopts_it() {
+        let _global = global_state().lock().await;
+        let Some(pool) = pool().await else { return };
+        let owner = user(&pool).await;
+        let store = RunnerStore::new(pool.clone());
+        let runner = registration(&store, owner, "First turn Mac").await.runner.id;
+        store.heartbeat(runner, &json!({ "backends": { "codex": true } })).await.unwrap();
+        let source = agent(&pool, owner).await;
+        let world = crate::world::WorldStore::new(pool.clone());
+        let forked = world.fork_agent(source, owner, &format!("fork-{}", Uuid::new_v4().simple()), "Fork", "Ana").await.unwrap().expect("fork").agent_id;
+        sqlx::query("UPDATE agent_profiles SET runner_id = NULL WHERE id = $1").bind(forked).execute(&pool).await.unwrap();
+        let with_session = agent(&pool, owner).await;
+        sqlx::query("INSERT INTO agent_sessions (agent_id, role, backend, model, status) VALUES ($1, 'main', 'codex', 'test-model', 'active')")
+            .bind(with_session)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let brand_new = agent(&pool, owner).await;
+        let mut adopted = Vec::new();
+        for id in [forked, with_session, brand_new] {
+            sqlx::query("INSERT INTO agent_inbox (agent_id, kind, payload) VALUES ($1, 'message', '{}')").bind(id).execute(&pool).await.unwrap();
+            adopted.extend(store.adopt_stranded(runner, Some(id)).await.unwrap());
+        }
+        assert_eq!(adopted, vec![forked, with_session, brand_new], "all three are adopted by the device");
+        first_turn_is_claimed(&pool, &store, runner, forked, "fork").await;
+        first_turn_is_claimed(&pool, &store, runner, with_session, "session-first").await;
+        first_turn_is_claimed(&pool, &store, runner, brand_new, "brand-new").await;
+        sqlx::query("DELETE FROM agent_profiles WHERE id = ANY($1)").bind(vec![source, forked, with_session, brand_new]).execute(&pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_fork_gets_a_device_when_it_is_made() {
+        let _global = global_state().lock().await;
+        let Some(pool) = pool().await else { return };
+        let owner = user(&pool).await;
+        let store = RunnerStore::new(pool.clone());
+        let runner = registration(&store, owner, "Fork Mac").await.runner.id;
+        store.heartbeat(runner, &json!({ "backends": { "codex": true } })).await.unwrap();
+        let source = agent(&pool, owner).await;
+        let world = crate::world::WorldStore::new(pool.clone());
+        let forked = world.fork_agent(source, owner, &format!("fork-{}", Uuid::new_v4().simple()), "Fork", "Ana").await.unwrap().expect("fork").agent_id;
+        let placed: Option<Uuid> = sqlx::query_scalar("SELECT runner_id FROM agent_profiles WHERE id = $1").bind(forked).fetch_one(&pool).await.unwrap();
+        assert_eq!(placed, Some(runner), "a fork is placed like every other new agent");
+        let session_device: Option<Uuid> = sqlx::query_scalar("SELECT runner_id FROM agent_sessions WHERE agent_id = $1 AND role = 'main'").bind(forked).fetch_one(&pool).await.unwrap();
+        assert_eq!(session_device, Some(runner), "its memory session lives on that device");
+        let folder: Option<String> = sqlx::query_scalar("SELECT working_dir FROM agent_sessions WHERE agent_id = $1 AND role = 'main'").bind(forked).fetch_one(&pool).await.unwrap();
+        assert_eq!(folder, Some(format!("agents/{forked}")), "and has the same home folder as every other main session");
+        first_turn_is_claimed(&pool, &store, runner, forked, "placed-fork").await;
+        sqlx::query("DELETE FROM agent_profiles WHERE id = ANY($1)").bind(vec![source, forked]).execute(&pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_migration_frees_first_turns_that_were_stranded_without_a_device() {
+        let _global = global_state().lock().await;
+        let Some(pool) = pool().await else { return };
+        let owner = user(&pool).await;
+        let store = RunnerStore::new(pool.clone());
+        let runner = registration(&store, owner, "Stranded Mac").await.runner.id;
+        store.heartbeat(runner, &json!({ "backends": { "codex": true } })).await.unwrap();
+        let stranded = agent(&pool, owner).await;
+        let started = agent(&pool, owner).await;
+        for id in [stranded, started] {
+            sqlx::query("UPDATE agent_profiles SET runner_id = $2 WHERE id = $1").bind(id).bind(runner).execute(&pool).await.unwrap();
+        }
+        let mut sessions = Vec::new();
+        for (id, cli_session) in [(stranded, None), (started, Some("cli-1"))] {
+            let session: Uuid = sqlx::query_scalar(
+                "INSERT INTO agent_sessions (agent_id, role, backend, model, status, cli_session_id) VALUES ($1, 'main', 'codex', 'test-model', 'active', $2) RETURNING id",
+            )
+            .bind(id)
+            .bind(cli_session)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            sqlx::query("UPDATE agent_sessions SET runner_id = NULL WHERE id = $1").bind(session).execute(&pool).await.unwrap();
+            let run: Uuid = sqlx::query_scalar("INSERT INTO session_runs (session_id, agent_id, kind, status, prompt) VALUES ($1, $2, 'turn', 'queued', 'first turn') RETURNING id")
+                .bind(session)
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            sessions.push((session, run));
+        }
+        assert!(store.claim_kinds(runner, &token("before"), &["turn".to_string()]).await.unwrap().is_none(), "stranded before the repair");
+        sqlx::raw_sql(include_str!("../../migrations/149_agent_device_reaches_sessions.sql")).execute(&pool).await.unwrap();
+        let claimed = store.claim_kinds(runner, &token("after"), &["turn".to_string()]).await.unwrap();
+        assert_eq!(claimed.map(|c| c.run_id), Some(sessions[0].1), "the never-started session got its device");
+        let untouched: Option<Uuid> = sqlx::query_scalar("SELECT runner_id FROM agent_sessions WHERE id = $1").bind(sessions[1].0).fetch_one(&pool).await.unwrap();
+        assert_eq!(untouched, None, "a session that already ran a CLI keeps its own history and device");
+        sqlx::query("DELETE FROM agent_profiles WHERE id = ANY($1)").bind(vec![stranded, started]).execute(&pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_sweep_hands_the_device_to_first_turns_that_no_trigger_reached() {
+        let _global = global_state().lock().await;
+        let Some(pool) = pool().await else { return };
+        let owner = user(&pool).await;
+        let store = RunnerStore::new(pool.clone());
+        let runner = registration(&store, owner, "Sweep Mac").await.runner.id;
+        store.heartbeat(runner, &json!({ "backends": { "codex": true } })).await.unwrap();
+        let stranded = agent(&pool, owner).await;
+        sqlx::query("UPDATE agent_profiles SET runner_id = $2 WHERE id = $1").bind(stranded).bind(runner).execute(&pool).await.unwrap();
+        let session: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_sessions (agent_id, role, backend, model, status) VALUES ($1, 'main', 'codex', 'test-model', 'active') RETURNING id",
+        )
+        .bind(stranded)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE agent_sessions SET runner_id = NULL WHERE id = $1").bind(session).execute(&pool).await.unwrap();
+        let run: Uuid = sqlx::query_scalar("INSERT INTO session_runs (session_id, agent_id, kind, status, prompt) VALUES ($1, $2, 'turn', 'queued', 'first turn') RETURNING id")
+            .bind(session)
+            .bind(stranded)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(store.claim_kinds(runner, &token("before-sweep"), &["turn".to_string()]).await.unwrap().is_none());
+        assert!(store.realign_session_devices().await.unwrap().contains(&stranded), "the sweep names the agent it repaired");
+        let claimed = store.claim_kinds(runner, &token("after-sweep"), &["turn".to_string()]).await.unwrap();
+        assert_eq!(claimed.map(|c| c.run_id), Some(run), "the first turn starts after the sweep");
+        assert!(!store.realign_session_devices().await.unwrap().contains(&stranded), "a repaired agent is not touched again");
+        sqlx::query("DELETE FROM agent_profiles WHERE id = $1").bind(stranded).execute(&pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handing_a_device_to_queued_first_turns_wakes_that_device() {
+        let _global = global_state().lock().await;
+        let Some(pool) = pool().await else { return };
+        if std::env::var("DATABASE_MAX_CONNECTIONS").as_deref() == Ok("1") {
+            eprintln!("SKIPPED: listening for the wake needs a second connection, run on a real Postgres");
+            return;
+        }
+        let owner = user(&pool).await;
+        let store = RunnerStore::new(pool.clone());
+        let runner = registration(&store, owner, "Wake Mac").await.runner.id;
+        let waiting = agent(&pool, owner).await;
+        let session: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_sessions (agent_id, role, backend, model, status) VALUES ($1, 'main', 'codex', 'test-model', 'active') RETURNING id",
+        )
+        .bind(waiting)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO session_runs (session_id, agent_id, kind, status, prompt) VALUES ($1, $2, 'turn', 'queued', 'first turn')")
+            .bind(session)
+            .bind(waiting)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut listener = sqlx::postgres::PgListener::connect(&std::env::var("TEST_DATABASE_URL").unwrap()).await.unwrap();
+        listener.listen("runner_jobs").await.unwrap();
+        sqlx::query("UPDATE agent_profiles SET runner_id = $2 WHERE id = $1").bind(waiting).bind(runner).execute(&pool).await.unwrap();
+        let wanted = runner.to_string();
+        let woke = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if listener.recv().await.unwrap().payload() == wanted {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(woke.is_ok(), "the device is woken the moment its agent's first turn becomes claimable");
+        sqlx::query("DELETE FROM agent_profiles WHERE id = $1").bind(waiting).execute(&pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_sessions_are_archived_folder_and_quick_chats_that_nothing_is_running() {
+        let _global = global_state().lock().await;
+        let Some(pool) = pool().await else { return };
+        let owner = user(&pool).await;
+        let other = user(&pool).await;
+        let mine = agent(&pool, owner).await;
+        let theirs = agent(&pool, other).await;
+        let store = RunnerStore::new(pool.clone());
+        let runner = registration(&store, owner, "Session Mac").await.runner.id;
+        let session = |agent: Uuid, role: &'static str, status: &'static str, secs: i64| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Uuid>(
+                    "INSERT INTO agent_sessions (agent_id, role, backend, model, status, updated_at)
+                     VALUES ($1, $2, 'claude', 'test-model', $3, NOW() - make_interval(secs => $4::double precision)) RETURNING id",
+                )
+                .bind(agent)
+                .bind(role)
+                .bind(status)
+                .bind(secs as f64)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let day = 86_400;
+        let archived_direct = session(mine, "direct", "archived", 2 * day).await;
+        let archived_quick = session(mine, "quick", "archived", 2 * day).await;
+        let archived_fresh = session(mine, "direct", "archived", 300).await;
+        let active = session(mine, "direct", "active", day).await;
+        let idle_direct = session(mine, "direct", "active", 4 * day).await;
+        let idle_quick = session(mine, "quick", "active", 30 * day).await;
+        let busy = session(mine, "quick", "archived", 30 * day).await;
+        let archived_task = session(mine, "task", "archived", 30 * day).await;
+        let foreign = session(theirs, "direct", "archived", 30 * day).await;
+        let deleted = Uuid::new_v4();
+        sqlx::query("INSERT INTO session_runs (session_id, agent_id, kind, status, prompt) VALUES ($1, $2, 'quick', 'running', 'go')")
+            .bind(busy)
+            .bind(mine)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut closed = store.closed_sessions(runner, &[archived_direct, archived_quick, archived_fresh, active, idle_direct, idle_quick, busy, archived_task, foreign, deleted]).await.unwrap();
+        closed.sort();
+        let mut expected = vec![archived_direct, archived_quick, idle_direct, deleted];
+        expected.sort();
+        assert_eq!(closed, expected, "archived folder and quick chats and unknown ones close after an hour, a folder session also after 3 idle days; never active recent ones, idle quick chats, running, fresh, task sessions or someone else's");
+        sqlx::query("DELETE FROM agent_profiles WHERE id = ANY($1)").bind(vec![mine, theirs]).execute(&pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_old_temp_folder_name_resolves_only_to_one_quest_of_the_runner_owner() {
+        let _global = global_state().lock().await;
+        let Some(pool) = pool().await else { return };
+        let owner = user(&pool).await;
+        let other = user(&pool).await;
+        let (mine, theirs) = (agent(&pool, owner).await, agent(&pool, other).await);
+        let store = RunnerStore::new(pool.clone());
+        let runner = registration(&store, owner, "Prefix Mac").await.runner.id;
+        let with_prefix = |prefix: &str| Uuid::parse_str(&format!("{prefix}{}", Uuid::new_v4().simple().to_string().get(12..).unwrap())).unwrap();
+        let task = |id: Uuid, agent: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query("INSERT INTO agent_tasks (id, user_id, title, assigned_agent_id, status) VALUES ($1, $2, 'Quest', $3, 'done')")
+                    .bind(id)
+                    .bind(owner)
+                    .bind(agent)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        };
+        let unique = Uuid::new_v4().simple().to_string()[..12].to_string();
+        let shared = Uuid::new_v4().simple().to_string()[..12].to_string();
+        let foreign = Uuid::new_v4().simple().to_string()[..12].to_string();
+        let found = with_prefix(&unique);
+        task(found, mine).await;
+        task(with_prefix(&shared), mine).await;
+        task(with_prefix(&shared), mine).await;
+        task(with_prefix(&foreign), theirs).await;
+        let asked = vec![unique.clone(), shared, foreign, "not-hex-at-all".into(), "abc".into()];
+        assert_eq!(store.quests_by_prefix(runner, &asked).await.unwrap(), vec![(unique, found)], "two quests behind one name, another owner's quest and junk names match nothing");
+        assert!(store.quests_by_prefix(runner, &[]).await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn closed_tasks_follow_grace_rules_and_disk_pressure() {
         let _global = global_state().lock().await;
@@ -3663,7 +4201,7 @@ mod tests {
         assert!(store.take_workspace_cleanup(runner).await.unwrap());
         assert!(!store.take_workspace_cleanup(runner).await.unwrap(), "a request is delivered once");
 
-        let notice = DiskNotice { free_bytes: 3_000_000_000, freed_bytes: 40_000_000_000, removed: 12, still_low: false, folders: Vec::new(), caches_bytes: 0 };
+        let notice = DiskNotice { free_bytes: 3_000_000_000, freed_bytes: 40_000_000_000, removed: 12, still_low: false, ..Default::default() };
         assert!(store.warn_disk_low(runner, &notice).await.unwrap());
         assert!(!store.warn_disk_low(runner, &notice).await.unwrap(), "one notice per hour");
         let bell: (String, String) = sqlx::query_as(
@@ -3675,10 +4213,19 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(bell.0, "alert");
-        assert!(bell.1.contains("removed 12 closed quest workspaces (40.0 GB)"), "{}", bell.1);
+        assert!(bell.1.contains("removed 12 closed quest folders (40.0 GB)"), "{}", bell.1);
+        let second = registration(&store, owner, "Second Mac").await.runner.id;
+        let kept = DiskNotice { still_low: true, kept: vec![DiskFolder { name: "quest abc".into(), bytes: 2_000_000_000, quest: Some(open) }], ..Default::default() };
+        assert!(store.warn_disk_low(second, &kept).await.unwrap());
+        let message: String = sqlx::query_scalar("SELECT payload->>'message' FROM world_events WHERE type = 'runner.disk_low' AND payload->>'runner_id' = $1")
+            .bind(second.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(message.contains("build folders of \"Quest\" (2.0 GB)"), "a kept folder is named by its quest title: {message}");
 
         let report = crate::world::WorldStore::new(pool.clone());
-        sqlx::query("UPDATE world_runners SET capabilities = jsonb_build_object('workspaces', jsonb_build_object('bytes', 9000000000, 'tasks', 3, 'free_gb', 2, 'total_gb', 460, 'low', true, 'largest', jsonb_build_array(jsonb_build_object('id', $2::text, 'bytes', 5000000000, 'temp_bytes', 4000000000), jsonb_build_object('id', $3::text, 'bytes', 3000000000, 'temp_bytes', 2000000000, 'build_bytes', 1000000000)), 'temp_bytes', 6000000000, 'build_bytes', 4000000000)) WHERE id = $1")
+        sqlx::query("UPDATE world_runners SET capabilities = jsonb_build_object('workspaces', jsonb_build_object('bytes', 9000000000, 'tasks', 3, 'free_gb', 2, 'total_gb', 460, 'low', true, 'largest', jsonb_build_array(jsonb_build_object('id', $2::text, 'bytes', 5000000000, 'temp_bytes', 4000000000), jsonb_build_object('id', $3::text, 'bytes', 3000000000, 'temp_bytes', 2000000000, 'build_bytes', 1000000000)), 'temp_bytes', 6000000000, 'build_bytes', 4000000000, 'seed_bytes', 1500000000)) WHERE id = $1")
             .bind(runner)
             .bind(done_old.to_string())
             .bind(open.to_string())
@@ -3689,13 +4236,23 @@ mod tests {
         assert_eq!(usage.len(), 1);
         assert_eq!((usage[0].bytes, usage[0].tasks, usage[0].reclaimable_bytes, usage[0].reclaimable_tasks, usage[0].low), (9_000_000_000, 3, 5_000_000_000, 1, true));
         assert_eq!((usage[0].temp_bytes, usage[0].reclaimable_temp_bytes), (6_000_000_000, 4_000_000_000), "only the closed quest's temp counts as reclaimable");
-        let request = crate::cleanup::CleanupRequest { owner, org: None, agent: None, kind: crate::cleanup::CleanupKind::Workspaces, older_than_days: 0, by_agent: None };
+        let request = crate::cleanup::CleanupRequest { owner, org: None, agent: None, kind: crate::cleanup::CleanupKind::QuestFolders, older_than_days: 0, by_agent: None };
         let preview = report.clean_up(request, false).await.unwrap();
-        assert_eq!((preview.rows, preview.bytes, preview.applied), (1, 6_000_000_000, false), "closed workspaces plus the idle quest's build folders");
-        assert_eq!((usage[0].build_bytes, usage[0].reclaimable_build_bytes), (4_000_000_000, 1_000_000_000), "only the idle quest's build folders are reclaimable");
+        assert_eq!((preview.rows, preview.bytes, preview.applied), (1, 5_000_000_000, false), "workspaces count closed quests only, never build caches");
+        assert_eq!((usage[0].build_bytes, usage[0].seed_bytes, usage[0].reclaimable_cache_bytes), (4_000_000_000, 1_500_000_000, 5_500_000_000), "build output and the shared dependency caches are separate rebuildable caches");
         assert!(!store.take_workspace_cleanup(runner).await.unwrap(), "a preview asks nothing of the device");
         assert!(report.clean_up(request, true).await.unwrap().applied);
         assert!(store.take_workspace_cleanup(runner).await.unwrap());
+        assert!(!store.take_cache_cleanup(runner).await.unwrap(), "clearing workspaces does not clear caches");
+        let caches = crate::cleanup::CleanupRequest { kind: crate::cleanup::CleanupKind::Caches, ..request };
+        let preview = report.clean_up(caches, false).await.unwrap();
+        assert_eq!((preview.rows, preview.bytes, preview.applied), (1, 5_500_000_000, false), "one device, its build output plus shared caches");
+        assert!(!store.take_cache_cleanup(runner).await.unwrap(), "a preview asks nothing of the device");
+        assert!(report.clean_up(caches, true).await.unwrap().applied);
+        assert!(store.take_cache_cleanup(runner).await.unwrap());
+        assert!(!store.take_cache_cleanup(runner).await.unwrap(), "a request is delivered once");
+        assert!(!store.take_workspace_cleanup(runner).await.unwrap(), "clearing caches does not remove workspaces");
+        assert!(report.clean_up(crate::cleanup::CleanupRequest { agent: Some(mine), ..caches }, false).await.is_err());
         assert!(report.clean_up(crate::cleanup::CleanupRequest { agent: Some(mine), ..request }, false).await.is_err());
 
         sqlx::query("DELETE FROM world_cleanups WHERE user_id = $1").bind(owner).execute(&pool).await.unwrap();
@@ -3817,14 +4374,7 @@ mod tests {
                 .apply_success(
                     &lease,
                     "done",
-                    Some("failed-session"),
-                    &json!({}),
-                    12,
-                    0.1,
-                    10,
-                    2,
-                    3,
-                )
+                    Some("failed-session"), Some(&Reported { cost_usd: 0.1, usage: RunnerUsage { input_tokens: 10, cached_input_tokens: 2, output_tokens: 3, context_tokens: 0 } }), Some(12))
                 .await
                 .unwrap(),
             ApplyCompletion::Applied
@@ -4183,19 +4733,11 @@ mod tests {
             .unwrap();
         let apply = store.clone();
         let pause = store.clone();
-        let baseline = json!({ "input_tokens": 10, "cached_input_tokens": 2, "output_tokens": 3 });
         let (applied, paused) = tokio::join!(
             apply.apply_success(
                 &lease,
                 "done",
-                Some("cli-session"),
-                &baseline,
-                12,
-                0.1,
-                10,
-                2,
-                3,
-            ),
+                Some("cli-session"), Some(&Reported { cost_usd: 0.1, usage: RunnerUsage { input_tokens: 10, cached_input_tokens: 2, output_tokens: 3, context_tokens: 0 } }), Some(12)),
             pause.update(
                 owner,
                 registration.runner.id,
@@ -4230,7 +4772,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-            assert_eq!(session_baseline, baseline);
+            assert_eq!(session_baseline, json!({ "input_tokens": 10, "cached_input_tokens": 2, "output_tokens": 3, "cost_usd": 0.1 }));
             assert!(store
                 .lease_for_completion(registration.runner.id, claim.lease_id)
                 .await
@@ -4244,7 +4786,7 @@ mod tests {
             assert_eq!((run.1, run.2, run.3, run.4), (0.0, 0, 0, 0));
         }
         let reapplied = store
-            .apply_success(&lease, "done", None, &baseline, 12, 0.1, 10, 2, 3)
+            .apply_success(&lease, "done", None, Some(&Reported { cost_usd: 0.1, usage: RunnerUsage { input_tokens: 10, cached_input_tokens: 2, output_tokens: 3, context_tokens: 0 } }), Some(12))
             .await
             .unwrap();
         assert!(matches!(
@@ -4282,5 +4824,268 @@ mod tests {
         .await
         .unwrap();
         assert!(!invalid);
+    }
+
+    const NO_SPACE: &str = "No space left on device: this device has only 1.0 GB free, so Loka did not start this run. Free up space on the device and retry.";
+
+    async fn work_run(pool: &PgPool, owner: Uuid, runner: Uuid, kind: &str) -> (Uuid, Uuid, Uuid) {
+        let (agent_id, session_id, run_id) = queued_run(pool, owner, runner).await;
+        sqlx::query("UPDATE session_runs SET kind = $2 WHERE id = $1").bind(run_id).bind(kind).execute(pool).await.unwrap();
+        sqlx::query("UPDATE agent_sessions SET cli_session_id = 'cli-session' WHERE id = $1").bind(session_id).execute(pool).await.unwrap();
+        (agent_id, session_id, run_id)
+    }
+
+    async fn refuse_at_start(store: &RunnerStore, runner: Uuid, error: &str) -> (ClaimedRun, bool) {
+        let claim = store.claim_kinds(runner, &token(&format!("mcp-space-{}", Uuid::new_v4())), &WORK_RUN_KINDS.map(String::from)).await.unwrap().unwrap();
+        let mut refused = completion(format!("agents/{}", claim.agent_id));
+        refused.exit_code = 1;
+        refused.error = Some(error.to_string());
+        let hash = token_hash(&format!("space-{}", claim.lease_id));
+        assert_eq!(store.begin_completion(runner, claim.lease_id, &hash, &refused).await.unwrap(), BeginCompletion::Begun);
+        let lease = store.lease_for_completion(runner, claim.lease_id).await.unwrap().unwrap();
+        let requeued = store.requeue_for_space(&lease, error).await.unwrap();
+        if requeued {
+            assert!(store.finish_completion(runner, claim.lease_id).await.unwrap(), "the lease settles once the run waits");
+        }
+        (claim, requeued)
+    }
+
+    async fn run_state(pool: &PgPool, run: Uuid) -> (String, Option<String>, Option<String>) {
+        sqlx::query_as("SELECT status, waiting_for, error FROM session_runs WHERE id = $1").bind(run).fetch_one(pool).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn every_run_kind_refused_for_lack_of_disk_waits_and_starts_when_there_is_room() {
+        let _global = global_state().lock().await;
+        let Some(pool) = pool().await else { return };
+        let owner = user(&pool).await;
+        let store = RunnerStore::new(pool.clone());
+        let runner = registration(&store, owner, "Full Mac").await.runner.id;
+        for kind in WORK_RUN_KINDS {
+            sqlx::query("UPDATE session_runs SET status = 'cancelled' WHERE runner_id = $1 AND status = 'queued'").bind(runner).execute(&pool).await.unwrap();
+            let (_, _, run) = work_run(&pool, owner, runner, kind).await;
+            let (_, requeued) = refuse_at_start(&store, runner, NO_SPACE).await;
+            assert!(requeued, "{kind} waits instead of failing");
+            assert_eq!(run_state(&pool, run).await, ("queued".to_string(), Some("disk".to_string()), None), "{kind}");
+            let waiting: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_events WHERE run_id = $1 AND type = 'run.waiting' AND payload->>'waiting' = 'true'")
+                .bind(run)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(waiting, 1, "{kind} is announced once");
+            assert!(
+                store.claim_kinds(runner, &token(&format!("mcp-early-{}", Uuid::new_v4())), &WORK_RUN_KINDS.map(String::from)).await.unwrap().is_none(),
+                "{kind} does not restart in a tight loop"
+            );
+            sqlx::query("UPDATE session_runs SET not_before = NOW() - INTERVAL '1 second' WHERE id = $1").bind(run).execute(&pool).await.unwrap();
+            let again = store.claim_kinds(runner, &token(&format!("mcp-later-{}", Uuid::new_v4())), &WORK_RUN_KINDS.map(String::from)).await.unwrap().expect("starts once there is room");
+            assert_eq!(again.run_id, run, "{kind} is the same run, not a copy");
+            assert_eq!(run_state(&pool, run).await, ("running".to_string(), None, None), "{kind}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_waiting_run_still_starts_when_the_heartbeat_or_a_crash_comes_before_the_completion_settles() {
+        let _global = global_state().lock().await;
+        let Some(pool) = pool().await else { return };
+        let owner = user(&pool).await;
+        let store = RunnerStore::new(pool.clone());
+        let runner = registration(&store, owner, "Racy").await.runner.id;
+        let kinds = WORK_RUN_KINDS.map(String::from);
+
+        let (_, _, run) = work_run(&pool, owner, runner, "task").await;
+        let claim = store.claim_kinds(runner, &token(&format!("mcp-race-{}", Uuid::new_v4())), &kinds).await.unwrap().unwrap();
+        let mut refused = completion(format!("agents/{}", claim.agent_id));
+        refused.exit_code = 1;
+        refused.error = Some(NO_SPACE.to_string());
+        let hash = token_hash(&format!("race-{}", claim.lease_id));
+        assert_eq!(store.begin_completion(runner, claim.lease_id, &hash, &refused).await.unwrap(), BeginCompletion::Begun);
+        let lease = store.lease_for_completion(runner, claim.lease_id).await.unwrap().unwrap();
+        assert!(store.requeue_for_space(&lease, NO_SPACE).await.unwrap());
+        let lease_status: String = sqlx::query_scalar("SELECT status FROM runner_leases WHERE id = $1").bind(claim.lease_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(lease_status, "completed", "the lease closes in the same transaction that queues the run again");
+
+        assert_eq!(store.set_disk_wait(runner, false).await.unwrap(), 1, "a heartbeat with room clears the waiting mark before the completion settles");
+        assert!(store.finish_completion(runner, claim.lease_id).await.unwrap(), "settling the completion afterwards is still fine");
+        assert!(store.finish_completion(runner, claim.lease_id).await.unwrap(), "and so is settling it twice");
+        sqlx::query("UPDATE session_runs SET not_before = NULL WHERE id = $1").bind(run).execute(&pool).await.unwrap();
+        let again = store.claim_kinds(runner, &token(&format!("mcp-race-2-{}", Uuid::new_v4())), &kinds).await.unwrap().expect("the run starts");
+        assert_eq!(again.run_id, run);
+
+        let (_, _, crashed) = work_run(&pool, owner, runner, "followup").await;
+        sqlx::query("UPDATE session_runs SET status = 'cancelled' WHERE id = $1").bind(run).execute(&pool).await.unwrap();
+        let claim = store.claim_kinds(runner, &token(&format!("mcp-race-3-{}", Uuid::new_v4())), &kinds).await.unwrap().unwrap();
+        assert_eq!(claim.run_id, crashed);
+        let hash = token_hash(&format!("race-{}", claim.lease_id));
+        assert_eq!(store.begin_completion(runner, claim.lease_id, &hash, &refused).await.unwrap(), BeginCompletion::Begun);
+        let lease = store.lease_for_completion(runner, claim.lease_id).await.unwrap().unwrap();
+        assert!(store.requeue_for_space(&lease, NO_SPACE).await.unwrap());
+        sqlx::query("UPDATE session_runs SET not_before = NULL WHERE id = $1").bind(crashed).execute(&pool).await.unwrap();
+        assert!(store.has_work(runner).await.unwrap(), "a crash before the completion settles leaves nothing blocking the session");
+        let restarted = store.claim_kinds(runner, &token(&format!("mcp-race-4-{}", Uuid::new_v4())), &kinds).await.unwrap().expect("the run starts after the crash");
+        assert_eq!(restarted.run_id, crashed);
+        assert_eq!(store.begin_completion(runner, claim.lease_id, &hash, &refused).await.unwrap(), BeginCompletion::Conflict, "the runner's retry of the old completion is stale once the run started again");
+    }
+
+    #[tokio::test]
+    async fn only_runs_that_never_started_and_ran_out_of_disk_wait() {
+        let _global = global_state().lock().await;
+        let Some(pool) = pool().await else { return };
+        let owner = user(&pool).await;
+        let store = RunnerStore::new(pool.clone());
+        let runner = registration(&store, owner, "Mixed").await.runner.id;
+
+        let (_, _, other) = work_run(&pool, owner, runner, "task").await;
+        let (_, requeued) = refuse_at_start(&store, runner, "Claude Code exited with code 1: spawn ENOENT").await;
+        assert!(!requeued, "other errors fail as before");
+        sqlx::query("UPDATE session_runs SET status = 'cancelled' WHERE id = $1").bind(other).execute(&pool).await.unwrap();
+
+        let (_, _, midway) = work_run(&pool, owner, runner, "task").await;
+        sqlx::query("INSERT INTO session_run_events (run_id, kind, body) VALUES ($1, 'tool', 'cargo build')").bind(midway).execute(&pool).await.unwrap();
+        let (_, requeued) = refuse_at_start(&store, runner, NO_SPACE).await;
+        assert!(!requeued, "a run that already took steps is not a start refusal");
+        sqlx::query("UPDATE session_runs SET status = 'cancelled' WHERE id = $1").bind(midway).execute(&pool).await.unwrap();
+
+        let (agent, _, cancelled) = work_run(&pool, owner, runner, "task").await;
+        let task = Uuid::new_v4();
+        sqlx::query("INSERT INTO agent_tasks (id, user_id, title, repo, status, assigned_agent_id) VALUES ($1, $2, 'Gone', 'owner/repo', 'cancelled', $3)")
+            .bind(task)
+            .bind(owner)
+            .bind(agent)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE session_runs SET task_id = $2 WHERE id = $1").bind(cancelled).bind(task).execute(&pool).await.unwrap();
+        let (_, requeued) = refuse_at_start(&store, runner, NO_SPACE).await;
+        assert!(!requeued, "a cancelled quest never waits for room");
+    }
+
+    #[tokio::test]
+    async fn the_heartbeat_marks_waiting_runs_once_and_releases_them_when_space_returns() {
+        let _global = global_state().lock().await;
+        let Some(pool) = pool().await else { return };
+        let owner = user(&pool).await;
+        let store = RunnerStore::new(pool.clone());
+        let runner = registration(&store, owner, "Low disk").await.runner.id;
+        let mut work = Vec::new();
+        for kind in WORK_RUN_KINDS {
+            work.push(work_run(&pool, owner, runner, kind).await.2);
+        }
+        let (_, _, chat) = queued_run(&pool, owner, runner).await;
+
+        assert_eq!(store.set_disk_wait(runner, true).await.unwrap(), WORK_RUN_KINDS.len(), "every work kind waits");
+        assert_eq!(store.set_disk_wait(runner, true).await.unwrap(), 0, "each following heartbeat is one cheap check with nothing to announce");
+        for run in &work {
+            assert_eq!(run_state(&pool, *run).await.1.as_deref(), Some("disk"));
+        }
+        assert_eq!(run_state(&pool, chat).await.1, None, "chat turns still run on a full disk");
+        let announced: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM world_events WHERE run_id = ANY($1) AND type = 'run.waiting'")
+            .bind(&work)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(announced, WORK_RUN_KINDS.len() as i64, "one announcement per run, not per heartbeat");
+
+        assert_eq!(store.set_disk_wait(runner, false).await.unwrap(), WORK_RUN_KINDS.len(), "space is back, so all of them are released");
+        for run in &work {
+            assert_eq!(run_state(&pool, *run).await, ("queued".to_string(), None, None));
+        }
+        assert_eq!(store.set_disk_wait(runner, false).await.unwrap(), 0);
+
+        let first = store.claim_kinds(runner, &token("mcp-slot-1"), &WORK_RUN_KINDS.map(String::from)).await.unwrap().unwrap();
+        let second = store.claim_kinds(runner, &token("mcp-slot-2"), &WORK_RUN_KINDS.map(String::from)).await.unwrap().unwrap();
+        assert_ne!(first.run_id, second.run_id, "one start per claim, one claim per free slot");
+        assert_eq!(store.set_disk_wait(runner, true).await.unwrap(), 2, "the runs still queued wait again, the ones that started do not");
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_quest_that_waits_for_disk_space_drops_its_run() {
+        let _global = global_state().lock().await;
+        let Some(pool) = pool().await else { return };
+        let owner = user(&pool).await;
+        let store = RunnerStore::new(pool.clone());
+        let runner = registration(&store, owner, "Cancel").await.runner.id;
+        let (agent, session, run) = work_run(&pool, owner, runner, "task").await;
+        let task = Uuid::new_v4();
+        sqlx::query("INSERT INTO agent_tasks (id, user_id, title, repo, status, assigned_agent_id) VALUES ($1, $2, 'Waiting', 'owner/repo', 'in_progress', $3)")
+            .bind(task)
+            .bind(owner)
+            .bind(agent)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE session_runs SET task_id = $2 WHERE id = $1").bind(run).bind(task).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE agent_sessions SET task_id = $2, role = 'task' WHERE id = $1").bind(session).bind(task).execute(&pool).await.unwrap();
+        let (_, requeued) = refuse_at_start(&store, runner, NO_SPACE).await;
+        assert!(requeued);
+        crate::world::WorldStore::new(pool.clone()).cancel_task(task, "Test", None).await.unwrap();
+        assert_eq!(run_state(&pool, run).await.0, "cancelled");
+        assert!(store.claim_kinds(runner, &token("mcp-cancelled"), &WORK_RUN_KINDS.map(String::from)).await.unwrap().is_none());
+        assert_eq!(store.set_disk_wait(runner, true).await.unwrap(), 0, "a cancelled run is never marked waiting again");
+    }
+
+    #[tokio::test]
+    async fn runs_that_failed_on_a_full_disk_go_back_in_the_queue() {
+        let _global = global_state().lock().await;
+        let Some(pool) = pool().await else { return };
+        let owner = user(&pool).await;
+        let store = RunnerStore::new(pool.clone());
+        let world = crate::world::WorldStore::new(pool.clone());
+        let runner = registration(&store, owner, "Stranded").await.runner.id;
+        let failed = |session_role: &'static str| {
+            let pool = pool.clone();
+            async move {
+                let (agent, session, run) = work_run(&pool, owner, runner, "task").await;
+                let task = Uuid::new_v4();
+                sqlx::query("INSERT INTO agent_tasks (id, user_id, title, repo, status, assigned_agent_id, error_message) VALUES ($1, $2, 'Stranded', 'owner/repo', 'failed', $3, 'No space left on device')")
+                    .bind(task)
+                    .bind(owner)
+                    .bind(agent)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                sqlx::query("UPDATE agent_sessions SET task_id = $2, role = $3, status = 'failed' WHERE id = $1").bind(session).bind(task).bind(session_role).execute(&pool).await.unwrap();
+                sqlx::query(
+                    "UPDATE session_runs SET task_id = $2, status = 'failed', error = 'No space left on device', finished_at = NOW(), cause = 'cli_error',
+                       diagnosis = '{\"cause\":\"cli_error\",\"failure\":\"disk_full\",\"stage\":\"start\",\"reason\":\"disk\",\"turns\":0}'::jsonb
+                     WHERE id = $1",
+                )
+                .bind(run)
+                .bind(task)
+                .execute(&pool)
+                .await
+                .unwrap();
+                (task, session, run)
+            }
+        };
+        let (task, session, run) = failed("task").await;
+        let (_, _, midway) = failed("task").await;
+        sqlx::query("UPDATE session_runs SET diagnosis = jsonb_set(diagnosis, '{turns}', '5') WHERE id = $1").bind(midway).execute(&pool).await.unwrap();
+        let (_, _, stepped) = failed("task").await;
+        sqlx::query("INSERT INTO session_run_events (run_id, kind, body) VALUES ($1, 'tool', 'cargo build')").bind(stepped).execute(&pool).await.unwrap();
+        let (_, _, later_stage) = failed("task").await;
+        sqlx::query("UPDATE session_runs SET diagnosis = jsonb_set(diagnosis, '{stage}', '\"run\"') WHERE id = $1").bind(later_stage).execute(&pool).await.unwrap();
+        let (_, _, handled) = failed("task").await;
+        sqlx::query(
+            "INSERT INTO session_runs (session_id, agent_id, task_id, kind, status, prompt)
+             SELECT session_id, agent_id, task_id, 'followup', 'completed', 'later' FROM session_runs WHERE id = $1",
+        )
+        .bind(handled)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let resumed = world.resume_disk_stranded().await.unwrap();
+        assert!(resumed.contains(&run), "a run refused at start on a full disk is put back");
+        assert!(!resumed.contains(&midway), "a run that took steps was not a start refusal");
+        assert!(!resumed.contains(&stepped), "a run with tool steps is not restarted from scratch");
+        assert!(!resumed.contains(&later_stage), "a run that got past the start stage is left alone");
+        assert!(!resumed.contains(&handled), "a quest somebody already restarted is left alone");
+        assert_eq!(run_state(&pool, run).await, ("queued".to_string(), Some("disk".to_string()), None));
+        let (quest, error): (String, Option<String>) = sqlx::query_as("SELECT status, error_message FROM agent_tasks WHERE id = $1").bind(task).fetch_one(&pool).await.unwrap();
+        assert_eq!((quest.as_str(), error), ("in_progress", None));
+        let status: String = sqlx::query_scalar("SELECT status FROM agent_sessions WHERE id = $1").bind(session).fetch_one(&pool).await.unwrap();
+        assert_eq!(status, "active");
+        assert!(world.resume_disk_stranded().await.unwrap().is_empty(), "a second start finds nothing left to do");
     }
 }

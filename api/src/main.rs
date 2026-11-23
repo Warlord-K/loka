@@ -29,6 +29,7 @@ pub struct AppState {
     pub world: loka_shared::world::WorldStore,
     pub runners: loka_shared::runners::RunnerStore,
     pub world_tx: tokio::sync::broadcast::Sender<loka_shared::world::EventWake>,
+    pub signal_tx: tokio::sync::broadcast::Sender<std::sync::Arc<loka_shared::world::WorldEvent>>,
     pub runner_tx: runner_wakes::RunnerWakes,
     pub term: Arc<terminal::TermHub>,
 }
@@ -91,9 +92,16 @@ async fn main() -> anyhow::Result<()> {
         Ok(made) => tracing::info!(made, "Gave webhook feeds without a secret a new one"),
         Err(error) => tracing::error!(%error, "Could not give webhook feeds their secrets"),
     }
+    match world.resume_disk_stranded().await {
+        Ok(runs) if runs.is_empty() => {}
+        Ok(runs) => tracing::info!(count = runs.len(), "Put runs that failed on a full disk back in the queue to wait for space"),
+        Err(error) => tracing::error!(%error, "Could not requeue runs that failed on a full disk"),
+    }
     let runners = loka_shared::runners::RunnerStore::new(db.pool().clone());
     let (world_tx, _) = tokio::sync::broadcast::channel(256);
     tokio::spawn(relay_world_events(database_url.clone(), world_tx.clone()));
+    let (signal_tx, _) = tokio::sync::broadcast::channel(1024);
+    tokio::spawn(relay_signals(database_url.clone(), signal_tx.clone()));
     let runner_tx = runner_wakes::RunnerWakes::default();
     let schedule_notify = Arc::new(tokio::sync::Notify::new());
     tokio::spawn(relay_runner_events(
@@ -109,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
         world,
         runners,
         world_tx,
+        signal_tx,
         runner_tx,
         term,
     };
@@ -366,6 +375,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/world/shell/{id}/cancel", post(routes::shell::cancel))
         .route("/world/shell/{id}/share", post(routes::shell::share))
         .route("/world/tasks/{id}/room", get(routes::world::quest_room))
+        .route("/world/tasks/{id}/resume", post(routes::world::quest_resume))
         .route("/world/tasks/{id}/milestones", get(routes::world::list_milestones).post(routes::world::add_milestones))
         .route("/world/tasks/{id}/milestones/check", post(routes::world::check_milestones))
         .route("/world/milestones/{id}", patch(routes::world::update_milestone).delete(routes::world::delete_milestone))
@@ -390,6 +400,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/world/reports/{id}/canvas", post(routes::reports::change_canvas))
         .route("/world/reports/{id}/practice", post(routes::reports::practice_this))
         .route("/world/reports/{id}/marks", post(routes::reports::add_mark))
+        .route("/world/reports/{id}/presence", post(routes::reports::presence))
         .route("/world/reports/{id}/marks/{mark}", patch(routes::reports::change_mark).delete(routes::reports::delete_mark))
         .route("/world/reports/{id}/revisions/{revision}", get(routes::reports::revision))
         .route("/world/reports/{id}/revisions/{revision}/restore", post(routes::reports::restore))
@@ -537,6 +548,11 @@ async fn sweep_runner_leases(state: AppState) {
         tokio::time::sleep(Duration::from_secs(15)).await;
         if last_stall_check.elapsed() >= Duration::from_secs(60) {
             last_stall_check = std::time::Instant::now();
+            match loka_agent::runner_server::RunnerCoordinator::new(state.db.clone(), state.world.clone()).deliver_lost_quick_replies(None).await {
+                Ok(0) => {}
+                Ok(count) => tracing::warn!(count, "delivered quick chat replies that never became messages"),
+                Err(error) => tracing::error!(%error, "delivering lost quick chat replies failed"),
+            }
             match state.world.settle_merged_quests().await {
                 Ok(settled) if !settled.is_empty() => {
                     tracing::info!(count = settled.len(), "settled quests whose pull request was already merged as done");
@@ -589,6 +605,14 @@ async fn sweep_runner_leases(state: AppState) {
                     }
                 }
                 Err(error) => tracing::error!(%error, "archived agent auto delete check failed"),
+            }
+            match state.runners.realign_session_devices().await {
+                Ok(agents) => {
+                    for agent_id in agents {
+                        tracing::warn!(agent_id = %agent_id, "gave a device to first turns that were waiting without one");
+                    }
+                }
+                Err(error) => tracing::error!(%error, "realigning session devices failed"),
             }
             match state.runners.stalled_on_offline_device().await {
                 Ok(stalled) => {
@@ -721,6 +745,25 @@ async fn relay_world_events(database_url: String, tx: tokio::sync::broadcast::Se
                 tracing::warn!("world event listener dropped, reconnecting");
             }
             Err(e) => tracing::error!(error = %e, "world event listener failed to connect"),
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn relay_signals(database_url: String, tx: tokio::sync::broadcast::Sender<std::sync::Arc<loka_shared::world::WorldEvent>>) {
+    loop {
+        match sqlx::postgres::PgListener::connect(&database_url).await {
+            Ok(mut listener) => {
+                if listener.listen(loka_shared::signals::CHANNEL).await.is_ok() {
+                    while let Ok(n) = listener.recv().await {
+                        if let Some(event) = loka_shared::signals::decode(n.payload()) {
+                            let _ = tx.send(std::sync::Arc::new(event));
+                        }
+                    }
+                }
+                tracing::warn!("world signal listener dropped, reconnecting");
+            }
+            Err(e) => tracing::error!(error = %e, "world signal listener failed to connect"),
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }

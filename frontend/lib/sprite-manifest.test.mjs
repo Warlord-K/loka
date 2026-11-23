@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { accessoryView, bodyFor, mirrored, parseManifest, placed, snapScale, viewOf, walkFrame, withArtOnly, wornLayer } from "./sprite-manifest.ts";
+import { ART_GROWTH, accessoryView, bodyFor, classicScale, mirrored, parseManifest, placed, snapScale, spriteGrid, viewOf, walkFrame, withArtOnly, wornLayer } from "./sprite-manifest.ts";
 import { canonicalBody, lookFor, speciesFor } from "./looks.ts";
 
 const canonical = canonicalBody;
@@ -37,50 +37,61 @@ const minimal = (extra = {}) => ({
   ...extra,
 });
 
-test("snap rule B keeps device pixels per art pixel on a multiple of 4, ties up", () => {
+test("the new art zooms out by its own growth so the town looks as big as the classic art", () => {
   const cases = [
     [1440, 900, 1, 4],
-    [1440, 900, 2, 8],
-    [1280, 720, 2, 8],
-    [1100, 700, 2, 8],
-    [1919, 1080, 1, 4],
+    [1440, 900, 2, 6],
+    [1512, 982, 2, 6],
+    [1728, 1117, 2, 8],
+    [1280, 720, 2, 4],
     [1920, 1080, 1, 4],
+    [1920, 1080, 2, 8],
     [1536, 864, 1.25, 4],
-    [1700, 1000, 1, 4],
-    [1920, 1152, 1, 8],
-    [2560, 1440, 2, 16],
-    [1600, 1000, 2, 12],
-    [1500, 1000, 2, 8],
-    [1760, 1100, 2, 12],
+    [1920, 1152, 1, 4],
+    [2560, 1440, 2, 12],
+    [2560, 1440, 1, 4],
+    [3840, 2160, 2, 18],
     [390, 844, 3, 4],
-    [430, 932, 3, 4],
-    [390, 844, 2, 4],
     [1280, 800, 1, 4],
-    [2560, 1440, 1, 8],
     [640, 400, 1, 4],
-    [5000, 3000, 4, 32],
+    [5000, 3000, 4, 24],
     [1440, 900, 0, 4],
   ];
   for (const [w, h, dpr, want] of cases) assert.equal(snapScale(w, h, dpr), want, `${w}x${h}@${dpr}`);
 });
 
-test("a dpr 3 phone and a dpr 1 laptop see about as many tiles as the classic art", () => {
-  const classic = (w, h, dpr) => Math.max(1, Math.round(Math.max(2, Math.floor(Math.min(w / 320, h / 192))) * Math.min(dpr, 2)));
-  for (const [w, h, dpr] of [[390, 844, 3], [430, 932, 3], [1440, 900, 1], [1280, 800, 1]]) {
-    const ratio = snapScale(w, h, dpr) / classic(w, h, dpr);
-    assert.ok(ratio >= 0.67 && ratio <= 1.33, `${w}x${h}@${dpr}: ${ratio}`);
-    assert.equal(snapScale(w, h, dpr) % 4, 0);
+test("a sprite px lands on whole device px except on retina screens, where half steps stay under a CSS px", () => {
+  for (let w = 960; w <= 3840; w += 37) {
+    for (const dpr of [1, 1.25, 1.5, 2, 3]) {
+      const p = snapScale(w, w * 0.6, dpr);
+      assert.ok(p >= 4, `${w}@${dpr}`);
+      assert.equal(p % (dpr >= 2 ? 2 : 4), 0, `${w}@${dpr}: ${p}`);
+    }
   }
 });
 
-test("snapped zoom stays within 0.8x to 1.33x of the classic scale, dpr capped at 2, once it is 3 or more", () => {
+test("on retina screens the town is within 0.8x to 1.1x of its classic size and agents within 1.2x", () => {
   for (let w = 960; w <= 3840; w += 37) {
-    for (const dpr of [1, 1.25, 1.5, 2, 3]) {
-      const want = Math.round(Math.max(2, Math.floor(Math.min(w / 320, (w * 0.6) / 192))) * Math.min(dpr, 2));
-      if (want < 3) continue;
-      const zoom = snapScale(w, w * 0.6, dpr) / want;
-      assert.ok(zoom >= 0.79 && zoom <= 1.34, `${w}@${dpr}: ${zoom}`);
+    for (const dpr of [2, 3]) {
+      const classic = classicScale(w, w * 0.6, dpr);
+      if (classic < 5) continue;
+      const town = (snapScale(w, w * 0.6, dpr) * ART_GROWTH) / classic;
+      const agent = (snapScale(w, w * 0.6, dpr) * 1.5) / classic;
+      assert.ok(town >= 0.8 && town <= 1.1, `${w}@${dpr}: town ${town}`);
+      assert.ok(agent <= 1.33, `${w}@${dpr}: agent ${agent}`);
     }
+  }
+});
+
+test("off the sprite grid, moving sprites snap to whole device px so their pixels never crawl", () => {
+  assert.equal(spriteGrid(4, 8), 4);
+  assert.equal(spriteGrid(2, 6), 2);
+  assert.equal(spriteGrid(4, 6), 6);
+  assert.deepEqual(placed([33, 119], 4, 100.3, 50.1, 8), placed([33, 119], 4, 100.3, 50.1));
+  for (const x of [10, 10.1, 10.25, 10.4, 10.77]) {
+    const [left, top] = placed([33, 119], 4, x, 50.3, 6);
+    assert.ok(Number.isInteger(Math.round(left * 6 * 1e6) / 1e6), `${x}: ${left}`);
+    assert.ok(Number.isInteger(Math.round(top * 6 * 1e6) / 1e6), `${x}: ${top}`);
   }
 });
 
@@ -95,7 +106,8 @@ test("manifest parses with defaults and lowercased colours", () => {
   assert.equal(m.things.shop.density, 2);
   assert.equal(m.things.shop.sign, null);
   assert.deepEqual(m.things.shop.masks, {});
-  assert.deepEqual(m.accessories.crown.sizes[0].front, { at: [0, 360], size: [36, 24], pivot: [18, 20], behind: false });
+  assert.deepEqual(m.accessories.crown.sizes[0].front, { at: [0, 360], size: [36, 24], pivot: [18, 20], behind: false, mirror: false });
+  assert.equal(m.accessories.crown.sideFaces, null);
   assert.equal(m.accessories.crown.atlas, null);
   assert.deepEqual(m.sources, {});
 });
@@ -215,6 +227,48 @@ test("accessories pick the size class nearest the body's head or body class", ()
   assert.deepEqual(accessoryView(shipped.accessories.scarf, human, "front"), shipped.accessories.scarf.sizes[44].front);
   assert.deepEqual(accessoryView(shipped.accessories.crown, { ...human, classes: { head: 66, body: 44 } }, "side"), shipped.accessories.crown.sizes[72].side);
   assert.equal(accessoryView(shipped.accessories.glasses, human, "back"), null);
+});
+
+test("every worn accessory picks its own art for each view and frame and faces the way the body faces", () => {
+  const HIDDEN_FROM_BEHIND = ["eyes", "chin"];
+  for (const [name, acc] of Object.entries(shipped.accessories)) {
+    const sides = Object.values(acc.sizes).filter((cut) => cut.side);
+    if (sides.length) assert.ok(acc.sideFaces === "left" || acc.sideFaces === "right", `${name} declares which way its side art faces`);
+    for (const [key, body] of Object.entries(shipped.bodies)) {
+      for (const facing of ["down", "right", "left", "up"]) {
+        const { view, mirror } = viewOf(body, facing);
+        const cut = accessoryView(acc, body, view);
+        const frames = [...(body.views[view] ?? body.views.front).idle, ...(body.views[view] ?? body.views.front).walk];
+        if (!cut) {
+          assert.ok(view !== "front", `${name} on ${key} has front art`);
+          continue;
+        }
+        const own = Object.values(acc.sizes).map((sizes) => sizes[view]).filter(Boolean);
+        assert.ok(own.some((c) => c.at[0] === cut.at[0] && c.at[1] === cut.at[1]), `${name} on ${key} ${facing} uses its own ${view} art, never another view's`);
+        if (view === "side") {
+          const faces = cut.mirror ? (acc.sideFaces === "left" ? "right" : "left") : acc.sideFaces;
+          assert.equal(faces, body.sideFaces, `${name} on ${key} faces the body's side`);
+          const shown = mirror ? (faces === "left" ? "right" : "left") : faces;
+          assert.equal(shown, facing, `${name} on ${key} walking ${facing} faces ${facing}`);
+          if (cut.mirror) assert.equal(cut.pivot[0], mirrored(own[0].pivot[0], cut.size[0]));
+        }
+        if (view === "back") assert.ok(!HIDDEN_FROM_BEHIND.includes(acc.slot), `${name} on ${key} is hidden from behind`);
+        const carries = acc.slot !== "hand" || Boolean(body.views.front.walk[0].slots.hand);
+        for (const [k, frame] of frames.entries()) if (carries) assert.ok(frame.slots[acc.slot], `${name} on ${key} ${view} frame ${k} has a ${acc.slot} anchor`);
+      }
+    }
+  }
+});
+
+test("glasses turn to face forward from the side, and glasses and beards are hidden from behind", () => {
+  const human = shipped.bodies.human;
+  assert.equal(accessoryView(shipped.accessories.glasses, human, "side").mirror, true);
+  for (const name of ["beard", "apron", "scarf", "cape", "cloak", "briefcase"]) assert.equal(accessoryView(shipped.accessories[name], human, "side").mirror, false, name);
+  assert.equal(accessoryView(shipped.accessories.glasses, human, "back"), null);
+  assert.equal(accessoryView(shipped.accessories.beard, human, "back"), null);
+  const sideless = parseManifest(minimal()).accessories.crown;
+  assert.equal(accessoryView(sideless, human, "side"), null);
+  assert.ok(accessoryView(sideless, human, "front"));
 });
 
 test("the briefcase rides the hand slot, which follows the hand on every walk frame", () => {

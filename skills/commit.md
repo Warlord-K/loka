@@ -21,4 +21,4 @@ Types:
 
 Scope: derive from the primary directory or module changed.
 Keep the subject line under 72 characters.
-Make atomic commits — one logical change per commit.
+Make atomic commits - one logical change per commit.

@@ -38,9 +38,15 @@ import {
   MapPin,
   MapTrifold,
   Minus,
+  MonitorPlay,
   Note,
   PencilSimple,
+  Phone,
   Plus,
+  At,
+  Hash,
+  Layout,
+  UsersThree,
   Quotes,
   GraduationCap,
   Trash,
@@ -51,7 +57,7 @@ import {
 import { PRACTICE_THIS_HINT, usePracticeThis } from "./practice-this";
 import { AnimatePresence, motion } from "framer-motion";
 import { cn } from "@/lib/utils";
-import { worldApi, type SearchResults, type WorldAgent } from "@/lib/world";
+import { worldApi, type ChannelSummary, type SearchResults, type WorldAgent } from "@/lib/world";
 import { canvasItemKind, canvasItemLabel, openReport, ReportError, reportsApi, wikify, type CanvasDoc, type CanvasItem, type CanvasMark, type CanvasOp, type ReportBrief, type ReportDetail, type StickyColor } from "@/lib/reports";
 import { RichText } from "./chat-kit";
 import { embedFromHref, EmbedView } from "./embeds";
@@ -66,10 +72,16 @@ import { commitMarkDelete, commitMarkDeleteOnExit, hideMarkDeletes, MARK_UNDO_MS
 import { takeEscape } from "@/lib/escape";
 import { worldUrl } from "./message-links";
 import { MeaningIcon } from "@/lib/meaning-icons";
+import { CanvasCursors } from "./canvas-cursors";
+import { AgentFace } from "./channel-ui";
+import { readDraft, saveDraft } from "./drafts";
+import { CALL_ABOUT_EVENT, MAX_QUOTED, quoteItems } from "@/lib/canvas-quote";
+import { EMBED_DRAG, embedItem, readEmbedDrag, type EmbedDrop } from "@/lib/canvas-embeds";
+import { EmbedItem, EmbedPicker, EmbedStage, type EmbedHost } from "./canvas-embed";
 
 const CanvasModel = dynamic(() => import("./canvas-model"), { ssr: false });
 
-type Tool = "select" | "hand" | "pen" | "pin" | "sticky" | "arrow" | "thing";
+type Tool = "select" | "hand" | "pen" | "pin" | "sticky" | "arrow" | "thing" | "embed";
 type ItemNode = Node<{ item: CanvasItem }, "item">;
 type MarkNode = Node<{ marks: CanvasMark[] }, "mark">;
 type CanvasNode = ItemNode | MarkNode;
@@ -92,6 +104,7 @@ const TOOLS: { tool: Tool | "image"; icon: PhosphorIcon; label: string; key: str
   { tool: "arrow", icon: ArrowUpRight, label: "Arrow between two items", key: "A" },
   { tool: "image", icon: ImageSquare, label: "Add an image, video or GLB model", key: "I" },
   { tool: "thing", icon: Cards, label: "Add a quest, report, to-do, message or agent as a card", key: "L" },
+  { tool: "embed", icon: MonitorPlay, label: "Add a live terminal or running quest", key: "E" },
 ];
 
 const SIDES: [string, Position][] = [
@@ -127,6 +140,7 @@ interface Ctx {
   removeMark: (mark: CanvasMark) => void;
   resize: (item: CanvasItem, box: { x: number; y: number; width: number; height: number }) => void;
   openMedia: (item: CanvasItem) => void;
+  embedHost: EmbedHost;
 }
 
 const CanvasCtx = createContext<Ctx | null>(null);
@@ -214,8 +228,10 @@ function ImageItem({ item }: { item: CanvasItem }) {
 }
 
 function ItemBody({ item }: { item: CanvasItem }) {
-  const { handles, onOpenAgent, runner, known, onWiki } = useCtx();
+  const { handles, onOpenAgent, runner, known, onWiki, embedHost } = useCtx();
   switch (item.kind) {
+    case "embed":
+      return <EmbedItem item={item} host={embedHost} />;
     case "image":
       return <ImageItem item={item} />;
     case "video":
@@ -303,7 +319,7 @@ function ItemView({ data, selected }: NodeProps<ItemNode>) {
         <Handle key={`t${side}`} id={`t${side}`} type="target" position={position} isConnectable={false} className="!invisible" />
       ))}
       <ItemBody item={item} />
-      {item.kind !== "frame" && item.kind !== "note" && <Caption item={item} />}
+      {item.kind !== "frame" && item.kind !== "note" && item.kind !== "embed" && <Caption item={item} />}
       {item.kind === "note" && item.caption && <p className="absolute left-0 right-0 top-full mt-1.5 text-w-xs text-w-text2">{item.caption}</p>}
       {SIDES.map(([side, position]) => (
         <Handle key={`s${side}`} id={`s${side}`} type="source" position={position} isConnectable={false} className="!invisible" />
@@ -428,9 +444,13 @@ interface BoardProps {
   onChanged: () => void;
   onHistory: () => void;
   onRename: (title: string) => Promise<void>;
+  onWorkspace?: () => void;
+  inWorkspace?: boolean;
+  workspaceChannel?: string | null;
+  onShowChannel?: (id: string) => void;
 }
 
-function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgent, onChanged, onHistory, onRename }: BoardProps) {
+function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgent, onChanged, onHistory, onRename, onWorkspace, inWorkspace = false, workspaceChannel = null, onShowChannel }: BoardProps) {
   const report = detail.report;
   const canEdit = detail.can_edit;
   const flow = useReactFlow<CanvasNode, Edge>();
@@ -453,6 +473,7 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
   const [marksOpen, setMarksOpen] = useState(false);
   const [linksOpen, setLinksOpen] = useState(false);
   const [single, setSingle] = useState<string | null>(null);
+  const [picked, setPicked] = useState<string[]>([]);
   const [note, setNote] = useState<string | null>(null);
   const [naming, setNaming] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -611,6 +632,8 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
       const next = applyNodeChanges(changes, list);
       selected.current = new Set(next.filter((n) => n.type === "item" && n.selected).map((n) => n.id));
       setSingle(selected.current.size === 1 ? [...selected.current][0] : null);
+      const many = selected.current.size > 0 ? [...selected.current] : [];
+      setPicked((was) => (was.length === many.length && was.every((id, i) => id === many[i]) ? was : many));
       return next;
     });
   }, []);
@@ -692,6 +715,28 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
     return flow.screenToFlowPosition({ x: (box?.left ?? 0) + (box?.width ?? 0) / 2, y: (box?.top ?? 0) + (box?.height ?? 0) / 2 });
   };
 
+  const addEmbeds = async (drops: EmbedDrop[], at?: { x: number; y: number }) => {
+    if (!drops.length) return;
+    const center = at ?? viewCenter();
+    await change([{ op: "add", items: drops.map((drop, i) => embedItem(drop, center, i)) }]);
+    setTool("select");
+    onChanged();
+  };
+
+  const dropEmbed = (e: React.DragEvent) => {
+    if (!canEdit || !e.dataTransfer.types.includes(EMBED_DRAG)) return;
+    e.preventDefault();
+    const drop = readEmbedDrag(e.dataTransfer.getData(EMBED_DRAG));
+    if (!drop) return;
+    void addEmbeds([drop], flow.screenToFlowPosition({ x: e.clientX, y: e.clientY }));
+  };
+
+  const overEmbed = (e: React.DragEvent) => {
+    if (!canEdit || !e.dataTransfer.types.includes(EMBED_DRAG)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = e.dataTransfer.effectAllowed === "move" ? "move" : "copy";
+  };
+
   const addThings = async (targets: string[]) => {
     if (!targets.length) return;
     const center = viewCenter();
@@ -713,6 +758,39 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
       source: `report:${report.id}#${item.id}`,
     });
   };
+
+  const chosen = picked.map((id) => doc.items.find((i) => i.id === id)).filter((i): i is CanvasItem => Boolean(i));
+  const pickedQuote = () => quoteItems(report, chosen.map((i) => ({ id: i.id, kind: canvasItemKind(i), label: canvasItemLabel(i) })));
+  const guide: GuideActions = {
+    toChat: () => {
+      const quote = pickedQuote();
+      if (quote) sendQuote(MAIN_TARGET, quote);
+    },
+    toChannel: (id) => {
+      const quote = pickedQuote();
+      if (!quote) return;
+      sendQuote(`channel:${id}`, quote);
+      if (inWorkspace && onShowChannel) onShowChannel(id);
+      else window.dispatchEvent(new CustomEvent("world:open-channel", { detail: { id } }));
+    },
+    askAgent: (agent) => {
+      const quote = pickedQuote();
+      if (!quote) return;
+      if (inWorkspace && workspaceChannel) {
+        sendQuote(`channel:${workspaceChannel}`, quote);
+        const key = `channel:${workspaceChannel}`;
+        const draft = readDraft(key).trim();
+        const mention = `@${agent.slug}`;
+        saveDraft(key, draft.startsWith(mention) ? `${draft} ` : `${mention} ${draft}`.trimEnd() + " ");
+        onShowChannel?.(workspaceChannel);
+      } else {
+        sendQuote(`agent:${agent.id}`, quote);
+        onOpenAgent(agent.id);
+      }
+    },
+  };
+
+  const callAbout = () => window.dispatchEvent(new CustomEvent(CALL_ABOUT_EVENT, { detail: { about: `report:${report.id}` } }));
 
   const quoteCanvas = () =>
     sendQuote(MAIN_TARGET, {
@@ -771,6 +849,7 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
     focused.current = focus;
     selected.current = new Set([id]);
     setSingle(id);
+    setPicked([]);
     setNodes((list) => list.map((n) => ({ ...n, selected: n.id === id })));
     window.setTimeout(() => void flow.setCenter(item.x + item.w / 2, item.y + item.h / 2, { zoom: Math.max(flow.getZoom(), 0.9), duration: reduced() ? 0 : 320 }), 450);
   }, [focus, nodes.length, doc.items, flow]);
@@ -799,6 +878,11 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
     if (done && done.flow.length > 1) void change([{ op: "add", items: [{ kind: "ink", points: done.flow }] }]);
   };
 
+  const embedHost = useMemo<EmbedHost>(
+    () => ({ reportId: report.id, ownerId: report.owner_user_id, meId, canEdit, remove: (item: CanvasItem) => void change([{ op: "remove", ids: [item.id] }]) }),
+    [report.id, report.owner_user_id, meId, canEdit, change],
+  );
+
   const ctx: Ctx = {
     report: { id: report.id, title: report.title },
     author,
@@ -817,6 +901,7 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
     removeMark,
     resize,
     openMedia,
+    embedHost,
   };
   const media = doc.items.filter(isPreviewable).map((i) => ({ id: i.id, mime: i.kind === "video" ? "video/mp4" : "image/png", name: i.caption ?? canvasItemKind(i), url: upload(i.upload_id) }));
   const viewingAt = media.findIndex((m) => m.id === viewing);
@@ -828,7 +913,8 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
 
   return (
     <CanvasCtx.Provider value={ctx}>
-      <div ref={wrap} style={FLOW_VARS} className={cn("@container/board relative h-full w-full bg-w-paper", tool === "pin" || tool === "sticky" || tool === "arrow" ? "[&_.react-flow__pane]:cursor-crosshair" : "")}>
+      <EmbedStage items={doc.items} host={embedHost}>
+      <div ref={wrap} style={FLOW_VARS} onDragOver={overEmbed} onDrop={dropEmbed} className={cn("@container/board relative h-full w-full bg-w-paper", tool === "pin" || tool === "sticky" || tool === "arrow" ? "[&_.react-flow__pane]:cursor-crosshair" : "")}>
         <ReactFlow<CanvasNode, Edge>
           nodes={nodes}
           edges={edges}
@@ -912,6 +998,7 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
           proOptions={{ hideAttribution: true }}
         >
           <Background variant={BackgroundVariant.Dots} gap={22} size={1.4} className="[&_circle]:fill-w-line2" />
+          <CanvasCursors reportId={report.id} items={doc.items} agents={agents} meId={meId} />
           {minimap && (
             <MiniMap
               pannable
@@ -988,6 +1075,8 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
               }}
             />
             <ClusterButton icon={Quotes} label="Quote this canvas in chat" onClick={quoteCanvas} />
+            {ownCanvas && <ClusterButton icon={Phone} label="Call your main agent about this canvas" onClick={callAbout} />}
+            {onWorkspace && !inWorkspace && <ClusterButton icon={Layout} label="Open as workspace, with your chat and channels beside it" onClick={onWorkspace} />}
             {ownCanvas && <ClusterButton icon={GraduationCap} label={practice.busy ? "Making the lesson" : practice.error ?? PRACTICE_THIS_HINT} active={practice.busy} onClick={practice.run} />}
             <ClusterButton icon={ClockCounterClockwise} label="History" onClick={onHistory} />
             <ClusterButton icon={copied ? Check : LinkIcon} label={copied ? "Link copied" : "Copy a link"} onClick={() => copy(worldUrl("report", report.id))} />
@@ -1060,6 +1149,14 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
         </AnimatePresence>
 
         <AnimatePresence>
+          {tool === "embed" && (
+            <motion.div {...POPOVER_MOTION} className="absolute bottom-16 left-1/2 z-30 w-[24rem] max-w-[calc(100%-1.5rem)] -translate-x-1/2">
+              <EmbedPicker meId={meId} onPick={(drop) => void addEmbeds([drop])} onClose={() => setTool("select")} />
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        <AnimatePresence>
           {tool === "thing" && (
             <motion.div {...POPOVER_MOTION} className="absolute bottom-16 left-1/2 z-30 w-[24rem] max-w-[calc(100%-1.5rem)] -translate-x-1/2">
               <ThingPicker onPick={(targets) => void addThings(targets)} onClose={() => setTool("select")} />
@@ -1121,7 +1218,7 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
         {doc.items.length === 0 && canEdit && tool === "select" && (
           <div className="pointer-events-none absolute inset-0 z-10 grid place-items-center p-6">
             <p className="max-w-sm text-balance text-center text-w-sm text-w-muted">
-              An empty canvas. Add a picture (I), a sticky note (S) or a quest, report, to-do or message as a live card (L), or ask an agent to fill it.
+              An empty canvas. Add a picture (I), a sticky note (S), a quest, report, to-do or message as a card (L), a live terminal or running quest (E), or ask an agent to fill it.
             </p>
           </div>
         )}
@@ -1139,6 +1236,9 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
           </div>
         )}
         {arrowFrom && <p className="absolute left-1/2 top-16 z-20 -translate-x-1/2 rounded-lg bg-w-invert px-3 py-1 text-w-xs text-w-oninvert">Now click the item the arrow points to</p>}
+        {chosen.length > 0 && !arrowFrom && (
+          <SelectionBar count={chosen.length} agents={agents} actions={guide} channelHint={inWorkspace && workspaceChannel ? "in the open channel" : null} />
+        )}
 
         <div role="toolbar" aria-label="Canvas tools" className="absolute bottom-3 left-1/2 z-20 flex -translate-x-1/2 items-center gap-0.5 rounded-lg border-2 border-w-ink bg-w-paper/95 p-0.5 shadow-[0_3px_0_rgb(var(--w-ink))]">
           {tools.map((t) => (
@@ -1155,6 +1255,7 @@ function Board({ detail, agents, meId, handles, focus, known, onWiki, onOpenAgen
           <ClusterButton icon={CornersOut} label="Fit to view" onClick={fit} />
         </div>
       </div>
+      </EmbedStage>
       <AnimatePresence>{viewingAt >= 0 && <Lightbox key="media" items={media} start={viewingAt} onClose={closeMedia} />}</AnimatePresence>
     </CanvasCtx.Provider>
   );
@@ -1247,6 +1348,91 @@ function ThingPicker({ onPick, onClose }: { onPick: (targets: string[]) => void;
           </li>
         ))}
       </ul>
+    </div>
+  );
+}
+
+interface GuideActions {
+  toChat: () => void;
+  toChannel: (id: string) => void;
+  askAgent: (agent: WorldAgent) => void;
+}
+
+function SelectionBar({ count, agents, actions, channelHint }: { count: number; agents: WorldAgent[]; actions: GuideActions; channelHint: string | null }) {
+  const [open, setOpen] = useState<"channel" | "agent" | null>(null);
+  const [channels, setChannels] = useState<ChannelSummary[] | null>(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    if (open !== "channel" || channels) return;
+    let live = true;
+    worldApi
+      .channels()
+      .then((list) => live && setChannels(list.filter((c) => c.kind !== "dm" && c.member)))
+      .catch(() => live && setFailed(true));
+    return () => {
+      live = false;
+    };
+  }, [open, channels]);
+  const close = () => setOpen(null);
+  const row = cn("flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-w-sm hover:bg-w-sand", EASE, FOCUS);
+  return (
+    <div
+      role="toolbar"
+      aria-label="Selected items"
+      onKeyDown={(e) => {
+        if (e.key === "Escape" && open) {
+          e.stopPropagation();
+          close();
+        }
+      }}
+      className="absolute left-1/2 top-16 z-20 -translate-x-1/2"
+    >
+      <div className="flex items-center gap-1 rounded-lg border-2 border-w-ink bg-w-paper/95 p-0.5 pl-2.5 shadow-[0_3px_0_rgb(var(--w-ink))]">
+        <span className="whitespace-nowrap text-w-xs font-semibold text-w-text2">{count} selected</span>
+        <button type="button" onClick={actions.toChat} className={cn(BTN_GHOST, BTN_SM, "gap-1.5")}>
+          <Quotes size={14} weight="bold" aria-hidden />
+          {count > MAX_QUOTED ? `Quote the first ${MAX_QUOTED}` : "Quote in chat"}
+        </button>
+        <button type="button" aria-expanded={open === "channel"} onClick={() => setOpen(open === "channel" ? null : "channel")} className={cn(BTN_GHOST, BTN_SM, "gap-1.5")}>
+          <Hash size={14} weight="bold" aria-hidden />
+          Send to a channel
+        </button>
+        <button type="button" aria-expanded={open === "agent"} onClick={() => setOpen(open === "agent" ? null : "agent")} className={cn(BTN_GHOST, BTN_SM, "gap-1.5")}>
+          <At size={14} weight="bold" aria-hidden />
+          Ask an agent
+        </button>
+      </div>
+      <AnimatePresence>
+        {open && (
+          <motion.div {...POPOVER_MOTION} className="nowheel absolute left-1/2 top-full mt-2 max-h-[min(20rem,50vh)] w-72 -translate-x-1/2 overflow-y-auto rounded-lg border-2 border-w-ink bg-w-paper p-1 shadow-[0_3px_0_rgb(var(--w-ink))]">
+            {open === "channel" ? (
+              channels === null ? (
+                <p className="px-2 py-2 text-w-sm text-w-muted">{failed ? "Channels did not load. Try again." : "Loading channels"}</p>
+              ) : channels.length === 0 ? (
+                <p className="px-2 py-2 text-w-sm text-w-muted">You are not in any channel yet.</p>
+              ) : (
+                channels.map((c) => (
+                  <button key={c.id} type="button" className={row} onClick={() => { actions.toChannel(c.id); close(); }}>
+                    {c.kind === "team" ? <UsersThree size={14} weight="duotone" className="shrink-0 text-w-link" /> : <Hash size={14} weight="duotone" className="shrink-0 text-w-link" />}
+                    <span className="min-w-0 flex-1 truncate">{c.name}</span>
+                  </button>
+                ))
+              )
+            ) : (
+              <>
+                <p className="px-2 pb-1 pt-1.5 text-w-xs text-w-muted">{channelHint ? `Mentions the agent ${channelHint}, with the items quoted` : "Opens its chat with the items quoted"}</p>
+                {agents.map((a) => (
+                  <button key={a.id} type="button" className={row} onClick={() => { actions.askAgent(a); close(); }}>
+                    <AgentFace agent={a} size={20} rounded="rounded-md" />
+                    <span className="min-w-0 flex-1 truncate">{a.name}</span>
+                    <span className="shrink-0 text-w-xs text-w-muted">@{a.slug}</span>
+                  </button>
+                ))}
+              </>
+            )}
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

@@ -14,5 +14,5 @@ When the plan involves database schema changes, detect the migration tool:
 
 Rules:
 - Always create a new migration file, never modify existing ones
-- Include both forward changes (what SQL does) — down/rollback only if the tool supports it
+- Include both forward changes (what SQL does) - down/rollback only if the tool supports it
 - Test the migration can be applied cleanly

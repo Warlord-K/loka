@@ -6,6 +6,7 @@ mod acp;
 mod api;
 mod apps;
 mod browser;
+mod browser_view;
 mod screen;
 mod claude;
 mod cli;
@@ -22,6 +23,7 @@ mod model_catalog;
 mod omp;
 mod opencode;
 mod preflight;
+mod quest_storage;
 mod remote_runner;
 mod resources;
 mod sandbox_wrap;
@@ -32,6 +34,12 @@ mod terminal;
 mod world;
 #[cfg(test)]
 mod bench_live;
+#[cfg(test)]
+mod test_env;
+#[cfg(test)]
+fn passed_on_to_clis(name: &str) -> bool {
+    cli::passed_on(name)
+}
 #[cfg(test)]
 mod parity_live;
 
@@ -108,8 +116,9 @@ async fn serve() -> anyhow::Result<()> {
     if config.github_token.is_empty() {
         warn!("GITHUB_TOKEN is not set, GitHub features are disabled");
     }
-    git::workspace::configure_git_auth(&config.github_token).await?;
-    git::workspace::configure_git_signing(config.signing.as_ref()).await?;
+    git::workspace::configure_git_auth(&config.github_token, &git::workspace::GitHost::INHERITED).await?;
+
+    git::workspace::configure_git_signing(config.signing.as_ref(), &git::workspace::GitHost::INHERITED).await?;
 
     if let Err(e) = config.write_opencode_global_config() {
         warn!(error = %e, "Failed to write opencode MCP config");

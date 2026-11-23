@@ -1,3 +1,5 @@
+import { EMBEDS, type CanvasEmbed } from "./canvas-embeds";
+
 export interface ReportBrief {
   id: string;
   owner_user_id: string;
@@ -24,7 +26,7 @@ export interface ReportBrief {
 
 export type ReportKind = "doc" | "canvas";
 
-export type CanvasKind = "image" | "video" | "model" | "note" | "sticky" | "ref" | "run" | "frame" | "ink" | "ui";
+export type CanvasKind = "image" | "video" | "model" | "note" | "sticky" | "ref" | "run" | "frame" | "ink" | "ui" | "embed";
 
 export type StickyColor = "lemon" | "rose" | "mint" | "aqua" | "honey" | "sand";
 
@@ -44,6 +46,7 @@ export interface CanvasItem {
   locked?: boolean;
   points?: [number, number][];
   spec?: unknown;
+  embed?: CanvasEmbed;
   by?: string;
 }
 
@@ -188,6 +191,8 @@ export const reportsApi = {
   changeCanvas: (id: string, ops: CanvasOp[], opts?: SendOptions) => send(`/api/world/reports/${id}/canvas`, "POST", { ops }, opts).then((r) => json<Report>(r)),
   addMark: (id: string, mark: { item_id?: string | null; x: number; y: number; kind: "pin" | "sticky"; body: string }) =>
     send(`/api/world/reports/${id}/marks`, "POST", mark).then((r) => json<CanvasMark>(r)),
+  presence: (id: string, at: { x?: number; y?: number; item?: string | null; leaving?: boolean }, opts?: SendOptions) =>
+    send(`/api/world/reports/${id}/presence`, "POST", at, opts).then(() => undefined, () => undefined),
   setMark: (id: string, mark: string, resolved: boolean, reply?: string) =>
     send(`/api/world/reports/${id}/marks/${mark}`, "PATCH", { resolved, reply }).then((r) => json<CanvasMark>(r)),
   removeMark: async (id: string, mark: string, opts?: SendOptions) => {
@@ -209,13 +214,14 @@ export function openReport(id?: string | null, item?: string | null) {
 }
 
 export function canvasItemLabel(item: CanvasItem): string {
-  const text = item.caption || item.text || item.target || item.command || (item.kind === "ui" ? "Card" : "");
+  const text = item.caption || item.text || item.target || item.command || (item.kind === "ui" ? "Card" : item.embed ? EMBEDS[item.embed.kind]?.label ?? "" : "");
   return text.replace(/\s+/g, " ").trim().slice(0, 160);
 }
 
 const REF_LABEL: Record<string, string> = { quest: "Quest", report: "Report", todo: "To-do", msg: "Message", agent: "Agent" };
 
 export function canvasItemKind(item: CanvasItem): string {
+  if (item.kind === "embed") return item.embed ? `Live ${EMBEDS[item.embed.kind]?.label.toLowerCase() ?? "embed"}` : CANVAS_KIND_LABEL.embed;
   return item.kind === "ref" ? (REF_LABEL[(item.target ?? "").split(":")[0]] ?? "Card") : CANVAS_KIND_LABEL[item.kind];
 }
 
@@ -230,6 +236,7 @@ export const CANVAS_KIND_LABEL: Record<CanvasKind, string> = {
   frame: "Frame",
   ink: "Drawing",
   ui: "Card",
+  embed: "Live embed",
 };
 
 export function headingSlug(text: string): string {
